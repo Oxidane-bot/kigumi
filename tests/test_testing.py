@@ -255,8 +255,8 @@ def test_cassette_rejects_replay_with_different_request(tmp_path: Path) -> None:
     assert matched.complete([{"role": "user", "content": "甲"}], "default").text == "recorded"
 
 
-def test_cassette_replays_legacy_tapes_without_request_sha(tmp_path: Path) -> None:
-    """教训 tape_compat: 旧格式磁带没有请求指纹,重放不得因此报错。"""
+def test_cassette_rejects_legacy_tapes_without_request_sha(tmp_path: Path) -> None:
+    """教训 tape_compat: 无指纹磁带必须报错重录,不得静默按序重放。"""
     path = tmp_path / "legacy.json"
     path.write_text(
         json.dumps(
@@ -274,7 +274,8 @@ def test_cassette_replays_legacy_tapes_without_request_sha(tmp_path: Path) -> No
     )
 
     replay = CassetteTransport(path)
-    assert replay.complete([{"role": "user", "content": "任意"}], "default").text == "legacy"
+    with pytest.raises(RuntimeError, match="re-record"):
+        replay.complete([{"role": "user", "content": "任意"}], "default")
 
 
 def test_skip_unless_env_lists_every_missing_environment_variable(

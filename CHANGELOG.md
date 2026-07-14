@@ -2,6 +2,12 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [Unreleased]
+
+### 变更
+
+- `CassetteTransport` 现在拒绝缺少 `request_sha` 的旧格式磁带并要求重录（此前静默按序重放）。
+
 ## [0.3.1] - 2026-07-14
 
 ### 新增

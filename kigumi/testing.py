@@ -152,7 +152,12 @@ class CassetteTransport:
         self._cursor += 1
         # 只按序重放会把换了顺序的调用静默配错答案;录了请求指纹就必须核。
         recorded_sha = entry.get("request_sha")
-        if recorded_sha is not None and recorded_sha != _request_sha(messages, model, params):
+        if recorded_sha is None:
+            raise RuntimeError(
+                f"Cassette entry {self._cursor - 1} lacks request_sha; "
+                f"re-record the tape: {self.path}"
+            )
+        if recorded_sha != _request_sha(messages, model, params):
             raise RuntimeError(
                 f"Cassette request mismatch at entry {self._cursor - 1}: {self.path}"
             )
