@@ -58,10 +58,6 @@ def _mapping(value: Any) -> dict[str, Any]:
     if callable(model_dump):
         dumped = model_dump()
         return dict(dumped) if isinstance(dumped, dict) else {}
-    as_dict = getattr(value, "dict", None)
-    if callable(as_dict):
-        dumped = as_dict()
-        return dict(dumped) if isinstance(dumped, dict) else {}
     return {}
 
 
