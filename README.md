@@ -58,7 +58,7 @@ with no further API cost.
 
 ## Status
 
-0.3.1, API not frozen. All four core layers are in place, with 351 tests passed and 1 skipped,
+0.4.0, API not frozen. All four core layers are in place, with 351 tests passed and 1 skipped,
 refined through three clean-room pilots (structured extraction /
 multimodal / DAG orchestration).
 
