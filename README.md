@@ -25,8 +25,9 @@ A foundation for building LLM pipelines with coding agents:
 - **DAG orchestration** (optional): explicit node/item cache policy, static
   reusable subgraphs, dynamic map/scan, owned materialized outputs, human
   checkpoints, and run diffs
-- **Three guard rings**: runtime refusal / pytest auto-collection /
-  git hooks, so the rules enforce themselves
+- **Four guard rings**: registration-time refusal plus three outer rings
+  (`dag check` / pytest auto-collection / git hooks), so the rules enforce
+  themselves
 
 ## Quick start
 
@@ -57,7 +58,7 @@ with no further API cost.
 
 ## Status
 
-0.2.0, API not frozen. All four core layers are in place, with 336 tests passed and 1 skipped,
+0.3.1, API not frozen. All four core layers are in place, with 351 tests passed and 1 skipped,
 refined through three clean-room pilots (structured extraction /
 multimodal / DAG orchestration).
 

@@ -37,7 +37,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    `CACHE_SCHEMA`；生成字节模块集合（当前为 `prompt.py`、`repair.py`）成员变化视同键成分变化。
 8. 键成分任何变化等于全项目缓存换族，必须记入 `CHANGELOG.md`。0.2.0 将
    `CACHE_SCHEMA` 从 1 升至 2，是为可选 external 成分进行的有意完整 L3 换族。
-   `[Unreleased]` 将 schema 从 2 升至 3，是为普通依赖边的可选消费投影进行的有意完整换族。
+   0.3.0 将 schema 从 2 升至 3，是为普通依赖边的可选消费投影进行的有意完整换族。
 
 ## Failure behavior
 
@@ -49,10 +49,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 
 - `kigumi/calling.py:141-223`
 - `kigumi/_declarations.py:9-27`
-- `kigumi/dag.py:51-65`
-- `kigumi/dag.py:1910-1980`
-- `kigumi/dag.py:2115-2164`
-- `kigumi/dag.py:2328-2329`
+- kigumi/dag.py 的 `CACHE_SCHEMA` 与 `_kigumi_key_inputs`
+- kigumi/dag.py 的 `Dag._key_components` 与 `Dag._libs_hash`
+- kigumi/dag.py 的 `_module_code_text`
 - `kigumi/artifacts.py:15-23`
 
 ## Verification

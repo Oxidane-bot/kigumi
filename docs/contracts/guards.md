@@ -27,8 +27,7 @@ Status: Active
 
 ## Affected surfaces
 
-- `kigumi/dag.py:1418-1472`
-- `kigumi/dag.py:2203-2240`
+- kigumi/dag.py 的 `_validate_registration` 与 `_extract_node_ast_metadata`
 - `kigumi/enforce.py:15-51`
 - `kigumi/enforce.py:54-118`
 - `kigumi/enforce.py:121-174`
