@@ -1,0 +1,17 @@
+TITLE_DELIMITER = '## {title}\n\n'
+WORDING_CLIPPED = '(已截断：原文 {original_chars} 字，保留 {kept_chars} 字)'
+WORDING_JSON_ONLY = '只输出一个 JSON 对象；不要输出解释、前后缀或代码围栏。'
+WORDING_REPAIR_ROUND = '这是第 {round} 轮修复。'
+WORDING_REPAIR_STUCK = '检测到输出与上次完全相同；请逐项修正错误，不得原样重交。'
+WORDING_REPAIR_PREAMBLE = '上次输出未通过校验。下面是错误：'
+WORDING_REPAIR_ECHO = '你上一轮的输出如下：'
+
+--- inject ---
+## 示例材料
+
+```json
+{
+  "a": 1,
+  "b": "木"
+}
+```

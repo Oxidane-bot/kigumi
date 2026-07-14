@@ -1,0 +1,23 @@
+## 输出格式
+
+字段：
+- `title`：`str`；必填；标题
+- `enabled`：`bool`；必填；是否启用
+- `location`：`SnapshotLocation`；必填；地点
+- `tags`：`list[str]`；必填；标签
+
+示例：
+```json
+{
+  "title": "<string>",
+  "enabled": false,
+  "location": {
+    "city": "<string>"
+  },
+  "tags": [
+    "<string>"
+  ]
+}
+```
+
+只输出一个 JSON 对象；不要输出解释、前后缀或代码围栏。
