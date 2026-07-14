@@ -15,7 +15,7 @@ from typing import Any
 from pipeline import build_dag
 
 from kigumi import LLMCaller
-from kigumi.dag import gc_artifacts
+from kigumi.store import gc_artifacts
 from kigumi.testing import ScriptedTransport
 
 TICKET_COUNT = 150
