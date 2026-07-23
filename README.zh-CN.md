@@ -19,6 +19,9 @@
 - **确定性重放**:内容寻址缓存,同输入逐字节同输出
 - **DAG 编排**(可选):显式节点/item 缓存策略、静态可复用子图、动态 map/scan、
   物化输出所有权、人工检查点与 run diff
+- **外部 Agent 节点**:provider-neutral staging、attachment、exact publish、普通 DAG 缓存，
+  内容寻址 `AgentSpec` 胶囊与原生、精确版本锁定的 Pi RPC adapter
+- **统一实验主体**:函数、Caller、workflow 与 Agent DAG 使用同一隔离证据网格，不自动选赢家
 - **守卫四环**:注册环拒载,外加 dag check / pytest 自动收集 / git hook 三个外环,让规矩自动执行
 
 ## 快速上手
@@ -48,8 +51,7 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 
 ## 状态
 
-0.4.0,API 未冻结。核心四层齐备,351 项测试通过、1 项跳过,经三个 clean-room
-试点(结构化抽取 / 多模态 / DAG 编排)回写打磨。
+0.5.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
 
 ## 安装
 
@@ -57,7 +59,10 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 uv add "kigumi[litellm]"
 ```
 
-不装 litellm extra 时可用 `StdlibTransport`(纯标准库 HTTP)或自实现 transport。
+不装 litellm extra 时可用 `StdlibTransport`(纯标准库 HTTP)或自实现 transport。Pi 是外部
+runtime：由用户自行安装、固定版本，并把命令与精确版本交给 `PiRpcAdapter`；Kigumi 不安装或
+升级 Node/Pi。staging 与 root-scoped 工具限制模型 I/O，但不是 OS sandbox，可信 Extension
+仍有宿主进程权限。
 
 ## 文档地图
 

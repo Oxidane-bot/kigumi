@@ -1,8 +1,24 @@
 """kigumi: load-bearing joinery for LLM content pipelines."""
 
-__version__ = "0.3.1"
+__version__ = "0.5.0"
 
 from ._declarations import CachePolicy
+from .agents import (
+    AgentAdapter,
+    AgentBuildContext,
+    AgentCapabilities,
+    AgentCompletion,
+    AgentError,
+    AgentFileSelector,
+    AgentLimits,
+    AgentPublish,
+    AgentRequest,
+    AgentResultView,
+    AgentRunContext,
+    AgentRunResult,
+    AgentSpec,
+    AgentTask,
+)
 from .artifacts import (
     atomic_write_json,
     atomic_write_text,
@@ -11,7 +27,17 @@ from .artifacts import (
     sha256_file,
     write_artifact,
 )
-from .bench import Variant, bench
+from .bench import (
+    AgentSubject,
+    CallerSubject,
+    DagSubject,
+    ExperimentSubject,
+    FunctionSubject,
+    TrialContext,
+    TrialObservation,
+    Variant,
+    bench,
+)
 from .blobs import BlobStore
 from .calling import Budget, BudgetExceeded, Caller, DryRunError, LLMCaller, observe
 from .config import KigumiConfig, find_project_root, load_config, load_env
@@ -27,6 +53,7 @@ from .dag import (
 from .errors import OutputOwnershipError
 from .evals import Judgment, evaluate, gated_metric, llm_judge, pairwise_judge
 from .optimize import Candidate, EvolveResult, evolve_prompt
+from .pi import PiRpcAdapter
 from .prompt import (
     Clipped,
     KigumiPromptWarning,
@@ -56,20 +83,39 @@ from .transport import (
 
 __all__ = [
     "AdaptiveCapacity",
+    "AgentAdapter",
+    "AgentBuildContext",
+    "AgentCapabilities",
+    "AgentCompletion",
+    "AgentError",
+    "AgentFileSelector",
+    "AgentLimits",
+    "AgentPublish",
+    "AgentRequest",
+    "AgentResultView",
+    "AgentRunContext",
+    "AgentRunResult",
+    "AgentSpec",
+    "AgentSubject",
+    "AgentTask",
     "BlobStore",
     "Budget",
     "BudgetExceeded",
     "Candidate",
     "CachePolicy",
     "Caller",
+    "CallerSubject",
     "CheckpointPending",
     "Clipped",
     "Dag",
+    "DagSubject",
     "DryRunError",
     "EmptyResponseError",
     "ExplainResult",
+    "ExperimentSubject",
     "EvolveResult",
     "FileSlots",
+    "FunctionSubject",
     "Judgment",
     "KigumiConfig",
     "KigumiPromptWarning",
@@ -79,6 +125,7 @@ __all__ = [
     "OutputOwnershipError",
     "observe",
     "PlanResult",
+    "PiRpcAdapter",
     "RepairExhausted",
     "Response",
     "RunResult",
@@ -87,6 +134,8 @@ __all__ = [
     "Subgraph",
     "TemplateSlotError",
     "Transport",
+    "TrialContext",
+    "TrialObservation",
     "TruncatedResponseError",
     "UndeclaredInputError",
     "Variant",

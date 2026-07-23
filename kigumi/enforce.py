@@ -240,7 +240,7 @@ def _is_node_decorator(decorator: ast.expr) -> bool:
     return (
         isinstance(decorator, ast.Call)
         and isinstance(decorator.func, ast.Attribute)
-        and decorator.func.attr in {"node", "map", "scan", "foreach"}
+        and decorator.func.attr in {"node", "map", "scan", "foreach", "agent"}
     )
 
 

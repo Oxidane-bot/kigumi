@@ -33,6 +33,16 @@ from ._declarations import (
     validate_segment,
 )
 from ._execution import ExecutionEnvelope
+from .agents import (
+    AgentAdapter,
+    AgentBuildContext,
+    AgentResultView,
+    AgentSpec,
+    AgentTask,
+    agent_external_identity,
+    execute_agent_task,
+    validate_agent_artifact,
+)
 from .artifacts import canonical_json, sha
 from .blobs import BlobStore
 from .calling import DryRunError, LLMCaller, observe
@@ -193,6 +203,10 @@ class _Node:
     local_items_source: str | None = None
     local_carry_source: str | None = None
     subgraph: str | None = None
+    executor: str = "function"
+    agent_adapter: AgentAdapter | None = None
+    agent_spec: AgentSpec | None = None
+    agent_identity: dict[str, Any] | None = None
 
 
 class NodeContext:
@@ -319,6 +333,10 @@ class NodeContext:
         digest, size = self._dag.blob_store.ingest(Path(source))
         return {"kigumi_blob": digest, "path": str(relative), "bytes": size}
 
+    def agent_result(self, artifact: Mapping[str, Any]) -> AgentResultView:
+        """Open a verified read-only view of an upstream Agent artifact."""
+        return AgentResultView(artifact, self._dag.blob_store)
+
 
 class Dag:
     """Own a project-local node registry, content-addressed cache, and run history."""
@@ -373,6 +391,60 @@ class Dag:
                 cache=node_cache,
                 external_fingerprint_digest=fingerprint_digest,
                 metadata=metadata,
+            )
+            return function
+
+        return register
+
+    def agent(
+        self,
+        name: str,
+        *,
+        adapter: AgentAdapter,
+        spec: AgentSpec,
+        deps: Iterable[str] = (),
+        prompts: Iterable[str] = (),
+        files: Iterable[str | Path] = (),
+        params: dict[str, Any] | None = None,
+        consumes: Mapping[str, ConsumeFunction] | None = None,
+        cache: CachePolicy = "auto",
+    ) -> Callable[[Callable[[dict[str, dict[str, Any]], AgentBuildContext], AgentTask]], Any]:
+        """Register an external-agent executor on the ordinary node scheduler."""
+        _validate_name(name, "Agent node")
+        if name in self._nodes:
+            raise ValueError(f"Node {name!r} is already registered")
+        node_cache = validate_cache_policy(cache)
+        try:
+            identity = agent_external_identity(adapter, spec)
+        except (TypeError, ValueError) as error:
+            if node_cache == "auto":
+                raise ValueError(
+                    "cache='auto' requires an Agent adapter with a stable identity; "
+                    "use cache='refresh' or cache='off' only for intentionally unkeyed runs"
+                ) from error
+            identity = {
+                "agent_executor_schema": 2,
+                "adapter": {"unkeyed": True},
+                "spec": spec.identity(),
+            }
+
+        def register(function: Any) -> Any:
+            metadata = _validate_registration(function)
+            self._register_node(
+                name,
+                function,
+                deps=tuple(deps),
+                prompts=tuple(prompts),
+                files=tuple(Path(path) for path in files),
+                params=copy.deepcopy(params) if params is not None else {},
+                consumes=consumes,
+                cache=node_cache,
+                external_fingerprint_digest=external_fingerprint_digest(identity),
+                metadata=metadata,
+                executor="agent",
+                agent_adapter=adapter,
+                agent_spec=spec,
+                agent_identity=copy.deepcopy(identity),
             )
             return function
 
@@ -577,6 +649,10 @@ class Dag:
         local_carry_source: str | None = None,
         subgraph: str | None = None,
         metadata: _NodeAstMetadata | None = None,
+        executor: str = "function",
+        agent_adapter: AgentAdapter | None = None,
+        agent_spec: AgentSpec | None = None,
+        agent_identity: dict[str, Any] | None = None,
     ) -> None:
         _validate_name(name, "Node")
         if name in self._nodes:
@@ -612,6 +688,10 @@ class Dag:
             local_items_source=local_items_source,
             local_carry_source=local_carry_source,
             subgraph=subgraph,
+            executor=executor,
+            agent_adapter=agent_adapter,
+            agent_spec=agent_spec,
+            agent_identity=agent_identity,
         )
 
     def mount(
@@ -844,9 +924,37 @@ class Dag:
                     elif artifact is None:
                         context = NodeContext(self, node, current_run_id)
                         try:
-                            artifact = node.function(  # type: ignore[call-arg]
-                                copy.deepcopy(self._function_inputs(node, inputs)), context
-                            )
+                            function_inputs = copy.deepcopy(self._function_inputs(node, inputs))
+                            if node.executor == "agent":
+                                build_context = AgentBuildContext(
+                                    node.params,
+                                    context.read_text,
+                                    context.read_bytes,
+                                    context.render,
+                                )
+                                task = node.function(function_inputs, build_context)  # type: ignore[call-arg]
+                                if not isinstance(task, AgentTask):
+                                    raise TypeError(
+                                        f"Agent node {node.name!r} builder must return AgentTask"
+                                    )
+                                assert node.agent_adapter is not None
+                                assert node.agent_spec is not None
+                                assert node.agent_identity is not None
+                                artifact = execute_agent_task(
+                                    node_name=node.name,
+                                    run_id=current_run_id,
+                                    task=task,
+                                    inputs=function_inputs,
+                                    declared_files=node.files,
+                                    resolve=self.config.resolve,
+                                    artifacts_path=self.config.artifacts_path,
+                                    blob_store=self.blob_store,
+                                    adapter=node.agent_adapter,
+                                    adapter_identity=node.agent_identity,
+                                    spec=node.agent_spec,
+                                )
+                            else:
+                                artifact = node.function(function_inputs, context)  # type: ignore[call-arg]
                         except CheckpointPending as pending:
                             envelope.record_pending(pending.name, pending.payload)
                             with state_lock:
@@ -860,6 +968,8 @@ class Dag:
                             label=f"Node {node.name!r}",
                             cache_policy="off" if context._checkpoint_used else node.cache,
                         )
+                    if node.executor == "agent":
+                        validate_agent_artifact(artifact, self.blob_store)
                     elapsed = time.monotonic() - started
                     with state_lock:
                         if cache_hit:
@@ -1382,6 +1492,7 @@ class Dag:
             kind = "scan" if node.scan else "map" if node.items_from is not None else "node"
             description[name] = {
                 "kind": kind,
+                "executor": node.executor,
                 "doc": _function_doc(node.function),
                 "deps": list(node.deps),
                 "items_from": _locator_description(node.items_from),
@@ -1398,6 +1509,10 @@ class Dag:
                 "validated_models": copy.deepcopy(list(node.validated_models)),
                 "checkpoints": list(node.checkpoints),
             }
+            if node.executor == "agent":
+                assert node.agent_adapter is not None
+                assert node.agent_identity is not None
+                description[name]["agent"] = copy.deepcopy(node.agent_identity)
             if node.consumes:
                 description[name]["consumes"] = list(node.consumes)
         description["subgraphs"] = copy.deepcopy(self._subgraphs)

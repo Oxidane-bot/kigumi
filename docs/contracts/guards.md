@@ -2,6 +2,9 @@
 
 Status: Active
 
+> `@dag.agent` builder 与其他节点装饰器同样进入 raw-I/O 扫描。`raw-io-ok` 必须带理由，
+> 且不能由 `raw-llm-ok` 代替。
+
 ## Purpose
 
 在节点边界阻止循环内裸 LLM 调用和未声明的原始文件读取，同时让必要豁免可审计而不被静默吞掉。

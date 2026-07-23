@@ -36,7 +36,10 @@ kigumi/
 ├── _execution.py   #     私有执行信封:缓存、审批、物化与 sidecar
 ├── __init__.py     #     顶层公开 API
 ├── artifacts.py    #     原子写入、规范 JSON 与 sidecar 基础件
-├── bench.py        #     流水线分段实验的确定性证据采集
+├── agents.py       #     AgentSpec 胶囊、staging、completion、attachment 与 exact publish
+├── pi.py           #     原生 Pi RPC adapter：版本、JSONL、进程组与证据
+├── _pi_bridge.ts   #     wheel 内固定 Pi Extension：root tools 与 submit_result
+├── bench.py        #     Function/Caller/Dag/Agent 实验主体的隔离证据网格
 ├── blobs.py        #     内容寻址二进制仓
 ├── calling.py      # L1  调用:内容寻址缓存 / dry-run 熔断 / 溯源 / 预算记账
 ├── cli.py          #     项目运维 CLI:kigumi
@@ -57,10 +60,26 @@ kigumi/
 └── views.py        #     DAG 声明与运行态的只读渲染,消费纯数据
 ```
 
-依赖:pydantic 是唯一内核依赖;litellm 为 optional extra(`kigumi[litellm]`,
-transport 已惰性导入)。LiteLLM 只是可选适配器；任意 SDK 都可实现 `Transport`，
-stdlib 适配器保证无 extra 也可用。L0–L2 不依赖 L3;
+依赖:pydantic 是唯一内核依赖;litellm 是 optional extra (`kigumi[litellm]`，transport
+已惰性导入)。Pi 由用户在 Python 包之外显式安装并固定版本，核心包不依赖 Node/Pi Python
+SDK。LiteLLM 只是可选适配器；任意 SDK 都可实现 `Transport`，stdlib 适配器保证无 extra
+也可用。L0–L2 不依赖 L3;
 命令式链项目只取底层。pytest11 入口在非 kigumi 项目中必须严格 no-op。
+
+## 外部 Agent 边界
+
+`Dag.agent` 是普通静态 node 的执行器 façade，不是第二套 scheduler。cache lookup 先于
+builder；builder 只能看到 canonical upstream、params、声明文件和声明 prompt。miss 时框架
+创建 staging workspace、运行 adapter、collect attachment、执行 exact publish 转换，然后继续
+走同一 seal/materialize/sidecar；hit 时不启动 builder/adapter，但会重新校验 attachment。
+
+三个概念不得混用：scratch 只活在 workspace；attachment 是无项目目标路径的内容引用；
+published output 才受既有输出所有权约束并写项目。`AgentSpec` 把 manifest、SYSTEM、Skill、
+Hook、model/tool/limits 作为内容寻址 capsule；`PiRpcAdapter` 固定关闭隐式发现、session、context
+和 built-in tools，只加载 staged capsule 与 wheel 内 bridge。bridge 提供 workspace-rooted
+`read/write/edit/grep/find/ls` 与终止工具 `submit_result`，但 workspace root 和关闭 shell 都不
+构成 OS sandbox，可信 Extension 仍有宿主权限。v1 不提供 Agent factory、自进化、多 Agent
+动态拓扑、winner 或自动 promotion；这些角色只能由静态 DAG 组合。
 
 ## 项目配置约定(`[tool.kigumi]`)
 

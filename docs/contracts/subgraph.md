@@ -2,6 +2,9 @@
 
 Status: Active
 
+> v1 没有 `Subgraph.agent`，也不允许 Agent 返回可执行拓扑。Agent 仅作为顶层
+> `Dag.agent` 静态节点；运行时动态展开仍限既有 map/scan。
+
 ## Purpose
 
 让多阶段 DAG 结构可声明一次、在不同 namespace 重复挂载，同时保持原有调度、缓存、审批和

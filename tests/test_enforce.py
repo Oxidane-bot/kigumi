@@ -130,3 +130,20 @@ def ordinary():
         (9, False, None),
         (13, True, "fixture input"),
     ]
+
+
+def test_raw_io_path_guard_treats_agent_builder_as_a_node_body(tmp_path: Path) -> None:
+    source = tmp_path / "nodes" / "agent.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        """
+@dag.agent("writer", adapter=adapter, config=config)
+def writer(inputs, ctx):
+    return Path("secret.txt").read_text()
+""",
+        encoding="utf-8",
+    )
+
+    findings = check_raw_io_node_paths([source.parent])
+
+    assert [(finding.lineno, finding.waived) for finding in findings] == [(4, False)]

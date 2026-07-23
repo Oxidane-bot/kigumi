@@ -25,6 +25,11 @@ A foundation for building LLM pipelines with coding agents:
 - **DAG orchestration** (optional): explicit node/item cache policy, static
   reusable subgraphs, dynamic map/scan, owned materialized outputs, human
   checkpoints, and run diffs
+- **External Agent nodes**: provider-neutral staged execution with captured
+  attachments, exact publication, ordinary DAG caching, content-addressed
+  `AgentSpec` capsules, and a native, exactly versioned Pi RPC adapter
+- **Experiment subjects**: one isolated evidence grid for functions, callers,
+  ordinary workflows, and Agent-backed DAGs—without automatic winner selection
 - **Four guard rings**: registration-time refusal plus three outer rings
   (`dag check` / pytest auto-collection / git hooks), so the rules enforce
   themselves
@@ -58,9 +63,8 @@ with no further API cost.
 
 ## Status
 
-0.4.0, API not frozen. All four core layers are in place, with 351 tests passed and 1 skipped,
-refined through three clean-room pilots (structured extraction /
-multimodal / DAG orchestration).
+0.5.0, API not frozen. The Agent boundary is intentionally an execution adapter,
+not an autonomous factory or optimizer.
 
 ## Install
 
@@ -69,7 +73,11 @@ uv add "kigumi[litellm]"
 ```
 
 Without the litellm extra you can use `StdlibTransport` (pure-stdlib HTTP)
-or implement your own transport.
+or implement your own transport. Pi is an external runtime: install it yourself,
+pin its version, and pass the executable plus exact version to `PiRpcAdapter`.
+Kigumi never installs or upgrades Node/Pi. The staged, root-scoped tool boundary
+limits model tool I/O but is **not** an OS sandbox; trusted Pi Extensions retain
+host-process permissions.
 
 ## Documentation map
 

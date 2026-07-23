@@ -2,6 +2,9 @@
 
 Status: Active
 
+> Agent collect 的 `kigumi_attachment` 没有项目目标路径，不参与认领；只有 exact publish
+> 转出的既有 `files` / `kigumi_blob.path` 进入本契约。ordinary materializer 不解释 attachment。
+
 ## Purpose
 
 阻止同一次运行中的不同生产者静默覆盖框架管理的项目物化输出，并保持缓存命中重物化可预测。

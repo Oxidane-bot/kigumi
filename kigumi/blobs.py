@@ -82,6 +82,14 @@ class BlobStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def read_verified(self, digest: str) -> bytes:
+        """Read immutable bytes only after verifying their content address."""
+        source = self.root / digest
+        actual_digest, _size = _file_digest_and_size(source)
+        if actual_digest != digest:
+            raise ValueError(f"Blob digest mismatch for {digest}: store content is {actual_digest}")
+        return source.read_bytes()
+
     def gc(self, referenced: set[str]) -> int:
         """Delete stored blobs that no retained artifact references."""
         if not self.root.is_dir():

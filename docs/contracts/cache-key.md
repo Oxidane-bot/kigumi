@@ -2,6 +2,10 @@
 
 Status: Active
 
+> 0.5.0：Agent 节点不新增顶层 key label；adapter/Pi version/bridge、AgentSpec capsule、
+> model/tools/limits/isolation 与 `agent_executor_schema=2` 哈希到既有 `external`。`AgentTask.task_sha` 只作证据，lookup
+> 已在 builder 前完成。普通节点 `CACHE_SCHEMA` 仍为 3。
+
 ## Purpose
 
 让同一语义输入稳定复用缓存，让任一会改变结果的输入改动都换键，避免陈旧结果静默回放。

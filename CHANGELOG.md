@@ -2,6 +2,36 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [0.5.0] - 2026-07-23
+
+### 新增
+
+- 新增 `Dag.agent` 与 provider-neutral `AgentAdapter` 契约。外部 Agent 在唯一 staging
+  workspace 中运行；只有声明输入会被复制进去，只有 collect 的文件会成为
+  `kigumi_attachment`，只有 exact publish 映射会进入既有 `files` / `kigumi_blob`
+  物化和输出所有权路径。
+- 新增内容寻址目录胶囊 `AgentSpec`、显式 `AgentLimits`、固定 `AgentCompletion` 与原生
+  `PiRpcAdapter`。Pi 在启动前精确校验版本；固定 bridge Extension 提供 workspace-rooted
+  文件工具与 `submit_result`，严格 LF JSONL、进程组 timeout、脱敏 RPC/stderr/trajectory、
+  Hook evidence 和 usage/cost 全部进入可由 GC 追踪的 attachment。Pi 由用户安装，Kigumi
+  不安装或升级 Node/Pi；staging 和工具 root 不是 OS sandbox。
+- `bench` 新增 `ExperimentSubject`、`FunctionSubject`、`CallerSubject`、`DagSubject`、
+  `AgentSubject`、`TrialContext` 与 `TrialObservation`，普通函数、Caller、DAG 和单 Agent
+  可进入同一隔离实验网格。Agent trial 固定 target `cache="off"`；报告 schema v2 保留完整
+  Judgment、usage/null、seed 声明、trajectory/raw evidence 与逐格错误。
+
+### 变更
+
+- **硬切**：`Variant.task` 与 `bench(..., caller_factory=...)` 已删除；改用
+  `Variant(subject=...)`。不提供兼容 shim。
+- **硬切**：删除旧 optional agent-protocol 实现、extra、测试和公开表述；删除 `AgentConfig`，
+  `Dag.agent(..., config=...)` 改为 `Dag.agent(..., spec=AgentSpec)`，不提供 shim。
+- Agent 静态执行语义通过既有 `external` 键成分中的 `agent_executor_schema=2` 换族；键包含
+  capsule、adapter/Pi exact version、bridge、model、tool 与 limits，Skill/Hook/manifest 的增删改
+  都会 miss。这是有意的 Agent 缓存换族。
+  普通节点的键标签、规范 JSON、`files`/`kigumi_blob` 字节语义均未改变，因此
+  `CACHE_SCHEMA` 保持 3，不发生全局 L3 缓存换族。
+
 ## [0.4.0] - 2026-07-14
 
 ### 变更

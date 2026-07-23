@@ -357,7 +357,8 @@ def _referenced_blob_digests(runs_root: Path, keep_last: int) -> set[str]:
     runs = sorted((path for path in runs_root.iterdir() if path.is_dir()), key=run_sort_key)
     referenced: set[str] = set()
     for run in runs[-keep_last:] if keep_last else []:
-        for artifact_path in run.glob("*.json"):
+        retained_json = [*run.glob("*.json"), *(run / "failures").glob("*.json")]
+        for artifact_path in retained_json:
             if artifact_path.name.endswith(".json.meta.json"):
                 continue
             try:
@@ -367,6 +368,10 @@ def _referenced_blob_digests(runs_root: Path, keep_last: int) -> set[str]:
                 continue
             for reference in _blob_references(artifact):
                 digest = reference.get("kigumi_blob")
+                if isinstance(digest, str):
+                    referenced.add(digest)
+            for reference in _attachment_references(artifact):
+                digest = reference.get("kigumi_attachment")
                 if isinstance(digest, str):
                     referenced.add(digest)
     return referenced
@@ -382,6 +387,18 @@ def _blob_references(value: Any) -> Iterable[dict[str, Any]]:
     elif isinstance(value, list):
         for child in value:
             yield from _blob_references(child)
+
+
+def _attachment_references(value: Any) -> Iterable[dict[str, Any]]:
+    """Yield captured evidence without giving it materialization semantics."""
+    if isinstance(value, dict):
+        if "kigumi_attachment" in value:
+            yield value
+        for child in value.values():
+            yield from _attachment_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _attachment_references(child)
 
 
 def _run_artifacts(runs_root: Path, run_id: str) -> dict[str, dict[str, Any]]:

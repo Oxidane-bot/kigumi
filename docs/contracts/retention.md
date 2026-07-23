@@ -2,6 +2,9 @@
 
 Status: Active
 
+> retained run 中的 `kigumi_attachment`（含 trajectory evidence）与 `kigumi_blob` 分别扫描、
+> 共同保护同一内容寻址 blob 仓；这不改变 materializable blob 语义。
+
 ## Purpose
 
 回收不可达缓存和 blob，同时保证保留窗口内的 run 仍能解释、复用并重新物化其声明的交付物。

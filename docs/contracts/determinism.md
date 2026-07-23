@@ -2,6 +2,9 @@
 
 Status: Active
 
+> Agent 可以非确定；Kigumi 只承诺静态 identity、canonical task/artifact、缓存重放和证据边界
+> 可审计。builder 必须由已入键事实纯推导；需要重执行时使用 refresh/off。
+
 ## Purpose
 
 把同一逻辑结果锁成同一字节形态，使缓存命中、缓存未命中与重放路径对下游没有可见差异。
