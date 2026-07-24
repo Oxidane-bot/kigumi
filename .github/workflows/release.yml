@@ -18,12 +18,19 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --extra dev --python 3.13
-      - name: Verify annotated tag and version identity
+      - name: Verify annotated tag
         run: |
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          git fetch --force origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"
+      - name: Verify version identity
+        run: |
           VERSION="$(uv run python -c 'import kigumi; print(kigumi.__version__)')"
           test "$GITHUB_REF_NAME" = "v$VERSION"
-          test -z "$(git status --porcelain)"
+      - name: Verify tracked tree is clean
+        run: |
+          git diff --exit-code
+          git diff --cached --exit-code
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
