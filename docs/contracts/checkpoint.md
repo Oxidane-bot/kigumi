@@ -19,7 +19,8 @@ Status: Active
 
 ## Invariants
 
-1. 审批绑定 payload 内容哈希；上游内容变化时旧批自动作废并重新挂起。
+1. 审批绑定 payload 内容哈希；同一 0.6 run 的 graph/source/policy 声明另由 schema-1 manifest
+   固定，声明变化必须 fail closed，而不是覆盖旧 run。新 payload 声明应使用新 run。
 2. 检查点身份先按节点作用域限定，再追加动态 item ID：普通节点为 `approval`，普通
    map/scan 项为 `approval@item`，挂载普通节点为 `approval@namespace.local`，挂载
    map/scan 项为 `approval@namespace.local@item`。重复挂载的同名检查点因此互不混淆。
@@ -31,6 +32,8 @@ Status: Active
 5. `run_id` 与最终检查点名必须是安全的单个非空文件系统路径成分。检查点名可在内部含
    `.` 与 `@`，但不得含 `/`、`\\`，也不得等于 `.` 或 `..`。
 6. 挂起只阻断下游，不阻断无关旁支。
+7. checkpoint pending 与 retry pending 共用下游阻断语义；completed 的独立分支和
+   `cache="off"` artifact 在同 run 恢复时复用，不重新执行。
 
 ## Failure behavior
 

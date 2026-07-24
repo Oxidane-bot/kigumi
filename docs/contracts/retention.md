@@ -20,7 +20,8 @@ Status: Active
 
 ## Invariants
 
-1. `gc_cache` 扫描每个被保留 run 目录下所有 `*.json.meta.json`；sidecar 的 `cache_key` 为字符串则该键入保留集，为字符串列表则全部入保留集。任何入保留集的键对应缓存不删。
+1. `gc_cache` 扫描每个被保留 run 目录下所有 `*.json.meta.json`；sidecar 的 `cache_key`
+   为字符串则该键入保留集，为字符串列表则全部入保留集。任何入保留集的键对应缓存不删。
 2. map item 键的契约来源是聚合 sidecar 的 `cache_key` 列表；逐项 sidecar 的字符串键是刻意冗余——聚合 sidecar 缺失或损坏时，逐项 sidecar 仍足以保住 item 缓存，不得误删。
 3. 无法解析或非 `dict` 的 sidecar 跳过，不影响其他 sidecar 的保留贡献；跳过意味着其引用的键可能被删，这是 fail-open 的已知边界。
 4. run 目录排序数字感知（`store.run_sort_key`），保留窗、blob 引用、explain 最新 run 三处一致。
@@ -29,6 +30,9 @@ Status: Active
    对不存在的引用无副作用。refresh 写入的条目按普通 run 引用保留。
 7. GC 的管理边界只包含 kigumi 的 node cache、blob 与 run 数据；当前回收只删除不可达
    node cache/blob，不删除 run 目录、项目物化路径，也不移动/删除 `ctx.ingest_file` 的外部 source。
+8. blob reachability 递归扫描 retained run 的 sidecar、failure、attempt receipt、resolution 与
+   success candidate JSON。`kigumi_attachment` 和 `kigumi_blob` 引用都保护同一 blob；
+   `hash_only` descriptor 没有 blob 引用，因此不会虚构 retained 内容。
 
 ## Failure behavior
 

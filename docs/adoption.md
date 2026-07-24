@@ -24,9 +24,15 @@ artifacts_dir = "artifacts"      # runs/ 与节点缓存的根
 llm_cache_dir = "artifacts/_llm" # L1 LLM 载荷；须与 LLMCaller.cache_dir 一致
 source_dirs = ["nodes", "lib"]   # 两个用途:helper 源码哈希 + 守卫扫描
 env_file = ".env"                # KIGUMI_MODEL_DEFAULT / KIGUMI_MODEL_PRO / api key
+agent_slots = 1                  # 外部 Agent 默认全局串行
+agent_lock_dir = "artifacts/_locks/agents"
+agent_slot_timeout_seconds = 300
 ```
 
 `.env` 里放模型别名与密钥(密钥永远不进 git,`kigumi doctor` 只报键名不报值)。
+`KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
+`KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS` 可覆盖容量配置；跨项目共享容量时把 lock dir
+显式指到同一个机器级目录。
 
 ### 2. 组装调用栈
 
@@ -34,7 +40,7 @@ env_file = ".env"                # KIGUMI_MODEL_DEFAULT / KIGUMI_MODEL_PRO / api
 
 ```python
 from pathlib import Path
-from kigumi import AdaptiveCapacity, Budget, LLMCaller
+from kigumi import AdaptiveCapacity, Budget, EvidencePolicy, LLMCaller
 from kigumi.transport import LiteLLMTransport
 
 capacity = AdaptiveCapacity("artifacts/request_capacity", max_slots=32)
@@ -43,6 +49,7 @@ caller = LLMCaller(                                   # L1:缓存/预算/dry-run
     transport,
     cache_dir=Path("artifacts/_llm"),
     budget=Budget(max_tokens=2_000_000),
+    evidence_policy=EvidencePolicy(response="redacted"),
 )
 ```
 
@@ -97,6 +104,45 @@ result = dag.run(workers=4)
 结果中的缓存命中、检查点和跳过节点仍按本次拓扑序排列；并发节点同时失败时，
 对外仍抛拓扑序最靠前的异常，其余失败会作为异常附注一并保留。检查点或跳过只阻断
 其下游，不阻断无关旁支。
+
+### Durable retry 与 resume
+
+默认没有 DAG 自动重试；只有节点显式声明 `RetryPolicy` 才创建 durable attempt：
+
+```python
+from kigumi import RetryPolicy
+
+retry = RetryPolicy(
+    max_attempts=3,
+    initial_delay_seconds=1,
+    multiplier=2,
+    max_delay_seconds=120,
+    jitter="full",
+)
+
+@dag.node("outline", retry=retry)
+def outline(inputs, ctx):
+    return {"text": ctx.call("...")}
+```
+
+`max_attempts` 含首次执行，默认只重试 rate limit、server error、timeout、connection。
+失败后 Kigumi 写 `due_at` 并返回 `RunResult(run_status="pending_retry")`，不会在进程内 sleep；
+外部 supervisor 到期调用 `dag.resume(run_id)`。同 run 的 graph、targets、force、源码/libs、
+retry/evidence policy 都由 `_run.json` 固定，任何变化 fail closed；0.5.x run 没有 manifest，
+只能查看，不能 resume。
+
+durable CALL 的 transport/length/empty internal retry 必须全为 0，Pi hidden retry 也必须关闭。
+若进程在 provider call/Pi spawn 后崩溃且没有 terminal receipt，状态为 ambiguous，必须人工：
+
+```bash
+dag retry-resolve run-0042 outline --attempt 1 --action retry \
+  --reason "provider logs confirm no accepted result"
+dag resume run-0042
+```
+
+`retry|fail` 都要求 reason 并进入 trace。Kigumi 不承诺外部 effect exactly-once；它保证的是
+attempt 边界可见、不能把不确定执行静默当成可安全重试。map 按 item 独立恢复；scan 复用已
+验证前缀，只重试失败 item。
 
 ### 只消费上游局部：`consumes`
 
@@ -797,7 +843,15 @@ symlink、重复资源、credential 和 `bash|shell|terminal` 会在 `AgentSpec.
 能力时，由可信 Hook 注册用途窄、名称窄的工具，不开放通用 shell。
 
 ```python
-from kigumi import AgentFileSelector, AgentPublish, AgentSpec, AgentTask, PiRpcAdapter
+from kigumi import (
+    AgentFileSelector,
+    AgentPublish,
+    AgentSpec,
+    AgentTask,
+    EvidencePolicy,
+    PiRpcAdapter,
+    RetryPolicy,
+)
 
 spec = AgentSpec.load("agents/writer")
 adapter = PiRpcAdapter(("pi",), expected_version="0.81.1")
@@ -808,6 +862,13 @@ adapter = PiRpcAdapter(("pi",), expected_version="0.81.1")
     spec=spec,
     deps=("brief",),
     files=("source/brief.md",),
+    evidence_policy=EvidencePolicy(
+        request="redacted",
+        response="redacted",
+        stderr="hash_only",
+        trajectory="redacted",
+    ),
+    retry=RetryPolicy(max_attempts=3),
 )
 def draft(inputs, ctx):
     return AgentTask(
@@ -821,6 +882,22 @@ Pi 由用户显式安装。adapter 先运行 `pi --version` 并与 `expected_ver
 或升级 Node/Pi。运行参数关闭 session、project context、隐式资源发现和 built-in tools，只加载
 staged capsule 与 Kigumi bridge。bridge 的同名文件工具把模型访问限定到 workspace；可信
 Extension 仍有宿主进程权限，因此这些限制与 staging workspace 都**不是 OS sandbox**。
+
+默认同一 `agent_lock_dir` 只有一个 Agent miss 可进入 staging/Pi；cache hit 不申请 slot。
+排队时间不消耗 `AgentLimits.timeout_seconds`，slot timeout 在 spawn/provider side effect 前
+产生 typed capacity failure。需要并发时显式提高 `agent_slots`，不要依赖每个 Python 进程各自
+的线程池上限。
+
+`agent_schema=2` 的 canonical artifact 只保留 task/completion、Agent identity、
+attachments、published outputs 与 `files`。usage、duration、workspace manifest、
+RPC/stderr/trajectory/Hook evidence、queue/slot 和退出原因在 sidecar 的 immutable origin
+provenance。cold 与 warm cache hit 暴露同一个 origin，`AgentSubject` 也从这里取 usage/evidence。
+
+`EvidencePolicy` 的三种模式都先清除 credential、authorization/header secret 与 URL query。
+`redacted` 保留事件/工具/model/usage/status 与内容摘要；`hash_only` 不存 raw blob。
+它不是加密或 ACL，L1 为重放仍保存 request/response payload；需要机密存储控制时必须由文件
+权限、磁盘加密和 artifact 生命周期另行承担。policy digest 改变不会换内容键，但会造成
+evidence miss；普通 CALL 可由 L1 重建 evidence，Agent 必须重新执行。
 
 单 Agent 可直接进入 bench；每格 target 固定 `cache="off"`，重复 seed 不会被 L3 hit 吞掉：
 
@@ -868,8 +945,9 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
   参数,磁带会报 mismatch——这是提醒你重录,不是 bug。
 - **`Budget` 超限抛 `BudgetExceeded` 时,触发的那次调用已经完成并计入
   缓存**;下一次同 key 调用会命中缓存,不再花钱。
-- **状态文件(evolve state / 节点缓存 / 磁带)损坏一律按"从头开始"处理,
-  不崩**;如果你看到意外的全量重算,先检查是不是文件被截断/手改过。
+- **缓存/磁带损坏可按 miss 或拒绝重放，但 durable run state 不可猜**：
+  `_run.json`、attempt state、candidate 或已完成 artifact 摘要不一致时 fail closed；
+  不能把可能已经产生外部 side effect 的损坏状态当成“从头开始”。
 
 ## 六、排障:按症状查
 
@@ -883,6 +961,7 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
 # 1. 定位:节点、map 项、缓存策略、物化输出、键成分和每次 LLM 调用
 kigumi trace run-0042
 kigumi trace run-0042 --node outline --json
+kigumi runs show run-0042 --json   # run/attempt/due_at/failure/policy 状态
 
 # 2. 查看调用:前者取完整 L1 载荷，后两者直接取输入与输出
 kigumi call 4f7a2c
@@ -910,6 +989,9 @@ kigumi diff run-0041 run-0042 --json
 | 两次 run 结果哪里不同 | `dag.diff(run_a, run_b)`,按内容哈希报 changed,不重跑节点 |
 | 想在花钱前看改动爆炸半径 | `dag.plan()`;`certain` 是下界、加 `at_risk` 是上界,`pending_on` 追 unknown 的原因链 |
 | 图形状/声明想整体过目 | `dag.render_mermaid(run_id)` 叠加运行态,挂起与被跳过节点会着色标出 |
+| retry 到期前 resume 没动作 | 这是正确行为；看 `pending_retries[].due_at`，由外部 supervisor 到期再调用 |
+| resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `dag retry-resolve ... retry|fail` 裁决 |
+| 同 run 报 declaration changed | 0.6 manifest 禁止覆盖；用原声明 resume，或为新声明创建新 run_id |
 
 `explain` 的判定语义与 `plan` 完全一致:上游 miss 导致成分无法诚实计算时报
 `unknown`(并给 `pending_on`),不猜测原因;对照的 run 没有该节点 sidecar 报

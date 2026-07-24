@@ -2,9 +2,9 @@
 
 Status: Active
 
-> 0.5.0：Agent 节点不新增顶层 key label；adapter/Pi version/bridge、AgentSpec capsule、
-> model/tools/limits/isolation 与 `agent_executor_schema=2` 哈希到既有 `external`。`AgentTask.task_sha` 只作证据，lookup
-> 已在 builder 前完成。普通节点 `CACHE_SCHEMA` 仍为 3。
+> 0.6.0：`CACHE_SCHEMA=4`，node cache envelope schema 2；
+> `agent_executor_schema=3`。这是有意的 L3/Agent cache 换族，不迁移 0.5.x 条目。
+> EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
 
 ## Purpose
 
@@ -34,7 +34,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 的语法残破文件退回原文。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
-6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=3, pydantic})`；其中
+6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=4, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
 7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时必须递增
@@ -42,6 +42,12 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 8. 键成分任何变化等于全项目缓存换族，必须记入 `CHANGELOG.md`。0.2.0 将
    `CACHE_SCHEMA` 从 1 升至 2，是为可选 external 成分进行的有意完整 L3 换族。
    0.3.0 将 schema 从 2 升至 3，是为普通依赖边的可选消费投影进行的有意完整换族。
+   0.6.0 将 schema 从 3 升至 4，并将 cache envelope 升至 schema 2，以绑定 immutable
+   origin provenance、Agent schema 2 和 evidence miss 语义。
+9. node cache envelope schema 2 固定保存 canonical artifact、artifact SHA-256 和首次执行的
+   immutable origin provenance。warm hit 不得以 replay metadata 覆盖 origin。
+10. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy
+    digest 与 Agent slots/lock/timeout 也不属于内容键。
 
 ## Failure behavior
 
