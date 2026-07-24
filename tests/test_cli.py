@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from kigumi import PromptRef, PromptSpec
 from kigumi.artifacts import atomic_write_json, canonical_json, write_artifact
 from kigumi.cli import main
 from kigumi.config import KigumiConfig
@@ -349,6 +350,7 @@ def test_runs_show_and_trace_include_durable_attempt_state(
     assert shown["status"] == "pending_retry"
     assert shown["attempts"][0]["failure"]["kind"] == "rate_limit"
     assert shown["evidence_policy_digests"]["ask"] == "evidence-digest"
+    assert shown["workflow_profile"]["resolution_status"] == "unavailable_legacy"
 
     assert main(["trace", "durable", "--json"]) == 0
     traced = json.loads(capsys.readouterr().out)
@@ -532,6 +534,37 @@ def test_cli_graph_html(tmp_path: Path, capsys) -> None:
     assert output.exists()
     assert "<html>" in output.read_text(encoding="utf-8")
     assert str(output) in capsys.readouterr().out
+
+
+def test_cli_profile_and_prompt_graph_share_canonical_ir(tmp_path: Path, capsys) -> None:
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "base.md").write_text("managed", encoding="utf-8")
+    dag = _cli_dag(tmp_path)
+
+    @dag.node("source", prompt_specs=(PromptSpec("managed", PromptRef("base")),))
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return {"prompt": ctx.resolve_prompt("managed")}
+
+    assert _run_dag_cli(dag, ["profile", "--format", "json"]) == 0
+    profile = json.loads(capsys.readouterr().out)
+    assert profile["workflow_profile_schema"] == 1
+    assert profile["prompts"]["specs"][0]["name"] == "managed"
+
+    assert _run_dag_cli(dag, ["graph", "--prompts"]) == 0
+    assert "flowchart TD" in capsys.readouterr().out
+
+    result = dag.run(run_id="profile-cli")
+    assert (
+        _run_dag_cli(
+            dag,
+            ["profile", "--run-id", result.run_id, "--format", "md"],
+        )
+        == 0
+    )
+    rendered = capsys.readouterr().out
+    assert "Workflow Profile (run)" in rendered
+    assert "| source | managed | base |" in rendered
 
 
 def test_cli_explain(tmp_path: Path, capsys) -> None:

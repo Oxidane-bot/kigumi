@@ -11,7 +11,8 @@ Status: Active
 
 ## Scope
 
-适用于 JSON 产物、摘要、节点缓存、map 聚合、固定 prompt 措辞，以及 L0/L1 的空响应和截断恢复。
+适用于 JSON 产物、摘要、节点缓存、map 聚合、Prompt snapshot/resolution、固定 prompt
+措辞，以及 L0/L1 的空响应和截断恢复。
 
 ## Source of truth
 
@@ -25,6 +26,11 @@ Status: Active
 3. wording 常量由 golden snapshot 锁字节；改动等于换族，记入 `CHANGELOG.md`。
 4. 空响应双闸：传输层重试后仍空则抛错；缓存层拒写空、读到空缓存按 miss。
 5. 截断处理：`finish_reason=length` 时只有调用方设了 `max_tokens` 才加倍重试，至多 2 次；否则直接抛 `TruncatedResponseError`；截断永不静默。
+6. 同一 Prompt snapshot、spec、projected inputs、params、item 与 carry 必须得到逐字节相同
+   `ResolvedPrompt` 和 resolution digest。base 控制插入顺序，fragment 原文逐字插入，
+   material 只经 `inject()`；框架不自动补分隔符。
+7. snapshot 在 run 开始后不可变；中途文件修改不造成节点间漂移。下一 run 观察到新字节并
+   按 selected-only 缓存规则决定 hit/miss。
 
 ## Failure behavior
 

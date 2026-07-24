@@ -19,8 +19,9 @@ Status: Active
 
 ## Invariants
 
-1. 审批绑定 payload 内容哈希；同一 0.6 run 的 graph/source/policy 声明另由 schema-1 manifest
-   固定，声明变化必须 fail closed，而不是覆盖旧 run。新 payload 声明应使用新 run。
+1. 审批绑定 payload 内容哈希；同一 0.7 run 的 graph/source/policy/Prompt 声明另由
+   schema-2 manifest 固定，声明变化必须 fail closed，而不是覆盖旧 run。新 payload 声明
+   应使用新 run；0.6/schema-1 run 只读不可恢复。
 2. 检查点身份先按节点作用域限定，再追加动态 item ID：普通节点为 `approval`，普通
    map/scan 项为 `approval@item`，挂载普通节点为 `approval@namespace.local`，挂载
    map/scan 项为 `approval@namespace.local@item`。重复挂载的同名检查点因此互不混淆。

@@ -61,7 +61,8 @@ def test_describe_and_summary_expose_registered_declarations(tmp_path: Path) -> 
     description = dag.describe()
 
     assert description["source"]["kind"] == "node"
-    assert description["source"]["params"]["large"].endswith("...")
+    assert description["source"]["params"]["large"].startswith("<str sha256=")
+    assert "x" * 20 not in description["source"]["params"]["large"]
     assert description["review"]["validated_models"] == [
         {"model": "_DescribeReview", "fields": {"title": "str", "score": "int"}}
     ]

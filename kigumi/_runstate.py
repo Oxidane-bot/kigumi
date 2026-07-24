@@ -11,8 +11,8 @@ from .artifacts import atomic_write_json, canonical_json, sha
 from .failures import canonical_failure
 from .retry import AmbiguousAttemptError, RetryPolicy
 
-RUN_MANIFEST_SCHEMA = 1
-ATTEMPT_RECEIPT_SCHEMA = 1
+RUN_MANIFEST_SCHEMA = 2
+ATTEMPT_RECEIPT_SCHEMA = 2
 
 
 def utc_now() -> datetime:
@@ -29,7 +29,7 @@ class RunManifestError(RuntimeError):
 
 
 class AttemptStore:
-    """Own one 0.6 run's immutable declaration and mutable attempt receipts."""
+    """Own one 0.7 run's immutable declaration and mutable attempt receipts."""
 
     def __init__(self, run_root: Path, manifest_identity: dict[str, Any]) -> None:
         self.run_root = run_root
@@ -43,7 +43,7 @@ class AttemptStore:
         if existing is None:
             if any(self.run_root.iterdir()):
                 raise RunManifestError(
-                    f"Run {self.run_root.name!r} predates run manifest schema 1 and "
+                    f"Run {self.run_root.name!r} predates run manifest schema 2 and "
                     "cannot be resumed"
                 )
             now = iso_now()
@@ -69,9 +69,20 @@ class AttemptStore:
                 "pending_retries",
                 "ambiguous_attempts",
                 "failure",
+                "resume_count",
+                "last_resumed_at",
+                "workflow_profile",
+                "workflow_profile_digest",
             }
         }
-        actual = {"run_manifest_schema": RUN_MANIFEST_SCHEMA, **self.identity}
+        actual = {
+            "run_manifest_schema": RUN_MANIFEST_SCHEMA,
+            **{
+                key: value
+                for key, value in self.identity.items()
+                if key not in {"workflow_profile", "workflow_profile_digest"}
+            },
+        }
         if expected != actual:
             changed = sorted(
                 key for key in set(expected) | set(actual) if expected.get(key) != actual.get(key)
@@ -80,6 +91,14 @@ class AttemptStore:
                 f"Run {self.run_root.name!r} declaration changed: {', '.join(changed)}"
             )
         return existing
+
+    def mark_resumed(self) -> None:
+        """Record an operator/runtime resume without changing immutable run identity."""
+        manifest = self._required_json(self.manifest_path)
+        manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+        manifest["last_resumed_at"] = iso_now()
+        manifest["updated_at"] = manifest["last_resumed_at"]
+        atomic_write_json(self.manifest_path, manifest)
 
     def update_manifest(
         self,
@@ -106,6 +125,7 @@ class AttemptStore:
         *,
         policy: RetryPolicy | None,
         declaration_digest: str,
+        prompt_resolutions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return run, pending, candidate, or completed state for one target."""
         state_path = self._state_path(target)
@@ -117,12 +137,14 @@ class AttemptStore:
                 attempt=1,
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
+                prompt_resolutions=prompt_resolutions or {},
             )
         self._validate_state(
             state,
             target=target,
             policy_digest=policy_digest,
             declaration_digest=declaration_digest,
+            prompt_resolutions=prompt_resolutions or {},
         )
         status = state.get("status")
         if status == "running":
@@ -138,6 +160,7 @@ class AttemptStore:
                 attempt=attempt,
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
+                prompt_resolutions=prompt_resolutions or {},
             )
         if status == "checkpoint_pending":
             return self._start_attempt(
@@ -145,6 +168,7 @@ class AttemptStore:
                 attempt=int(state["attempt"]),
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
+                prompt_resolutions=prompt_resolutions or {},
             )
         if status == "retry_scheduled":
             due = datetime.fromisoformat(str(state["due_at"]))
@@ -155,6 +179,7 @@ class AttemptStore:
                 attempt=int(state["next_attempt"]),
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
+                prompt_resolutions=prompt_resolutions or {},
             )
         if status == "success_candidate":
             candidate = self._required_json(
@@ -179,17 +204,25 @@ class AttemptStore:
             return {"action": "failed", "state": state}
         raise RunManifestError(f"Attempt state for {target!r} has invalid status {status!r}")
 
-    def mark_side_effect(self, target: str) -> None:
+    def mark_side_effect(
+        self,
+        target: str,
+        active_effect: dict[str, Any] | None = None,
+    ) -> None:
         """Persist the provider/Agent side-effect boundary before crossing it."""
         state = self._required_json(self._state_path(target))
         if state.get("status") != "running":
             raise RunManifestError(f"Cannot mark side effect for {target!r} in non-running state")
-        if state.get("side_effect_started") is not True:
-            state["side_effect_started"] = True
-            state["side_effect_started_at"] = iso_now()
-            state["updated_at"] = iso_now()
-            atomic_write_json(self._state_path(target), state)
-            self._write_receipt(target, int(state["attempt"]), state)
+        if active_effect is not None:
+            canonical = json.loads(canonical_json(active_effect))
+            if not isinstance(canonical, dict):
+                raise RunManifestError("active side effect must be a canonical object")
+            state["active_effect"] = canonical
+        state["side_effect_started"] = True
+        state.setdefault("side_effect_started_at", iso_now())
+        state["updated_at"] = iso_now()
+        atomic_write_json(self._state_path(target), state)
+        self._write_receipt(target, int(state["attempt"]), state)
 
     def mark_checkpoint(self, target: str, checkpoint: str) -> None:
         state = self._required_json(self._state_path(target))
@@ -244,6 +277,7 @@ class AttemptStore:
         error: Exception,
         *,
         policy: RetryPolicy | None,
+        calls: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Persist terminal or retry-scheduled failure state."""
         from .failures import failure_provider_kind, failure_retry_after_ms
@@ -257,6 +291,7 @@ class AttemptStore:
             and policy.allows(failure_provider_kind(error))
         )
         state["failure"] = failure
+        state["calls"] = json.loads(canonical_json(calls or []))
         state["failed_at"] = iso_now()
         if retryable:
             schedule = policy.schedule(
@@ -356,6 +391,7 @@ class AttemptStore:
         attempt: int,
         policy_digest: str | None,
         declaration_digest: str,
+        prompt_resolutions: dict[str, Any],
     ) -> dict[str, Any]:
         now = iso_now()
         state = {
@@ -367,6 +403,7 @@ class AttemptStore:
             "side_effect_started": False,
             "policy_digest": policy_digest,
             "declaration_digest": declaration_digest,
+            "prompt_resolutions": json.loads(canonical_json(prompt_resolutions)),
             "started_at": now,
             "updated_at": now,
         }
@@ -383,6 +420,7 @@ class AttemptStore:
         target: str,
         policy_digest: str | None,
         declaration_digest: str,
+        prompt_resolutions: dict[str, Any],
     ) -> None:
         if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
             raise RunManifestError(f"Attempt state for {target!r} has unsupported schema")
@@ -391,6 +429,7 @@ class AttemptStore:
             or state.get("target_digest") != sha(target)
             or state.get("policy_digest") != policy_digest
             or state.get("declaration_digest") != declaration_digest
+            or state.get("prompt_resolutions") != prompt_resolutions
         ):
             raise RunManifestError(f"Attempt state declaration changed for {target!r}")
 

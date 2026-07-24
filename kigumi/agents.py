@@ -21,7 +21,7 @@ from typing import Any, Literal, Protocol
 
 from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
-from .evidence import EvidenceMode, EvidencePolicy, capture_evidence
+from .evidence import EvidenceMode, EvidencePolicy, capture_evidence, scrub_evidence
 from .failures import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
@@ -511,11 +511,13 @@ class AgentBuildContext:
         read_text: Callable[[str | Path, str], str],
         read_bytes: Callable[[str | Path], bytes],
         render: Callable[..., str],
+        resolve_prompt: Callable[[str], str] | None = None,
     ) -> None:
         self._params = copy.deepcopy(dict(params))
         self._read_text = read_text
         self._read_bytes = read_bytes
         self._render = render
+        self._resolve_prompt = resolve_prompt
 
     @property
     def params(self) -> dict[str, Any]:
@@ -529,6 +531,11 @@ class AgentBuildContext:
 
     def render(self, template_name: str, **slots: str) -> str:
         return self._render(template_name, **slots)
+
+    def resolve_prompt(self, spec_name: str) -> str:
+        if self._resolve_prompt is None:
+            raise ValueError("Agent builder has no declared PromptSpec resolver")
+        return self._resolve_prompt(spec_name)
 
 
 class AgentResultView:
@@ -626,6 +633,7 @@ def execute_agent_task(
     adapter_identity: Mapping[str, Any],
     spec: AgentSpec,
     evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+    prompt_resolution: Mapping[str, Any] | None = None,
 ) -> AgentTaskExecution:
     expected_adapter = adapter_identity.get("adapter")
     unkeyed = isinstance(expected_adapter, Mapping) and expected_adapter.get("unkeyed") is True
@@ -789,6 +797,13 @@ def execute_agent_task(
         provenance = {
             "task_sha256": sha(task.canonical()),
             "instruction_sha256": sha(task.instruction),
+            "instruction_evidence": scrub_evidence(
+                str(task.instruction),
+                mode=evidence_policy.request,
+            ),
+            "prompt_resolution": copy.deepcopy(
+                dict(prompt_resolution) if prompt_resolution is not None else None
+            ),
             "spec_digest": spec.digest,
             "usage": dict(result.usage) if result.usage is not None else None,
             "duration_seconds": duration_seconds,
@@ -814,10 +829,17 @@ def execute_agent_task(
         else:
             typed_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.PROTOCOL)
         failure = {
-            "failure_schema": 1,
+            "failure_schema": 2,
             "node": node_name,
             "task_sha256": sha(task.canonical()),
             "instruction_sha256": sha(task.instruction),
+            "instruction_evidence": scrub_evidence(
+                str(task.instruction),
+                mode=evidence_policy.request,
+            ),
+            "prompt_resolution": copy.deepcopy(
+                dict(prompt_resolution) if prompt_resolution is not None else None
+            ),
             "status": "failed",
             "failure": canonical_failure(typed_error),
             "usage": usage,

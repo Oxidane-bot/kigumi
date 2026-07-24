@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from .calling import Caller
+from .calling import Caller, prompt_resolution_boundary
 from .prompt import (
     WORDING_REPAIR_ECHO,
     WORDING_REPAIR_PREAMBLE,
     WORDING_REPAIR_ROUND,
     WORDING_REPAIR_STUCK,
+    PromptResolution,
+    ResolvedPrompt,
     schema_format_section,
 )
 
@@ -37,6 +40,7 @@ def repair_loop(
     reminder: str | Callable[[ValueError, int], str] | None = None,
     sink: Callable[[dict[str, Any]], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    _base_resolution: PromptResolution | None = None,
     **params: Any,
 ) -> Validated:
     """Call, validate, and repair a response within a fixed attempt budget.
@@ -50,13 +54,26 @@ def repair_loop(
     if max_repairs < 0:
         raise ValueError("max_repairs must be non-negative")
 
+    base_resolution = (
+        messages.resolution if isinstance(messages, ResolvedPrompt) else _base_resolution
+    )
     base_messages = _normalize_messages(messages)
     attempt_messages = deepcopy(base_messages)
     rounds: list[dict[str, Any]] = []
     previous_raw: str | None = None
 
     for attempt in range(max_repairs + 1):
-        raw = caller.call(attempt_messages, model=model, **params)
+        lineage = (
+            prompt_resolution_boundary(
+                base_resolution,
+                phase="primary" if attempt == 0 else "repair",
+                repair_round=attempt,
+            )
+            if base_resolution is not None
+            else nullcontext()
+        )
+        with lineage:
+            raw = caller.call(attempt_messages, model=model, **params)
         try:
             return validate(raw)
         except ValueError as error:
@@ -136,6 +153,7 @@ def call_validated(
     **params: Any,
 ) -> Model:
     """Call for a Pydantic model, applying deterministic JSON normalization first."""
+    base_resolution = prompt.resolution if isinstance(prompt, ResolvedPrompt) else None
     completed_prompt = prompt
     if include_format_section:
         completed_prompt = f"{prompt}\n\n{schema_format_section(model_cls)}"
@@ -164,6 +182,7 @@ def call_validated(
         reminder=reminder,
         sink=sink,
         on_event=on_event,
+        _base_resolution=base_resolution,
         **params,
     )
 

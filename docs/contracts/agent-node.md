@@ -30,11 +30,12 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 
 ## Invariants
 
-1. `Dag.agent(..., spec=AgentSpec)` 无 `AgentConfig` 兼容入口；lookup 在 builder/Pi 之前。
+1. `Dag.agent(..., spec=AgentSpec)` 无 `AgentConfig` 兼容入口；L3 lookup 在 builder/Pi 之前。
+   miss 先运行 builder 以绑定可选 `ResolvedPrompt` instruction，再申请 slot。
 2. Agent 复用普通 node 的拓扑、cache lookup、seal、output claim、materialize、sidecar 和 run。
 3. `external` 摘要包含 `agent_executor_schema=3`、adapter/Pi expected version、bridge 与路径
    policy digest、capsule digest、provider/model/thinking、工具和 limits；普通 L3
-   `CACHE_SCHEMA=4`。
+   `CACHE_SCHEMA=5`。
 4. miss 只 staging 声明文件、canonical upstream 和 capsule snapshot；scratch 不保留。
 5. collect 产生无项目目标路径的 `kigumi_attachment`；`AgentCompletion.outputs` 必须全部来自
    本次 collect，并覆盖全部 publish source；只有 exact publish 进入普通物化。
@@ -56,9 +57,13 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
     retained sidecar/failure/attempt receipt 追踪引用。
 14. Pi 固定关闭 hidden Agent/provider retry；`auto_retry_start/end`、thinking-off 仍出现 thinking
     或 observed response model substitution 都立即 fail closed。
-15. miss 在 staging/Pi spawn 前获得全局 Agent slot；hit 不占 slot。slot timeout 为 typed
-    capacity failure，queue wait 不消耗 execution timeout。
-16. v1 capsule 没有自动进化、winner/promotion、Agent factory、动态多 Agent 拓扑；
+15. miss 的 builder 完成后、staging/Pi spawn 前获得全局 Agent slot；hit 不运行 builder、
+    不占 slot。slot timeout 为 typed capacity failure，queue wait 不消耗 execution timeout，
+    failure receipt 保留 builder 已绑定的 managed/unmanaged instruction lineage。
+16. `AgentTask.instruction` 可直接接收 `ResolvedPrompt`；success、failure、timeout、capacity、
+    hidden retry 与 ambiguous active effect 使用同一 resolution 形态。普通字符串保持
+    unmanaged。
+17. v1 capsule 没有自动进化、winner/promotion、Agent factory、动态多 Agent 拓扑；
     writer/reviewer/arbiter 由用户用静态 DAG 组合。
 
 ## Failure behavior

@@ -1,11 +1,11 @@
 # Durable retry 与 run resume 契约
 
-Status: Active (0.6.0)
+Status: Active (0.7.0)
 
 ## Public surface
 
 `RetryPolicy` 可用于 `Dag.node`、`Dag.agent`、map/scan；默认 `retry=None`，绝不自动重试。
-恢复入口为 `Dag.resume(run_id, workers=1)`；`Dag.run(run_id=已有 0.6 run)` 走同一绑定实现。
+恢复入口为 `Dag.resume(run_id, workers=1)`；`Dag.run(run_id=已有 0.7 run)` 走同一绑定实现。
 人工裁决使用：
 
 ```text
@@ -21,11 +21,14 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
    `retry_after_ms` 是下界；`max_delay_seconds` 只限制本地指数退避。
 3. retry digest 属于 run execution identity 与 attempt receipt，不进入 L3 内容键。durable
    CALL 要求 transport/length/empty hidden retry 全为 0；Pi hidden retry 事件立即失败。
-4. `_run.json` schema 1 绑定 graph identity、targets、force、source/libs、retry/evidence
-   digests 与状态。0.5.x/缺 manifest run 只读，不可 resume；声明变化 fail closed。
+4. `_run.json` schema 2 绑定 graph identity、targets、force、source/libs、retry/evidence
+   digests、完整 Prompt 候选 universe、WorkflowProfile 及其 digest。schema-1/0.6 run
+   只读，不可 resume；任何声明或未选中候选变化都 fail closed。
 5. 每个 `runs/<run>/attempts/<target_digest>/state.json` 与 `attempt-NNNN.json` 使用 receipt
-   schema 1。执行前写 running；provider call/Pi spawn 前写 `side_effect_started=true`；
-   成功先写 canonical candidate，再 seal/materialize/sidecar，最后 completed。
+   schema 2，并绑定当前 target 的全部 Prompt resolution。执行前写 running；每次 live
+   provider CALL 或 Agent spawn 前原子写 `side_effect_started=true`、active effect、
+   actual prompt/instruction digest 与 resolution；成功先写 schema-2 canonical candidate，
+   再 seal/materialize/schema-2 sidecar，最后 completed。
 6. crash-after-success 可提交 candidate 而不重做 side effect。crash 且 side effect 未开始可
    恢复同 attempt；已开始但无 terminal receipt 必须 ambiguous，未经带 reason 的人工裁决
    不得重试。
@@ -33,8 +36,9 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
    side effect；外部 supervisor 负责到期再次调用。
 8. pending retry 与 checkpoint 一样只阻断下游，不阻断独立分支。map 每 item 独立 attempt；
    scan 复用已验证前缀，只重试失败 item，后缀保持未执行。
-9. 同 run completed artifact（含 `cache="off"`）恢复时必须重验 artifact digest、key
-   components、输出/blob 字节，并且不重新执行。
+9. 同 run completed artifact（含 `cache="off"`）恢复时必须重验 Prompt snapshot/selection/
+   resolution digest、candidate、artifact、origin、sidecar、输出/blob 字节，并且不重新执行。
+   manifest 记录 `resume_count` 与 `last_resumed_at`，但它们不改变 immutable run identity。
 
 ## Exactly-once boundary
 

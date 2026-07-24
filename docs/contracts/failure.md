@@ -1,6 +1,6 @@
 # Failure 契约
 
-Status: Active (0.6.0)
+Status: Active (0.7.0)
 
 ## Purpose / source of truth
 
@@ -22,6 +22,9 @@ CALL 与 Agent 共享 provider-neutral、可序列化的失败事实；实现权
    `RetryPolicy` 决定。
 6. CALL failed metadata、Agent failure JSON、attempt receipt 和 run manifest failure
    保存 canonical typed failure，不保存可用于控制流的异常 prose。
+7. schema-2 Agent failure receipt 与 CALL attempt calls 在 managed 输入存在时必须同时保存
+   Prompt resolution；capacity、timeout、provider、hidden-retry、protocol 与 ambiguous 路径
+   同形，画像默认不展开 instruction/request 内容。
 
 ## Failure behavior / verification
 

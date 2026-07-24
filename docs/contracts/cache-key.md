@@ -2,8 +2,8 @@
 
 Status: Active
 
-> 0.6.0：`CACHE_SCHEMA=4`，node cache envelope schema 2；
-> `agent_executor_schema=3`。这是有意的 L3/Agent cache 换族，不迁移 0.5.x 条目。
+> 0.7.0：`CACHE_SCHEMA=5`，node cache envelope schema 3；
+> `agent_executor_schema=3` 保持不变。这是有意的完整 L3 cache 换族，不迁移 0.6.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
 
 ## Purpose
@@ -23,8 +23,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 ## Invariants
 
 1. L1 键等于 `sha({messages, model=resolved 后模型, params(调用方原样,传输层归一化不回写), seed})`；`seed` 只是键命名空间，不发给供应商。
-2. L3 成分标签固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<t>`、`files:<p>`、
-   `params`、`item`、`item_files:<p>`、`carry`、`kigumi`，声明外部指纹时额外且仅额外出现
+2. L3 成分标签固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<t>`、
+   `prompt_specs:<name>`、`files:<p>`、`params`、`item`、`item_files:<p>`、`carry`、
+   `kigumi`，声明外部指纹时额外且仅额外出现
    `external=sha(external_fingerprint)`；普通依赖边默认取完整上游产物摘要，声明
    `consumes[dep]` 时同一 `upstream:<dep>` 标签改取 canonical 投影视图摘要，不新增标签；
    推导单点在 `dag._key_components`，原始指纹不落盘。
@@ -34,7 +35,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 的语法残破文件退回原文。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
-6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=4, pydantic})`；其中
+6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=5, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
 7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时必须递增
@@ -43,10 +44,18 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    `CACHE_SCHEMA` 从 1 升至 2，是为可选 external 成分进行的有意完整 L3 换族。
    0.3.0 将 schema 从 2 升至 3，是为普通依赖边的可选消费投影进行的有意完整换族。
    0.6.0 将 schema 从 3 升至 4，并将 cache envelope 升至 schema 2，以绑定 immutable
-   origin provenance、Agent schema 2 和 evidence miss 语义。
-9. node cache envelope schema 2 固定保存 canonical artifact、artifact SHA-256 和首次执行的
-   immutable origin provenance。warm hit 不得以 replay metadata 覆盖 origin。
-10. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy
+   origin provenance、Agent schema 2 和 evidence miss 语义。0.7.0 再从 4 升至 5，并把
+   envelope 升至 schema 3，以引入声明式 Prompt resolution、selected-only L3 成分和
+   hash-bound origin。
+9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
+   axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
+   variant 的内容 digest。同节点声明的所有 PromptSpec 都保守入键，即使本次函数未调用。
+   未选中候选的完整字节 universe 只进入 run manifest graph identity，因此改它可复用相同
+   selected-only L3 条目，但旧 run 因声明 identity 漂移拒绝 resume。legacy `prompts=()`
+   仍按全部模板内容入键。
+10. node cache envelope schema 3 固定保存 canonical artifact、artifact SHA-256、首次执行的
+    immutable origin provenance 与 origin digest。warm hit 不得以 replay metadata 覆盖 origin。
+11. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy
     digest 与 Agent slots/lock/timeout 也不属于内容键。
 
 ## Failure behavior

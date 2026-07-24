@@ -13,9 +13,17 @@ from kigumi import (
     AgentSpec,
     Dag,
     EvidencePolicy,
+    InputRef,
     LLMCaller,
     PiRpcAdapter,
+    PromptAxis,
+    PromptLayer,
+    PromptMaterial,
+    PromptRef,
+    PromptResolution,
+    PromptSpec,
     ProviderFailure,
+    ResolvedPrompt,
     RetryPolicy,
 )
 from kigumi.config import KigumiConfig
@@ -46,6 +54,14 @@ def main() -> int:
             EvidencePolicy,
             RetryPolicy,
             ProviderFailure,
+            PromptRef,
+            InputRef,
+            PromptAxis,
+            PromptLayer,
+            PromptMaterial,
+            PromptSpec,
+            PromptResolution,
+            ResolvedPrompt,
         )
     )
     package = files("kigumi")

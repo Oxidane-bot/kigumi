@@ -68,6 +68,7 @@ class ExecutionEnvelope:
         cache_policy: CachePolicy = "auto",
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
         agent_provenance: dict[str, Any] | None = None,
+        prompt_resolutions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Validate, canonicalize, and persist one cacheable artifact."""
         if not isinstance(artifact, dict):
@@ -83,6 +84,7 @@ class ExecutionEnvelope:
                     calls or [],
                     evidence_policy=evidence_policy,
                     agent_provenance=agent_provenance,
+                    prompt_resolutions=prompt_resolutions,
                 ),
             )
         return sealed
@@ -145,6 +147,7 @@ class ExecutionEnvelope:
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
         origin_provenance: dict[str, Any] | None = None,
         agent_provenance: dict[str, Any] | None = None,
+        prompt_resolutions: dict[str, Any] | None = None,
     ) -> None:
         """Persist one run artifact and its deterministic metadata shape."""
         origin = (
@@ -156,11 +159,13 @@ class ExecutionEnvelope:
                 calls,
                 evidence_policy=evidence_policy,
                 agent_provenance=agent_provenance,
+                prompt_resolutions=prompt_resolutions,
             )
         )
         if origin is None or origin.get("artifact_sha256") != sha(artifact):
             raise ValueError("run sidecar cannot resolve hash-bound origin provenance")
         metadata: dict[str, Any] = {
+            "run_sidecar_schema": 2,
             "node": label,
             "cache_key": cache_key,
             "cache": "hit" if cache_hit else "miss",
@@ -169,7 +174,10 @@ class ExecutionEnvelope:
             "seconds": seconds,
             "calls": copy.deepcopy(calls),
             "execution_calls": copy.deepcopy(calls),
+            "prompt_resolutions": copy.deepcopy(prompt_resolutions or {}),
+            "prompt_resolutions_digest": sha(prompt_resolutions or {}),
             "origin_provenance": copy.deepcopy(origin),
+            "origin_provenance_digest": sha(origin),
             "artifact_sha256": origin["artifact_sha256"],
             "prompt_sha256": origin["prompt_sha256"],
             "model": origin["model"],
@@ -195,6 +203,7 @@ def _origin_provenance(
     *,
     evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
     agent_provenance: dict[str, Any] | None = None,
+    prompt_resolutions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     copied_calls = copy.deepcopy(calls)
     agent = artifact.get("agent")
@@ -246,6 +255,7 @@ def _origin_provenance(
         "artifact_sha256": sha(artifact),
         "calls": copied_calls,
         "agent": retained_agent_provenance,
+        "prompt_resolutions": copy.deepcopy(prompt_resolutions or {}),
         "prompt_sha256": prompt_sha256,
         "model": model,
         "params": copy.deepcopy(params),

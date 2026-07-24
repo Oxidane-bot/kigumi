@@ -84,7 +84,7 @@ def test_agent_capacity_defaults_to_one_and_explicit_slots_allow_parallelism(
     assert parallel_adapter.peak == 2
 
 
-def test_agent_slot_timeout_is_typed_and_happens_before_builder_or_adapter(
+def test_agent_slot_timeout_is_typed_and_happens_after_builder_before_adapter(
     tmp_path: Path,
 ) -> None:
     adapter = _SleepingAdapter()
@@ -109,7 +109,7 @@ def test_agent_slot_timeout_is_typed_and_happens_before_builder_or_adapter(
     ):
         dag.run()
     assert raised.value.runtime_code is AgentRuntimeFailureCode.CAPACITY
-    assert builders == 0
+    assert builders == 1
     assert adapter.runs == 0
 
 

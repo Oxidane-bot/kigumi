@@ -18,6 +18,9 @@ A foundation for building LLM pipelines with coding agents:
 
 - **Injection and assembly**: a single entry point for material injection,
   strict template rendering, format sections auto-generated from schemas
+- **Layered Prompt declarations**: finite selector axes, fixed fragments and
+  fenced runtime materials resolve before cache lookup, with selected-only L3
+  caching and content-free lineage
 - **Repair loop**: failed validation turns into corrective instructions,
   model context is preserved, retries are bounded, lessons are locked in
 - **Deterministic replay**: content-addressed caching — same input,
@@ -32,6 +35,8 @@ A foundation for building LLM pipelines with coding agents:
 - **Typed failures and explicit recovery**: shared provider failure facts,
   deterministic retry schedules, persisted attempt receipts, and fail-closed
   handling of ambiguous side effects
+- **Workflow profiles**: one canonical static/runtime IR for Prompt-aware
+  Mermaid, Markdown, JSON, `describe`, trace, and run inspection
 - **Experiment subjects**: one isolated evidence grid for functions, callers,
   ordinary workflows, and Agent-backed DAGs—without automatic winner selection
 - **Four guard rings**: registration-time refusal plus three outer rings
@@ -67,8 +72,43 @@ with no further API cost.
 
 ## Status
 
-0.6.0, API not frozen. The Agent boundary is intentionally an execution adapter,
+0.7.0, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
+
+## Layered Prompt example
+
+```python
+from kigumi import InputRef, PromptAxis, PromptLayer, PromptRef, PromptSpec
+
+WRITE = PromptSpec(
+    name="write",
+    base=PromptRef("base/task"),
+    layers=(
+        PromptLayer(
+            slot="mode",
+            source=PromptAxis(
+                name="mode",
+                selector=InputRef("config", path=("mode",)),
+                variants={
+                    "concise": PromptRef("variants/concise"),
+                    "detailed": PromptRef("variants/detailed"),
+                },
+            ),
+        ),
+    ),
+)
+
+
+@dag.node("write", deps=("config",), prompt_specs=(WRITE,))
+def write(inputs, ctx):
+    return {"text": ctx.call(ctx.resolve_prompt("write"))}
+```
+
+Kigumi snapshots all declared Prompt files once per run. The selected variant
+enters the L3 key; unselected variant bytes remain in run identity, so editing
+one can reuse the selected cache but cannot silently resume an old run. Inspect
+the complete declaration or persisted selections with `dag profile` and
+`dag graph --prompts`.
 
 ## Install
 
@@ -87,7 +127,8 @@ Automatic DAG retry is off by default. When a node declares `RetryPolicy`,
 Kigumi persists run/attempt state and returns pending instead of sleeping;
 an external supervisor calls `Dag.resume()` when due. `EvidencePolicy` controls
 retention after mandatory secret scrubbing, but is not encryption or access
-control. Runs created before 0.6 remain inspectable but cannot be resumed.
+control. 0.6 runs remain inspectable as legacy profiles but cannot be resumed
+under the 0.7 manifest.
 
 ## Documentation map
 

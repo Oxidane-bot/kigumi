@@ -30,8 +30,9 @@ Status: Active
    对不存在的引用无副作用。refresh 写入的条目按普通 run 引用保留。
 7. GC 的管理边界只包含 kigumi 的 node cache、blob 与 run 数据；当前回收只删除不可达
    node cache/blob，不删除 run 目录、项目物化路径，也不移动/删除 `ctx.ingest_file` 的外部 source。
-8. blob reachability 递归扫描 retained run 的 sidecar、failure、attempt receipt、resolution 与
-   success candidate JSON。`kigumi_attachment` 和 `kigumi_blob` 引用都保护同一 blob；
+8. blob reachability 递归扫描 retained run 的 schema-2 sidecar、origin、failure、
+   schema-2 attempt receipt、manual resolution 与 schema-2 success candidate JSON。
+   `kigumi_attachment` 和 `kigumi_blob` 引用都保护同一 blob；
    `hash_only` descriptor 没有 blob 引用，因此不会虚构 retained 内容。
 
 ## Failure behavior

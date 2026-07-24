@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .profile import load_run_profile
 from .store import run_directory
 
 
@@ -64,20 +65,25 @@ def trace_run(
     durable = durable_run_state(run_path)
     if durable:
         result.update(durable)
+    manifest = _read_json(run_path / "_run.json")
+    if manifest.get("run_manifest_schema") in {1, 2}:
+        result["workflow_profile"] = load_run_profile(run_path)
     if warnings:
         result["warnings"] = warnings
     return result
 
 
 def durable_run_state(run_path: Path) -> dict[str, Any]:
-    """Read schema-1 run/attempt state without importing an executable DAG."""
+    """Read supported durable run/attempt state without importing an executable DAG."""
     manifest = _read_json(run_path / "_run.json")
-    if manifest.get("run_manifest_schema") != 1:
+    manifest_schema = manifest.get("run_manifest_schema")
+    if manifest_schema not in {1, 2}:
         return {}
+    attempt_schema = int(manifest_schema)
     attempts: list[dict[str, Any]] = []
     for state_path in sorted((run_path / "attempts").glob("*/state.json")):
         state = _read_json(state_path)
-        if state.get("attempt_receipt_schema") != 1:
+        if state.get("attempt_receipt_schema") != attempt_schema:
             continue
         attempts.append(
             {
@@ -91,6 +97,8 @@ def durable_run_state(run_path: Path) -> dict[str, Any]:
                     "failure",
                     "policy_digest",
                     "resolution",
+                    "active_effect",
+                    "prompt_resolutions",
                 )
                 if key in state
             }
@@ -103,6 +111,7 @@ def durable_run_state(run_path: Path) -> dict[str, Any]:
         "evidence_policy_digests": manifest.get("evidence_policy_digests", {}),
         "pending_retries": manifest.get("pending_retries", []),
         "ambiguous_attempts": manifest.get("ambiguous_attempts", []),
+        "resolution_status": ("available" if manifest_schema == 2 else "unavailable_legacy"),
     }
 
 
@@ -183,6 +192,8 @@ def _trace_entry(
                     "prompt_sha": call.get("prompt_sha"),
                     "seconds": call.get("seconds"),
                     "usage": call.get("usage"),
+                    "managed": isinstance(call.get("prompt_resolution"), dict),
+                    "prompt_resolution": call.get("prompt_resolution"),
                     "payload_path": payload_path,
                 }
             )

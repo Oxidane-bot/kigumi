@@ -38,6 +38,9 @@ Status: Active
    foreach 仍在注册期固化。
 8. 重复挂载把检查点身份限定到 qualified 挂载节点：普通节点使用
    `approval@namespace.local`，map/scan 项再追加 `@item`；不同挂载可独立挂起和批准。
+9. `Subgraph.node/map/scan` 支持与 Dag 相同的 `prompt_specs` 静态声明；mount 只重写本地
+   InputRef 的依赖绑定，不改变 PromptSpec 或生成运行时拓扑。ItemRef/CarryRef 限制与顶层
+   map/scan 相同，完整候选 universe 进入挂载后 run identity。
 
 ## Failure behavior
 

@@ -2,6 +2,52 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [0.7.0] - 2026-07-24
+
+### 新增
+
+- 新增声明式分层 Prompt：`PromptRef`、`InputRef`、`ParamRef`、`ItemRef`、
+  `CarryRef`、`PromptAxis`、`PromptLayer`、`PromptMaterial`、`PromptSpec`、
+  `ResolvedPrompt` 与 `PromptResolution` 全部顶层导出。Dag 的 node/agent/map/scan/
+  foreach 及 Subgraph 的 node/map/scan 支持 `prompt_specs=()`；严格 selector、精确 slot、
+  无 slot fragment 与统一 `inject()` material 在缓存 lookup 和副作用前解析。
+- 每个 run 新增不可变 `PromptCatalogSnapshot`。同一 run 一次读取全部声明文件；axis 只把
+  实际 selection 与所选 fragment 内容放入 L3 key，未选中候选仍进入完整 run graph identity。
+  修改未选中 variant 可复用 selected-only L3 cache，但旧 run 因声明 universe 漂移拒绝
+  resume。
+- CALL、validated repair 与 Agent instruction 新增 Prompt lineage。直接调用
+  `ResolvedPrompt` 为 managed；字符串拼接后自然丢失 lineage 并标记 unmanaged。多 CALL、
+  L1 hit、primary/repair round、Agent success/failure/capacity/ambiguous 与 live side-effect
+  boundary 均保存当前 resolution。
+- 新增 `Dag.profile(run_id=None, include_content=False)`、`dag profile` 和
+  `dag graph --prompts`。`workflow_profile_schema=1` canonical IR 汇总静态图、Subgraph、
+  Prompt 候选与来源边；运行画像只读持久化 state，展示 node/item/attempt/CALL 的
+  current/origin selection、cache、model、usage、repair、failure/retry/ambiguous/resume。
+  `describe`、trace 与 runs show 复用该 IR；Markdown 同时输出 Mermaid 总图与 Prompt 总表。
+
+### 变更
+
+- **0.7 硬切**：`CACHE_SCHEMA` 从 4 升至 5，node cache envelope 从 schema 2 升至 3，
+  run manifest 从 schema 1 升至 2，attempt receipt、success candidate 与 run sidecar
+  升至 schema 2；新增 `prompt_resolution_schema=1`、`workflow_profile_schema=1`。
+  `agent_schema=2` 与 `agent_executor_schema=3` 保持不变。0.6 L3 cache 自然 miss，不提供
+  迁移器或兼容 shim。
+- schema-2 run manifest 绑定完整 Prompt 候选 universe 与 WorkflowProfile digest；
+  resume 重新验证 snapshot、selection、resolution、candidate、artifact、origin、sidecar
+  与 blob，并记录 `resume_count`/`last_resumed_at`。0.6/schema-1 run 仅只读显示
+  `resolution_status=unavailable_legacy`，明确拒绝 resume。
+- cache-hit sidecar 同时保存本 run 重新解析的 current resolution 与 immutable cache origin
+  的历史实际调用。`full`、`redacted`、`hash_only` 下 resolution 结构同形且不保存原文；
+  profile 内容展开仍服从该 run 的 EvidencePolicy，后者不是访问控制。
+- Agent builder 先构造并绑定 managed instruction，再申请全局 slot；cache hit 仍跳过
+  builder 和 slot，capacity failure 则保留已解析 instruction lineage。
+
+### 保持兼容
+
+- 既有 `prompts=()`、`ctx.render()`、字符串 `ctx.call()`、字符串 Agent instruction 和
+  chat message list 保留；未采用新声明时明确显示为 unmanaged。没有远端 registry、
+  Jinja/宏、隐式 default/override、动态 Prompt/DAG 拓扑、模型生成 variant 或自动 promotion。
+
 ## [0.6.0] - 2026-07-24
 
 ### 新增

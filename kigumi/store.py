@@ -20,7 +20,7 @@ from .errors import OutputOwnershipError
 
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
-_NODE_CACHE_ENVELOPE_SCHEMA = 2
+_NODE_CACHE_ENVELOPE_SCHEMA = 3
 
 
 def runs_root(artifacts_path: Path) -> Path:
@@ -80,12 +80,15 @@ def _read_node_cache_envelope(
     artifact = payload.get("artifact")
     origin = payload.get("origin_provenance")
     artifact_sha256 = payload.get("artifact_sha256")
+    origin_sha256 = payload.get("origin_sha256")
     if (
         not isinstance(artifact, dict)
         or not isinstance(origin, dict)
         or not isinstance(artifact_sha256, str)
         or artifact_sha256 != sha(artifact)
         or origin.get("artifact_sha256") != artifact_sha256
+        or not isinstance(origin_sha256, str)
+        or origin_sha256 != sha(origin)
     ):
         return None
     return payload
@@ -107,6 +110,7 @@ def write_node_cache(
         {
             "cache_schema": _NODE_CACHE_ENVELOPE_SCHEMA,
             "artifact_sha256": artifact_sha256,
+            "origin_sha256": sha(origin_provenance),
             "artifact": artifact,
             "origin_provenance": origin_provenance,
         },

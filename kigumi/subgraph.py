@@ -21,6 +21,7 @@ from ._declarations import (
     validate_consumes,
     validate_segment,
 )
+from .prompt import PromptSpec, validate_prompt_bindings, validate_prompt_specs
 
 AggregateFunction = Callable[[dict[str, dict[str, Any]], list[str]], dict[str, Any]]
 
@@ -31,6 +32,7 @@ class _SubgraphNode:
     function: Callable[..., dict[str, Any]]
     deps: tuple[str, ...]
     prompts: tuple[str, ...]
+    prompt_specs: tuple[PromptSpec, ...]
     files: tuple[Path, ...]
     params: dict[str, Any]
     cache: CachePolicy
@@ -70,15 +72,22 @@ class Subgraph:
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
         *,
+        prompt_specs: Iterable[PromptSpec] = (),
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
     ) -> Callable[[Callable[..., dict[str, Any]]], Callable[..., dict[str, Any]]]:
         """Declare one ordinary local node."""
+        fixed_prompts = tuple(prompts)
         return self._decorator(
             name,
             deps=tuple(deps),
-            prompts=tuple(prompts),
+            prompts=fixed_prompts,
+            prompt_specs=validate_prompt_specs(
+                tuple(prompt_specs),
+                legacy_prompts=fixed_prompts,
+                dynamic_kind="node",
+            ),
             files=tuple(Path(path) for path in files),
             params=copy.deepcopy(params) if params is not None else {},
             consumes=consumes,
@@ -94,6 +103,7 @@ class Subgraph:
         key_fn: Callable[[Any], str] | None = None,
         deps: Iterable[str] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
         params: dict[str, Any] | None = None,
@@ -105,10 +115,16 @@ class Subgraph:
         """Declare a local runtime map expansion."""
         _validate_locator(items_from, "items_from")
         source, path = items_from
+        fixed_prompts = tuple(prompts)
         return self._decorator(
             name,
             deps=tuple(dict.fromkeys((*deps, source))),
-            prompts=tuple(prompts),
+            prompts=fixed_prompts,
+            prompt_specs=validate_prompt_specs(
+                tuple(prompt_specs),
+                legacy_prompts=fixed_prompts,
+                dynamic_kind="map",
+            ),
             files=tuple(Path(file) for file in files),
             params=copy.deepcopy(params) if params is not None else {},
             consumes=consumes,
@@ -130,6 +146,7 @@ class Subgraph:
         carry_fn: Callable[[dict[str, Any]], Any] | None = None,
         deps: Iterable[str] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
         params: dict[str, Any] | None = None,
@@ -143,13 +160,19 @@ class Subgraph:
         if carry_from is not None:
             _validate_locator(carry_from, "carry_from")
         source, path = items_from
+        fixed_prompts = tuple(prompts)
         refs = (*deps, source)
         if carry_from is not None:
             refs = (*refs, carry_from[0])
         return self._decorator(
             name,
             deps=tuple(dict.fromkeys(refs)),
-            prompts=tuple(prompts),
+            prompts=fixed_prompts,
+            prompt_specs=validate_prompt_specs(
+                tuple(prompt_specs),
+                legacy_prompts=fixed_prompts,
+                dynamic_kind="scan",
+            ),
             files=tuple(Path(file) for file in files),
             params=copy.deepcopy(params) if params is not None else {},
             consumes=consumes,
@@ -170,6 +193,7 @@ class Subgraph:
         *,
         deps: tuple[str, ...],
         prompts: tuple[str, ...],
+        prompt_specs: tuple[PromptSpec, ...],
         files: tuple[Path, ...],
         params: dict[str, Any],
         consumes: Mapping[str, ConsumeFunction] | None,
@@ -207,11 +231,22 @@ class Subgraph:
                 items_from=items_from,
                 carry_from=carry_from,
             )
+            function_inputs = set(deps)
+            if items_from is not None:
+                function_inputs.discard(items_from[0])
+            if scan and carry_from is not None:
+                function_inputs.discard(carry_from[0])
+            validate_prompt_bindings(
+                prompt_specs,
+                inputs=function_inputs,
+                params=set(params),
+            )
             self._nodes[local_name] = _SubgraphNode(
                 local_name,
                 function,
                 deps,
                 prompts,
+                prompt_specs,
                 files,
                 params,
                 policy,

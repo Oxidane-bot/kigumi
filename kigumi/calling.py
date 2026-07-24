@@ -29,14 +29,18 @@ from .failures import (
     canonical_failure,
     provider_failure_from_exception,
 )
+from .prompt import PromptResolution, ResolvedPrompt
 from .slots import FileSlots
 from .transport import EmptyResponseError, Transport
 
 _call_observer: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
     "kigumi_call_observer", default=None
 )
-_durable_side_effect: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
-    "kigumi_durable_side_effect", default=None
+_durable_side_effect: contextvars.ContextVar[Callable[[dict[str, Any]], None] | None] = (
+    contextvars.ContextVar("kigumi_durable_side_effect", default=None)
+)
+_prompt_lineage: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "kigumi_prompt_lineage", default=None
 )
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
@@ -53,13 +57,40 @@ def observe() -> Iterator[list[dict[str, Any]]]:
 
 
 @contextmanager
-def durable_side_effect_boundary(callback: Callable[[], None]) -> Iterator[None]:
+def durable_side_effect_boundary(
+    callback: Callable[[dict[str, Any]], None],
+) -> Iterator[None]:
     """Mark the first live provider request in one durable attempt."""
     token = _durable_side_effect.set(callback)
     try:
         yield
     finally:
         _durable_side_effect.reset(token)
+
+
+@contextmanager
+def prompt_resolution_boundary(
+    resolution: PromptResolution,
+    *,
+    phase: str = "primary",
+    repair_round: int = 0,
+) -> Iterator[None]:
+    """Bind a base Prompt resolution to transformed primary/repair requests."""
+    if phase not in {"primary", "repair"}:
+        raise ValueError("prompt resolution phase must be primary or repair")
+    if repair_round < 0:
+        raise ValueError("repair_round must be non-negative")
+    lineage = {
+        **resolution.canonical(),
+        "base_resolution_digest": resolution.digest,
+        "phase": phase,
+        "repair_round": repair_round,
+    }
+    token = _prompt_lineage.set(lineage)
+    try:
+        yield
+    finally:
+        _prompt_lineage.reset(token)
 
 
 def _data_url(data: bytes, mime: str) -> str:
@@ -171,6 +202,14 @@ class LLMCaller:
         **params: Any,
     ) -> str:
         """Return a cached or live completion for normalized chat messages."""
+        prompt_lineage = _prompt_lineage.get()
+        if prompt_lineage is None and isinstance(messages, ResolvedPrompt):
+            prompt_lineage = {
+                **messages.resolution.canonical(),
+                "base_resolution_digest": messages.resolution.digest,
+                "phase": "primary",
+                "repair_round": 0,
+            }
         normalized_messages = self._normalize_messages(messages)
         prepared = self._prepare_file_references(normalized_messages)
         key_messages = prepared.key_messages if prepared is not None else normalized_messages
@@ -195,6 +234,7 @@ class LLMCaller:
                 model=resolved_model,
                 params=params,
                 messages=key_messages,
+                prompt_lineage=prompt_lineage,
             )
 
         with self._lock_for_key(key):
@@ -207,6 +247,7 @@ class LLMCaller:
                     model=resolved_model,
                     params=params,
                     messages=key_messages,
+                    prompt_lineage=prompt_lineage,
                 )
 
             if self.dry:
@@ -225,7 +266,18 @@ class LLMCaller:
                     durable_callback = _durable_side_effect.get()
                     if durable_callback is not None:
                         self._validate_durable_transport()
-                        durable_callback()
+                        durable_callback(
+                            {
+                                "active_effect_schema": 1,
+                                "kind": "call",
+                                "key": key,
+                                "model": resolved_model,
+                                "params_digest": sha(params),
+                                "prompt_sha": sha(key_messages),
+                                "managed": prompt_lineage is not None,
+                                "prompt_resolution": copy.deepcopy(prompt_lineage),
+                            }
+                        )
                     response = self.transport.complete(transport_messages, model, **params)
             except Exception as error:
                 seconds = time.monotonic() - started
@@ -249,6 +301,7 @@ class LLMCaller:
                     cache="failure",
                     failure=canonical_failure(failure),
                     request_value=cache_messages,
+                    prompt_lineage=prompt_lineage,
                 )
                 self._append_call(metadata)
                 raise failure from None
@@ -281,6 +334,7 @@ class LLMCaller:
                             "text": response.text,
                             "reasoning": response.reasoning,
                         },
+                        prompt_lineage=prompt_lineage,
                     )
                 )
                 raise failure from None
@@ -302,6 +356,7 @@ class LLMCaller:
                         "text": response.text,
                         "reasoning": response.reasoning,
                     },
+                    prompt_lineage=prompt_lineage,
                 ),
                 "response": response.text,
                 "messages": cache_messages,
@@ -316,7 +371,8 @@ class LLMCaller:
     @staticmethod
     def _normalize_messages(messages: list[dict[str, Any]] | str) -> list[dict[str, Any]]:
         if isinstance(messages, str):
-            return [{"role": "user", "content": messages}]
+            # Strip a ResolvedPrompt subclass only after its lineage was captured.
+            return [{"role": "user", "content": str(messages)}]
         return messages
 
     @classmethod
@@ -477,6 +533,7 @@ class LLMCaller:
         model: str,
         params: dict[str, Any],
         messages: list[dict[str, Any]],
+        prompt_lineage: dict[str, Any] | None,
     ) -> str:
         cached_response = cached["response"]
         cached_metadata = cached.get("meta", {})
@@ -510,6 +567,7 @@ class LLMCaller:
                     "text": cached_response,
                     "reasoning": cached.get("reasoning"),
                 },
+                prompt_lineage=prompt_lineage,
             )
         )
         return cached_response
@@ -542,6 +600,7 @@ class LLMCaller:
         failure: dict[str, Any] | None = None,
         request_value: Any | None = None,
         response_value: Any | None = None,
+        prompt_lineage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata = {
             "key": key,
@@ -570,6 +629,8 @@ class LLMCaller:
         }
         if failure is not None:
             metadata["failure"] = copy.deepcopy(failure)
+        if prompt_lineage is not None:
+            metadata["prompt_resolution"] = copy.deepcopy(prompt_lineage)
         return metadata
 
     def _validate_durable_transport(self) -> None:

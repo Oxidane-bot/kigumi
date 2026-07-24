@@ -109,6 +109,10 @@ def test_sidecar_shapes_distinguish_node_aggregate_and_item(tmp_path: Path) -> N
         "provider_response_id",
         "usage",
         "created_at",
+        "run_sidecar_schema",
+        "prompt_resolutions",
+        "prompt_resolutions_digest",
+        "origin_provenance_digest",
     }
 
     assert isinstance(source_metadata["cache_key"], str)

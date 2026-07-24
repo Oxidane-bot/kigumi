@@ -24,6 +24,7 @@ from .enforce import (
     waiver_reasons,
 )
 from .inspect import diff_components, durable_run_state, load_call, trace_run
+from .profile import WorkflowProfileError, load_run_profile
 from .prompt import TemplateSlotError, load_template, render_template, slot_names
 from .store import approve_checkpoint, diff_runs, gc_artifacts, run_directory, run_sort_key
 
@@ -369,10 +370,31 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
     if not run_path.is_dir():
         _error(f"run not found: {run_id}")
         return 1
+    workflow: dict[str, Any] | None = None
+    if _read_json(run_path / "_run.json").get("run_manifest_schema") in {1, 2}:
+        try:
+            workflow = load_run_profile(run_path)
+        except WorkflowProfileError as error:
+            _error(str(error))
+            return 1
     nodes: list[dict[str, Any]] = []
-    for sidecar in sorted(run_path.glob("*.json.meta.json")):
-        metadata = _read_json(sidecar)
-        name = sidecar.name.removesuffix(".json.meta.json")
+    runtime_nodes = (
+        workflow["run"]["nodes"]
+        if workflow is not None and isinstance(workflow.get("run"), dict)
+        else None
+    )
+    if isinstance(runtime_nodes, list):
+        node_sources = runtime_nodes
+    else:
+        node_sources = [
+            {
+                "target": sidecar.name.removesuffix(".json.meta.json"),
+                **_read_json(sidecar),
+            }
+            for sidecar in sorted(run_path.glob("*.json.meta.json"))
+        ]
+    for metadata in node_sources:
+        name = metadata.get("target", metadata.get("name"))
         calls = metadata.get("calls", [])
         call_count = len(calls) if isinstance(calls, list) else 0
         nodes.append(
@@ -404,6 +426,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                 "evidence_policy_digests": durable.get("evidence_policy_digests", {}),
                 "pending_retries": durable.get("pending_retries", []),
                 "ambiguous_attempts": durable.get("ambiguous_attempts", []),
+                "workflow_profile": workflow,
             }
         )
     else:

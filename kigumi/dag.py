@@ -24,6 +24,7 @@ from typing import Any
 
 import pydantic
 
+from . import profile as workflow_profile
 from . import prompt, repair, store, views
 from ._declarations import (
     CachePolicy,
@@ -34,7 +35,7 @@ from ._declarations import (
     validate_segment,
 )
 from ._execution import ExecutionEnvelope
-from ._runstate import AttemptStore, RunManifestError
+from ._runstate import RUN_MANIFEST_SCHEMA, AttemptStore, RunManifestError
 from .agents import (
     AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
@@ -47,13 +48,13 @@ from .agents import (
     validate_agent_artifact,
     validate_agent_provenance,
 )
-from .artifacts import canonical_json, sha
+from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
 from .calling import DryRunError, LLMCaller, durable_side_effect_boundary, observe
 from .config import KigumiConfig
 from .enforce import check_paths, check_raw_io_node_paths, check_raw_io_source, check_source
 from .errors import OutputOwnershipError
-from .evidence import EvidencePolicy
+from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
@@ -61,7 +62,16 @@ from .failures import (
     canonical_failure,
     failure_provider_kind,
 )
-from .prompt import load_template, render_template
+from .prompt import (
+    PromptCatalogSnapshot,
+    PromptResolutionError,
+    PromptSpec,
+    ResolvedPrompt,
+    render_template,
+    validate_prompt_bindings,
+    validate_prompt_resolution_record,
+    validate_prompt_specs,
+)
 from .retry import RetryExhausted, RetryPolicy
 from .slots import FileSlots, SlotTimeoutError
 from .subgraph import Subgraph
@@ -74,7 +84,8 @@ PostNodeHook = Callable[[str, dict[str, Any], bool], None]
 _NO_CARRY = object()
 _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
-CACHE_SCHEMA = 4
+CACHE_SCHEMA = 5
+SUCCESS_CANDIDATE_SCHEMA = 2
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
@@ -210,6 +221,7 @@ class _Node:
     function: NodeFunction | MapFunction | ScanFunction
     deps: tuple[str, ...]
     prompts: tuple[str, ...]
+    prompt_specs: tuple[PromptSpec, ...]
     files: tuple[Path, ...]
     params: dict[str, Any]
     consumes: dict[str, ConsumeFunction]
@@ -248,6 +260,8 @@ class NodeContext:
         *,
         checkpoint_suffix: str | None = None,
         item_files: tuple[Path, ...] = (),
+        prompt_snapshot: PromptCatalogSnapshot | None = None,
+        prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
     ) -> None:
         self._dag = dag
         self._node = node
@@ -255,6 +269,8 @@ class NodeContext:
         self._checkpoint_suffix = checkpoint_suffix
         self._item_files = item_files
         self._checkpoint_used = False
+        self._prompt_snapshot = prompt_snapshot
+        self._prompt_resolutions = dict(prompt_resolutions or {})
 
     @property
     def params(self) -> dict[str, Any]:
@@ -328,7 +344,21 @@ class NodeContext:
             raise ValueError(
                 f"Template {template_name!r} is not declared for node {self._node.name!r}"
             )
-        return render_template(load_template(self._dag._prompt_path(template_name)), slots)
+        template = (
+            self._prompt_snapshot.text(template_name)
+            if self._prompt_snapshot is not None
+            else self._dag._prompt_snapshot((self._node,)).text(template_name)
+        )
+        return render_template(template, slots)
+
+    def resolve_prompt(self, spec_name: str) -> ResolvedPrompt:
+        """Return one PromptSpec resolved before this target's L3 lookup."""
+        try:
+            return self._prompt_resolutions[spec_name]
+        except KeyError as error:
+            raise ValueError(
+                f"PromptSpec {spec_name!r} is not declared for node {self._node.name!r}"
+            ) from error
 
     def checkpoint(self, name: str, payload: Any) -> Any:
         """Return approval data bound to this exact payload or stop for human review."""
@@ -400,6 +430,7 @@ class Dag:
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
         *,
+        prompt_specs: Iterable[PromptSpec] = (),
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
@@ -411,6 +442,11 @@ class Dag:
             raise ValueError(f"Node {name!r} is already registered")
         node_deps = tuple(deps)
         node_prompts = tuple(prompts)
+        node_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=node_prompts,
+            dynamic_kind="node",
+        )
         node_files = tuple(Path(path) for path in files)
         node_params = copy.deepcopy(params) if params is not None else {}
         node_cache = validate_cache_policy(cache)
@@ -424,6 +460,7 @@ class Dag:
                 function,
                 deps=node_deps,
                 prompts=node_prompts,
+                prompt_specs=node_prompt_specs,
                 files=node_files,
                 params=node_params,
                 consumes=consumes,
@@ -444,6 +481,7 @@ class Dag:
         spec: AgentSpec,
         deps: Iterable[str] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
         consumes: Mapping[str, ConsumeFunction] | None = None,
@@ -459,6 +497,12 @@ class Dag:
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
         retry_policy = _validate_retry_policy(retry)
+        node_prompts = tuple(prompts)
+        node_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=node_prompts,
+            dynamic_kind="node",
+        )
         try:
             identity = agent_external_identity(adapter, spec)
         except (TypeError, ValueError) as error:
@@ -479,7 +523,8 @@ class Dag:
                 name,
                 function,
                 deps=tuple(deps),
-                prompts=tuple(prompts),
+                prompts=node_prompts,
+                prompt_specs=node_prompt_specs,
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
                 consumes=consumes,
@@ -505,6 +550,7 @@ class Dag:
         key_fn: Callable[[Any], str] | None = None,
         deps: Iterable[str] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
         params: dict[str, Any] | None = None,
@@ -524,6 +570,11 @@ class Dag:
         source_name, artifact_key = items_from
         map_deps = tuple(dict.fromkeys((*deps, source_name)))
         map_prompts = tuple(prompts)
+        map_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=map_prompts,
+            dynamic_kind="map",
+        )
         map_files = tuple(Path(path) for path in files)
         map_params = copy.deepcopy(params) if params is not None else {}
         map_cache = validate_cache_policy(cache)
@@ -537,6 +588,7 @@ class Dag:
                 function,
                 deps=map_deps,
                 prompts=map_prompts,
+                prompt_specs=map_prompt_specs,
                 files=map_files,
                 params=map_params,
                 consumes=consumes,
@@ -563,6 +615,7 @@ class Dag:
         carry_fn: Callable[[dict[str, Any]], Any] | None = None,
         deps: Iterable[str] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
         params: dict[str, Any] | None = None,
@@ -584,6 +637,11 @@ class Dag:
             all_deps = (*all_deps, carry_source)
         scan_deps = tuple(dict.fromkeys(all_deps))
         scan_prompts = tuple(prompts)
+        scan_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=scan_prompts,
+            dynamic_kind="scan",
+        )
         scan_files = tuple(Path(path) for path in files)
         scan_params = copy.deepcopy(params) if params is not None else {}
         scan_cache = validate_cache_policy(cache)
@@ -597,6 +655,7 @@ class Dag:
                 function,
                 deps=scan_deps,
                 prompts=scan_prompts,
+                prompt_specs=scan_prompt_specs,
                 files=scan_files,
                 params=scan_params,
                 consumes=consumes,
@@ -623,6 +682,7 @@ class Dag:
         *,
         deps: Iterable[str] | Callable[[Any], Iterable[str]] = (),
         prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
         params: dict[str, Any] | None = None,
@@ -636,6 +696,11 @@ class Dag:
         # 生成器只能消费一次;不先固定,第二个 item 起声明就静默变空。
         fixed_deps = deps if callable(deps) else tuple(deps)
         fixed_prompts = tuple(prompts)
+        fixed_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=fixed_prompts,
+            dynamic_kind="node",
+        )
         fixed_files = tuple(Path(path) for path in files)
         fixed_params = copy.deepcopy(params) if params is not None else {}
         fixed_cache = validate_cache_policy(cache)
@@ -669,6 +734,7 @@ class Dag:
                     function,
                     deps=item_deps,
                     prompts=fixed_prompts,
+                    prompt_specs=fixed_prompt_specs,
                     files=item_files,
                     params=item_params,
                     consumes=consumes,
@@ -688,6 +754,7 @@ class Dag:
         *,
         deps: tuple[str, ...],
         prompts: tuple[str, ...],
+        prompt_specs: tuple[PromptSpec, ...],
         files: tuple[Path, ...],
         params: dict[str, Any],
         consumes: Mapping[str, ConsumeFunction] | None = None,
@@ -722,11 +789,24 @@ class Dag:
             items_from=items_from,
             carry_from=carry_from,
         )
+        function_inputs = (
+            {local for local, _actual in input_bindings} if input_bindings else set(deps)
+        )
+        if items_from is not None:
+            function_inputs.discard(local_items_source or items_from[0])
+        if scan and carry_from is not None:
+            function_inputs.discard(local_carry_source or carry_from[0])
+        validate_prompt_bindings(
+            prompt_specs,
+            inputs=function_inputs,
+            params=set(params),
+        )
         self._nodes[name] = _Node(
             name=name,
             function=function,
             deps=deps,
             prompts=prompts,
+            prompt_specs=prompt_specs,
             files=files,
             params=params,
             consumes=projections,
@@ -850,6 +930,7 @@ class Dag:
                 function=declaration.function,
                 deps=actual_deps,
                 prompts=declaration.prompts,
+                prompt_specs=declaration.prompt_specs,
                 files=declaration.files,
                 params=copy.deepcopy(declaration.params),
                 consumes=dict(declaration.consumes),
@@ -943,6 +1024,7 @@ class Dag:
 
         # 源码只在 run 开始读一次:中途改文件不得让同一 run 内的缓存键漂移。
         libs_hash = self._libs_hash()
+        prompt_snapshot = self._prompt_snapshot()
         attempt_store = AttemptStore(
             run_dir,
             self._run_manifest_identity(
@@ -951,9 +1033,12 @@ class Dag:
                 requested_force,
                 order,
                 libs_hash,
+                prompt_snapshot,
             ),
         )
         attempt_store.initialize()
+        if existing_manifest is not None:
+            attempt_store.mark_resumed()
         attempt_store.update_manifest("running")
         envelope = ExecutionEnvelope(
             artifacts_path=self.config.artifacts_path,
@@ -980,12 +1065,29 @@ class Dag:
             cache_key: str | list[str]
             item_cache_keys: list[str] | None = None
             key_components: dict[str, str] | None = None
+            prompt_resolutions: dict[str, ResolvedPrompt] = {}
+            prompt_resolution_records: dict[str, Any] = {}
+            function_inputs: dict[str, dict[str, Any]] = {}
             if node.items_from is None:
+                function_inputs = self._function_inputs(node, inputs)
+                prompt_resolutions = self._resolve_prompt_specs(
+                    node,
+                    prompt_snapshot,
+                    inputs,
+                    function_inputs=function_inputs,
+                )
+                prompt_resolution_records = {
+                    name: resolved.resolution.canonical()
+                    for name, resolved in prompt_resolutions.items()
+                }
                 key_components = self._key_components(
                     node,
                     upstream_shas,
                     libs_hash,
                     upstream_artifacts=inputs,
+                    prompt_snapshot=prompt_snapshot,
+                    prompt_resolutions=prompt_resolutions,
+                    projected_inputs=function_inputs,
                 )
                 cache_key = sha(key_components)
                 prior_state = (
@@ -1004,6 +1106,7 @@ class Dag:
                         key_components,
                         cache_key,
                         validate_agent=node.executor == "agent",
+                        prompt_resolutions=prompt_resolution_records,
                     )
                     origin = prior_metadata.get("origin_provenance")
                     if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -1055,6 +1158,7 @@ class Dag:
                             forced_items=forced_items.get(node.name, set()),
                             envelope=envelope,
                             attempt_store=attempt_store,
+                            prompt_snapshot=prompt_snapshot,
                         )
                         cache_key = item_cache_keys
                         with state_lock:
@@ -1070,6 +1174,7 @@ class Dag:
                             node.name,
                             policy=node.retry,
                             declaration_digest=declaration_digest,
+                            prompt_resolutions=prompt_resolution_records,
                         )
                         action = prepared["action"]
                         if action == "pending":
@@ -1087,6 +1192,7 @@ class Dag:
                                 key_components,
                                 cache_key,
                                 validate_agent=node.executor == "agent",
+                                prompt_resolutions=prompt_resolution_records,
                             )
                             origin = prior_metadata.get("origin_provenance")
                             if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -1095,9 +1201,10 @@ class Dag:
                         elif action == "candidate":
                             candidate = prepared["candidate"]
                             if (
-                                candidate.get("candidate_schema") != 1
+                                candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
                                 or candidate.get("cache_key") != cache_key
                                 or candidate.get("key_components") != key_components
+                                or candidate.get("prompt_resolutions") != prompt_resolution_records
                                 or not isinstance(candidate.get("artifact"), dict)
                             ):
                                 raise RunManifestError(
@@ -1120,18 +1227,46 @@ class Dag:
                             started = time.monotonic() - float(candidate.get("seconds", 0.0))
                             checkpoint_used = candidate.get("checkpoint_used") is True
                         else:
-                            context = NodeContext(self, node, current_run_id)
+                            context = NodeContext(
+                                self,
+                                node,
+                                current_run_id,
+                                prompt_snapshot=prompt_snapshot,
+                                prompt_resolutions=prompt_resolutions,
+                            )
                             try:
-                                function_inputs = copy.deepcopy(self._function_inputs(node, inputs))
+                                function_inputs = copy.deepcopy(function_inputs)
                                 boundary = (
                                     durable_side_effect_boundary(
-                                        lambda: attempt_store.mark_side_effect(node.name)
+                                        lambda effect: attempt_store.mark_side_effect(
+                                            node.name, effect
+                                        )
                                     )
                                     if node.retry is not None and node.executor != "agent"
                                     else nullcontext()
                                 )
                                 with boundary:
                                     if node.executor == "agent":
+                                        build_context = AgentBuildContext(
+                                            node.params,
+                                            context.read_text,
+                                            context.read_bytes,
+                                            context.render,
+                                            context.resolve_prompt,
+                                        )
+                                        task = node.function(  # type: ignore[call-arg]
+                                            function_inputs, build_context
+                                        )
+                                        if not isinstance(task, AgentTask):
+                                            raise TypeError(
+                                                f"Agent node {node.name!r} builder "
+                                                "must return AgentTask"
+                                            )
+                                        instruction_resolution = (
+                                            task.instruction.resolution.canonical()
+                                            if isinstance(task.instruction, ResolvedPrompt)
+                                            else None
+                                        )
                                         try:
                                             lease_context = self.agent_slots.acquire(
                                                 timeout_seconds=(
@@ -1139,25 +1274,26 @@ class Dag:
                                                 )
                                             )
                                             with lease_context as lease:
-                                                build_context = AgentBuildContext(
-                                                    node.params,
-                                                    context.read_text,
-                                                    context.read_bytes,
-                                                    context.render,
-                                                )
-                                                task = node.function(  # type: ignore[call-arg]
-                                                    function_inputs, build_context
-                                                )
-                                                if not isinstance(task, AgentTask):
-                                                    raise TypeError(
-                                                        f"Agent node {node.name!r} builder "
-                                                        "must return AgentTask"
-                                                    )
                                                 assert node.agent_adapter is not None
                                                 assert node.agent_spec is not None
                                                 assert node.agent_identity is not None
                                                 if node.retry is not None:
-                                                    attempt_store.mark_side_effect(node.name)
+                                                    attempt_store.mark_side_effect(
+                                                        node.name,
+                                                        {
+                                                            "active_effect_schema": 1,
+                                                            "kind": "agent",
+                                                            "instruction_sha256": sha(
+                                                                str(task.instruction)
+                                                            ),
+                                                            "managed": (
+                                                                instruction_resolution is not None
+                                                            ),
+                                                            "prompt_resolution": (
+                                                                instruction_resolution
+                                                            ),
+                                                        },
+                                                    )
                                                 outcome = execute_agent_task(
                                                     node_name=node.name,
                                                     run_id=current_run_id,
@@ -1171,11 +1307,45 @@ class Dag:
                                                     adapter_identity=node.agent_identity,
                                                     spec=node.agent_spec,
                                                     evidence_policy=evidence_policy,
+                                                    prompt_resolution=instruction_resolution,
                                                 )
                                         except SlotTimeoutError:
-                                            raise AgentExecutionFailure(
+                                            capacity_error = AgentExecutionFailure(
                                                 runtime_code=(AgentRuntimeFailureCode.CAPACITY)
-                                            ) from None
+                                            )
+                                            atomic_write_json(
+                                                run_dir / "failures" / f"{node.name}.json",
+                                                {
+                                                    "failure_schema": 2,
+                                                    "node": node.name,
+                                                    "task_sha256": sha(task.canonical()),
+                                                    "instruction_sha256": sha(
+                                                        str(task.instruction)
+                                                    ),
+                                                    "instruction_evidence": scrub_evidence(
+                                                        str(task.instruction),
+                                                        mode=evidence_policy.request,
+                                                    ),
+                                                    "prompt_resolution": (instruction_resolution),
+                                                    "status": "failed",
+                                                    "failure": canonical_failure(capacity_error),
+                                                    "usage": None,
+                                                    "stop_reason": "capacity",
+                                                    "duration_seconds": 0.0,
+                                                    "workspace_manifest": [],
+                                                    "attachments": [],
+                                                    "published": [],
+                                                    "trajectory": None,
+                                                    "evidence": [],
+                                                    "evidence_policy": (
+                                                        evidence_policy.canonical()
+                                                    ),
+                                                    "evidence_policy_digest": (
+                                                        evidence_policy.digest
+                                                    ),
+                                                },
+                                            )
+                                            raise capacity_error from None
                                         artifact = outcome.artifact
                                         agent_provenance = {
                                             **outcome.provenance,
@@ -1197,6 +1367,7 @@ class Dag:
                                     node.name,
                                     error,
                                     policy=node.retry,
+                                    calls=calls,
                                 )
                                 if failure_outcome["action"] == "pending":
                                     with state_lock:
@@ -1221,7 +1392,7 @@ class Dag:
                             attempt_store.save_candidate(
                                 node.name,
                                 {
-                                    "candidate_schema": 1,
+                                    "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
                                     "artifact": artifact,
                                     "cache_key": cache_key,
                                     "key_components": key_components,
@@ -1229,6 +1400,7 @@ class Dag:
                                     "agent_provenance": copy.deepcopy(agent_provenance),
                                     "seconds": time.monotonic() - started,
                                     "checkpoint_used": checkpoint_used,
+                                    "prompt_resolutions": prompt_resolution_records,
                                 },
                             )
                         if not resumed_completed:
@@ -1242,6 +1414,7 @@ class Dag:
                                 cache_policy=("off" if checkpoint_used else node.cache),
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
+                                prompt_resolutions=prompt_resolution_records,
                             )
                     if node.executor == "agent":
                         validate_agent_artifact(artifact, self.blob_store)
@@ -1277,6 +1450,7 @@ class Dag:
                                 cache_policy=node.cache,
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
+                                prompt_resolutions=prompt_resolution_records,
                             )
                         if node.items_from is None and artifact is not None and not cache_hit:
                             attempt_store.mark_completed(
@@ -1398,17 +1572,21 @@ class Dag:
         )
 
     def resume(self, run_id: str, *, workers: int = 1) -> RunResult:
-        """Resume one schema-1 run under its originally bound declaration."""
+        """Resume one schema-2 run under its originally bound declaration."""
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
         try:
             manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
             raise RunManifestError(
-                f"Run {run_id!r} has no valid 0.6 run manifest and cannot be resumed"
+                f"Run {run_id!r} has no valid 0.7 run manifest and cannot be resumed"
             ) from error
-        if not isinstance(manifest, dict) or manifest.get("run_manifest_schema") != 1:
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
+        ):
             raise RunManifestError(
-                f"Run {run_id!r} has no valid 0.6 run manifest and cannot be resumed"
+                f"Run {run_id!r} is legacy/read-only or has no valid 0.7 manifest; "
+                "it cannot be resumed"
             )
         targets = manifest.get("targets")
         force = manifest.get("force")
@@ -1441,7 +1619,10 @@ class Dag:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
             raise RunManifestError(f"Run {run_id!r} has no valid manifest") from error
-        if not isinstance(manifest, dict) or manifest.get("run_manifest_schema") != 1:
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
+        ):
             raise RunManifestError(f"Run {run_id!r} has no valid manifest")
         attempts = AttemptStore(run_dir, {})
         attempts.resolve(
@@ -1466,6 +1647,7 @@ class Dag:
         force: tuple[str, ...],
         order: list[str],
         libs_hash: str,
+        prompt_snapshot: PromptCatalogSnapshot,
     ) -> dict[str, Any]:
         declarations: dict[str, Any] = {}
         retry_digests: dict[str, str | None] = {}
@@ -1479,8 +1661,11 @@ class Dag:
                 "source": _source_hash(node.function),
                 "deps": list(node.deps),
                 "prompts": {
-                    prompt_name: sha(load_template(self._prompt_path(prompt_name)))
+                    prompt_name: sha(prompt_snapshot.text(prompt_name))
                     for prompt_name in node.prompts
+                },
+                "prompt_specs": {
+                    spec.name: prompt_snapshot.declaration(spec) for spec in node.prompt_specs
                 },
                 "files": {
                     path.as_posix(): _bytes_hash(self.config.resolve(path).read_bytes())
@@ -1499,6 +1684,7 @@ class Dag:
                 "evidence_policy_digest": evidence.digest,
             }
         source_digest = sha(declarations)
+        static_profile = self._static_workflow_profile(prompt_snapshot)
         return {
             "run_id": run_id,
             "graph_identity": sha(
@@ -1515,6 +1701,8 @@ class Dag:
             "libs_digest": libs_hash,
             "retry_policy_digests": retry_digests,
             "evidence_policy_digests": evidence_digests,
+            "workflow_profile": static_profile,
+            "workflow_profile_digest": sha(static_profile),
         }
 
     @staticmethod
@@ -1540,6 +1728,7 @@ class Dag:
         cache_key: str,
         *,
         validate_agent: bool = False,
+        prompt_resolutions: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         artifact_path = run_dir / f"{label}.json"
         sidecar_path = Path(f"{artifact_path}.meta.json")
@@ -1555,17 +1744,26 @@ class Dag:
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")
         if (
-            metadata.get("artifact_sha256") != artifact_digest
+            metadata.get("run_sidecar_schema") != 2
+            or metadata.get("artifact_sha256") != artifact_digest
             or not isinstance(origin, dict)
             or origin.get("artifact_sha256") != artifact_digest
+            or metadata.get("origin_provenance_digest") != sha(origin)
+            or metadata.get("prompt_resolutions_digest")
+            != sha(metadata.get("prompt_resolutions", {}))
             or metadata.get("key_components") != key_components
             or metadata.get("cache_key") != cache_key
+            or (
+                prompt_resolutions is not None
+                and metadata.get("prompt_resolutions") != dict(prompt_resolutions)
+            )
         ):
             raise RunManifestError(
                 f"Completed target {label!r} failed artifact or declaration validation"
             )
         if validate_agent:
             validate_agent_artifact(artifact, self.blob_store)
+        _validate_persisted_prompt_lineage(metadata, label)
         return artifact, metadata
 
     def plan(
@@ -1573,6 +1771,8 @@ class Dag:
         run_id: str | None = None,
         targets: Iterable[str] | None = None,
         force: Iterable[str] = (),
+        *,
+        _prompt_snapshot: PromptCatalogSnapshot | None = None,
     ) -> PlanResult:
         """Forecast cache work without calling node functions or allocating a run directory.
 
@@ -1586,6 +1786,9 @@ class Dag:
         order = self._topological_order(selected)
         forced_nodes, forced_items = self._parse_forced(force)
         libs_hash = self._libs_hash()
+        prompt_snapshot = _prompt_snapshot or self._prompt_snapshot(
+            self._nodes[name] for name in order
+        )
         nodes: dict[str, str] = {}
         pending_on: dict[str, tuple[str, ...]] = {}
         artifact_shas: dict[str, str] = {}
@@ -1619,6 +1822,7 @@ class Dag:
                         upstream_shas,
                         libs_hash,
                         upstream_artifacts=inputs,
+                        prompt_snapshot=prompt_snapshot,
                     )
                 )
                 artifact = (
@@ -1686,6 +1890,7 @@ class Dag:
                             item=item,
                             item_files=item_files,
                             carry=carry,
+                            prompt_snapshot=prompt_snapshot,
                         )
                     )
                     artifact = (
@@ -1734,6 +1939,7 @@ class Dag:
                     upstream_artifacts=inputs,
                     item=item,
                     item_files=item_files,
+                    prompt_snapshot=prompt_snapshot,
                 )
                 cache_key = sha(key_components)
                 artifact = (
@@ -1771,7 +1977,8 @@ class Dag:
         语义，不把无法取得的内容变化臆测为某一项输入变化。
         """
         node_name, item_id = self._parse_explain_name(name)
-        forecast = self.plan()
+        prompt_snapshot = self._prompt_snapshot()
+        forecast = self.plan(_prompt_snapshot=prompt_snapshot)
         status = forecast.nodes.get(name)
         if status is None:
             if item_id is not None and forecast.nodes.get(node_name) == "unknown":
@@ -1795,7 +2002,11 @@ class Dag:
                 forecast.pending_on.get(name, forecast.pending_on.get(node_name, ())),
             )
 
-        current = self._current_key_components(node_name, item_id)
+        current = self._current_key_components(
+            node_name,
+            item_id,
+            prompt_snapshot=prompt_snapshot,
+        )
         changed = sorted(
             label
             for label in set(previous) | set(current)
@@ -1849,11 +2060,18 @@ class Dag:
             raise ValueError(f"Invalid sidecar for {name!r} in run {run_dir.name!r}")
         return metadata
 
-    def _current_key_components(self, node_name: str, item_id: str | None) -> dict[str, str]:
+    def _current_key_components(
+        self,
+        node_name: str,
+        item_id: str | None,
+        *,
+        prompt_snapshot: PromptCatalogSnapshot | None = None,
+    ) -> dict[str, str]:
         """重建一个 explain 目标的当前键成分，不执行节点函数。"""
         memo: dict[str, dict[str, Any]] = {}
         components: dict[str, dict[str, str]] = {}
         libs_hash = self._libs_hash()
+        prompt_snapshot = prompt_snapshot or self._prompt_snapshot()
 
         def artifact_for(name: str) -> dict[str, Any]:
             if name in memo:
@@ -1867,6 +2085,7 @@ class Dag:
                     upstream_shas,
                     libs_hash,
                     upstream_artifacts=inputs,
+                    prompt_snapshot=prompt_snapshot,
                 )
                 artifact = store.read_node_cache(self.config.artifacts_path, sha(component))
                 if artifact is None:
@@ -1902,6 +2121,7 @@ class Dag:
                     item=item,
                     item_files=item_files,
                     carry=carry,
+                    prompt_snapshot=prompt_snapshot,
                 )
                 artifact = store.read_node_cache(self.config.artifacts_path, sha(component))
                 if artifact is None:
@@ -1931,6 +2151,7 @@ class Dag:
                 target_upstream_shas,
                 libs_hash,
                 upstream_artifacts=target_inputs,
+                prompt_snapshot=prompt_snapshot,
             )
 
         assert target_node.items_from is not None
@@ -1961,6 +2182,7 @@ class Dag:
                 item=item,
                 item_files=item_files,
                 carry=carry,
+                prompt_snapshot=prompt_snapshot,
             )
             if current_item_id == item_id:
                 return component
@@ -1982,45 +2204,226 @@ class Dag:
         ``validated_models`` 与 ``checkpoints`` 是注册期 AST 的尽力检测结果，
         仅供人和工具审阅，不构成运行时契约。
         """
-        description: dict[str, Any] = {}
-        for name, node in self._nodes.items():
-            kind = "scan" if node.scan else "map" if node.items_from is not None else "node"
-            description[name] = {
-                "kind": kind,
-                "executor": node.executor,
-                "doc": _function_doc(node.function),
-                "deps": list(node.deps),
-                "items_from": _locator_description(node.items_from),
-                "carry_from": _locator_description(node.carry_from),
-                "prompts": list(node.prompts),
-                "files": [str(path) for path in node.files],
-                "params": {key: _short_repr(node.params[key]) for key in sorted(node.params)},
-                "has_files_fn": node.files_fn is not None,
-                "has_carry_fn": node.carry_fn is not None,
-                "has_aggregate_fn": node.aggregate_fn is not None,
-                "cache": node.cache,
-                "has_external_fingerprint": node.external_fingerprint_digest is not None,
-                "retry_policy": (node.retry.canonical() if node.retry is not None else None),
-                "retry_policy_digest": (node.retry.digest if node.retry is not None else None),
-                "evidence_policy": (
-                    node.evidence_policy or self._caller_evidence_policy()
-                ).canonical(),
-                "evidence_policy_digest": (
-                    node.evidence_policy or self._caller_evidence_policy()
-                ).digest,
-                "subgraph": node.subgraph,
-                "validated_models": copy.deepcopy(list(node.validated_models)),
-                "checkpoints": list(node.checkpoints),
+        profile = self._static_workflow_profile()
+        graph = profile["graph"]
+        description = {
+            entry["name"]: copy.deepcopy(entry["declaration"]) for entry in graph["nodes"]
+        }
+        description["subgraphs"] = {
+            mount["namespace"]: {
+                key: copy.deepcopy(value) for key, value in mount.items() if key != "namespace"
             }
-            if node.executor == "agent":
-                assert node.agent_adapter is not None
-                assert node.agent_identity is not None
-                description[name]["agent"] = copy.deepcopy(node.agent_identity)
-            if node.consumes:
-                description[name]["consumes"] = list(node.consumes)
-        description["subgraphs"] = copy.deepcopy(self._subgraphs)
-        description["models"] = _describe_models(self._nodes.values())
+            for mount in graph["mounts"]
+        }
+        description["models"] = copy.deepcopy(graph["models"])
         return description
+
+    def _node_profile_declaration(self, name: str, node: _Node) -> dict[str, Any]:
+        """Build the declaration projection embedded in the canonical profile IR."""
+        del name
+        kind = "scan" if node.scan else "map" if node.items_from is not None else "node"
+        declaration: dict[str, Any] = {
+            "kind": kind,
+            "executor": node.executor,
+            "doc": _function_doc(node.function),
+            "deps": list(node.deps),
+            "items_from": _locator_description(node.items_from),
+            "carry_from": _locator_description(node.carry_from),
+            "prompts": list(node.prompts),
+            "prompt_specs": [spec.canonical() for spec in node.prompt_specs],
+            "files": [str(path) for path in node.files],
+            "params": {
+                key: f"<{type(node.params[key]).__name__} sha256={sha(node.params[key])}>"
+                for key in sorted(node.params)
+            },
+            "has_files_fn": node.files_fn is not None,
+            "has_carry_fn": node.carry_fn is not None,
+            "has_aggregate_fn": node.aggregate_fn is not None,
+            "cache": node.cache,
+            "has_external_fingerprint": node.external_fingerprint_digest is not None,
+            "retry_policy": node.retry.canonical() if node.retry is not None else None,
+            "retry_policy_digest": node.retry.digest if node.retry is not None else None,
+            "evidence_policy": (node.evidence_policy or self._caller_evidence_policy()).canonical(),
+            "evidence_policy_digest": (
+                node.evidence_policy or self._caller_evidence_policy()
+            ).digest,
+            "subgraph": node.subgraph,
+            "validated_models": copy.deepcopy(list(node.validated_models)),
+            "checkpoints": list(node.checkpoints),
+        }
+        if node.executor == "agent":
+            assert node.agent_adapter is not None
+            assert node.agent_identity is not None
+            declaration["agent"] = copy.deepcopy(node.agent_identity)
+        if node.consumes:
+            declaration["consumes"] = list(node.consumes)
+        return declaration
+
+    def _static_workflow_profile(
+        self,
+        prompt_snapshot: PromptCatalogSnapshot | None = None,
+    ) -> dict[str, Any]:
+        """Build the one canonical content-free IR used by all profile surfaces."""
+        snapshot = prompt_snapshot or self._prompt_snapshot()
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        specs: list[dict[str, Any]] = []
+        for name, node in self._nodes.items():
+            declaration = self._node_profile_declaration(name, node)
+            nodes.append(
+                {
+                    "name": name,
+                    "kind": declaration["kind"],
+                    "executor": node.executor,
+                    "subgraph": node.subgraph,
+                    "cache": node.cache,
+                    "params_digest": sha(node.params),
+                    "retry_policy": (node.retry.canonical() if node.retry is not None else None),
+                    "retry_policy_digest": (node.retry.digest if node.retry is not None else None),
+                    "evidence_policy": (
+                        node.evidence_policy or self._caller_evidence_policy()
+                    ).canonical(),
+                    "evidence_policy_digest": (
+                        node.evidence_policy or self._caller_evidence_policy()
+                    ).digest,
+                    "declaration": declaration,
+                }
+            )
+            locator_sources = {
+                locator[0] for locator in (node.items_from, node.carry_from) if locator is not None
+            }
+            edges.extend(
+                {"from": dependency, "to": name, "role": "dependency", "path": []}
+                for dependency in node.deps
+                if dependency not in locator_sources
+            )
+            if node.items_from is not None:
+                edges.append(
+                    {
+                        "from": node.items_from[0],
+                        "to": name,
+                        "role": "items_from",
+                        "path": [node.items_from[1]],
+                    }
+                )
+            if node.carry_from is not None:
+                edges.append(
+                    {
+                        "from": node.carry_from[0],
+                        "to": name,
+                        "role": "carry_from",
+                        "path": [node.carry_from[1]],
+                    }
+                )
+            bindings = dict(node.input_bindings)
+
+            def add_prompt_edge(
+                source: dict[str, Any],
+                *,
+                role: str,
+                prompt_spec: str,
+                _bindings: dict[str, str] = bindings,
+                _node: _Node = node,
+                _name: str = name,
+                **details: Any,
+            ) -> None:
+                source_kind = source["kind"]
+                source_node: str | None
+                binding: dict[str, Any]
+                if source_kind == "input":
+                    local = source["name"]
+                    source_node = _bindings.get(local, local)
+                    binding = {"input": local}
+                elif source_kind == "item":
+                    source_node = _node.items_from[0] if _node.items_from is not None else None
+                    binding = {
+                        "items_from": _locator_description(_node.items_from),
+                    }
+                elif source_kind == "carry":
+                    source_node = _node.carry_from[0] if _node.carry_from is not None else None
+                    binding = {
+                        "carry_from": _locator_description(_node.carry_from),
+                    }
+                else:
+                    source_node = None
+                    binding = {"param": source["name"]}
+                edges.append(
+                    {
+                        "from": source_node,
+                        "to": _name,
+                        "role": role,
+                        "prompt_spec": prompt_spec,
+                        "path": copy.deepcopy(source.get("path", [])),
+                        "source": copy.deepcopy(source),
+                        "binding": binding,
+                        **details,
+                    }
+                )
+
+            for spec in node.prompt_specs:
+                declaration = snapshot.declaration(spec)
+                specs.append(
+                    {
+                        "id": f"{name}:{spec.name}",
+                        "node": name,
+                        "name": spec.name,
+                        "declaration": declaration,
+                        "resolution_status": "unresolved",
+                    }
+                )
+                canonical = spec.canonical()
+                for layer in canonical["layers"]:
+                    source = layer["source"]
+                    if source["kind"] != "axis":
+                        continue
+                    selector = source["selector"]
+                    add_prompt_edge(
+                        selector,
+                        role="selector",
+                        prompt_spec=spec.name,
+                        axis=source["name"],
+                    )
+                for material in canonical["materials"]:
+                    source = material["source"]
+                    add_prompt_edge(
+                        source,
+                        role="material",
+                        prompt_spec=spec.name,
+                        slot=material["slot"],
+                    )
+        return {
+            "workflow_profile_schema": workflow_profile.WORKFLOW_PROFILE_SCHEMA,
+            "mode": "static",
+            "resolution_status": "unresolved",
+            "graph": {
+                "nodes": nodes,
+                "edges": edges,
+                "mounts": [
+                    {"namespace": namespace, **copy.deepcopy(declaration)}
+                    for namespace, declaration in self._subgraphs.items()
+                ],
+                "models": _describe_models(self._nodes.values()),
+            },
+            "prompts": {"specs": specs},
+            "run": None,
+        }
+
+    def profile(
+        self,
+        run_id: str | None = None,
+        *,
+        include_content: bool = False,
+    ) -> dict[str, Any]:
+        """Return a static or persisted runtime WorkflowProfile without execution."""
+        if run_id is None:
+            return self._static_workflow_profile()
+        run_path = store.run_directory(self.config.artifacts_path, run_id)
+        if not run_path.is_dir():
+            raise ValueError(f"Run {run_id!r} does not exist")
+        return workflow_profile.load_run_profile(
+            run_path,
+            include_content=include_content,
+        )
 
     def render_summary(self) -> str:
         """渲染每节点一行的 Markdown 声明表，不读取运行状态。"""
@@ -2108,6 +2511,7 @@ class Dag:
             "check": self._cli_check,
             "plan": self._cli_plan,
             "graph": self._cli_graph,
+            "profile": self._cli_profile,
             "explain": self._cli_explain,
             "describe": self._cli_describe,
             "resume": self._cli_resume,
@@ -2190,12 +2594,27 @@ class Dag:
 
     def _cli_graph(self, args: argparse.Namespace) -> int:
         """Print the terminal graph or write the self-contained HTML graph."""
-        if args.html is None:
+        if args.prompts:
+            print(
+                workflow_profile.render_profile_mermaid(
+                    self.profile(args.run_id),
+                    prompts=True,
+                )
+            )
+        elif args.html is None:
             print(self.render_pipeline_text(run_id=args.run_id))
         else:
             output = Path(args.html)
             output.write_text(self.render_pipeline(run_id=args.run_id), encoding="utf-8")
             print(output)
+        return 0
+
+    def _cli_profile(self, args: argparse.Namespace) -> int:
+        value = self.profile(args.run_id, include_content=args.include_content)
+        if args.format == "json":
+            print(json.dumps(value, ensure_ascii=False, indent=2))
+        else:
+            print(workflow_profile.render_profile_markdown(value))
         return 0
 
     def _cli_explain(self, args: argparse.Namespace) -> int:
@@ -2212,7 +2631,7 @@ class Dag:
         return 0
 
     def _cli_resume(self, args: argparse.Namespace) -> int:
-        """Resume a bound 0.6 run and report its durable terminal/pending state."""
+        """Resume a bound 0.7 run and report its durable terminal/pending state."""
         try:
             result = self.resume(args.run_id, workers=args.workers)
         except Exception as error:
@@ -2410,6 +2829,7 @@ class Dag:
         forced_items: set[str],
         envelope: ExecutionEnvelope,
         attempt_store: AttemptStore,
+        prompt_snapshot: PromptCatalogSnapshot,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
@@ -2435,6 +2855,17 @@ class Dag:
                     item_files = (
                         tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                     )
+                    prompt_resolutions = self._resolve_prompt_specs(
+                        node,
+                        prompt_snapshot,
+                        inputs,
+                        item=item,
+                        function_inputs=shared_inputs,
+                    )
+                    prompt_resolution_records = {
+                        name: resolved.resolution.canonical()
+                        for name, resolved in prompt_resolutions.items()
+                    }
                     key_components = self._key_components(
                         node,
                         upstream_shas,
@@ -2442,6 +2873,9 @@ class Dag:
                         upstream_artifacts=inputs,
                         item=item,
                         item_files=item_files,
+                        prompt_snapshot=prompt_snapshot,
+                        prompt_resolutions=prompt_resolutions,
+                        projected_inputs=shared_inputs,
                     )
                     cache_key = sha(key_components)
                     declaration_digest = self._attempt_declaration_digest(
@@ -2459,6 +2893,7 @@ class Dag:
                             target,
                             key_components,
                             cache_key,
+                            prompt_resolutions=prompt_resolution_records,
                         )
                         cache_hit = prior_metadata.get("cache") == "hit"
                         resumed_completed = True
@@ -2476,6 +2911,7 @@ class Dag:
                             target,
                             policy=node.retry,
                             declaration_digest=declaration_digest,
+                            prompt_resolutions=prompt_resolution_records,
                         )
                         action = prepared["action"]
                         if action == "pending":
@@ -2494,14 +2930,16 @@ class Dag:
                                 target,
                                 key_components,
                                 cache_key,
+                                prompt_resolutions=prompt_resolution_records,
                             )
                             resumed_completed = True
                         elif action == "candidate":
                             candidate = prepared["candidate"]
                             if (
-                                candidate.get("candidate_schema") != 1
+                                candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
                                 or candidate.get("cache_key") != cache_key
                                 or candidate.get("key_components") != key_components
+                                or candidate.get("prompt_resolutions") != prompt_resolution_records
                                 or not isinstance(candidate.get("artifact"), dict)
                             ):
                                 raise RunManifestError(f"Success candidate for {target!r} changed")
@@ -2521,11 +2959,13 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
+                                prompt_snapshot=prompt_snapshot,
+                                prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
                                 durable_side_effect_boundary(
-                                    lambda attempt_target=target: attempt_store.mark_side_effect(
-                                        attempt_target
+                                    lambda effect, attempt_target=target: (
+                                        attempt_store.mark_side_effect(attempt_target, effect)
                                     )
                                 )
                                 if node.retry is not None
@@ -2551,6 +2991,7 @@ class Dag:
                                     target,
                                     error,
                                     policy=node.retry,
+                                    calls=calls,
                                 )
                                 if failure_outcome["action"] == "pending":
                                     return {
@@ -2580,7 +3021,7 @@ class Dag:
                             attempt_store.save_candidate(
                                 target,
                                 {
-                                    "candidate_schema": 1,
+                                    "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
                                     "artifact": artifact,
                                     "cache_key": cache_key,
                                     "key_components": key_components,
@@ -2588,6 +3029,7 @@ class Dag:
                                     "agent_provenance": None,
                                     "seconds": time.monotonic() - started,
                                     "checkpoint_used": checkpoint_used,
+                                    "prompt_resolutions": prompt_resolution_records,
                                 },
                             )
                         if not resumed_completed:
@@ -2598,6 +3040,7 @@ class Dag:
                                 calls=calls,
                                 cache_policy=("off" if checkpoint_used else node.cache),
                                 evidence_policy=self._caller_evidence_policy(),
+                                prompt_resolutions=prompt_resolution_records,
                             )
                     return {
                         "id": item_id,
@@ -2610,6 +3053,7 @@ class Dag:
                         "calls": calls,
                         "resumed_completed": resumed_completed,
                         "target": target,
+                        "prompt_resolutions": prompt_resolution_records,
                     }
             except Exception as error:
                 # KeyboardInterrupt/SystemExit 不许伪装成单项失败被聚合吞掉:
@@ -2652,6 +3096,7 @@ class Dag:
                         outputs=outputs,
                         cache_policy=node.cache,
                         evidence_policy=self._caller_evidence_policy(),
+                        prompt_resolutions=outcome["prompt_resolutions"],
                     )
                 if outcome["cache"] != "hit" and not outcome["resumed_completed"]:
                     attempt_store.mark_completed(
@@ -2716,6 +3161,7 @@ class Dag:
         forced_items: set[str],
         envelope: ExecutionEnvelope,
         attempt_store: AttemptStore,
+        prompt_snapshot: PromptCatalogSnapshot,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
@@ -2754,6 +3200,18 @@ class Dag:
                     item_files = (
                         tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                     )
+                    prompt_resolutions = self._resolve_prompt_specs(
+                        node,
+                        prompt_snapshot,
+                        inputs,
+                        item=item,
+                        carry=carry,
+                        function_inputs=shared_inputs,
+                    )
+                    prompt_resolution_records = {
+                        name: resolved.resolution.canonical()
+                        for name, resolved in prompt_resolutions.items()
+                    }
                     key_components = self._key_components(
                         node,
                         upstream_shas,
@@ -2762,6 +3220,9 @@ class Dag:
                         item=item,
                         item_files=item_files,
                         carry=carry,
+                        prompt_snapshot=prompt_snapshot,
+                        prompt_resolutions=prompt_resolutions,
+                        projected_inputs=shared_inputs,
                     )
                     cache_key = sha(key_components)
                     declaration_digest = self._attempt_declaration_digest(
@@ -2779,6 +3240,7 @@ class Dag:
                             target,
                             key_components,
                             cache_key,
+                            prompt_resolutions=prompt_resolution_records,
                         )
                         cache_hit = prior_metadata.get("cache") == "hit"
                         resumed_completed = True
@@ -2796,6 +3258,7 @@ class Dag:
                             target,
                             policy=node.retry,
                             declaration_digest=declaration_digest,
+                            prompt_resolutions=prompt_resolution_records,
                         )
                         action = prepared["action"]
                         if action == "pending":
@@ -2810,14 +3273,16 @@ class Dag:
                                 target,
                                 key_components,
                                 cache_key,
+                                prompt_resolutions=prompt_resolution_records,
                             )
                             resumed_completed = True
                         elif action == "candidate":
                             candidate = prepared["candidate"]
                             if (
-                                candidate.get("candidate_schema") != 1
+                                candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
                                 or candidate.get("cache_key") != cache_key
                                 or candidate.get("key_components") != key_components
+                                or candidate.get("prompt_resolutions") != prompt_resolution_records
                                 or not isinstance(candidate.get("artifact"), dict)
                             ):
                                 raise RunManifestError(f"Success candidate for {target!r} changed")
@@ -2837,11 +3302,13 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
+                                prompt_snapshot=prompt_snapshot,
+                                prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
                                 durable_side_effect_boundary(
-                                    lambda attempt_target=target: attempt_store.mark_side_effect(
-                                        attempt_target
+                                    lambda effect, attempt_target=target: (
+                                        attempt_store.mark_side_effect(attempt_target, effect)
                                     )
                                 )
                                 if node.retry is not None
@@ -2864,6 +3331,7 @@ class Dag:
                                     target,
                                     error,
                                     policy=node.retry,
+                                    calls=calls,
                                 )
                                 if failure_outcome["action"] == "pending":
                                     raise _MapRetryPending([target]) from error
@@ -2889,7 +3357,7 @@ class Dag:
                             attempt_store.save_candidate(
                                 target,
                                 {
-                                    "candidate_schema": 1,
+                                    "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
                                     "artifact": artifact,
                                     "cache_key": cache_key,
                                     "key_components": key_components,
@@ -2897,6 +3365,7 @@ class Dag:
                                     "agent_provenance": None,
                                     "seconds": time.monotonic() - started,
                                     "checkpoint_used": checkpoint_used,
+                                    "prompt_resolutions": prompt_resolution_records,
                                 },
                             )
                         if not resumed_completed:
@@ -2907,6 +3376,7 @@ class Dag:
                                 calls=calls,
                                 cache_policy=("off" if checkpoint_used else node.cache),
                                 evidence_policy=self._caller_evidence_policy(),
+                                prompt_resolutions=prompt_resolution_records,
                             )
                     completed[item_id] = artifact
                     cache_keys.append(cache_key)
@@ -2925,6 +3395,7 @@ class Dag:
                             outputs=outputs,
                             cache_policy=node.cache,
                             evidence_policy=self._caller_evidence_policy(),
+                            prompt_resolutions=prompt_resolution_records,
                         )
                     if not cache_hit and not resumed_completed:
                         attempt_store.mark_completed(
@@ -2964,6 +3435,9 @@ class Dag:
         item: Any = _NO_ITEM,
         item_files: tuple[Path, ...] = (),
         carry: Any = _NO_CARRY,
+        prompt_snapshot: PromptCatalogSnapshot | None = None,
+        prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
+        projected_inputs: Mapping[str, dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """从注入的上游摘要推导普通节点、map 或 scan 项的精确键成分。
 
@@ -2980,6 +3454,18 @@ class Dag:
         }
         if node.external_fingerprint_digest is not None:
             components["external"] = node.external_fingerprint_digest
+        snapshot = prompt_snapshot or self._prompt_snapshot((node,))
+        resolutions = (
+            dict(prompt_resolutions)
+            if prompt_resolutions is not None
+            else self._resolve_prompt_specs(
+                node,
+                snapshot,
+                upstream_artifacts or {},
+                item=item,
+                carry=carry,
+            )
+        )
         excluded_upstreams: set[str] = set()
         if item is not _NO_ITEM:
             assert node.items_from is not None
@@ -2991,6 +3477,8 @@ class Dag:
         def upstream_digest(local: str, actual: str) -> str:
             if local not in node.consumes:
                 return upstream_shas[actual]
+            if projected_inputs is not None:
+                return sha(projected_inputs[local])
             if upstream_artifacts is None:
                 raise RuntimeError(
                     f"Node {node.name!r} consumes dependency {local!r} "
@@ -3010,9 +3498,10 @@ class Dag:
                 for name in upstream_shas
                 if name not in excluded_upstreams
             )
+        components.update((f"prompts:{name}", sha(snapshot.text(name))) for name in node.prompts)
         components.update(
-            (f"prompts:{name}", sha(load_template(self._prompt_path(name))))
-            for name in node.prompts
+            (f"prompt_specs:{name}", resolved.resolution.digest)
+            for name, resolved in resolutions.items()
         )
         components.update(
             (f"files:{path}", _bytes_hash(self.config.resolve(path).read_bytes()))
@@ -3027,6 +3516,56 @@ class Dag:
             # carry_fn 的源码不入键；只有本项实际收到的内容才是输入事实。
             components["carry"] = sha(carry)
         return dict(sorted(components.items()))
+
+    def _prompt_snapshot(self, nodes: Iterable[_Node] | None = None) -> PromptCatalogSnapshot:
+        selected = tuple(self._nodes.values()) if nodes is None else tuple(nodes)
+        specs = tuple(spec for node in selected for spec in node.prompt_specs)
+        legacy = tuple(name for node in selected for name in node.prompts)
+        return PromptCatalogSnapshot.capture(
+            self.config.prompts_path,
+            prompt_specs=specs,
+            legacy_prompts=legacy,
+        )
+
+    def _resolve_prompt_specs(
+        self,
+        node: _Node,
+        snapshot: PromptCatalogSnapshot,
+        upstream_artifacts: Mapping[str, dict[str, Any]],
+        *,
+        item: Any = _NO_ITEM,
+        carry: Any = _NO_CARRY,
+        function_inputs: Mapping[str, dict[str, Any]] | None = None,
+    ) -> dict[str, ResolvedPrompt]:
+        if not node.prompt_specs:
+            return {}
+        omitted_local: set[str] = set()
+        if item is not _NO_ITEM:
+            assert node.items_from is not None
+            omitted_local.add(node.local_items_source or node.items_from[0])
+            if node.scan and node.carry_from is not None:
+                omitted_local.add(node.local_carry_source or node.carry_from[0])
+        resolved_inputs = (
+            dict(function_inputs)
+            if function_inputs is not None
+            else self._function_inputs(
+                node,
+                upstream_artifacts,
+                omitted_local=omitted_local,
+            )
+        )
+        return {
+            spec.name: snapshot.resolve(
+                spec,
+                inputs=resolved_inputs,
+                params=node.params,
+                item=None if item is _NO_ITEM else item,
+                carry=None if carry is _NO_CARRY else carry,
+                has_item=item is not _NO_ITEM,
+                has_carry=carry is not _NO_CARRY,
+            )
+            for spec in node.prompt_specs
+        }
 
     def _libs_hash(self) -> str:
         contents: list[str] = []
@@ -3058,6 +3597,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     graph = commands.add_parser("graph")
     graph.add_argument("--html")
     graph.add_argument("--run-id")
+    graph.add_argument("--prompts", action="store_true")
+
+    profile = commands.add_parser("profile")
+    profile.add_argument("--run-id")
+    profile.add_argument("--format", choices=("json", "md"), default="md")
+    profile.add_argument("--include-content", action="store_true")
 
     explain = commands.add_parser("explain")
     explain.add_argument("node_name")
@@ -3104,15 +3649,6 @@ def _locator_description(locator: tuple[str, str] | None) -> dict[str, str] | No
     return {"node": locator[0], "path": locator[1]}
 
 
-def _short_repr(value: Any, limit: int = 120) -> str:
-    """限制参数展示长度，避免声明摘要被大值淹没。"""
-    try:
-        rendered = repr(value)
-    except Exception:
-        rendered = f"<{type(value).__name__}>"
-    return rendered if len(rendered) <= limit else f"{rendered[: limit - 3]}..."
-
-
 def _function_doc(function: Callable[..., Any]) -> str | None:
     """读取注册函数清理后的首行 docstring，缺席时保持为空。"""
     doc = inspect.getdoc(function)
@@ -3153,6 +3689,46 @@ def _read_run_metadata(run_directory: Path) -> dict[str, dict[str, Any]]:
         if isinstance(candidate, dict) and isinstance(candidate.get("node"), str):
             metadata[candidate["node"]] = candidate
     return metadata
+
+
+def _validate_persisted_prompt_lineage(
+    metadata: Mapping[str, Any],
+    label: str,
+) -> None:
+    """Fail closed when a resumable sidecar contains internally corrupt lineage."""
+
+    def validate_resolution(value: Any, context: str) -> None:
+        if value is None:
+            return
+        try:
+            validate_prompt_resolution_record(value)
+        except PromptResolutionError as error:
+            raise RunManifestError(
+                f"Completed target {label!r} has invalid {context}: {error}"
+            ) from error
+
+    def validate_resolutions(value: Any, context: str) -> None:
+        if not isinstance(value, Mapping):
+            raise RunManifestError(f"Completed target {label!r} has invalid {context}")
+        for resolution in value.values():
+            validate_resolution(resolution, context)
+
+    def validate_calls(value: Any, context: str) -> None:
+        if not isinstance(value, list) or not all(isinstance(call, Mapping) for call in value):
+            raise RunManifestError(f"Completed target {label!r} has invalid {context}")
+        for call in value:
+            validate_resolution(call.get("prompt_resolution"), context)
+
+    validate_resolutions(metadata.get("prompt_resolutions"), "current Prompt resolutions")
+    validate_calls(metadata.get("calls"), "current CALL lineage")
+    origin = metadata.get("origin_provenance")
+    if not isinstance(origin, Mapping):
+        raise RunManifestError(f"Completed target {label!r} has invalid origin provenance")
+    validate_resolutions(origin.get("prompt_resolutions"), "origin Prompt resolutions")
+    validate_calls(origin.get("calls"), "origin CALL lineage")
+    agent = origin.get("agent")
+    if isinstance(agent, Mapping):
+        validate_resolution(agent.get("prompt_resolution"), "origin Agent lineage")
 
 
 def _pending_checkpoint_belongs_to_node(

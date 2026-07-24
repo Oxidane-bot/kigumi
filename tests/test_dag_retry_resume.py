@@ -371,7 +371,7 @@ def test_legacy_run_without_manifest_is_read_only_and_cannot_resume(
 
     with pytest.raises(RuntimeError, match="cannot be resumed"):
         dag.resume("legacy")
-    with pytest.raises(RuntimeError, match="predates run manifest schema 1"):
+    with pytest.raises(RuntimeError, match="predates run manifest schema 2"):
         dag.run(run_id="legacy")
 
 

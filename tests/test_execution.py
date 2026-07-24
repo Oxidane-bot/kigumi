@@ -46,7 +46,7 @@ def test_seal_rejects_non_dict_and_canonicalizes(tmp_path: Path) -> None:
     cache_payload = json.loads(
         node_cache_path(tmp_path / "artifacts", "key").read_text(encoding="utf-8")
     )
-    assert cache_payload["cache_schema"] == 2
+    assert cache_payload["cache_schema"] == 3
     assert cache_payload["artifact"] == sealed
     assert cache_payload["artifact_sha256"] == cache_payload["origin_provenance"]["artifact_sha256"]
 
