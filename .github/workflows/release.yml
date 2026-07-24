@@ -5,19 +5,73 @@ on:
     tags: ["v*"]
 
 jobs:
-  build:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --extra dev --python 3.13
+      - name: Verify annotated tag and version identity
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          VERSION="$(uv run python -c 'import kigumi; print(kigumi.__version__)')"
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+          test -z "$(git status --porcelain)"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - run: uv run pytest -q
+
+  build:
+    needs: [quality, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
       - run: uv build
+      - id: version
+        run: echo "version=$(uv run python -c 'import kigumi; print(kigumi.__version__)')" >> "$GITHUB_OUTPUT"
+      - run: uv run python scripts/verify_dist.py --expected-version "${{ steps.version.outputs.version }}"
+      - name: Smoke wheel in a fresh environment
+        run: |
+          uv venv --python 3.13 .dist-venv
+          uv pip install --python .dist-venv/bin/python dist/*.whl
+          KIGUMI_EXPECTED_VERSION="${{ steps.version.outputs.version }}" \
+            .dist-venv/bin/python scripts/smoke_installed.py
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [quality, test, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -28,3 +82,76 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify-pypi:
+    needs: [publish, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Wait for PyPI and verify published hashes
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.request
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          with urllib.request.urlopen(f"https://pypi.org/pypi/kigumi/{version}/json", timeout=30) as response:
+              payload = json.load(response)
+          published = {item["filename"]: item["digests"]["sha256"] for item in payload["urls"]}
+          local = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in Path("dist").iterdir()
+              if path.is_file()
+          }
+          if published != local:
+              raise SystemExit(f"PyPI/local hash mismatch: published={published} local={local}")
+          PY
+            then break; fi
+            test "$attempt" -lt 6
+            sleep 10
+          done
+      - name: Install from PyPI and smoke public API
+        run: |
+          uv venv --python 3.13 .pypi-venv
+          uv pip install --python .pypi-venv/bin/python "kigumi==$VERSION"
+          KIGUMI_EXPECTED_VERSION="$VERSION" .pypi-venv/bin/python scripts/smoke_installed.py
+
+  github-release:
+    needs: [verify-pypi, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Extract release notes
+        run: |
+          awk -v heading="## [$VERSION]" \
+            'index($0, heading) == 1 {emit=1; next} /^## \\[/{emit=0} emit' \
+            CHANGELOG.md > /tmp/release-notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Kigumi $VERSION" \
+            --notes-file /tmp/release-notes.md \
+            --verify-tag
