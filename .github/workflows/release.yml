@@ -152,8 +152,9 @@ jobs:
       - name: Extract release notes
         run: |
           awk -v heading="## [$VERSION]" \
-            'index($0, heading) == 1 {emit=1; next} /^## \\[/{emit=0} emit' \
+            'index($0, heading) == 1 {emit=1; next} /^## \[/{emit=0} emit' \
             CHANGELOG.md > /tmp/release-notes.md
+          test -s /tmp/release-notes.md
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
