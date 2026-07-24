@@ -9,8 +9,9 @@ import {
 	createWriteTool,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { isAbsolute, posix, win32 } from "node:path";
 import { Type } from "typebox";
+
+import { checkedPath } from "./_pi_bridge_policy.mjs";
 
 const ROOT_TOOLS = ["read", "write", "edit", "grep", "find", "ls"] as const;
 const RESERVED = new Set(["bash", "shell", "terminal"]);
@@ -22,19 +23,6 @@ const TOOL_FACTORIES = {
 	find: createFindTool,
 	ls: createLsTool,
 };
-
-function checkedPath(raw: unknown): string {
-	if (typeof raw !== "string" || raw.length === 0 || raw.includes("\\") || raw.includes("\0")) {
-		throw new Error("Kigumi tool paths must be non-empty POSIX paths");
-	}
-	if (isAbsolute(raw) || posix.isAbsolute(raw) || win32.isAbsolute(raw)) {
-		throw new Error("Kigumi tools reject absolute paths");
-	}
-	if (raw.split("/").includes("..")) {
-		throw new Error("Kigumi tools reject parent traversal");
-	}
-	return raw;
-}
 
 function jsonSafe(value: unknown): boolean {
 	try {

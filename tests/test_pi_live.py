@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from pathlib import Path
@@ -35,16 +36,48 @@ def test_real_pi_rpc_conformance(tmp_path: Path) -> None:
     (capsule / "agent.toml").write_text(manifest, encoding="utf-8")
     spec = type(spec).load(capsule)
     dag = _make_dag(tmp_path)
-    adapter = PiRpcAdapter(tuple(shlex.split(command)), version)
+    sentinel = "kigumi-live-secret-must-not-persist"
+    adapter = PiRpcAdapter(
+        tuple(shlex.split(command)),
+        version,
+        env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": sentinel},
+    )
 
     @dag.agent("pi", adapter=adapter, spec=spec, cache="off")
     def pi_node(inputs: dict[str, Any], ctx: Any) -> AgentTask:
         return AgentTask(
-            "Write exactly 'pi live ok' to live.txt, then submit_result with live.txt.",
-            collect=(AgentFileSelector("live.txt"),),
-            publish=(AgentPublish("live.txt", "published/live.txt"),),
+            "Write exactly 'pi live one' to one.txt and exactly 'pi live two' to two.txt, "
+            "then submit_result with both files.",
+            collect=(AgentFileSelector("one.txt"), AgentFileSelector("two.txt")),
+            publish=(
+                AgentPublish("one.txt", "published/one.txt"),
+                AgentPublish("two.txt", "published/two.txt"),
+            ),
         )
 
-    artifact = dag.run().artifacts["pi"]
+    result = dag.run()
+    artifact = result.artifacts["pi"]
     assert artifact["completion"]["status"] == "completed"
-    assert (tmp_path / "published" / "live.txt").read_text(encoding="utf-8") == "pi live ok"
+    assert artifact["completion"]["outputs"] == ["one.txt", "two.txt"]
+    assert [item["workspace_path"] for item in artifact["attachments"]] == [
+        "one.txt",
+        "two.txt",
+    ]
+    assert (tmp_path / "published" / "one.txt").read_text(encoding="utf-8") == "pi live one"
+    assert (tmp_path / "published" / "two.txt").read_text(encoding="utf-8") == "pi live two"
+
+    sidecar = json.loads(
+        (tmp_path / "artifacts" / "runs" / result.run_id / "pi.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    origin = sidecar["origin_provenance"]["agent"]
+    assert isinstance(origin["usage"], dict)
+    assert origin["trajectory"]["events"] > 0
+    assert origin["evidence"]
+    assert origin["slot_identity"] == "slot_000"
+    assert origin["queue_wait_seconds"] >= 0
+    assert origin["exit_reason"] == "completed"
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            assert sentinel.encode() not in path.read_bytes()

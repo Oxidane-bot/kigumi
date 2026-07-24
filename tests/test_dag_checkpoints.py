@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from kigumi._runstate import RunManifestError
 from kigumi.dag import CheckpointPending, Dag
 from tests._dag_helpers import _make_dag
 
@@ -97,12 +98,14 @@ def test_approval_binds_to_payload_content(tmp_path: Path) -> None:
     assert first.run(run_id="bind-run").artifacts["review"] == {"approval": {"ok": True}}
 
     changed = make("v2")
-    assert changed.run(run_id="bind-run").pending_checkpoints == ["editor"]
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        changed.run(run_id="bind-run")
+    assert changed.run(run_id="bind-run-v2").pending_checkpoints == ["editor"]
     assert (
-        tmp_path / "artifacts" / "runs" / "bind-run" / "approvals" / "editor.pending.json"
+        tmp_path / "artifacts" / "runs" / "bind-run-v2" / "approvals" / "editor.pending.json"
     ).exists()
-    changed.approve("bind-run", "editor", {"ok": "second"})
-    resumed = changed.run(run_id="bind-run")
+    changed.approve("bind-run-v2", "editor", {"ok": "second"})
+    resumed = changed.run(run_id="bind-run-v2")
     assert resumed.artifacts["review"] == {"approval": {"ok": "second"}}
 
 

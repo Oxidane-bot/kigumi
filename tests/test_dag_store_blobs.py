@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
+from kigumi.artifacts import sha
+from kigumi.calling import LLMCaller
+from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.testing import FakeTransport
+from kigumi.transport import Response
 from tests._dag_helpers import _make_dag
 
 
@@ -48,6 +53,53 @@ def test_run_sidecar_contains_cache_and_new_caller_provenance(tmp_path: Path) ->
     assert metadata["cache_key"]
     assert len(metadata["calls"]) == 1
     assert metadata["calls"][0]["cache"] == "miss"
+
+
+def test_warm_sidecar_preserves_hash_bound_origin_call_provenance(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            Response(
+                "model output",
+                {"total_tokens": 7, "cost": 0.25},
+                "stop",
+                model="wire-model",
+                provider_response_id="response-123",
+            )
+        ],
+        resolved_models={"logical-model": "wire-model"},
+    )
+    dag = Dag(
+        KigumiConfig(project_root=tmp_path, source_dirs=[]),
+        LLMCaller(transport, tmp_path / "llm"),
+    )
+
+    @dag.node("ask")
+    def ask(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return {
+            "answer": ctx.llm(
+                "say something",
+                model="logical-model",
+                temperature=0,
+            )
+        }
+
+    first = dag.run(run_id="provenance-replay")
+    cold_sidecar = tmp_path / "artifacts" / "runs" / "provenance-replay" / "ask.json.meta.json"
+    cold = json.loads(cold_sidecar.read_text(encoding="utf-8"))
+    second = dag.run(run_id="provenance-warm")
+    warm_sidecar = tmp_path / "artifacts" / "runs" / "provenance-warm" / "ask.json.meta.json"
+    warm = json.loads(warm_sidecar.read_text(encoding="utf-8"))
+
+    expected_artifact_sha = sha(first.artifacts["ask"])
+    assert second.cache_hits == ["ask"]
+    assert warm["artifact_sha256"] == expected_artifact_sha
+    assert warm["execution_calls"] == []
+    assert warm["origin_provenance"] == cold["origin_provenance"]
+    assert warm["prompt_sha256"] == cold["calls"][0]["prompt_sha"]
+    assert warm["model"] == "wire-model"
+    assert warm["params"] == {"temperature": 0}
+    assert warm["provider_response_id"] == "response-123"
+    assert warm["usage"] == {"total_tokens": 7, "cost": 0.25}
 
 
 def test_miss_and_hit_paths_feed_downstream_identical_shape(tmp_path: Path) -> None:

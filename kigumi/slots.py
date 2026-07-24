@@ -8,8 +8,25 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
+
+
+class SlotTimeoutError(TimeoutError):
+    """Raised before protected work when no file-lock slot becomes available."""
+
+    def __init__(self, wait_seconds: float) -> None:
+        self.wait_seconds = wait_seconds
+        super().__init__(f"Timed out waiting {wait_seconds:.3f}s for a shared slot")
+
+
+@dataclass(frozen=True)
+class SlotLease:
+    """Observable identity and queue wait for one acquired advisory slot."""
+
+    slot_identity: str | None
+    wait_seconds: float
 
 
 class AdaptiveCapacity:
@@ -122,21 +139,28 @@ class FileSlots:
         return self._lock_dir is not None and self._slots >= 1
 
     @contextmanager
-    def acquire(self) -> Iterator[None]:
+    def acquire(self, *, timeout_seconds: float | None = None) -> Iterator[SlotLease]:
         """Hold one slot, releasing it even when the protected request fails."""
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int | float)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be positive or null")
         if not self.enabled:
-            yield
+            yield SlotLease(None, 0.0)
             return
         assert self._lock_dir is not None
         self._lock_dir.mkdir(parents=True, exist_ok=True)
-        handle = self._acquire_handle()
+        started = time.monotonic()
+        handle, identity = self._acquire_handle(started, timeout_seconds)
         try:
-            yield
+            yield SlotLease(identity, time.monotonic() - started)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
 
-    def _acquire_handle(self) -> TextIO:
+    def _acquire_handle(self, started: float, timeout_seconds: float | None) -> tuple[TextIO, str]:
         assert self._lock_dir is not None
         while True:
             for index in range(self._effective_slots()):
@@ -147,7 +171,9 @@ class FileSlots:
                 except BlockingIOError:
                     handle.close()
                     continue
-                return handle
+                return handle, f"slot_{index:03d}"
+            if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
+                raise SlotTimeoutError(time.monotonic() - started)
             time.sleep(0.05)
 
     def _effective_slots(self) -> int:

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from kigumi.calling import LLMCaller
-from kigumi.slots import AdaptiveCapacity, FileSlots
+from kigumi.slots import AdaptiveCapacity, FileSlots, SlotTimeoutError
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -91,6 +91,19 @@ def test_disabled_slots_pass_through_without_filesystem_side_effects(
 def test_file_slots_limit_parallel_processes(tmp_path: Path) -> None:
     """教训 cross_process_limit: 多进程真实请求不能超过配置槽位。"""
     assert _run_workers(tmp_path, slots=2) <= 2
+
+
+def test_file_slot_timeout_has_no_lock_leak(tmp_path: Path) -> None:
+    slots = FileSlots(tmp_path / "locks", 1)
+    with slots.acquire() as first:
+        assert first.slot_identity == "slot_000"
+        try:
+            with FileSlots(tmp_path / "locks", 1).acquire(timeout_seconds=0.01):
+                raise AssertionError("occupied slot must not be acquired")
+        except SlotTimeoutError as error:
+            assert error.wait_seconds >= 0.01
+    with slots.acquire(timeout_seconds=0.1) as second:
+        assert second.slot_identity == "slot_000"
 
 
 def test_capacity_file_clamps_and_invalid_values_fall_back(tmp_path: Path) -> None:

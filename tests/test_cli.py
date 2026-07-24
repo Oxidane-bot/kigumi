@@ -58,6 +58,9 @@ def test_init_creates_default_layout_and_refuses_repeat(
     assert (tmp_path / "nodes" / ".gitkeep").exists()
     assert (tmp_path / "lib" / ".gitkeep").exists()
     assert "artifacts/" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    config_text = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+    assert "agent_slots = 1" in config_text
+    assert 'agent_lock_dir = "artifacts/_locks/agents"' in config_text
     assert main(["init"]) == 1
     assert "already exists" in capsys.readouterr().err
 
@@ -306,6 +309,51 @@ def test_trace_call_diff_and_json_run_views_use_persisted_evidence(
     assert "run not found: run-typo" in capsys.readouterr().err
     assert main(["trace", "run-2", "--node", "typo"]) == 1
     assert "node not found in run-2: typo" in capsys.readouterr().err
+
+
+def test_runs_show_and_trace_include_durable_attempt_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    run = root / "artifacts" / "runs" / "durable"
+    atomic_write_json(
+        run / "_run.json",
+        {
+            "run_manifest_schema": 1,
+            "status": "pending_retry",
+            "evidence_policy_digests": {"ask": "evidence-digest"},
+            "retry_policy_digests": {"ask": "retry-digest"},
+            "pending_retries": [{"target": "ask", "due_at": "2030-01-01T00:00:00+00:00"}],
+            "ambiguous_attempts": [],
+        },
+    )
+    atomic_write_json(
+        run / "attempts" / "digest" / "state.json",
+        {
+            "attempt_receipt_schema": 1,
+            "target": "ask",
+            "attempt": 1,
+            "status": "retry_scheduled",
+            "side_effect_started": True,
+            "due_at": "2030-01-01T00:00:00+00:00",
+            "failure": {
+                "failure_type": "provider",
+                "kind": "rate_limit",
+            },
+        },
+    )
+    monkeypatch.chdir(root)
+
+    assert main(["runs", "show", "durable", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["status"] == "pending_retry"
+    assert shown["attempts"][0]["failure"]["kind"] == "rate_limit"
+    assert shown["evidence_policy_digests"]["ask"] == "evidence-digest"
+
+    assert main(["trace", "durable", "--json"]) == 0
+    traced = json.loads(capsys.readouterr().out)
+    assert traced["attempts"][0]["due_at"] == "2030-01-01T00:00:00+00:00"
+    assert traced["run_status"] == "pending_retry"
 
 
 def test_runs_approve_diff_and_gc_commands_use_persisted_artifacts(

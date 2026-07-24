@@ -9,8 +9,9 @@ from typing import Any
 import pytest
 
 import kigumi.calling as calling_module
+from kigumi import EvidencePolicy, ProviderFailure, ProviderFailureKind, observe
 from kigumi.artifacts import sha
-from kigumi.calling import Budget, BudgetExceeded, DryRunError, EmptyResponseError, LLMCaller
+from kigumi.calling import Budget, BudgetExceeded, DryRunError, LLMCaller
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -51,8 +52,6 @@ def test_seed_changes_cache_key(tmp_path: Path) -> None:
 
 
 def test_observe_collects_call_metadata_and_resets(tmp_path: Path) -> None:
-    from kigumi import observe
-
     caller = LLMCaller(FakeTransport(), tmp_path)
 
     with observe() as calls:
@@ -61,6 +60,57 @@ def test_observe_collects_call_metadata_and_resets(tmp_path: Path) -> None:
     assert len(calls) == 1
     caller.call("outside")
     assert len(calls) == 1
+
+
+def test_call_evidence_policy_is_rebuilt_from_l1_without_provider_request(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([Response("sensitive answer", {}, "stop")])
+    full = LLMCaller(
+        transport,
+        tmp_path,
+        evidence_policy=EvidencePolicy(request="full", response="full"),
+    )
+    assert full.call("sensitive prompt") == "sensitive answer"
+    redacted = LLMCaller(
+        transport,
+        tmp_path,
+        evidence_policy=EvidencePolicy(request="redacted", response="hash_only"),
+    )
+    assert redacted.call("sensitive prompt") == "sensitive answer"
+    assert len(transport.requests) == 1
+    assert redacted.calls[0]["request_evidence"][0]["content"]["redacted"] is True
+    assert redacted.calls[0]["response_evidence"]["mode"] == "hash_only"
+
+
+def test_failed_call_observation_contains_canonical_typed_failure(tmp_path: Path) -> None:
+    class FailingTransport:
+        def resolve(self, model: str) -> str:
+            return model
+
+        def complete(self, messages, model: str, **params):
+            del messages, model, params
+            error = type("TypedError", (RuntimeError,), {"status_code": 429})
+            raise error("untrusted prose")
+
+    caller = LLMCaller(FailingTransport(), tmp_path)
+    with observe() as calls, pytest.raises(ProviderFailure) as raised:
+        caller.call("hello", model="provider/model")
+    assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
+    assert calls[0]["cache"] == "failure"
+    assert calls[0]["failure"]["failure_type"] == "provider"
+    assert calls[0]["failure"]["provider_failure"] == raised.value.canonical()
+
+
+def test_empty_custom_transport_response_has_typed_failed_call_metadata(
+    tmp_path: Path,
+) -> None:
+    caller = LLMCaller(FakeTransport([Response("", {}, "stop")]), tmp_path)
+    with observe() as calls, pytest.raises(ProviderFailure) as raised:
+        caller.call("hello")
+    assert raised.value.kind is ProviderFailureKind.UNKNOWN
+    assert calls[0]["failure"]["provider_failure"]["stage"] == "response"
+    assert calls[0]["cache"] == "failure"
 
 
 def test_torn_cache_treated_as_miss(tmp_path: Path) -> None:
@@ -186,6 +236,7 @@ def test_provider_response_id_is_preserved_in_cache_and_call_provenance(tmp_path
                 "stop",
                 model="provider/model",
                 provider_response_id="resp-123",
+                model_observed=True,
             )
         ]
     )
@@ -197,15 +248,24 @@ def test_provider_response_id_is_preserved_in_cache_and_call_provenance(tmp_path
     payload = json.loads(next((tmp_path / "llm").glob("*.json")).read_text(encoding="utf-8"))
     assert payload["meta"]["provider_response_id"] == "resp-123"
     assert [call["provider_response_id"] for call in caller.calls] == ["resp-123", "resp-123"]
+    assert payload["meta"]["provider_model"] == "provider/model"
+    assert payload["meta"]["provider_model_observed"] is True
+    assert [call["provider_model"] for call in caller.calls] == [
+        "provider/model",
+        "provider/model",
+    ]
+    assert [call["provider_model_observed"] for call in caller.calls] == [True, True]
 
 
 def test_empty_transport_response_is_rejected_without_cache(tmp_path: Path) -> None:
     """教训 empty_response_poison: 非法空响应不能被第三方 transport 写进缓存。"""
     caller = LLMCaller(FakeTransport([Response("", {}, "stop")]), tmp_path)
 
-    with pytest.raises(EmptyResponseError):
+    with pytest.raises(ProviderFailure) as raised:
         caller.call("hello")
 
+    assert raised.value.kind is ProviderFailureKind.UNKNOWN
+    assert raised.value.stage.value == "response"
     assert not (tmp_path / "llm").exists()
 
 

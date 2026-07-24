@@ -304,6 +304,7 @@ def _response_data(response: Response) -> dict[str, Any]:
         "reasoning": response.reasoning,
         "model": response.model,
         "provider_response_id": response.provider_response_id,
+        "model_observed": response.model_observed,
     }
 
 

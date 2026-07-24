@@ -1,8 +1,7 @@
 """kigumi: load-bearing joinery for LLM content pipelines."""
 
-__version__ = "0.5.0"
-
 from ._declarations import CachePolicy
+from ._version import __version__
 from .agents import (
     AgentAdapter,
     AgentBuildContext,
@@ -52,6 +51,14 @@ from .dag import (
 )
 from .errors import OutputOwnershipError
 from .evals import Judgment, evaluate, gated_metric, llm_judge, pairwise_judge
+from .evidence import EvidenceMode, EvidencePolicy
+from .failures import (
+    AgentExecutionFailure,
+    AgentRuntimeFailureCode,
+    ProviderFailure,
+    ProviderFailureKind,
+    ProviderFailureStage,
+)
 from .optimize import Candidate, EvolveResult, evolve_prompt
 from .pi import PiRpcAdapter
 from .prompt import (
@@ -68,6 +75,7 @@ from .prompt import (
     slot_names,
 )
 from .repair import RepairExhausted, call_validated, repair_loop
+from .retry import AmbiguousAttemptError, RetryExhausted, RetryPolicy, RetrySchedule
 from .slots import AdaptiveCapacity, FileSlots
 from .store import approve_checkpoint, diff_runs, gc_artifacts, gc_cache
 from .subgraph import Subgraph
@@ -82,12 +90,15 @@ from .transport import (
 )
 
 __all__ = [
+    "__version__",
     "AdaptiveCapacity",
     "AgentAdapter",
     "AgentBuildContext",
     "AgentCapabilities",
     "AgentCompletion",
     "AgentError",
+    "AgentExecutionFailure",
+    "AgentRuntimeFailureCode",
     "AgentFileSelector",
     "AgentLimits",
     "AgentPublish",
@@ -110,6 +121,8 @@ __all__ = [
     "Dag",
     "DagSubject",
     "DryRunError",
+    "EvidenceMode",
+    "EvidencePolicy",
     "EmptyResponseError",
     "ExplainResult",
     "ExperimentSubject",
@@ -126,7 +139,13 @@ __all__ = [
     "observe",
     "PlanResult",
     "PiRpcAdapter",
+    "ProviderFailure",
+    "ProviderFailureKind",
+    "ProviderFailureStage",
     "RepairExhausted",
+    "RetryExhausted",
+    "RetryPolicy",
+    "RetrySchedule",
     "Response",
     "RunResult",
     "ScriptedTransport",
@@ -138,6 +157,7 @@ __all__ = [
     "TrialObservation",
     "TruncatedResponseError",
     "UndeclaredInputError",
+    "AmbiguousAttemptError",
     "Variant",
     "approve_checkpoint",
     "atomic_write_json",

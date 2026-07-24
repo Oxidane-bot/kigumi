@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 
 import pytest
 
+from kigumi import ProviderFailure, ProviderFailureKind
 from kigumi.transport import (
     EmptyResponseError,
     LiteLLMTransport,
@@ -75,6 +76,29 @@ def test_length_retry_exhaustion_raises(monkeypatch) -> None:
     assert parameters == [12, 24, 48]
 
 
+def test_all_transport_retry_classes_can_be_disabled(monkeypatch) -> None:
+    responses = [
+        {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]},
+        {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "litellm",
+        SimpleNamespace(completion=lambda **_kwargs: responses.pop(0)),
+    )
+    transport = LiteLLMTransport(
+        aliases={"default": "provider/model"},
+        max_retries=0,
+        max_length_retries=0,
+        max_empty_retries=0,
+    )
+
+    with pytest.raises(TruncatedResponseError, match="after 0 max_tokens retries"):
+        transport.complete([], "default", max_tokens=12)
+    with pytest.raises(EmptyResponseError, match="after 0 retries"):
+        transport.complete([], "default")
+
+
 def test_empty_response_retries(monkeypatch) -> None:
     responses = [
         {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
@@ -138,8 +162,8 @@ def test_429_backoff_retries(monkeypatch) -> None:
     assert delays == [0.25, 0.5]
 
 
-def test_transient_retry_exhaustion_names_the_model(monkeypatch) -> None:
-    """教训 retry_context: 多模型流水线的最终传输错误必须点名失败模型。"""
+def test_transient_retry_exhaustion_returns_typed_provider_failure(monkeypatch) -> None:
+    """Retry control consumes structured facts rather than provider prose."""
 
     def completion(**_kwargs: Any) -> None:
         raise HTTPError("https://example.test", 429, "rate limited", {}, None)
@@ -147,29 +171,33 @@ def test_transient_retry_exhaustion_names_the_model(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
     monkeypatch.setattr("kigumi.transport.time.sleep", lambda _delay: None)
 
-    with pytest.raises(
-        RuntimeError, match="Transport failed for model 'provider/model' after 1 retries"
-    ):
+    with pytest.raises(ProviderFailure) as raised:
         LiteLLMTransport(aliases={"default": "provider/model"}, max_retries=1).complete(
             [], "default"
         )
+    assert raised.value.provider == "litellm"
+    assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
+    assert raised.value.status_code == 429
 
 
-def test_stdlib_retry_exhaustion_names_the_endpoint(monkeypatch) -> None:
-    """教训 retry_endpoint: 标准库适配器的重试错误还要标明请求端点。"""
+def test_stdlib_retry_exhaustion_returns_typed_failure_without_endpoint_secret(
+    monkeypatch,
+) -> None:
 
     def fake_urlopen(*_args: Any, **_kwargs: Any) -> None:
         raise HTTPError("https://example.test/v1/chat/completions", 429, "limited", {}, None)
 
     monkeypatch.setattr("kigumi.transport.urlopen", fake_urlopen)
 
-    with pytest.raises(RuntimeError, match="api_base 'https://example.test'"):
+    with pytest.raises(ProviderFailure) as raised:
         StdlibTransport(
             "https://example.test",
             "secret",
             aliases={"default": "provider/model"},
             max_retries=0,
         ).complete([], "default")
+    assert raised.value.provider == "openai-compatible"
+    assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
 
 
 def test_transient_errors_adjust_adaptive_capacity_before_success(monkeypatch) -> None:
@@ -238,7 +266,23 @@ def test_stdlib_transport_posts_and_normalizes_response(monkeypatch) -> None:
     assert response.reasoning == "internal"
     assert response.usage == {"total_tokens": 3}
     assert response.provider_response_id == "chatcmpl-test-123"
+    assert response.model == "mock-model"
+    assert response.model_observed is True
     assert requests[0].full_url == "https://example.test/v1/chat/completions"
+
+
+def test_provider_model_fallback_is_marked_unobserved(monkeypatch) -> None:
+    """A requested-model fallback is routing context, not provider evidence."""
+
+    def completion(**_kwargs: Any) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+
+    response = LiteLLMTransport(aliases={"default": "provider/model"}).complete([], "default")
+
+    assert response.model == "provider/model"
+    assert response.model_observed is False
 
 
 def test_json_mode_translates_to_response_format(monkeypatch) -> None:

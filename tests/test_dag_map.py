@@ -92,44 +92,37 @@ def test_sidecar_shapes_distinguish_node_aggregate_and_item(tmp_path: Path) -> N
     source_metadata = json.loads((run_root / "source.json.meta.json").read_text(encoding="utf-8"))
     aggregate = json.loads((run_root / "work.json.meta.json").read_text(encoding="utf-8"))
     item = json.loads((run_root / "work@one.json.meta.json").read_text(encoding="utf-8"))
+    common_fields = {
+        "node",
+        "cache_key",
+        "cache",
+        "cache_policy",
+        "outputs",
+        "seconds",
+        "calls",
+        "execution_calls",
+        "origin_provenance",
+        "artifact_sha256",
+        "prompt_sha256",
+        "model",
+        "params",
+        "provider_response_id",
+        "usage",
+        "created_at",
+    }
 
     assert isinstance(source_metadata["cache_key"], str)
-    assert set(source_metadata) == {
-        "node",
-        "cache_key",
-        "key_components",
-        "cache",
-        "cache_policy",
-        "outputs",
-        "seconds",
-        "calls",
-        "created_at",
-    }
+    assert set(source_metadata) == common_fields | {"key_components"}
     assert isinstance(aggregate["cache_key"], list)
-    assert set(aggregate) == {
-        "node",
-        "cache_key",
-        "cache",
-        "cache_policy",
-        "outputs",
-        "seconds",
-        "calls",
-        "created_at",
-    }
+    assert set(aggregate) == common_fields
     assert "key_components" not in aggregate
     assert item["node"] == "work@one"
-    assert set(item) == {
-        "node",
-        "cache_key",
-        "key_components",
-        "cache",
-        "cache_policy",
-        "outputs",
-        "seconds",
-        "calls",
-        "created_at",
-    }
+    assert set(item) == common_fields | {"key_components"}
     assert "key_components" in item
+    assert all(
+        metadata["origin_provenance"]["artifact_sha256"] == metadata["artifact_sha256"]
+        for metadata in (source_metadata, aggregate, item)
+    )
 
 
 def test_map_aggregate_fn_can_narrow_downstream_artifact(tmp_path: Path) -> None:

@@ -247,19 +247,25 @@ class AgentSubject:
             evidence = _latest_agent_failure(context.evidence_root)
             raise _AgentSubjectFailure(error, evidence) from error
         artifact = result.artifacts["agent"]
+        sidecar_path = context.evidence_root / "runs" / result.run_id / "agent.json.meta.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        origin = sidecar.get("origin_provenance", {})
+        agent_origin = origin.get("agent", {}) if isinstance(origin, Mapping) else {}
+        if not isinstance(agent_origin, Mapping):
+            agent_origin = {}
         return TrialObservation(
             self.output(copy.deepcopy(artifact)),
-            usage=copy.deepcopy(artifact.get("usage")),
+            usage=copy.deepcopy(agent_origin.get("usage")),
             evidence={
                 "run_id": result.run_id,
                 "target": "agent",
                 "cache": "off",
                 "agent": self.identity(),
-                "trajectory": copy.deepcopy(artifact.get("trajectory")),
-                "raw_evidence": copy.deepcopy(artifact.get("evidence", [])),
+                "trajectory": copy.deepcopy(agent_origin.get("trajectory")),
+                "raw_evidence": copy.deepcopy(agent_origin.get("evidence", [])),
             },
             seed_applied=False,
-            duration_seconds=artifact.get("duration_seconds"),
+            duration_seconds=agent_origin.get("duration_seconds"),
         )
 
 

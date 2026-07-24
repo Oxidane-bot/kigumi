@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from kigumi._runstate import RunManifestError
 from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
@@ -71,8 +72,8 @@ def test_force_recomputes_a_cache_hit_and_replaces_cached_artifact(tmp_path: Pat
     assert len(caller.calls) == 2
 
 
-def test_changed_same_run_artifact_is_archived_once(tmp_path: Path) -> None:
-    """教训 evidence_archive: 覆盖同 run 产物前必须保留旧数据与 sidecar。"""
+def test_changed_same_run_declaration_fails_closed(tmp_path: Path) -> None:
+    """0.6 run manifests bind declarations and prevent same-run replacement."""
 
     def make(value: str) -> Dag:
         dag = _make_dag(tmp_path)
@@ -84,13 +85,10 @@ def test_changed_same_run_artifact_is_archived_once(tmp_path: Path) -> None:
         return dag
 
     assert make("first").run(run_id="evidence").artifacts["work"] == {"value": "first"}
-    assert make("second").run(run_id="evidence").artifacts["work"] == {"value": "second"}
-    history = tmp_path / "artifacts" / "runs" / "evidence" / "history" / "0001"
-    assert (history / "work.json").exists()
-    assert (history / "work.json.meta.json").exists()
-
-    assert make("second").run(run_id="evidence").cache_hits == ["work"]
-    assert [path.name for path in (history.parent).iterdir() if path.is_dir()] == ["0001"]
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        make("second").run(run_id="evidence")
+    artifact_path = tmp_path / "artifacts" / "runs" / "evidence" / "work.json"
+    assert json.loads(artifact_path.read_text(encoding="utf-8")) == {"value": "first"}
 
 
 def test_force_rejects_unknown_node_names(tmp_path: Path) -> None:
@@ -222,8 +220,8 @@ def test_workers_must_be_positive(tmp_path: Path) -> None:
         dag.run(workers=0)
 
 
-def test_concurrent_archives_share_one_history_directory(tmp_path: Path) -> None:
-    """教训 archive_race: 并发节点归档必须共用同一个 history 目录,一次 run 一份历史。"""
+def test_concurrent_changed_run_declarations_fail_before_execution(tmp_path: Path) -> None:
+    """Changed declarations are rejected before concurrent nodes can overwrite a run."""
     data = tmp_path / "data.txt"
 
     def build(tag: str) -> Dag:
@@ -254,10 +252,8 @@ def test_concurrent_archives_share_one_history_directory(tmp_path: Path) -> None
     data.write_text("one", encoding="utf-8")
     build("one").run(run_id="race", workers=2)
     data.write_text("two", encoding="utf-8")
-    build("two").run(run_id="race", workers=2)
-
-    history = tmp_path / "artifacts" / "runs" / "race" / "history"
-    assert [path.name for path in sorted(history.iterdir()) if path.is_dir()] == ["0001"]
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        build("two").run(run_id="race", workers=2)
 
 
 def test_parallel_failures_keep_topological_first_and_note_the_rest(tmp_path: Path) -> None:

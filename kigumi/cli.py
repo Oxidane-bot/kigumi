@@ -23,7 +23,7 @@ from .enforce import (
     raw_io_waiver_reasons,
     waiver_reasons,
 )
-from .inspect import diff_components, load_call, trace_run
+from .inspect import diff_components, durable_run_state, load_call, trace_run
 from .prompt import TemplateSlotError, load_template, render_template, slot_names
 from .store import approve_checkpoint, diff_runs, gc_artifacts, run_directory, run_sort_key
 
@@ -149,6 +149,9 @@ def _init(root: Path, *, hooks: bool) -> int:
         'llm_cache_dir = "artifacts/_llm"\n'
         'source_dirs = ["nodes", "lib"]\n'
         'env_file = ".env"\n'
+        "agent_slots = 1\n"
+        'agent_lock_dir = "artifacts/_locks/agents"\n'
+        "agent_slot_timeout_seconds = 300\n"
     )
     existing = pyproject.read_text(encoding="utf-8")
     atomic_write_text(pyproject, existing.rstrip() + block)
@@ -333,6 +336,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             hits = sum(1 for item in metadata if item.get("cache") == "hit")
             misses = sum(1 for item in metadata if item.get("cache") == "miss")
             pending = _pending_names(run_path)
+            durable = durable_run_state(run_path)
             runs.append(
                 {
                     "run_id": run_path.name,
@@ -340,6 +344,9 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                     "hits": hits,
                     "misses": misses,
                     "pending": len(pending),
+                    "status": durable.get("run_status", "legacy"),
+                    "pending_retries": len(durable.get("pending_retries", [])),
+                    "ambiguous_attempts": len(durable.get("ambiguous_attempts", [])),
                 }
             )
         if json_output:
@@ -348,7 +355,9 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             for run in runs:
                 print(
                     f"{run['run_id']} nodes={run['nodes']} hits={run['hits']} "
-                    f"misses={run['misses']} pending={run['pending']}"
+                    f"misses={run['misses']} pending={run['pending']} "
+                    f"status={run['status']} retries={run['pending_retries']} "
+                    f"ambiguous={run['ambiguous_attempts']}"
                 )
         return 0
     assert run_id is not None
@@ -375,6 +384,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             }
         )
     pending = _pending_names(run_path)
+    durable = durable_run_state(run_path)
     approvals = run_path / "approvals"
     approved: list[str] = []
     if approvals.is_dir():
@@ -382,8 +392,22 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             if not approval.name.endswith(".pending.json"):
                 approved.append(approval.stem)
     if json_output:
-        _print_json({"run_id": run_id, "nodes": nodes, "pending": pending, "approved": approved})
+        _print_json(
+            {
+                "run_id": run_id,
+                "nodes": nodes,
+                "pending": pending,
+                "approved": approved,
+                "status": durable.get("run_status", "legacy"),
+                "attempts": durable.get("attempts", []),
+                "retry_policy_digests": durable.get("retry_policy_digests", {}),
+                "evidence_policy_digests": durable.get("evidence_policy_digests", {}),
+                "pending_retries": durable.get("pending_retries", []),
+                "ambiguous_attempts": durable.get("ambiguous_attempts", []),
+            }
+        )
     else:
+        print(f"status: {durable.get('run_status', 'legacy')}")
         for entry in nodes:
             print(
                 f"{entry['name']} cache={entry['cache']} seconds={entry['seconds']} "
@@ -393,6 +417,20 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             print(f"pending: {name}")
         for name in approved:
             print(f"approved: {name}")
+        for attempt in durable.get("attempts", []):
+            details = [
+                f"attempt={attempt.get('attempt')}",
+                f"status={attempt.get('status')}",
+            ]
+            if attempt.get("due_at") is not None:
+                details.append(f"due_at={attempt['due_at']}")
+            failure = attempt.get("failure")
+            if isinstance(failure, dict):
+                details.append(f"failure={canonical_json(failure)}")
+            print(f"attempt: {attempt.get('target')} {' '.join(details)}")
+        evidence = durable.get("evidence_policy_digests", {})
+        if evidence:
+            print(f"evidence policies: {canonical_json(evidence)}")
     return 0
 
 
@@ -473,8 +511,22 @@ def _trace(config: KigumiConfig, run_id: str, node: str | None, *, json_output: 
         _print_json(result)
         return 0
     print(f"run: {result['run_id']}")
+    if "run_status" in result:
+        print(f"status: {result['run_status']}")
     for entry in result["nodes"]:
         _print_trace_node(entry, indent="")
+    for attempt in result.get("attempts", []):
+        line = (
+            f"attempt {attempt.get('target')} #{attempt.get('attempt')} "
+            f"status={attempt.get('status')}"
+        )
+        if attempt.get("due_at") is not None:
+            line += f" due_at={attempt['due_at']}"
+        if isinstance(attempt.get("failure"), dict):
+            line += f" failure={canonical_json(attempt['failure'])}"
+        print(line)
+    if result.get("evidence_policy_digests"):
+        print(f"evidence policies: {canonical_json(result['evidence_policy_digests'])}")
     for warning in result.get("warnings", []):
         print(f"warning: {warning}")
     return 0

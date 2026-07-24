@@ -20,6 +20,7 @@ from .errors import OutputOwnershipError
 
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
+_NODE_CACHE_ENVELOPE_SCHEMA = 2
 
 
 def runs_root(artifacts_path: Path) -> Path:
@@ -45,18 +46,71 @@ def node_cache_path(artifacts_path: Path, cache_key: str) -> Path:
 
 def read_node_cache(artifacts_path: Path, cache_key: str) -> dict[str, Any] | None:
     """Read a valid node cache artifact, treating torn or invalid files as misses."""
+    payload = _read_node_cache_envelope(artifacts_path, cache_key)
+    if payload is None:
+        return None
+    artifact = payload["artifact"]
+    return artifact if isinstance(artifact, dict) else None
+
+
+def read_node_cache_origin(
+    artifacts_path: Path,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    """Return immutable origin provenance for one valid node-cache entry."""
+
+    payload = _read_node_cache_envelope(artifacts_path, cache_key)
+    if payload is None:
+        return None
+    origin = payload["origin_provenance"]
+    return origin if isinstance(origin, dict) else None
+
+
+def _read_node_cache_envelope(
+    artifacts_path: Path,
+    cache_key: str,
+) -> dict[str, Any] | None:
     try:
         with node_cache_path(artifacts_path, cache_key).open(encoding="utf-8") as handle:
             payload = json.load(handle)
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
-    artifact = payload.get("artifact") if isinstance(payload, dict) else None
-    return artifact if isinstance(artifact, dict) else None
+    if not isinstance(payload, dict) or payload.get("cache_schema") != _NODE_CACHE_ENVELOPE_SCHEMA:
+        return None
+    artifact = payload.get("artifact")
+    origin = payload.get("origin_provenance")
+    artifact_sha256 = payload.get("artifact_sha256")
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(origin, dict)
+        or not isinstance(artifact_sha256, str)
+        or artifact_sha256 != sha(artifact)
+        or origin.get("artifact_sha256") != artifact_sha256
+    ):
+        return None
+    return payload
 
 
-def write_node_cache(artifacts_path: Path, cache_key: str, artifact: dict[str, Any]) -> None:
-    """Persist one canonical node artifact in its existing cache envelope."""
-    atomic_write_json(node_cache_path(artifacts_path, cache_key), {"artifact": artifact})
+def write_node_cache(
+    artifacts_path: Path,
+    cache_key: str,
+    artifact: dict[str, Any],
+    origin_provenance: dict[str, Any],
+) -> None:
+    """Persist one canonical node artifact and immutable origin provenance."""
+
+    artifact_sha256 = sha(artifact)
+    if origin_provenance.get("artifact_sha256") != artifact_sha256:
+        raise ValueError("node-cache origin provenance does not bind its artifact")
+    atomic_write_json(
+        node_cache_path(artifacts_path, cache_key),
+        {
+            "cache_schema": _NODE_CACHE_ENVELOPE_SCHEMA,
+            "artifact_sha256": artifact_sha256,
+            "artifact": artifact,
+            "origin_provenance": origin_provenance,
+        },
+    )
 
 
 def allocate_run_id(artifacts_path: Path) -> str:
@@ -357,10 +411,10 @@ def _referenced_blob_digests(runs_root: Path, keep_last: int) -> set[str]:
     runs = sorted((path for path in runs_root.iterdir() if path.is_dir()), key=run_sort_key)
     referenced: set[str] = set()
     for run in runs[-keep_last:] if keep_last else []:
-        retained_json = [*run.glob("*.json"), *(run / "failures").glob("*.json")]
+        # Retained sidecars, failures, and durable attempt receipts are all
+        # evidence roots. Materialization still ignores attachment markers.
+        retained_json = list(run.rglob("*.json"))
         for artifact_path in retained_json:
-            if artifact_path.name.endswith(".json.meta.json"):
-                continue
             try:
                 with artifact_path.open(encoding="utf-8") as handle:
                     artifact = json.load(handle)
@@ -408,7 +462,7 @@ def _run_artifacts(runs_root: Path, run_id: str) -> dict[str, dict[str, Any]]:
     if not run_path.is_dir():
         return artifacts
     for path in sorted(run_path.glob("*.json")):
-        if path.name.endswith(".json.meta.json"):
+        if path.name.startswith("_") or path.name.endswith(".json.meta.json"):
             continue
         try:
             with path.open(encoding="utf-8") as handle:

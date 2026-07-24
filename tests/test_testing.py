@@ -108,7 +108,14 @@ class RecordingTransport:
         **params: Any,
     ) -> Response:
         self.calls += 1
-        return Response("recorded", {"total_tokens": 2}, "stop", "trace", model)
+        return Response(
+            "recorded",
+            {"total_tokens": 2},
+            "stop",
+            "trace",
+            model,
+            model_observed=True,
+        )
 
 
 def test_cassette_replays_in_order_and_records_atomically(tmp_path: Path) -> None:
@@ -120,7 +127,9 @@ def test_cassette_replays_in_order_and_records_atomically(tmp_path: Path) -> Non
     assert recording.complete([], "default").text == "recorded"
     replay = CassetteTransport(path)
 
-    assert replay.complete([], "default").reasoning == "trace"
+    replayed = replay.complete([], "default")
+    assert replayed.reasoning == "trace"
+    assert replayed.model_observed is True
     with pytest.raises(RuntimeError, match="Cassette exhausted"):
         replay.complete([], "default")
     assert recorder.calls == 1

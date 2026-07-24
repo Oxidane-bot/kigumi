@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -33,7 +34,9 @@ from ._declarations import (
     validate_segment,
 )
 from ._execution import ExecutionEnvelope
+from ._runstate import AttemptStore, RunManifestError
 from .agents import (
+    AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
     AgentBuildContext,
     AgentResultView,
@@ -42,14 +45,25 @@ from .agents import (
     agent_external_identity,
     execute_agent_task,
     validate_agent_artifact,
+    validate_agent_provenance,
 )
 from .artifacts import canonical_json, sha
 from .blobs import BlobStore
-from .calling import DryRunError, LLMCaller, observe
+from .calling import DryRunError, LLMCaller, durable_side_effect_boundary, observe
 from .config import KigumiConfig
 from .enforce import check_paths, check_raw_io_node_paths, check_raw_io_source, check_source
 from .errors import OutputOwnershipError
+from .evidence import EvidencePolicy
+from .failures import (
+    AgentExecutionFailure,
+    AgentRuntimeFailureCode,
+    ProviderFailure,
+    canonical_failure,
+    failure_provider_kind,
+)
 from .prompt import load_template, render_template
+from .retry import RetryExhausted, RetryPolicy
+from .slots import FileSlots, SlotTimeoutError
 from .subgraph import Subgraph
 
 NodeFunction = Callable[[dict[str, dict[str, Any]], "NodeContext"], dict[str, Any]]
@@ -60,7 +74,8 @@ PostNodeHook = Callable[[str, dict[str, Any], bool], None]
 _NO_CARRY = object()
 _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
+_DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
 def _kigumi_key_inputs() -> dict[str, Any]:
@@ -98,6 +113,14 @@ class _MapCheckpointPending(RuntimeError):
         self.names = names
 
 
+class _MapRetryPending(RuntimeError):
+    """Carry durable item retry targets back to the outer scheduler."""
+
+    def __init__(self, names: list[str]) -> None:
+        super().__init__("Dynamic item retry pending")
+        self.names = names
+
+
 @dataclass(frozen=True)
 class RunResult:
     """Completed artifacts plus cache, checkpoint, and skip state for one run."""
@@ -108,6 +131,9 @@ class RunResult:
     run_id: str
     skipped: list[str]
     map_items: dict[str, dict[str, str]]
+    pending_retries: list[str]
+    ambiguous_attempts: list[str]
+    run_status: str
 
 
 @dataclass(frozen=True)
@@ -207,6 +233,8 @@ class _Node:
     agent_adapter: AgentAdapter | None = None
     agent_spec: AgentSpec | None = None
     agent_identity: dict[str, Any] | None = None
+    evidence_policy: EvidencePolicy | None = None
+    retry: RetryPolicy | None = None
 
 
 class NodeContext:
@@ -354,6 +382,15 @@ class Dag:
         self._nodes: dict[str, _Node] = {}
         self._subgraphs: dict[str, dict[str, Any]] = {}
         self.blob_store = BlobStore(store.blob_store_root(self.config.artifacts_path))
+        self.agent_slots = FileSlots(
+            self.config.agent_lock_path,
+            self.config.agent_slots,
+        )
+
+    def _caller_evidence_policy(self) -> EvidencePolicy:
+        """Support lightweight test/dry-run callers without weakening the default."""
+        policy = getattr(self.caller, "evidence_policy", _DEFAULT_EVIDENCE_POLICY)
+        return policy if isinstance(policy, EvidencePolicy) else _DEFAULT_EVIDENCE_POLICY
 
     def node(
         self,
@@ -366,6 +403,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Callable[[NodeFunction], NodeFunction]:
         """Register a deterministic node without sharing registry state with other DAGs."""
         _validate_name(name, "Node")
@@ -377,6 +415,7 @@ class Dag:
         node_params = copy.deepcopy(params) if params is not None else {}
         node_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        retry_policy = _validate_retry_policy(retry)
 
         def register(function: NodeFunction) -> NodeFunction:
             metadata = _validate_registration(function)
@@ -390,6 +429,7 @@ class Dag:
                 consumes=consumes,
                 cache=node_cache,
                 external_fingerprint_digest=fingerprint_digest,
+                retry=retry_policy,
                 metadata=metadata,
             )
             return function
@@ -408,12 +448,17 @@ class Dag:
         params: dict[str, Any] | None = None,
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
+        evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+        retry: RetryPolicy | None = None,
     ) -> Callable[[Callable[[dict[str, dict[str, Any]], AgentBuildContext], AgentTask]], Any]:
         """Register an external-agent executor on the ordinary node scheduler."""
         _validate_name(name, "Agent node")
         if name in self._nodes:
             raise ValueError(f"Node {name!r} is already registered")
         node_cache = validate_cache_policy(cache)
+        if not isinstance(evidence_policy, EvidencePolicy):
+            raise TypeError("evidence_policy must be EvidencePolicy")
+        retry_policy = _validate_retry_policy(retry)
         try:
             identity = agent_external_identity(adapter, spec)
         except (TypeError, ValueError) as error:
@@ -423,7 +468,7 @@ class Dag:
                     "use cache='refresh' or cache='off' only for intentionally unkeyed runs"
                 ) from error
             identity = {
-                "agent_executor_schema": 2,
+                "agent_executor_schema": AGENT_EXECUTOR_SCHEMA,
                 "adapter": {"unkeyed": True},
                 "spec": spec.identity(),
             }
@@ -445,6 +490,8 @@ class Dag:
                 agent_adapter=adapter,
                 agent_spec=spec,
                 agent_identity=copy.deepcopy(identity),
+                evidence_policy=evidence_policy,
+                retry=retry_policy,
             )
             return function
 
@@ -465,6 +512,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Callable[[MapFunction], MapFunction]:
         """Register a runtime-data fan-out node while retaining one static graph vertex.
 
@@ -480,6 +528,7 @@ class Dag:
         map_params = copy.deepcopy(params) if params is not None else {}
         map_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        retry_policy = _validate_retry_policy(retry)
 
         def register(function: MapFunction) -> MapFunction:
             metadata = _validate_registration(function)
@@ -497,6 +546,7 @@ class Dag:
                 aggregate_fn=aggregate_fn,
                 cache=map_cache,
                 external_fingerprint_digest=fingerprint_digest,
+                retry=retry_policy,
                 metadata=metadata,
             )
             return function
@@ -520,6 +570,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Callable[[ScanFunction], ScanFunction]:
         """Register a runtime list whose items form one carry-dependent serial chain."""
         _validate_name(name, "Scan node")
@@ -537,6 +588,7 @@ class Dag:
         scan_params = copy.deepcopy(params) if params is not None else {}
         scan_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        retry_policy = _validate_retry_policy(retry)
 
         def register(function: ScanFunction) -> ScanFunction:
             metadata = _validate_registration(function)
@@ -557,6 +609,7 @@ class Dag:
                 carry_fn=carry_fn,
                 cache=scan_cache,
                 external_fingerprint_digest=fingerprint_digest,
+                retry=retry_policy,
                 metadata=metadata,
             )
             return function
@@ -577,6 +630,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Callable[[NodeFunction], NodeFunction]:
         """Register one node per item, fixing names, dependencies, and params immediately."""
         # 生成器只能消费一次;不先固定,第二个 item 起声明就静默变空。
@@ -586,6 +640,7 @@ class Dag:
         fixed_params = copy.deepcopy(params) if params is not None else {}
         fixed_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        retry_policy = _validate_retry_policy(retry)
         fixed_items: list[tuple[str, tuple[str, ...], tuple[Path, ...], dict[str, Any]]] = []
         for index, raw_item in enumerate(items):
             item = copy.deepcopy(raw_item)
@@ -619,6 +674,7 @@ class Dag:
                     consumes=consumes,
                     cache=fixed_cache,
                     external_fingerprint_digest=fingerprint_digest,
+                    retry=retry_policy,
                     metadata=metadata,
                 )
             return function
@@ -653,6 +709,8 @@ class Dag:
         agent_adapter: AgentAdapter | None = None,
         agent_spec: AgentSpec | None = None,
         agent_identity: dict[str, Any] | None = None,
+        evidence_policy: EvidencePolicy | None = None,
+        retry: RetryPolicy | None = None,
     ) -> None:
         _validate_name(name, "Node")
         if name in self._nodes:
@@ -692,6 +750,8 @@ class Dag:
             agent_adapter=agent_adapter,
             agent_spec=agent_spec,
             agent_identity=agent_identity,
+            evidence_policy=evidence_policy,
+            retry=retry,
         )
 
     def mount(
@@ -838,7 +898,25 @@ class Dag:
         """Run a topological target closure and persist every completed node artifact."""
         if workers < 1:
             raise ValueError("workers must be at least 1")
-        selected = tuple(self._nodes) if targets is None else tuple(targets)
+        requested_force = tuple(force)
+        existing_manifest: dict[str, Any] | None = None
+        if run_id is not None:
+            manifest_path = store.run_directory(self.config.artifacts_path, run_id) / "_run.json"
+            try:
+                candidate_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                candidate_manifest = None
+            if isinstance(candidate_manifest, dict):
+                existing_manifest = candidate_manifest
+        selected = (
+            tuple(existing_manifest.get("targets", ()))
+            if targets is None and existing_manifest is not None
+            else tuple(self._nodes)
+            if targets is None
+            else tuple(targets)
+        )
+        if not requested_force and existing_manifest is not None:
+            requested_force = tuple(existing_manifest.get("force", ()))
         order = self._topological_order(selected)
         current_run_id = (
             run_id if run_id is not None else store.allocate_run_id(self.config.artifacts_path)
@@ -847,8 +925,9 @@ class Dag:
         cache_hits: list[str] = []
         map_items: dict[str, dict[str, str]] = {}
         pending_checkpoints: list[tuple[str, str]] = []
+        pending_retry_targets: list[str] = []
         skipped: list[str] = []
-        forced_nodes, forced_items = self._parse_forced(force)
+        forced_nodes, forced_items = self._parse_forced(requested_force)
         state_lock = threading.RLock()
         archive_lock = threading.Lock()
         allocated_archive: list[str] = []
@@ -864,6 +943,18 @@ class Dag:
 
         # 源码只在 run 开始读一次:中途改文件不得让同一 run 内的缓存键漂移。
         libs_hash = self._libs_hash()
+        attempt_store = AttemptStore(
+            run_dir,
+            self._run_manifest_identity(
+                current_run_id,
+                selected,
+                requested_force,
+                order,
+                libs_hash,
+            ),
+        )
+        attempt_store.initialize()
+        attempt_store.update_manifest("running")
         envelope = ExecutionEnvelope(
             artifacts_path=self.config.artifacts_path,
             run_id=current_run_id,
@@ -879,6 +970,9 @@ class Dag:
 
         def execute(node_name: str) -> tuple[str, str | None]:
             node = self._nodes[node_name]
+            evidence_policy = node.evidence_policy or self._caller_evidence_policy()
+            agent_provenance: dict[str, Any] | None = None
+            resumed_completed = False
             with state_lock:
                 inputs = {dependency: artifacts[dependency] for dependency in node.deps}
                 upstream_shas = {dependency: artifact_shas[dependency] for dependency in node.deps}
@@ -894,15 +988,58 @@ class Dag:
                     upstream_artifacts=inputs,
                 )
                 cache_key = sha(key_components)
-                artifact, cache_hit = envelope.lookup(
-                    cache_key,
-                    forced=node.name in forced_nodes,
-                    cache_policy=node.cache,
+                prior_state = (
+                    attempt_store.state_for(node.name) if existing_manifest is not None else None
                 )
+                run_artifact = run_dir / f"{node.name}.json"
+                run_sidecar = run_dir / f"{node.name}.json.meta.json"
+                if (
+                    existing_manifest is not None
+                    and run_artifact.is_file()
+                    and run_sidecar.is_file()
+                ):
+                    artifact, prior_metadata = self._resume_completed_artifact(
+                        run_dir,
+                        node.name,
+                        key_components,
+                        cache_key,
+                        validate_agent=node.executor == "agent",
+                    )
+                    origin = prior_metadata.get("origin_provenance")
+                    if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                        agent_provenance = copy.deepcopy(origin["agent"])
+                    cache_hit = prior_metadata.get("cache") == "hit"
+                    resumed_completed = True
+                elif prior_state is not None:
+                    artifact, cache_hit = None, False
+                else:
+                    artifact, cache_hit = envelope.lookup(
+                        cache_key,
+                        forced=node.name in forced_nodes,
+                        cache_policy=node.cache,
+                        evidence_policy_digest=evidence_policy.digest,
+                    )
             else:
                 artifact = None
                 cache_hit = False
                 cache_key = []
+            if (
+                node.executor == "agent"
+                and artifact is not None
+                and cache_hit
+                and isinstance(cache_key, str)
+                and agent_provenance is None
+            ):
+                origin = store.read_node_cache_origin(
+                    self.config.artifacts_path,
+                    cache_key,
+                )
+                retained_agent = origin.get("agent") if isinstance(origin, dict) else None
+                if not isinstance(retained_agent, dict):
+                    raise ValueError(
+                        f"Agent cache entry for {node.name!r} has no origin provenance"
+                    )
+                agent_provenance = copy.deepcopy(retained_agent)
             try:
                 with observe() as calls:
                     if node.items_from is not None:
@@ -917,59 +1054,202 @@ class Dag:
                             forced_all=node.name in forced_nodes,
                             forced_items=forced_items.get(node.name, set()),
                             envelope=envelope,
+                            attempt_store=attempt_store,
                         )
                         cache_key = item_cache_keys
                         with state_lock:
                             map_items[node.name] = item_statuses
                     elif artifact is None:
-                        context = NodeContext(self, node, current_run_id)
-                        try:
-                            function_inputs = copy.deepcopy(self._function_inputs(node, inputs))
-                            if node.executor == "agent":
-                                build_context = AgentBuildContext(
-                                    node.params,
-                                    context.read_text,
-                                    context.read_bytes,
-                                    context.render,
-                                )
-                                task = node.function(function_inputs, build_context)  # type: ignore[call-arg]
-                                if not isinstance(task, AgentTask):
-                                    raise TypeError(
-                                        f"Agent node {node.name!r} builder must return AgentTask"
-                                    )
-                                assert node.agent_adapter is not None
-                                assert node.agent_spec is not None
-                                assert node.agent_identity is not None
-                                artifact = execute_agent_task(
-                                    node_name=node.name,
-                                    run_id=current_run_id,
-                                    task=task,
-                                    inputs=function_inputs,
-                                    declared_files=node.files,
-                                    resolve=self.config.resolve,
-                                    artifacts_path=self.config.artifacts_path,
-                                    blob_store=self.blob_store,
-                                    adapter=node.agent_adapter,
-                                    adapter_identity=node.agent_identity,
-                                    spec=node.agent_spec,
-                                )
-                            else:
-                                artifact = node.function(function_inputs, context)  # type: ignore[call-arg]
-                        except CheckpointPending as pending:
-                            envelope.record_pending(pending.name, pending.payload)
-                            with state_lock:
-                                pending_checkpoints.append((node_name, pending.name))
-                            return node_name, "pending"
-                        # miss 路径喂下游的必须与命中路径同形态:命中读的是排序后的
-                        # 磁盘 JSON,活字典键序会让下游 prompt 文本随上游 hit/miss 漂移。
-                        artifact = envelope.seal(
-                            artifact,
-                            cache_key,
-                            label=f"Node {node.name!r}",
-                            cache_policy="off" if context._checkpoint_used else node.cache,
+                        assert key_components is not None
+                        declaration_digest = self._attempt_declaration_digest(
+                            node,
+                            key_components,
+                            evidence_policy,
                         )
+                        prepared = attempt_store.prepare(
+                            node.name,
+                            policy=node.retry,
+                            declaration_digest=declaration_digest,
+                        )
+                        action = prepared["action"]
+                        if action == "pending":
+                            with state_lock:
+                                pending_retry_targets.append(node.name)
+                            return node_name, "retry_pending"
+                        if action == "failed":
+                            raise RunManifestError(
+                                f"Run target {node.name!r} is already terminally failed"
+                            )
+                        if action == "completed":
+                            artifact, prior_metadata = self._resume_completed_artifact(
+                                run_dir,
+                                node.name,
+                                key_components,
+                                cache_key,
+                                validate_agent=node.executor == "agent",
+                            )
+                            origin = prior_metadata.get("origin_provenance")
+                            if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                                agent_provenance = copy.deepcopy(origin["agent"])
+                            resumed_completed = True
+                        elif action == "candidate":
+                            candidate = prepared["candidate"]
+                            if (
+                                candidate.get("candidate_schema") != 1
+                                or candidate.get("cache_key") != cache_key
+                                or candidate.get("key_components") != key_components
+                                or not isinstance(candidate.get("artifact"), dict)
+                            ):
+                                raise RunManifestError(
+                                    f"Success candidate for {node.name!r} no longer "
+                                    "matches its declaration"
+                                )
+                            artifact = copy.deepcopy(candidate["artifact"])
+                            saved_calls = candidate.get("calls", [])
+                            if not isinstance(saved_calls, list):
+                                raise RunManifestError(
+                                    f"Success candidate calls for {node.name!r} are invalid"
+                                )
+                            calls.extend(copy.deepcopy(saved_calls))
+                            saved_agent = candidate.get("agent_provenance")
+                            agent_provenance = (
+                                copy.deepcopy(saved_agent)
+                                if isinstance(saved_agent, dict)
+                                else None
+                            )
+                            started = time.monotonic() - float(candidate.get("seconds", 0.0))
+                            checkpoint_used = candidate.get("checkpoint_used") is True
+                        else:
+                            context = NodeContext(self, node, current_run_id)
+                            try:
+                                function_inputs = copy.deepcopy(self._function_inputs(node, inputs))
+                                boundary = (
+                                    durable_side_effect_boundary(
+                                        lambda: attempt_store.mark_side_effect(node.name)
+                                    )
+                                    if node.retry is not None and node.executor != "agent"
+                                    else nullcontext()
+                                )
+                                with boundary:
+                                    if node.executor == "agent":
+                                        try:
+                                            lease_context = self.agent_slots.acquire(
+                                                timeout_seconds=(
+                                                    self.config.agent_slot_timeout_seconds
+                                                )
+                                            )
+                                            with lease_context as lease:
+                                                build_context = AgentBuildContext(
+                                                    node.params,
+                                                    context.read_text,
+                                                    context.read_bytes,
+                                                    context.render,
+                                                )
+                                                task = node.function(  # type: ignore[call-arg]
+                                                    function_inputs, build_context
+                                                )
+                                                if not isinstance(task, AgentTask):
+                                                    raise TypeError(
+                                                        f"Agent node {node.name!r} builder "
+                                                        "must return AgentTask"
+                                                    )
+                                                assert node.agent_adapter is not None
+                                                assert node.agent_spec is not None
+                                                assert node.agent_identity is not None
+                                                if node.retry is not None:
+                                                    attempt_store.mark_side_effect(node.name)
+                                                outcome = execute_agent_task(
+                                                    node_name=node.name,
+                                                    run_id=current_run_id,
+                                                    task=task,
+                                                    inputs=function_inputs,
+                                                    declared_files=node.files,
+                                                    resolve=self.config.resolve,
+                                                    artifacts_path=(self.config.artifacts_path),
+                                                    blob_store=self.blob_store,
+                                                    adapter=node.agent_adapter,
+                                                    adapter_identity=node.agent_identity,
+                                                    spec=node.agent_spec,
+                                                    evidence_policy=evidence_policy,
+                                                )
+                                        except SlotTimeoutError:
+                                            raise AgentExecutionFailure(
+                                                runtime_code=(AgentRuntimeFailureCode.CAPACITY)
+                                            ) from None
+                                        artifact = outcome.artifact
+                                        agent_provenance = {
+                                            **outcome.provenance,
+                                            "queue_wait_seconds": lease.wait_seconds,
+                                            "slot_identity": lease.slot_identity,
+                                        }
+                                    else:
+                                        artifact = node.function(  # type: ignore[call-arg]
+                                            function_inputs, context
+                                        )
+                            except CheckpointPending as pending:
+                                envelope.record_pending(pending.name, pending.payload)
+                                attempt_store.mark_checkpoint(node.name, pending.name)
+                                with state_lock:
+                                    pending_checkpoints.append((node_name, pending.name))
+                                return node_name, "pending"
+                            except Exception as error:
+                                failure_outcome = attempt_store.record_failure(
+                                    node.name,
+                                    error,
+                                    policy=node.retry,
+                                )
+                                if failure_outcome["action"] == "pending":
+                                    with state_lock:
+                                        pending_retry_targets.append(node.name)
+                                    return node_name, "retry_pending"
+                                if (
+                                    node.retry is not None
+                                    and node.retry.allows(failure_provider_kind(error))
+                                    and int(failure_outcome["state"]["attempt"])
+                                    >= node.retry.max_attempts
+                                ):
+                                    raise RetryExhausted(
+                                        node.name,
+                                        int(failure_outcome["state"]["attempt"]),
+                                        canonical_failure(error),
+                                    ) from error
+                                raise
+                            if not isinstance(artifact, dict):
+                                raise TypeError(f"Node {node.name!r} must return a dict artifact")
+                            artifact = json.loads(canonical_json(artifact))
+                            checkpoint_used = context._checkpoint_used
+                            attempt_store.save_candidate(
+                                node.name,
+                                {
+                                    "candidate_schema": 1,
+                                    "artifact": artifact,
+                                    "cache_key": cache_key,
+                                    "key_components": key_components,
+                                    "calls": copy.deepcopy(calls),
+                                    "agent_provenance": copy.deepcopy(agent_provenance),
+                                    "seconds": time.monotonic() - started,
+                                    "checkpoint_used": checkpoint_used,
+                                },
+                            )
+                        if not resumed_completed:
+                            # miss 路径喂下游的必须与命中路径同形态:命中读的是
+                            # 排序后的磁盘 JSON,活字典键序不能让下游 prompt 漂移。
+                            artifact = envelope.seal(
+                                artifact,
+                                cache_key,
+                                label=f"Node {node.name!r}",
+                                calls=calls,
+                                cache_policy=("off" if checkpoint_used else node.cache),
+                                evidence_policy=evidence_policy,
+                                agent_provenance=agent_provenance,
+                            )
                     if node.executor == "agent":
                         validate_agent_artifact(artifact, self.blob_store)
+                        if isinstance(agent_provenance, dict):
+                            validate_agent_provenance(
+                                agent_provenance,
+                                self.blob_store,
+                            )
                     elapsed = time.monotonic() - started
                     with state_lock:
                         if cache_hit:
@@ -979,26 +1259,39 @@ class Dag:
                             artifact,
                             allow_item_owners=node.items_from is not None,
                         )
-                        if self.post_node is not None:
+                        if self.post_node is not None and not resumed_completed:
                             self.post_node(node.name, artifact, cache_hit)
                         artifacts[node.name] = artifact
-                        artifact_shas[node.name] = sha(artifact)
-                        envelope.write_sidecar(
-                            node.name,
-                            artifact,
-                            cache_key,
-                            cache_hit=cache_hit,
-                            seconds=elapsed,
-                            calls=calls,
-                            key_components=key_components,
-                            outputs=outputs,
-                            cache_policy=node.cache,
-                        )
+                        artifact_sha256 = sha(artifact)
+                        artifact_shas[node.name] = artifact_sha256
+                        if not resumed_completed:
+                            envelope.write_sidecar(
+                                node.name,
+                                artifact,
+                                cache_key,
+                                cache_hit=cache_hit,
+                                seconds=elapsed,
+                                calls=calls,
+                                key_components=key_components,
+                                outputs=outputs,
+                                cache_policy=node.cache,
+                                evidence_policy=evidence_policy,
+                                agent_provenance=agent_provenance,
+                            )
+                        if node.items_from is None and artifact is not None and not cache_hit:
+                            attempt_store.mark_completed(
+                                node.name,
+                                artifact_sha256=artifact_sha256,
+                            )
                     return node_name, "success"
             except _MapCheckpointPending as pending:
                 with state_lock:
                     pending_checkpoints.extend((node_name, name) for name in pending.names)
                 return node_name, "pending"
+            except _MapRetryPending as pending:
+                with state_lock:
+                    pending_retry_targets.extend(pending.names)
+                return node_name, "retry_pending"
 
         def classify_ready() -> list[str]:
             ready: list[str] = []
@@ -1011,7 +1304,10 @@ class Dag:
                     dependency_states = [
                         states[dependency] for dependency in self._nodes[node_name].deps
                     ]
-                    if any(state in {"pending", "skipped"} for state in dependency_states):
+                    if any(
+                        state in {"pending", "retry_pending", "skipped"}
+                        for state in dependency_states
+                    ):
                         # 上游挂起或被跳过时下游不执行,但必须留下可见记录,不许静默消失。
                         states[node_name] = "skipped"
                         with state_lock:
@@ -1054,6 +1350,16 @@ class Dag:
                     "additional concurrent failure: "
                     f"{node_name}: {type(additional).__name__}: {additional}"
                 )
+            if isinstance(error, Exception):
+                pending_retries = attempt_store.pending_retries()
+                ambiguous_attempts = attempt_store.ambiguous_attempts()
+                status = "ambiguous" if ambiguous_attempts else "failed"
+                attempt_store.update_manifest(
+                    status,
+                    pending_retries=pending_retries,
+                    ambiguous_attempts=ambiguous_attempts,
+                    failure=canonical_failure(error) if status == "failed" else None,
+                )
             raise error
 
         ordered_cache_hits = [name for name in order if name in cache_hits]
@@ -1064,6 +1370,21 @@ class Dag:
             if pending_node == node_name
         ]
         ordered_skipped = [name for name in order if name in skipped]
+        pending_retry_records = attempt_store.pending_retries()
+        ambiguous_records = attempt_store.ambiguous_attempts()
+        if ambiguous_records:
+            run_status = "ambiguous"
+        elif pending_retry_records:
+            run_status = "pending_retry"
+        elif ordered_pending:
+            run_status = "checkpoint_pending"
+        else:
+            run_status = "completed"
+        attempt_store.update_manifest(
+            run_status,
+            pending_retries=pending_retry_records,
+            ambiguous_attempts=ambiguous_records,
+        )
         return RunResult(
             artifacts,
             ordered_cache_hits,
@@ -1071,7 +1392,181 @@ class Dag:
             current_run_id,
             ordered_skipped,
             {name: map_items[name] for name in order if name in map_items},
+            [str(record["target"]) for record in pending_retry_records],
+            [str(record["target"]) for record in ambiguous_records],
+            run_status,
         )
+
+    def resume(self, run_id: str, *, workers: int = 1) -> RunResult:
+        """Resume one schema-1 run under its originally bound declaration."""
+        run_dir = store.run_directory(self.config.artifacts_path, run_id)
+        try:
+            manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise RunManifestError(
+                f"Run {run_id!r} has no valid 0.6 run manifest and cannot be resumed"
+            ) from error
+        if not isinstance(manifest, dict) or manifest.get("run_manifest_schema") != 1:
+            raise RunManifestError(
+                f"Run {run_id!r} has no valid 0.6 run manifest and cannot be resumed"
+            )
+        targets = manifest.get("targets")
+        force = manifest.get("force")
+        if not isinstance(targets, list) or not all(isinstance(name, str) for name in targets):
+            raise RunManifestError(f"Run {run_id!r} has invalid target bindings")
+        if not isinstance(force, list) or not all(isinstance(name, str) for name in force):
+            raise RunManifestError(f"Run {run_id!r} has invalid force bindings")
+        return self.run(
+            targets=targets,
+            run_id=run_id,
+            force=force,
+            workers=workers,
+        )
+
+    def retry_resolve(
+        self,
+        run_id: str,
+        target: str,
+        *,
+        attempt: int,
+        action: str,
+        reason: str,
+    ) -> None:
+        """Persist an explicit operator verdict for one ambiguous attempt."""
+        if action not in {"retry", "fail"}:
+            raise ValueError("retry resolution action must be 'retry' or 'fail'")
+        run_dir = store.run_directory(self.config.artifacts_path, run_id)
+        manifest_path = run_dir / "_run.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise RunManifestError(f"Run {run_id!r} has no valid manifest") from error
+        if not isinstance(manifest, dict) or manifest.get("run_manifest_schema") != 1:
+            raise RunManifestError(f"Run {run_id!r} has no valid manifest")
+        attempts = AttemptStore(run_dir, {})
+        attempts.resolve(
+            target,
+            attempt=attempt,
+            action=action,  # type: ignore[arg-type]
+            reason=reason,
+        )
+        pending = attempts.pending_retries()
+        ambiguous = attempts.ambiguous_attempts()
+        status = "failed" if action == "fail" else "pending_retry"
+        attempts.update_manifest(
+            status,
+            pending_retries=pending,
+            ambiguous_attempts=ambiguous,
+        )
+
+    def _run_manifest_identity(
+        self,
+        run_id: str,
+        targets: tuple[str, ...],
+        force: tuple[str, ...],
+        order: list[str],
+        libs_hash: str,
+    ) -> dict[str, Any]:
+        declarations: dict[str, Any] = {}
+        retry_digests: dict[str, str | None] = {}
+        evidence_digests: dict[str, str] = {}
+        for name in order:
+            node = self._nodes[name]
+            evidence = node.evidence_policy or self._caller_evidence_policy()
+            retry_digests[name] = node.retry.digest if node.retry is not None else None
+            evidence_digests[name] = evidence.digest
+            declarations[name] = {
+                "source": _source_hash(node.function),
+                "deps": list(node.deps),
+                "prompts": {
+                    prompt_name: sha(load_template(self._prompt_path(prompt_name)))
+                    for prompt_name in node.prompts
+                },
+                "files": {
+                    path.as_posix(): _bytes_hash(self.config.resolve(path).read_bytes())
+                    for path in node.files
+                },
+                "params": sha(node.params),
+                "consumes": sorted(node.consumes),
+                "cache": node.cache,
+                "external": node.external_fingerprint_digest,
+                "executor": node.executor,
+                "agent": copy.deepcopy(node.agent_identity),
+                "items_from": list(node.items_from) if node.items_from is not None else None,
+                "scan": node.scan,
+                "carry_from": list(node.carry_from) if node.carry_from is not None else None,
+                "retry_policy_digest": retry_digests[name],
+                "evidence_policy_digest": evidence.digest,
+            }
+        source_digest = sha(declarations)
+        return {
+            "run_id": run_id,
+            "graph_identity": sha(
+                {
+                    "declarations": declarations,
+                    "targets": list(targets),
+                    "force": list(force),
+                    "libs": libs_hash,
+                }
+            ),
+            "targets": list(targets),
+            "force": list(force),
+            "source_digest": source_digest,
+            "libs_digest": libs_hash,
+            "retry_policy_digests": retry_digests,
+            "evidence_policy_digests": evidence_digests,
+        }
+
+    @staticmethod
+    def _attempt_declaration_digest(
+        node: _Node,
+        key_components: dict[str, str],
+        evidence_policy: EvidencePolicy,
+    ) -> str:
+        return sha(
+            {
+                "target": node.name,
+                "key_components": key_components,
+                "retry_policy_digest": (node.retry.digest if node.retry is not None else None),
+                "evidence_policy_digest": evidence_policy.digest,
+            }
+        )
+
+    def _resume_completed_artifact(
+        self,
+        run_dir: Path,
+        label: str,
+        key_components: dict[str, str],
+        cache_key: str,
+        *,
+        validate_agent: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        artifact_path = run_dir / f"{label}.json"
+        sidecar_path = Path(f"{artifact_path}.meta.json")
+        try:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise RunManifestError(
+                f"Completed target {label!r} has missing or invalid run artifacts"
+            ) from error
+        if not isinstance(artifact, dict) or not isinstance(metadata, dict):
+            raise RunManifestError(f"Completed target {label!r} has invalid run artifacts")
+        artifact_digest = sha(artifact)
+        origin = metadata.get("origin_provenance")
+        if (
+            metadata.get("artifact_sha256") != artifact_digest
+            or not isinstance(origin, dict)
+            or origin.get("artifact_sha256") != artifact_digest
+            or metadata.get("key_components") != key_components
+            or metadata.get("cache_key") != cache_key
+        ):
+            raise RunManifestError(
+                f"Completed target {label!r} failed artifact or declaration validation"
+            )
+        if validate_agent:
+            validate_agent_artifact(artifact, self.blob_store)
+        return artifact, metadata
 
     def plan(
         self,
@@ -1505,6 +2000,14 @@ class Dag:
                 "has_aggregate_fn": node.aggregate_fn is not None,
                 "cache": node.cache,
                 "has_external_fingerprint": node.external_fingerprint_digest is not None,
+                "retry_policy": (node.retry.canonical() if node.retry is not None else None),
+                "retry_policy_digest": (node.retry.digest if node.retry is not None else None),
+                "evidence_policy": (
+                    node.evidence_policy or self._caller_evidence_policy()
+                ).canonical(),
+                "evidence_policy_digest": (
+                    node.evidence_policy or self._caller_evidence_policy()
+                ).digest,
                 "subgraph": node.subgraph,
                 "validated_models": copy.deepcopy(list(node.validated_models)),
                 "checkpoints": list(node.checkpoints),
@@ -1560,11 +2063,42 @@ class Dag:
                 for pending_name in pending_names
             )
         }
+        attempt_states: dict[str, list[dict[str, Any]]] = {}
+        for state_path in sorted((run_directory / "attempts").glob("*/state.json")):
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            target = state.get("target") if isinstance(state, dict) else None
+            if not isinstance(target, str):
+                continue
+            node_name = target.partition("@")[0]
+            attempt_states.setdefault(node_name, []).append(state)
+        retry_nodes = {
+            name
+            for name, states in attempt_states.items()
+            if any(state.get("status") == "retry_scheduled" for state in states)
+        }
+        ambiguous_nodes = {
+            name
+            for name, states in attempt_states.items()
+            if any(state.get("status") == "ambiguous" for state in states)
+        }
+        failed_nodes = {
+            name
+            for name, states in attempt_states.items()
+            if any(state.get("status") == "failed" for state in states)
+        }
+        blocked_nodes = pending_nodes | retry_nodes | ambiguous_nodes | failed_nodes
         return {
             "metadata": metadata,
             "pending_names": pending_names,
             "pending_nodes": pending_nodes,
-            "skipped_nodes": _downstream_nodes(self._nodes, pending_nodes),
+            "retry_nodes": retry_nodes,
+            "ambiguous_nodes": ambiguous_nodes,
+            "failed_nodes": failed_nodes,
+            "attempt_states": attempt_states,
+            "skipped_nodes": _downstream_nodes(self._nodes, blocked_nodes),
         }
 
     def cli(self, argv: list[str] | None = None) -> None:
@@ -1576,6 +2110,8 @@ class Dag:
             "graph": self._cli_graph,
             "explain": self._cli_explain,
             "describe": self._cli_describe,
+            "resume": self._cli_resume,
+            "retry-resolve": self._cli_retry_resolve,
         }
         sys.exit(handlers[args.command](args))
 
@@ -1673,6 +2209,38 @@ class Dag:
             print(json.dumps(self.describe(), ensure_ascii=False, indent=2))
         else:
             print(self.render_summary())
+        return 0
+
+    def _cli_resume(self, args: argparse.Namespace) -> int:
+        """Resume a bound 0.6 run and report its durable terminal/pending state."""
+        try:
+            result = self.resume(args.run_id, workers=args.workers)
+        except Exception as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(
+            f"run={result.run_id} status={result.run_status} "
+            f"artifacts={len(result.artifacts)} retries={len(result.pending_retries)} "
+            f"ambiguous={len(result.ambiguous_attempts)}"
+        )
+        return 0
+
+    def _cli_retry_resolve(self, args: argparse.Namespace) -> int:
+        """Persist an explicit operator verdict for an ambiguous attempt."""
+        try:
+            self.retry_resolve(
+                args.run_id,
+                args.target,
+                attempt=args.attempt,
+                action=args.action,
+                reason=args.reason,
+            )
+        except Exception as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(
+            f"resolved {args.target} attempt={args.attempt} action={args.action} run={args.run_id}"
+        )
         return 0
 
     def approve(self, run_id: str, name: str, data: Any) -> None:
@@ -1841,6 +2409,7 @@ class Dag:
         forced_all: bool,
         forced_items: set[str],
         envelope: ExecutionEnvelope,
+        attempt_store: AttemptStore,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
@@ -1860,6 +2429,7 @@ class Dag:
 
         def execute_item(item_id: str, item: Any) -> dict[str, Any]:
             started = time.monotonic()
+            target = f"{node.name}@{item_id}"
             try:
                 with observe() as calls:
                     item_files = (
@@ -1874,34 +2444,161 @@ class Dag:
                         item_files=item_files,
                     )
                     cache_key = sha(key_components)
-                    artifact, cache_hit = envelope.lookup(
-                        cache_key,
-                        forced=forced_all or item_id in forced_items,
-                        cache_policy=node.cache,
+                    declaration_digest = self._attempt_declaration_digest(
+                        node,
+                        key_components,
+                        self._caller_evidence_policy(),
                     )
-                    if artifact is None:
-                        context = NodeContext(
-                            self,
-                            node,
-                            run_id,
-                            checkpoint_suffix=item_id,
-                            item_files=item_files,
+                    resumed_completed = False
+                    run_root = envelope.artifacts_path / "runs" / run_id
+                    if (run_root / f"{target}.json").is_file() and (
+                        run_root / f"{target}.json.meta.json"
+                    ).is_file():
+                        artifact, prior_metadata = self._resume_completed_artifact(
+                            run_root,
+                            target,
+                            key_components,
+                            cache_key,
                         )
-                        try:
-                            artifact = node.function(item, copy.deepcopy(shared_inputs), context)  # type: ignore[call-arg]
-                        except CheckpointPending as pending:
-                            envelope.record_pending(pending.name, pending.payload)
+                        cache_hit = prior_metadata.get("cache") == "hit"
+                        resumed_completed = True
+                    elif attempt_store.state_for(target) is not None:
+                        artifact, cache_hit = None, False
+                    else:
+                        artifact, cache_hit = envelope.lookup(
+                            cache_key,
+                            forced=forced_all or item_id in forced_items,
+                            cache_policy=node.cache,
+                            evidence_policy_digest=self._caller_evidence_policy().digest,
+                        )
+                    if artifact is None:
+                        prepared = attempt_store.prepare(
+                            target,
+                            policy=node.retry,
+                            declaration_digest=declaration_digest,
+                        )
+                        action = prepared["action"]
+                        if action == "pending":
                             return {
                                 "id": item_id,
-                                "status": "pending",
-                                "pending": pending.name,
+                                "status": "retry_pending",
+                                "target": target,
                             }
-                        artifact = envelope.seal(
-                            artifact,
-                            cache_key,
-                            label=f"Map node {node.name!r} item {item_id!r}",
-                            cache_policy="off" if context._checkpoint_used else node.cache,
-                        )
+                        if action == "failed":
+                            raise RunManifestError(
+                                f"Map target {target!r} is already terminally failed"
+                            )
+                        if action == "completed":
+                            artifact, _metadata = self._resume_completed_artifact(
+                                envelope.artifacts_path / "runs" / run_id,
+                                target,
+                                key_components,
+                                cache_key,
+                            )
+                            resumed_completed = True
+                        elif action == "candidate":
+                            candidate = prepared["candidate"]
+                            if (
+                                candidate.get("candidate_schema") != 1
+                                or candidate.get("cache_key") != cache_key
+                                or candidate.get("key_components") != key_components
+                                or not isinstance(candidate.get("artifact"), dict)
+                            ):
+                                raise RunManifestError(f"Success candidate for {target!r} changed")
+                            artifact = copy.deepcopy(candidate["artifact"])
+                            saved_calls = candidate.get("calls", [])
+                            if not isinstance(saved_calls, list):
+                                raise RunManifestError(
+                                    f"Success candidate calls for {target!r} are invalid"
+                                )
+                            calls.extend(copy.deepcopy(saved_calls))
+                            checkpoint_used = candidate.get("checkpoint_used") is True
+                            started = time.monotonic() - float(candidate.get("seconds", 0.0))
+                        else:
+                            context = NodeContext(
+                                self,
+                                node,
+                                run_id,
+                                checkpoint_suffix=item_id,
+                                item_files=item_files,
+                            )
+                            boundary = (
+                                durable_side_effect_boundary(
+                                    lambda attempt_target=target: attempt_store.mark_side_effect(
+                                        attempt_target
+                                    )
+                                )
+                                if node.retry is not None
+                                else nullcontext()
+                            )
+                            try:
+                                with boundary:
+                                    artifact = node.function(  # type: ignore[call-arg]
+                                        item,
+                                        copy.deepcopy(shared_inputs),
+                                        context,
+                                    )
+                            except CheckpointPending as pending:
+                                envelope.record_pending(pending.name, pending.payload)
+                                attempt_store.mark_checkpoint(target, pending.name)
+                                return {
+                                    "id": item_id,
+                                    "status": "pending",
+                                    "pending": pending.name,
+                                }
+                            except Exception as error:
+                                failure_outcome = attempt_store.record_failure(
+                                    target,
+                                    error,
+                                    policy=node.retry,
+                                )
+                                if failure_outcome["action"] == "pending":
+                                    return {
+                                        "id": item_id,
+                                        "status": "retry_pending",
+                                        "target": target,
+                                    }
+                                if (
+                                    node.retry is not None
+                                    and node.retry.allows(failure_provider_kind(error))
+                                    and int(failure_outcome["state"]["attempt"])
+                                    >= node.retry.max_attempts
+                                ):
+                                    raise RetryExhausted(
+                                        target,
+                                        int(failure_outcome["state"]["attempt"]),
+                                        canonical_failure(error),
+                                    ) from error
+                                raise
+                            if not isinstance(artifact, dict):
+                                raise TypeError(
+                                    f"Map node {node.name!r} item {item_id!r} "
+                                    "must return a dict artifact"
+                                )
+                            artifact = json.loads(canonical_json(artifact))
+                            checkpoint_used = context._checkpoint_used
+                            attempt_store.save_candidate(
+                                target,
+                                {
+                                    "candidate_schema": 1,
+                                    "artifact": artifact,
+                                    "cache_key": cache_key,
+                                    "key_components": key_components,
+                                    "calls": copy.deepcopy(calls),
+                                    "agent_provenance": None,
+                                    "seconds": time.monotonic() - started,
+                                    "checkpoint_used": checkpoint_used,
+                                },
+                            )
+                        if not resumed_completed:
+                            artifact = envelope.seal(
+                                artifact,
+                                cache_key,
+                                label=(f"Map node {node.name!r} item {item_id!r}"),
+                                calls=calls,
+                                cache_policy=("off" if checkpoint_used else node.cache),
+                                evidence_policy=self._caller_evidence_policy(),
+                            )
                     return {
                         "id": item_id,
                         "status": "success",
@@ -1911,6 +2608,8 @@ class Dag:
                         "key_components": key_components,
                         "seconds": time.monotonic() - started,
                         "calls": calls,
+                        "resumed_completed": resumed_completed,
+                        "target": target,
                     }
             except Exception as error:
                 # KeyboardInterrupt/SystemExit 不许伪装成单项失败被聚合吞掉:
@@ -1930,6 +2629,7 @@ class Dag:
         cache_keys: list[str] = []
         item_cache_statuses: dict[str, str] = {}
         pending: list[str] = []
+        retry_pending: list[str] = []
         failures: list[dict[str, Any]] = []
         for outcome in outcomes:
             if outcome["status"] == "success":
@@ -1940,24 +2640,35 @@ class Dag:
                 completed[item_id] = artifact
                 label = f"{node.name}@{item_id}"
                 outputs = envelope.materialize(label, artifact)
-                envelope.write_sidecar(
-                    label,
-                    artifact,
-                    outcome["cache_key"],
-                    cache_hit=outcome["cache"] == "hit",
-                    seconds=outcome["seconds"],
-                    calls=outcome["calls"],
-                    key_components=outcome["key_components"],
-                    outputs=outputs,
-                    cache_policy=node.cache,
-                )
+                if not outcome["resumed_completed"]:
+                    envelope.write_sidecar(
+                        label,
+                        artifact,
+                        outcome["cache_key"],
+                        cache_hit=outcome["cache"] == "hit",
+                        seconds=outcome["seconds"],
+                        calls=outcome["calls"],
+                        key_components=outcome["key_components"],
+                        outputs=outputs,
+                        cache_policy=node.cache,
+                        evidence_policy=self._caller_evidence_policy(),
+                    )
+                if outcome["cache"] != "hit" and not outcome["resumed_completed"]:
+                    attempt_store.mark_completed(
+                        outcome["target"],
+                        artifact_sha256=sha(artifact),
+                    )
             elif outcome["status"] == "pending":
                 pending.append(outcome["pending"])
+            elif outcome["status"] == "retry_pending":
+                retry_pending.append(outcome["target"])
             else:
                 failures.append(outcome)
         if failures:
             first = failures[0]["error"]
             if isinstance(first, DryRunError):
+                raise first
+            if isinstance(first, (RetryExhausted, ProviderFailure)):
                 raise first
             details = ", ".join(
                 f"{outcome['id']} ({type(outcome['error']).__name__}: {outcome['error']})"
@@ -1966,6 +2677,8 @@ class Dag:
             raise RuntimeError(f"Map node {node.name!r} failed items: {details}") from first
         if pending:
             raise _MapCheckpointPending(pending)
+        if retry_pending:
+            raise _MapRetryPending(retry_pending)
 
         artifact = self._aggregate_map_artifact(node, completed, ids)
         return (
@@ -2002,6 +2715,7 @@ class Dag:
         forced_all: bool,
         forced_items: set[str],
         envelope: ExecutionEnvelope,
+        attempt_store: AttemptStore,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
@@ -2034,6 +2748,7 @@ class Dag:
 
         for item_id, item in entries:
             started = time.monotonic()
+            target = f"{node.name}@{item_id}"
             try:
                 with observe() as calls:
                     item_files = (
@@ -2049,54 +2764,181 @@ class Dag:
                         carry=carry,
                     )
                     cache_key = sha(key_components)
-                    artifact, cache_hit = envelope.lookup(
-                        cache_key,
-                        forced=forced_all or item_id in forced_items,
-                        cache_policy=node.cache,
+                    declaration_digest = self._attempt_declaration_digest(
+                        node,
+                        key_components,
+                        self._caller_evidence_policy(),
                     )
-                    if artifact is None:
-                        context = NodeContext(
-                            self,
-                            node,
-                            run_id,
-                            checkpoint_suffix=item_id,
-                            item_files=item_files,
-                        )
-                        try:
-                            artifact = node.function(  # type: ignore[call-arg]
-                                item, copy.deepcopy(carry), copy.deepcopy(shared_inputs), context
-                            )
-                        except CheckpointPending as pending:
-                            envelope.record_pending(pending.name, pending.payload)
-                            raise _MapCheckpointPending([pending.name]) from pending
-                        artifact = envelope.seal(
-                            artifact,
+                    resumed_completed = False
+                    run_root = envelope.artifacts_path / "runs" / run_id
+                    if (run_root / f"{target}.json").is_file() and (
+                        run_root / f"{target}.json.meta.json"
+                    ).is_file():
+                        artifact, prior_metadata = self._resume_completed_artifact(
+                            run_root,
+                            target,
+                            key_components,
                             cache_key,
-                            label=f"Scan node {node.name!r} item {item_id!r}",
-                            cache_policy="off" if context._checkpoint_used else node.cache,
                         )
+                        cache_hit = prior_metadata.get("cache") == "hit"
+                        resumed_completed = True
+                    elif attempt_store.state_for(target) is not None:
+                        artifact, cache_hit = None, False
+                    else:
+                        artifact, cache_hit = envelope.lookup(
+                            cache_key,
+                            forced=forced_all or item_id in forced_items,
+                            cache_policy=node.cache,
+                            evidence_policy_digest=self._caller_evidence_policy().digest,
+                        )
+                    if artifact is None:
+                        prepared = attempt_store.prepare(
+                            target,
+                            policy=node.retry,
+                            declaration_digest=declaration_digest,
+                        )
+                        action = prepared["action"]
+                        if action == "pending":
+                            raise _MapRetryPending([target])
+                        if action == "failed":
+                            raise RunManifestError(
+                                f"Scan target {target!r} is already terminally failed"
+                            )
+                        if action == "completed":
+                            artifact, _metadata = self._resume_completed_artifact(
+                                envelope.artifacts_path / "runs" / run_id,
+                                target,
+                                key_components,
+                                cache_key,
+                            )
+                            resumed_completed = True
+                        elif action == "candidate":
+                            candidate = prepared["candidate"]
+                            if (
+                                candidate.get("candidate_schema") != 1
+                                or candidate.get("cache_key") != cache_key
+                                or candidate.get("key_components") != key_components
+                                or not isinstance(candidate.get("artifact"), dict)
+                            ):
+                                raise RunManifestError(f"Success candidate for {target!r} changed")
+                            artifact = copy.deepcopy(candidate["artifact"])
+                            saved_calls = candidate.get("calls", [])
+                            if not isinstance(saved_calls, list):
+                                raise RunManifestError(
+                                    f"Success candidate calls for {target!r} are invalid"
+                                )
+                            calls.extend(copy.deepcopy(saved_calls))
+                            checkpoint_used = candidate.get("checkpoint_used") is True
+                            started = time.monotonic() - float(candidate.get("seconds", 0.0))
+                        else:
+                            context = NodeContext(
+                                self,
+                                node,
+                                run_id,
+                                checkpoint_suffix=item_id,
+                                item_files=item_files,
+                            )
+                            boundary = (
+                                durable_side_effect_boundary(
+                                    lambda attempt_target=target: attempt_store.mark_side_effect(
+                                        attempt_target
+                                    )
+                                )
+                                if node.retry is not None
+                                else nullcontext()
+                            )
+                            try:
+                                with boundary:
+                                    artifact = node.function(  # type: ignore[call-arg]
+                                        item,
+                                        copy.deepcopy(carry),
+                                        copy.deepcopy(shared_inputs),
+                                        context,
+                                    )
+                            except CheckpointPending as pending:
+                                envelope.record_pending(pending.name, pending.payload)
+                                attempt_store.mark_checkpoint(target, pending.name)
+                                raise _MapCheckpointPending([pending.name]) from pending
+                            except Exception as error:
+                                failure_outcome = attempt_store.record_failure(
+                                    target,
+                                    error,
+                                    policy=node.retry,
+                                )
+                                if failure_outcome["action"] == "pending":
+                                    raise _MapRetryPending([target]) from error
+                                if (
+                                    node.retry is not None
+                                    and node.retry.allows(failure_provider_kind(error))
+                                    and int(failure_outcome["state"]["attempt"])
+                                    >= node.retry.max_attempts
+                                ):
+                                    raise RetryExhausted(
+                                        target,
+                                        int(failure_outcome["state"]["attempt"]),
+                                        canonical_failure(error),
+                                    ) from error
+                                raise
+                            if not isinstance(artifact, dict):
+                                raise TypeError(
+                                    f"Scan node {node.name!r} item {item_id!r} "
+                                    "must return a dict artifact"
+                                )
+                            artifact = json.loads(canonical_json(artifact))
+                            checkpoint_used = context._checkpoint_used
+                            attempt_store.save_candidate(
+                                target,
+                                {
+                                    "candidate_schema": 1,
+                                    "artifact": artifact,
+                                    "cache_key": cache_key,
+                                    "key_components": key_components,
+                                    "calls": copy.deepcopy(calls),
+                                    "agent_provenance": None,
+                                    "seconds": time.monotonic() - started,
+                                    "checkpoint_used": checkpoint_used,
+                                },
+                            )
+                        if not resumed_completed:
+                            artifact = envelope.seal(
+                                artifact,
+                                cache_key,
+                                label=(f"Scan node {node.name!r} item {item_id!r}"),
+                                calls=calls,
+                                cache_policy=("off" if checkpoint_used else node.cache),
+                                evidence_policy=self._caller_evidence_policy(),
+                            )
                     completed[item_id] = artifact
                     cache_keys.append(cache_key)
                     item_cache_statuses[item_id] = "hit" if cache_hit else "miss"
                     label = f"{node.name}@{item_id}"
                     outputs = envelope.materialize(label, artifact)
-                    envelope.write_sidecar(
-                        label,
-                        artifact,
-                        cache_key,
-                        cache_hit=cache_hit,
-                        seconds=time.monotonic() - started,
-                        calls=calls,
-                        key_components=key_components,
-                        outputs=outputs,
-                        cache_policy=node.cache,
-                    )
+                    if not resumed_completed:
+                        envelope.write_sidecar(
+                            label,
+                            artifact,
+                            cache_key,
+                            cache_hit=cache_hit,
+                            seconds=time.monotonic() - started,
+                            calls=calls,
+                            key_components=key_components,
+                            outputs=outputs,
+                            cache_policy=node.cache,
+                            evidence_policy=self._caller_evidence_policy(),
+                        )
+                    if not cache_hit and not resumed_completed:
+                        attempt_store.mark_completed(
+                            target,
+                            artifact_sha256=sha(artifact),
+                        )
                     carry = node.carry_fn(artifact) if node.carry_fn is not None else artifact
-            except _MapCheckpointPending:
+            except (_MapCheckpointPending, _MapRetryPending):
                 raise
             except OutputOwnershipError:
                 raise
             except Exception as error:
+                if isinstance(error, (RetryExhausted, ProviderFailure)):
+                    raise
                 raise RuntimeError(
                     f"Scan node {node.name!r} failed item {item_id!r}: "
                     f"{type(error).__name__}: {error}"
@@ -2223,6 +3065,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
     describe = commands.add_parser("describe")
     describe.add_argument("--format", choices=("md", "json"), default="md")
+
+    resume = commands.add_parser("resume")
+    resume.add_argument("run_id")
+    resume.add_argument("--workers", type=int, default=1)
+
+    resolve = commands.add_parser("retry-resolve")
+    resolve.add_argument("run_id")
+    resolve.add_argument("target")
+    resolve.add_argument("--attempt", type=int, required=True)
+    resolve.add_argument("--action", choices=("retry", "fail"), required=True)
+    resolve.add_argument("--reason", required=True)
     return parser
 
 
@@ -2563,3 +3416,9 @@ def _validate_name(name: str, kind: str) -> None:
             f"{kind} names must be non-empty, contain no '@', and be a single relative path "
             "component"
         )
+
+
+def _validate_retry_policy(retry: RetryPolicy | None) -> RetryPolicy | None:
+    if retry is not None and not isinstance(retry, RetryPolicy):
+        raise TypeError("retry must be RetryPolicy or None")
+    return retry

@@ -17,7 +17,47 @@ class KigumiConfig:
     llm_cache_dir: str = "artifacts/_llm"
     source_dirs: list[str] = field(default_factory=lambda: ["nodes", "lib"])
     env_file: str = ".env"
+    agent_slots: int = 1
+    agent_lock_dir: str = "artifacts/_locks/agents"
+    agent_slot_timeout_seconds: float = 300.0
     project_root: Path = field(default_factory=Path.cwd, repr=False)
+
+    def __post_init__(self) -> None:
+        overrides: tuple[tuple[str, str, type[int] | type[float]], ...] = (
+            ("agent_slots", "KIGUMI_AGENT_SLOTS", int),
+            (
+                "agent_slot_timeout_seconds",
+                "KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS",
+                float,
+            ),
+        )
+        for field_name, environment_name, parser in overrides:
+            raw = os.getenv(environment_name)
+            if raw is None:
+                continue
+            try:
+                setattr(self, field_name, parser(raw.strip()))
+            except ValueError as error:
+                raise ValueError(f"{environment_name} must be a valid number") from error
+        lock_override = os.getenv("KIGUMI_AGENT_LOCK_DIR")
+        if lock_override is not None:
+            if not lock_override.strip():
+                raise ValueError("KIGUMI_AGENT_LOCK_DIR must not be empty")
+            self.agent_lock_dir = lock_override.strip()
+        if (
+            isinstance(self.agent_slots, bool)
+            or not isinstance(self.agent_slots, int)
+            or self.agent_slots < 1
+        ):
+            raise ValueError("agent_slots must be at least 1")
+        if (
+            isinstance(self.agent_slot_timeout_seconds, bool)
+            or not isinstance(self.agent_slot_timeout_seconds, int | float)
+            or self.agent_slot_timeout_seconds <= 0
+        ):
+            raise ValueError("agent_slot_timeout_seconds must be positive")
+        if not isinstance(self.agent_lock_dir, str) or not self.agent_lock_dir:
+            raise ValueError("agent_lock_dir must be a non-empty path")
 
     def resolve(self, path: str | Path) -> Path:
         """Resolve a configured project-relative path to an absolute path."""
@@ -51,6 +91,11 @@ class KigumiConfig:
         """The resolved environment-file path."""
         return self.resolve(self.env_file)
 
+    @property
+    def agent_lock_path(self) -> Path:
+        """The shared lock root for external-Agent execution capacity."""
+        return self.resolve(self.agent_lock_dir)
+
 
 def find_project_root(start: Path) -> Path | None:
     """Find the nearest ancestor containing ``pyproject.toml``."""
@@ -78,7 +123,16 @@ def load_config(project_root: Path) -> KigumiConfig | None:
     values = tool["kigumi"]
     if not isinstance(values, dict):
         raise ValueError("[tool.kigumi] must be a table")
-    known = {"prompts_dir", "artifacts_dir", "llm_cache_dir", "source_dirs", "env_file"}
+    known = {
+        "prompts_dir",
+        "artifacts_dir",
+        "llm_cache_dir",
+        "source_dirs",
+        "env_file",
+        "agent_slots",
+        "agent_lock_dir",
+        "agent_slot_timeout_seconds",
+    }
     unknown = sorted(set(values) - known)
     if unknown:
         raise ValueError(f"Unknown kigumi configuration keys: {', '.join(unknown)}")

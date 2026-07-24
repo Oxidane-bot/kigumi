@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import copy
 import json
 import mimetypes
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
@@ -21,12 +22,23 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .artifacts import atomic_write_json, sha, sha256_file
+from .evidence import EvidencePolicy, scrub_evidence
+from .failures import (
+    ProviderFailure,
+    ProviderFailureStage,
+    canonical_failure,
+    provider_failure_from_exception,
+)
 from .slots import FileSlots
 from .transport import EmptyResponseError, Transport
 
 _call_observer: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
     "kigumi_call_observer", default=None
 )
+_durable_side_effect: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "kigumi_durable_side_effect", default=None
+)
+_DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
 @contextmanager
@@ -38,6 +50,16 @@ def observe() -> Iterator[list[dict[str, Any]]]:
         yield calls
     finally:
         _call_observer.reset(token)
+
+
+@contextmanager
+def durable_side_effect_boundary(callback: Callable[[], None]) -> Iterator[None]:
+    """Mark the first live provider request in one durable attempt."""
+    token = _durable_side_effect.set(callback)
+    try:
+        yield
+    finally:
+        _durable_side_effect.reset(token)
 
 
 def _data_url(data: bytes, mime: str) -> str:
@@ -125,6 +147,7 @@ class LLMCaller:
         budget: Budget | None = None,
         dry: bool = False,
         slots: FileSlots | None = None,
+        evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
     ) -> None:
         self.transport = transport
         self.cache_dir = Path(cache_dir)
@@ -132,6 +155,9 @@ class LLMCaller:
         self.budget = budget
         self.dry = dry
         self.slots = slots
+        if not isinstance(evidence_policy, EvidencePolicy):
+            raise TypeError("evidence_policy must be EvidencePolicy")
+        self.evidence_policy = evidence_policy
         self.calls: list[dict[str, Any]] = []
         self._calls_lock = threading.Lock()
         # 键锁只增不减:caller 与一次 run 同生命周期,键集有界;若改成常驻服务需先加回收。
@@ -194,13 +220,70 @@ class LLMCaller:
             )
             # 槽位限的是远程请求本身;base64 展开是本地工作,不许占着槽做。
             slot_context = self.slots.acquire() if self.slots is not None else nullcontext()
-            with slot_context:
-                response = self.transport.complete(transport_messages, model, **params)
+            try:
+                with slot_context:
+                    durable_callback = _durable_side_effect.get()
+                    if durable_callback is not None:
+                        self._validate_durable_transport()
+                        durable_callback()
+                    response = self.transport.complete(transport_messages, model, **params)
+            except Exception as error:
+                seconds = time.monotonic() - started
+                failure = (
+                    error
+                    if isinstance(error, ProviderFailure)
+                    else provider_failure_from_exception(
+                        error,
+                        provider=type(self.transport).__name__,
+                        stage=ProviderFailureStage.TRANSPORT,
+                    )
+                )
+                metadata = self._meta(
+                    key=key,
+                    model_alias=model,
+                    model=resolved_model,
+                    params=params,
+                    messages=key_messages,
+                    seconds=seconds,
+                    usage={},
+                    cache="failure",
+                    failure=canonical_failure(failure),
+                    request_value=cache_messages,
+                )
+                self._append_call(metadata)
+                raise failure from None
             seconds = time.monotonic() - started
             if not response.text:
-                raise EmptyResponseError(
+                empty = EmptyResponseError(
                     f"Transport returned an empty response for model {resolved_model!r}."
                 )
+                failure = provider_failure_from_exception(
+                    empty,
+                    provider=type(self.transport).__name__,
+                    stage=ProviderFailureStage.RESPONSE,
+                )
+                self._append_call(
+                    self._meta(
+                        key=key,
+                        model_alias=model,
+                        model=resolved_model,
+                        params=params,
+                        messages=key_messages,
+                        seconds=seconds,
+                        usage=response.usage,
+                        cache="failure",
+                        provider_response_id=response.provider_response_id,
+                        provider_model=response.model,
+                        provider_model_observed=response.model_observed,
+                        failure=canonical_failure(failure),
+                        request_value=cache_messages,
+                        response_value={
+                            "text": response.text,
+                            "reasoning": response.reasoning,
+                        },
+                    )
+                )
+                raise failure from None
             payload = {
                 "meta": self._meta(
                     key=key,
@@ -212,6 +295,13 @@ class LLMCaller:
                     usage=response.usage,
                     cache="miss",
                     provider_response_id=response.provider_response_id,
+                    provider_model=response.model,
+                    provider_model_observed=response.model_observed,
+                    request_value=cache_messages,
+                    response_value={
+                        "text": response.text,
+                        "reasoning": response.reasoning,
+                    },
                 ),
                 "response": response.text,
                 "messages": cache_messages,
@@ -366,7 +456,7 @@ class LLMCaller:
         return {"type": "file", "file": file_part}
 
     @staticmethod
-    def _read_cached_response(cache_path: Path) -> tuple[str, dict[str, Any]] | None:
+    def _read_cached_response(cache_path: Path) -> dict[str, Any] | None:
         try:
             with cache_path.open(encoding="utf-8") as handle:
                 cached = json.load(handle)
@@ -376,12 +466,11 @@ class LLMCaller:
         if not isinstance(response, str) or not response:
             # 空响应永远不会被合法写入;读到即按撕裂缓存处理,走 miss。
             return None
-        metadata = cached.get("meta", {})
-        return response, dict(metadata) if isinstance(metadata, dict) else {}
+        return cached
 
     def _record_cache_hit(
         self,
-        cached: tuple[str, dict[str, Any]],
+        cached: dict[str, Any],
         *,
         key: str,
         model_alias: str,
@@ -389,13 +478,20 @@ class LLMCaller:
         params: dict[str, Any],
         messages: list[dict[str, Any]],
     ) -> str:
-        cached_response, cached_metadata = cached
+        cached_response = cached["response"]
+        cached_metadata = cached.get("meta", {})
+        if not isinstance(cached_metadata, dict):
+            cached_metadata = {}
         cached_usage = cached_metadata.get("usage", {})
         if not isinstance(cached_usage, dict):
             cached_usage = {}
         provider_response_id = cached_metadata.get("provider_response_id")
         if not isinstance(provider_response_id, str):
             provider_response_id = None
+        provider_model = cached_metadata.get("provider_model")
+        if not isinstance(provider_model, str):
+            provider_model = None
+        provider_model_observed = cached_metadata.get("provider_model_observed") is True
         self._append_call(
             self._meta(
                 key=key,
@@ -407,6 +503,13 @@ class LLMCaller:
                 usage=cached_usage,
                 cache="hit",
                 provider_response_id=provider_response_id,
+                provider_model=provider_model,
+                provider_model_observed=provider_model_observed,
+                request_value=cached.get("messages", messages),
+                response_value={
+                    "text": cached_response,
+                    "reasoning": cached.get("reasoning"),
+                },
             )
         )
         return cached_response
@@ -434,8 +537,13 @@ class LLMCaller:
         usage: dict[str, Any],
         cache: str,
         provider_response_id: str | None = None,
+        provider_model: str | None = None,
+        provider_model_observed: bool = False,
+        failure: dict[str, Any] | None = None,
+        request_value: Any | None = None,
+        response_value: Any | None = None,
     ) -> dict[str, Any]:
-        return {
+        metadata = {
             "key": key,
             "model_alias": model_alias,
             "model": model,
@@ -446,4 +554,34 @@ class LLMCaller:
             "usage": usage,
             "cache": cache,
             "provider_response_id": provider_response_id,
+            "provider_model": provider_model,
+            "provider_model_observed": provider_model_observed,
+            "evidence_policy_digest": self.evidence_policy.digest,
+            "evidence_policy": self.evidence_policy.canonical(),
+            "request_evidence": scrub_evidence(
+                messages if request_value is None else request_value,
+                mode=self.evidence_policy.request,
+            ),
+            "response_evidence": (
+                scrub_evidence(response_value, mode=self.evidence_policy.response)
+                if response_value is not None
+                else None
+            ),
         }
+        if failure is not None:
+            metadata["failure"] = copy.deepcopy(failure)
+        return metadata
+
+    def _validate_durable_transport(self) -> None:
+        limits = {
+            "max_retries": getattr(self.transport, "max_retries", 0),
+            "max_length_retries": getattr(self.transport, "max_length_retries", 0),
+            "max_empty_retries": getattr(self.transport, "max_empty_retries", 0),
+        }
+        enabled = {name: value for name, value in limits.items() if value != 0}
+        if enabled:
+            details = ", ".join(f"{name}={value}" for name, value in sorted(enabled.items()))
+            raise RuntimeError(
+                "Durable retry requires transport, length, and empty retries to be 0 "
+                f"before the provider call ({details})"
+            )

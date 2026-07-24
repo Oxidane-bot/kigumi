@@ -7,9 +7,13 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .failures import (
+    ProviderFailureKind,
+    ProviderFailureStage,
+    provider_failure_from_exception,
+)
 from .slots import AdaptiveCapacity
 
 
@@ -23,6 +27,7 @@ class Response:
     reasoning: str | None = None
     model: str = ""
     provider_response_id: str | None = None
+    model_observed: bool = False
 
 
 class EmptyResponseError(RuntimeError):
@@ -62,14 +67,17 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _is_transient_error(error: BaseException) -> bool:
-    if isinstance(error, HTTPError):
-        return error.code == 429 or 500 <= error.code < 600
-    if isinstance(error, (ConnectionError, TimeoutError, URLError)):
-        return True
-    status_code = getattr(error, "status_code", None)
-    if status_code is None:
-        status_code = getattr(error, "status", None)
-    return status_code == 429 or isinstance(status_code, int) and 500 <= status_code < 600
+    failure = provider_failure_from_exception(
+        error,
+        provider="transport",
+        stage=ProviderFailureStage.TRANSPORT,
+    )
+    return failure.kind in {
+        ProviderFailureKind.RATE_LIMIT,
+        ProviderFailureKind.SERVER_ERROR,
+        ProviderFailureKind.TIMEOUT,
+        ProviderFailureKind.CONNECTION,
+    }
 
 
 class _RetryingTransport:
@@ -82,13 +90,17 @@ class _RetryingTransport:
         backoff_base: float = 1.0,
         *,
         capacity: AdaptiveCapacity | None = None,
+        max_length_retries: int = 2,
+        max_empty_retries: int = 2,
     ) -> None:
-        if max_retries < 0:
-            raise ValueError("max_retries must be non-negative")
+        if min(max_retries, max_length_retries, max_empty_retries) < 0:
+            raise ValueError("transport retry limits must be non-negative")
         if backoff_base < 0:
             raise ValueError("backoff_base must be non-negative")
         self.aliases = self._aliases_from_environment() if aliases is None else dict(aliases)
         self.max_retries = max_retries
+        self.max_length_retries = max_length_retries
+        self.max_empty_retries = max_empty_retries
         self.backoff_base = backoff_base
         self.capacity = capacity
 
@@ -130,18 +142,19 @@ class _RetryingTransport:
         while True:
             try:
                 response = self._complete_once(normalized_messages, resolved_model, current_params)
-            except BaseException as error:
-                transient = _is_transient_error(error)
+            except Exception as error:
+                failure = provider_failure_from_exception(
+                    error,
+                    provider=self._provider_name(),
+                    stage=ProviderFailureStage.TRANSPORT,
+                )
+                transient = _is_transient_error(failure)
                 if transient and self.capacity is not None:
                     self.capacity.on_throttle()
                 if not transient:
-                    raise
+                    raise failure from None
                 if transient_retries >= self.max_retries:
-                    endpoint = self._failure_endpoint()
-                    raise RuntimeError(
-                        f"Transport failed for model {resolved_model!r} after "
-                        f"{self.max_retries} retries{endpoint}: {error}"
-                    ) from error
+                    raise failure from None
                 self._sleep_for_retry(transient_retries)
                 transient_retries += 1
                 continue
@@ -152,7 +165,7 @@ class _RetryingTransport:
                         f"Model {resolved_model!r} returned a truncated response; "
                         "explicitly set max_tokens then retry."
                     )
-                if length_retries >= 2:
+                if length_retries >= self.max_length_retries:
                     raise TruncatedResponseError(
                         f"Model {resolved_model!r} remained truncated after {length_retries} "
                         "max_tokens retries."
@@ -161,7 +174,7 @@ class _RetryingTransport:
                 length_retries += 1
                 continue
             if not response.text:
-                if empty_retries >= 2:
+                if empty_retries >= self.max_empty_retries:
                     raise EmptyResponseError(
                         f"Model {resolved_model!r} returned an empty response after "
                         f"{empty_retries} retries."
@@ -206,6 +219,10 @@ class _RetryingTransport:
         """Return concrete-adapter context suitable for a final retry error."""
         return ""
 
+    def _provider_name(self) -> str:
+        """Return the stable provider adapter label used in typed failures."""
+        return type(self).__name__
+
 
 class LiteLLMTransport(_RetryingTransport):
     """Transport backed by LiteLLM, imported only when a call is actually made."""
@@ -225,6 +242,9 @@ class LiteLLMTransport(_RetryingTransport):
         raw_response = litellm.completion(model=model, messages=messages, **params)
         return _response_from_provider(raw_response, model)
 
+    def _provider_name(self) -> str:
+        return "litellm"
+
 
 class StdlibTransport(_RetryingTransport):
     """OpenAI-compatible transport implemented with the Python standard library."""
@@ -239,12 +259,16 @@ class StdlibTransport(_RetryingTransport):
         timeout: float = 300.0,
         *,
         capacity: AdaptiveCapacity | None = None,
+        max_length_retries: int = 2,
+        max_empty_retries: int = 2,
     ) -> None:
         super().__init__(
             aliases=aliases,
             max_retries=max_retries,
             backoff_base=backoff_base,
             capacity=capacity,
+            max_length_retries=max_length_retries,
+            max_empty_retries=max_empty_retries,
         )
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
@@ -275,6 +299,9 @@ class StdlibTransport(_RetryingTransport):
         """Add the HTTP endpoint to retry exhaustion diagnostics."""
         return f" at api_base {self.api_base!r}"
 
+    def _provider_name(self) -> str:
+        return "openai-compatible"
+
 
 def _response_from_provider(raw_response: Any, requested_model: str) -> Response:
     choices = _value(raw_response, "choices", []) or []
@@ -286,15 +313,18 @@ def _response_from_provider(raw_response: Any, requested_model: str) -> Response
     if reasoning is None:
         reasoning = _value(raw_response, "reasoning_content") or _value(raw_response, "reasoning")
     provider_response_id = _value(raw_response, "id")
+    provider_model = _value(raw_response, "model")
+    model_observed = isinstance(provider_model, str) and bool(provider_model.strip())
     return Response(
         text=text,
         usage=_mapping(_value(raw_response, "usage")),
         finish_reason=_value(choice, "finish_reason"),
         reasoning=reasoning if isinstance(reasoning, str) else None,
-        model=_value(raw_response, "model", requested_model) or requested_model,
+        model=provider_model if model_observed else requested_model,
         provider_response_id=(
             provider_response_id
             if isinstance(provider_response_id, str) and provider_response_id.strip()
             else None
         ),
+        model_observed=model_observed,
     )

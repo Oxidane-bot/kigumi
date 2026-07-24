@@ -61,9 +61,49 @@ def trace_run(
         "run_id": run_id,
         "nodes": [entries[name] for name in sorted(entries)],
     }
+    durable = durable_run_state(run_path)
+    if durable:
+        result.update(durable)
     if warnings:
         result["warnings"] = warnings
     return result
+
+
+def durable_run_state(run_path: Path) -> dict[str, Any]:
+    """Read schema-1 run/attempt state without importing an executable DAG."""
+    manifest = _read_json(run_path / "_run.json")
+    if manifest.get("run_manifest_schema") != 1:
+        return {}
+    attempts: list[dict[str, Any]] = []
+    for state_path in sorted((run_path / "attempts").glob("*/state.json")):
+        state = _read_json(state_path)
+        if state.get("attempt_receipt_schema") != 1:
+            continue
+        attempts.append(
+            {
+                key: state[key]
+                for key in (
+                    "target",
+                    "attempt",
+                    "status",
+                    "side_effect_started",
+                    "due_at",
+                    "failure",
+                    "policy_digest",
+                    "resolution",
+                )
+                if key in state
+            }
+        )
+    attempts.sort(key=lambda item: (str(item.get("target", "")), int(item.get("attempt", 0))))
+    return {
+        "run_status": manifest.get("status", "unknown"),
+        "attempts": attempts,
+        "retry_policy_digests": manifest.get("retry_policy_digests", {}),
+        "evidence_policy_digests": manifest.get("evidence_policy_digests", {}),
+        "pending_retries": manifest.get("pending_retries", []),
+        "ambiguous_attempts": manifest.get("ambiguous_attempts", []),
+    }
 
 
 def load_call(llm_cache_path: Path, key_prefix: str) -> tuple[str, dict[str, Any]]:

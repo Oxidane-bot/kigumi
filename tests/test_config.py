@@ -30,6 +30,33 @@ def test_empty_kigumi_table_activates_defaults(tmp_path: Path) -> None:
     assert config.artifacts_path == (tmp_path / "artifacts").resolve()
     assert config.llm_cache_dir == "artifacts/_llm"
     assert config.llm_cache_path == (tmp_path / "artifacts" / "_llm").resolve()
+    assert config.agent_slots == 1
+    assert config.agent_lock_path == (tmp_path / "artifacts" / "_locks" / "agents").resolve()
+    assert config.agent_slot_timeout_seconds == 300
+
+
+def test_agent_capacity_environment_overrides_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi]
+agent_slots = 2
+agent_lock_dir = "project-locks"
+agent_slot_timeout_seconds = 12
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("KIGUMI_AGENT_SLOTS", "4")
+    monkeypatch.setenv("KIGUMI_AGENT_LOCK_DIR", str(tmp_path / "machine-locks"))
+    monkeypatch.setenv("KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS", "3.5")
+
+    config = load_config(tmp_path)
+
+    assert config is not None
+    assert config.agent_slots == 4
+    assert config.agent_lock_path == (tmp_path / "machine-locks").resolve()
+    assert config.agent_slot_timeout_seconds == 3.5
 
 
 def test_unknown_config_key_fails_loudly(tmp_path: Path) -> None:

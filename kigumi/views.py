@@ -79,6 +79,9 @@ def render_mermaid(description: Mapping[str, Any], runtime: Mapping[str, Any] | 
         if runtime is not None and entry["kind"] in {"map", "scan"}:
             hit_count, miss_count = _item_cache_counts(name, runtime["metadata"])
             label += f"<br/>{hit_count} hit / {miss_count} miss"
+        if runtime is not None:
+            for detail in _runtime_details(name, entry, runtime):
+                label += f"<br/>{detail}"
         lines.append(f'{node_ids[name]}["{_mermaid_label(label)}"]')
 
     for name, entry in _nodes(description).items():
@@ -101,6 +104,9 @@ def render_mermaid(description: Mapping[str, Any], runtime: Mapping[str, Any] | 
             "classDef miss fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
             "classDef skipped fill:#e5e7eb,stroke:#6b7280,color:#374151",
             "classDef checkpoint_pending fill:#fef3c7,stroke:#d97706,color:#78350f",
+            "classDef retry_pending fill:#fef3c7,stroke:#d97706,color:#78350f",
+            "classDef ambiguous fill:#ffedd5,stroke:#ea580c,color:#7c2d12",
+            "classDef failed fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
         ]
     )
     if runtime is not None:
@@ -133,6 +139,11 @@ def render_pipeline(
                 hit_count, miss_count = _item_cache_counts(name, runtime["metadata"])
                 detail_lines.append(
                     f'<div class="node-counts">{hit_count} hit / {miss_count} miss</div>'
+                )
+            if runtime is not None:
+                detail_lines.extend(
+                    f'<div class="node-runtime">{_pipeline_escape(detail)}</div>'
+                    for detail in _runtime_details(name, entry, runtime)
                 )
             cards.append(
                 f'<div class="node" style="{_pipeline_node_style(entry)}">'
@@ -187,12 +198,15 @@ h1 {{ color: #444; font-size: 14px; font-weight: 600; margin-bottom: 8px; text-a
   font-size: 9.5px; line-height: 1.3; margin-top: 3px; overflow: hidden;
 }}
 .node-type {{ color: #999; font-size: 9px; font-style: italic; margin-top: 3px; }}
-.node-status, .node-counts {{ font-size: 9px; margin-top: 3px; }}
+.node-status, .node-counts, .node-runtime {{ font-size: 9px; margin-top: 3px; }}
 .status-hit {{ color: #2e7d32; }}
 .status-miss {{ color: #c62828; }}
 .status-pending {{ color: #b8860b; }}
+.status-retry_pending {{ color: #b8860b; }}
+.status-ambiguous {{ color: #ea580c; }}
+.status-failed {{ color: #c62828; }}
 .status-skipped {{ color: #757575; }}
-.node-counts {{ color: #777; }}
+.node-counts, .node-runtime {{ color: #777; }}
 .connector {{ display: flex; height: 20px; justify-content: center; }}
 </style>
 </head>
@@ -232,7 +246,8 @@ def render_pipeline_text(
                 if runtime is not None and entry["kind"] in {"map", "scan"}
                 else None
             )
-            cards.append(_pipeline_text_card(name, entry, status, counts))
+            details = _runtime_details(name, entry, runtime) if runtime is not None else []
+            cards.append(_pipeline_text_card(name, entry, status, counts, details))
 
         content_height = max((height for _, _, height, _ in cards), default=0)
         card_lines = [
@@ -346,6 +361,7 @@ def _pipeline_text_card(
     entry: Mapping[str, Any],
     status: str | None,
     counts: tuple[int, int] | None,
+    details: list[str],
 ) -> tuple[str, list[str], int, int]:
     """准备一个文本工位框的内容，并计算同波次对齐所需高度。"""
     type_label = _pipeline_text_type_label(entry)
@@ -358,6 +374,7 @@ def _pipeline_text_card(
     if counts is not None:
         hit_count, miss_count = counts
         contents.append(f"{hit_count} hit / {miss_count} miss")
+    contents.extend(details)
     width = min(
         22,
         max(12, max(_pipeline_text_width(line) for line in (*contents, type_label)) + 2),
@@ -441,6 +458,40 @@ def _pipeline_status(name: str, entry: Mapping[str, Any], runtime: Mapping[str, 
     return "pending" if state == "checkpoint_pending" else state
 
 
+def _runtime_details(name: str, entry: Mapping[str, Any], runtime: Mapping[str, Any]) -> list[str]:
+    """Expose durable attempt and evidence bindings in run-aware graphs."""
+    details: list[str] = []
+    states = runtime.get("attempt_states", {}).get(name, [])
+    if states:
+        priority = {
+            "ambiguous": 0,
+            "retry_scheduled": 1,
+            "failed": 2,
+            "running": 3,
+            "success_candidate": 4,
+            "completed": 5,
+        }
+        state = min(states, key=lambda item: priority.get(str(item.get("status")), 99))
+        details.append(f"attempt={state.get('attempt', '?')}")
+        if state.get("due_at") is not None:
+            details.append(f"due={state['due_at']}")
+        failure = state.get("failure")
+        if isinstance(failure, Mapping):
+            provider_failure = failure.get("provider_failure")
+            kind = (
+                failure.get("kind")
+                or failure.get("runtime_code")
+                or (provider_failure.get("kind") if isinstance(provider_failure, Mapping) else None)
+                or failure.get("failure_type")
+            )
+            if kind is not None:
+                details.append(f"failure={kind}")
+    evidence_digest = entry.get("evidence_policy_digest")
+    if isinstance(evidence_digest, str):
+        details.append(f"evidence={evidence_digest[:12]}")
+    return details
+
+
 def _item_cache_counts(name: str, metadata: Mapping[str, Mapping[str, Any]]) -> tuple[int, int]:
     """仅从 item sidecar 汇总 map 或 scan 的 hit/miss，不重新计算键。"""
     prefix = f"{name}@"
@@ -455,6 +506,12 @@ def _item_cache_counts(name: str, metadata: Mapping[str, Mapping[str, Any]]) -> 
 def _render_state(name: str, entry: Mapping[str, Any], runtime: Mapping[str, Any]) -> str | None:
     """映射 sidecar 与已知检查点到 Mermaid class，缺失记录保持未着色。"""
     metadata = runtime["metadata"]
+    if name in runtime.get("ambiguous_nodes", set()):
+        return "ambiguous"
+    if name in runtime.get("retry_nodes", set()):
+        return "retry_pending"
+    if name in runtime.get("failed_nodes", set()):
+        return "failed"
     if (metadata_entry := metadata.get(name)) is not None and metadata_entry.get("cache") in {
         "hit",
         "miss",

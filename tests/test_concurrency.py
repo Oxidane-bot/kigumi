@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from kigumi._runstate import RunManifestError
 from kigumi.calling import DryRunError, LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import CheckpointPending, Dag
@@ -62,8 +63,10 @@ def _make_dag(tmp_path: Path) -> Dag:
     return Dag(config, LLMCaller(FakeTransport(), tmp_path))
 
 
-def test_parallel_nodes_archive_under_one_history_id(tmp_path: Path, monkeypatch: Any) -> None:
-    """同一 run 的并发重写必须共用一个 history id。"""
+def test_parallel_changed_run_declaration_does_not_archive(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """0.6 manifests reject changed declarations before archive allocation."""
     import kigumi.dag as dag_module
 
     barrier = threading.Barrier(2)
@@ -95,10 +98,11 @@ def test_parallel_nodes_archive_under_one_history_id(tmp_path: Path, monkeypatch
         return original(path)
 
     monkeypatch.setattr(dag_module.store, "next_history_id", count_history_id)
-    build(2).run(run_id="shared", workers=2)
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        build(2).run(run_id="shared", workers=2)
 
-    assert calls == 1
-    assert (tmp_path / "artifacts" / "runs" / "shared" / "history" / "0001").is_dir()
+    assert calls == 0
+    assert not (tmp_path / "artifacts" / "runs" / "shared" / "history").exists()
 
 
 def test_map_parallel_failures_preserve_all_details_and_dry_run(tmp_path: Path) -> None:

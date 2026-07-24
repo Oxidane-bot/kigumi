@@ -2,6 +2,55 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [0.6.0] - 2026-07-24
+
+### 新增
+
+- 新增 CALL/Agent 共用的 `ProviderFailure`、`ProviderFailureStage`、
+  `ProviderFailureKind`，以及仅描述 Agent spawn/version/process/protocol/policy/capacity
+  故障的 `AgentExecutionFailure` 与 `AgentRuntimeFailureCode`。控制流只依赖 wire status、
+  typed SDK 字段和运行时事实；provider prose 只保留脱敏摘要。
+- 新增 `EvidencePolicy`，分别控制 request、response、stderr 与 trajectory 的 `full`、
+  `redacted`、`hash_only` 保留模式。所有模式先强制清理 credential、header secret 和 URL
+  query；canonical artifact 与执行 evidence 分离，policy digest 绑定不可变 origin provenance。
+- 新增默认 1 slot 的跨线程/跨进程 Agent 容量门禁；项目配置与
+  `KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
+  `KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS` 可覆盖。cache hit 不占 slot，排队不消耗执行 timeout。
+- 新增显式 `RetryPolicy`、`RetrySchedule`、`RetryExhausted` 与
+  `AmbiguousAttemptError`。`Dag.node`、`Dag.agent`、map/scan 可声明 durable retry；默认
+  `retry=None`，不会自动重试。
+- 新增 schema-1 run manifest 与 attempt receipt、成功 candidate、确定性 full jitter、
+  provider retry-after 下界、ambiguous side-effect 裁决和 `Dag.resume()`。
+  `dag resume`、`dag retry-resolve`、`kigumi runs show`、`kigumi trace` 与 run-aware graph
+  暴露 attempt、due time、typed failure、evidence policy 和恢复状态。
+
+### 变更
+
+- **硬切**：`CACHE_SCHEMA` 从 3 升至 4，node cache envelope 升至 schema 2；
+  `agent_executor_schema` 升至 3，canonical Agent artifact 升至 `agent_schema=2`。
+  0.5.x L3/Agent cache 自然 miss，不提供迁移或兼容 shim。
+- **硬切**：0.6 run 由 `_run.json` 绑定 graph、targets、force、源码/libs、retry 和 evidence
+  policy identity。缺少 manifest 的 0.5.x run 仅 best-effort 只读，明确拒绝 resume；
+  同一 0.6 run 的声明漂移 fail closed。
+- Agent canonical artifact 只保留 task/completion、Agent identity、collected attachments、
+  published outputs 和 `files`；usage、duration、workspace manifest、RPC、stderr、
+  trajectory、Hook 与执行 metadata 迁入 hash-bound origin provenance。
+- CALL failed metadata 与 Agent failure JSON 改为 canonical typed failure。429、5xx、
+  timeout、connection、401/403、invalid request、model mismatch 与 unknown 均有稳定分类。
+- Pi bridge 绑定独立路径策略资源，拒绝 `.kigumi/**` 的大小写别名；adapter 关闭并监测
+  hidden retry，验证 thinking-off 和 response model observation，扫描 workspace credential
+  泄漏，并压缩累积 streaming trajectory。
+- 标准 transport 分别配置 transport、length 与 empty-response retry；durable CALL 在任一
+  hidden retry 非零时于 provider side effect 前拒绝。`Response.model_observed` 明确区分实际
+  wire observation 与 requested-model fallback。
+- GC 的 blob reachability 扩展到 retained sidecar、failure、attempt receipt 和 candidate；
+  普通 materializer 仍不解释 evidence。
+
+### 移除
+
+- 移除旧 Agent failure code API；不保留装饰性 failure 枚举或兼容别名。
+- 不引入 ArtifactRef、跨图 handoff、outbox、自动 winner、Agent factory 或动态 Agent 拓扑。
+
 ## [0.5.0] - 2026-07-23
 
 ### 新增

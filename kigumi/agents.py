@@ -21,6 +21,17 @@ from typing import Any, Literal, Protocol
 
 from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
+from .evidence import EvidenceMode, EvidencePolicy, capture_evidence
+from .failures import (
+    AgentExecutionFailure,
+    AgentRuntimeFailureCode,
+    ProviderFailure,
+    canonical_failure,
+)
+
+AGENT_EXECUTOR_SCHEMA = 3
+AGENT_SCHEMA = 2
+_DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
 class AgentError(RuntimeError):
@@ -586,11 +597,19 @@ def agent_external_identity(adapter: AgentAdapter, spec: AgentSpec) -> dict[str,
     _reject_credentials(identity)
     canonical_json(identity)
     return {
-        "agent_executor_schema": 2,
+        "agent_executor_schema": AGENT_EXECUTOR_SCHEMA,
         "adapter": identity,
         "spec": spec.identity(),
         "isolation": {"level": "staged", "enforced_by": "kigumi-workspace"},
     }
+
+
+@dataclass(frozen=True)
+class AgentTaskExecution:
+    """Canonical Agent artifact and its separately retained execution evidence."""
+
+    artifact: dict[str, Any]
+    provenance: dict[str, Any]
 
 
 def execute_agent_task(
@@ -606,7 +625,8 @@ def execute_agent_task(
     adapter: AgentAdapter,
     adapter_identity: Mapping[str, Any],
     spec: AgentSpec,
-) -> dict[str, Any]:
+    evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+) -> AgentTaskExecution:
     expected_adapter = adapter_identity.get("adapter")
     unkeyed = isinstance(expected_adapter, Mapping) and expected_adapter.get("unkeyed") is True
     if not unkeyed and (
@@ -659,16 +679,20 @@ def execute_agent_task(
         evidence_bytes += len(data)
         if evidence_bytes > limits.max_bytes:
             raise AgentResultError("Agent evidence exceeds max_bytes")
-        digest = blob_store.put(data)
         evidence_names.add(checked)
-        evidence.append(
-            {
-                "kigumi_attachment": digest,
-                "workspace_path": f".kigumi/evidence/{checked}",
-                "bytes": len(data),
-                "media_type": media_type,
-            }
-        )
+        mode = evidence_policy.stderr if "stderr" in checked.lower() else evidence_policy.trajectory
+        captured = capture_evidence(data, media_type=media_type, mode=mode)
+        reference = {
+            **captured.descriptor,
+            "workspace_path": f".kigumi/evidence/{checked}",
+        }
+        if captured.data is not None:
+            reference["kigumi_attachment"] = blob_store.put(captured.data)
+            reference["stored_bytes"] = len(captured.data)
+        evidence.append(reference)
+
+    if not isinstance(evidence_policy, EvidencePolicy):
+        raise TypeError("evidence_policy must be EvidencePolicy")
 
     try:
         for declared in declared_files:
@@ -738,9 +762,8 @@ def execute_agent_task(
                     {"source": mapping.source, "path": mapping.destination, "bytes": len(data)}
                 )
         artifact: dict[str, Any] = {
-            "agent_schema": 1,
-            "task_sha": sha(task.canonical()),
-            "status": "completed",
+            "agent_schema": AGENT_SCHEMA,
+            "task": task.canonical(),
             "completion": result.completion.canonical(),
             "agent": {
                 **copy.deepcopy(dict(adapter_identity)),
@@ -749,46 +772,77 @@ def execute_agent_task(
                     "terminal": capabilities.terminal,
                 },
                 "isolation": {"level": "staged", "enforced_by": "kigumi-workspace"},
-                "execution": dict(result.metadata),
             },
-            "usage": dict(result.usage) if result.usage is not None else None,
-            "duration_seconds": time.monotonic() - started,
-            "manifest": _manifest_changes(baseline, _workspace_manifest(workspace)),
             "attachments": attachments,
-            "evidence": evidence,
             "published": published,
-            "trajectory": _capture_trajectory(events, truncated, blob_store),
         }
         if files:
             artifact["files"] = files
         validate_agent_artifact(artifact, blob_store)
-        return artifact
+        duration_seconds = time.monotonic() - started
+        trajectory = _capture_trajectory(
+            events,
+            truncated,
+            blob_store,
+            mode=evidence_policy.trajectory,
+        )
+        provenance = {
+            "task_sha256": sha(task.canonical()),
+            "instruction_sha256": sha(task.instruction),
+            "spec_digest": spec.digest,
+            "usage": dict(result.usage) if result.usage is not None else None,
+            "duration_seconds": duration_seconds,
+            "workspace_manifest": _manifest_changes(baseline, _workspace_manifest(workspace)),
+            "execution": dict(result.metadata),
+            "trajectory": trajectory,
+            "evidence": evidence,
+            "exit_reason": "completed",
+            "evidence_policy": evidence_policy.canonical(),
+            "evidence_policy_digest": evidence_policy.digest,
+        }
+        return AgentTaskExecution(artifact, provenance)
     except Exception as error:
         try:
             failure_attachments = _collect(workspace, task.collect, limits, blob_store)
         except Exception:
             failure_attachments = []
         usage, stop_reason = _trajectory_summary(events)
+        if isinstance(error, AgentExecutionFailure):
+            typed_error = error
+        elif isinstance(error, ProviderFailure):
+            typed_error = AgentExecutionFailure(provider_failure=error)
+        else:
+            typed_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.PROTOCOL)
         failure = {
-            "agent_schema": 1,
+            "failure_schema": 1,
             "node": node_name,
+            "task_sha256": sha(task.canonical()),
+            "instruction_sha256": sha(task.instruction),
             "status": "failed",
-            "error_type": type(error).__name__,
-            "error": str(error),
+            "failure": canonical_failure(typed_error),
             "usage": usage,
             "stop_reason": stop_reason,
             "duration_seconds": time.monotonic() - started,
-            "manifest": _manifest_changes(baseline, _workspace_manifest(workspace)),
+            "workspace_manifest": _manifest_changes(baseline, _workspace_manifest(workspace)),
             "attachments": failure_attachments,
             "published": [],
-            "trajectory": _capture_trajectory(events, truncated, blob_store),
+            "trajectory": _capture_trajectory(
+                events,
+                truncated,
+                blob_store,
+                mode=evidence_policy.trajectory,
+            ),
             "evidence": evidence,
+            "evidence_policy": evidence_policy.canonical(),
+            "evidence_policy_digest": evidence_policy.digest,
         }
         atomic_write_json(
             artifacts_path / "runs" / run_id / "failures" / f"{node_name}.json",
             failure,
         )
-        raise
+        if typed_error is error:
+            raise
+        raise typed_error from error
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -862,8 +916,25 @@ def _manifest_changes(before: Mapping[str, str], after: Mapping[str, str]) -> li
 
 
 def validate_agent_artifact(artifact: Mapping[str, Any], blob_store: BlobStore) -> None:
-    if artifact.get("agent_schema") != 1:
+    if artifact.get("agent_schema") != AGENT_SCHEMA:
         raise AgentResultError("Agent artifact has an unsupported schema")
+    allowed = {
+        "agent_schema",
+        "task",
+        "completion",
+        "agent",
+        "attachments",
+        "published",
+        "files",
+    }
+    if extra := set(artifact) - allowed:
+        raise AgentResultError(
+            "Agent artifact contains execution evidence outside origin provenance: "
+            + ", ".join(sorted(extra))
+        )
+    task = artifact.get("task")
+    if not isinstance(task, Mapping) or not isinstance(task.get("instruction"), str):
+        raise AgentResultError("Agent artifact task must be canonical task data")
     completion_value = artifact.get("completion")
     if not isinstance(completion_value, Mapping):
         raise AgentResultError("Agent artifact completion must be an object")
@@ -924,36 +995,54 @@ def validate_agent_artifact(artifact: Mapping[str, Any], blob_store: BlobStore) 
     actual_blobs = list(_materializable_blob_references(artifact))
     if actual_blobs != expected_blobs:
         raise AgentResultError("Agent artifact blobs must come only from exact publications")
-    trajectory = artifact.get("trajectory")
-    if isinstance(trajectory, dict) and "kigumi_attachment" in trajectory:
-        _validate_attachment_reference(trajectory, blob_store)
-    evidence = artifact.get("evidence", [])
-    if not isinstance(evidence, list):
-        raise AgentResultError("Agent artifact evidence must be a list")
-    for reference in evidence:
-        if not isinstance(reference, dict):
-            raise AgentResultError("Agent evidence reference must be an object")
-        _validate_attachment_reference(reference, blob_store)
+
+
+def validate_agent_provenance(provenance: Mapping[str, Any], blob_store: BlobStore) -> None:
+    """Verify every retained Agent evidence attachment before cold/warm replay."""
+    for reference in _evidence_attachment_references(provenance):
+        digest = reference.get("kigumi_attachment")
+        path = reference.get("workspace_path")
+        stored_bytes = reference.get("stored_bytes", reference.get("bytes"))
+        if (
+            not isinstance(digest, str)
+            or not isinstance(path, str)
+            or not isinstance(stored_bytes, int)
+        ):
+            raise AgentResultError("Agent evidence attachment marker is malformed")
+        _workspace_pattern(path)
+        data = blob_store.read_verified(digest)
+        if len(data) != stored_bytes:
+            raise AgentResultError(f"Agent evidence attachment {path!r} byte count does not match")
 
 
 def _capture_trajectory(
-    events: list[dict[str, Any]], truncated: bool, blob_store: BlobStore
+    events: list[dict[str, Any]],
+    truncated: bool,
+    blob_store: BlobStore,
+    *,
+    mode: EvidenceMode,
 ) -> dict[str, Any]:
     if not events:
-        return {"events": 0, "truncated": truncated}
+        return {"events": 0, "truncated": truncated, "mode": mode}
     data = "".join(
         json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         for event in events
     ).encode("utf-8")
-    digest = blob_store.put(data)
-    return {
-        "kigumi_attachment": digest,
+    captured = capture_evidence(
+        data,
+        media_type="application/x-ndjson",
+        mode=mode,
+    )
+    result = {
+        **captured.descriptor,
         "workspace_path": ".kigumi/normalized-events.jsonl",
-        "bytes": len(data),
-        "media_type": "application/x-ndjson",
         "events": len(events),
         "truncated": truncated,
     }
+    if captured.data is not None:
+        result["kigumi_attachment"] = blob_store.put(captured.data)
+        result["stored_bytes"] = len(captured.data)
+    return result
 
 
 def _trajectory_summary(
@@ -1001,3 +1090,14 @@ def _materializable_blob_references(value: Any) -> Iterable[dict[str, Any]]:
     elif isinstance(value, list):
         for child in value:
             yield from _materializable_blob_references(child)
+
+
+def _evidence_attachment_references(value: Any) -> Iterable[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        if "kigumi_attachment" in value:
+            yield value
+        for child in value.values():
+            yield from _evidence_attachment_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _evidence_attachment_references(child)

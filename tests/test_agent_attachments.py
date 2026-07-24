@@ -13,7 +13,8 @@ def test_ordinary_materializer_ignores_attachment_and_view_verifies_it(tmp_path:
     blobs = BlobStore(tmp_path / "artifacts" / "_cache" / "blobs")
     digest = blobs.put(b"notes")
     artifact = {
-        "agent_schema": 1,
+        "agent_schema": 2,
+        "task": {"instruction": "write", "collect": [], "publish": []},
         "completion": {
             "status": "completed",
             "summary": "done",
@@ -28,6 +29,8 @@ def test_ordinary_materializer_ignores_attachment_and_view_verifies_it(tmp_path:
                 "media_type": "text/markdown",
             }
         ],
+        "agent": {},
+        "published": [],
     }
     assert materialize_artifact(artifact, "agent", lambda path: tmp_path / path, blobs) == []
     view = AgentResultView(artifact, blobs)
