@@ -45,7 +45,7 @@ from kigumi.transport import LiteLLMTransport
 
 capacity = AdaptiveCapacity("artifacts/request_capacity", max_slots=32)
 transport = LiteLLMTransport(..., capacity=capacity)  # L0:发请求/429 自适应容量
-caller = LLMCaller(                                   # L1:缓存/预算/dry-run/溯源
+caller = LLMCaller(  # L1:缓存/预算/dry-run/溯源
     transport,
     cache_dir=Path("artifacts/_llm"),
     budget=Budget(max_tokens=2_000_000),
@@ -64,20 +64,25 @@ caller = LLMCaller(                                   # L1:缓存/预算/dry-run
 from kigumi import Dag
 from kigumi.config import KigumiConfig
 
+
 def observe(node_name, artifact, cache_hit):
     log_node(node_name, cache_hit=cache_hit)  # 指标、日志或追踪的观测钩子
 
+
 dag = Dag(KigumiConfig(project_root=Path(__file__).parent), caller, post_node=observe)
+
 
 @dag.node("outline", prompts=("outline",), files=("fixtures/style.md",))
 def outline(inputs, ctx):
-    prompt = ctx.render("outline", material=...)      # 严格渲染,槽位不符即炸
+    prompt = ctx.render("outline", material=...)  # 严格渲染,槽位不符即炸
     return {"text": ctx.call(prompt)}
+
 
 @dag.node("review", deps=("outline",))
 def review(inputs, ctx):
     approved = ctx.checkpoint("outline_ok", inputs["outline"])  # 人工闸
     return {"approved": approved}
+
 
 result = dag.run(workers=4)
 ```
@@ -120,6 +125,7 @@ retry = RetryPolicy(
     jitter="full",
 )
 
+
 @dag.node("outline", retry=retry)
 def outline(inputs, ctx):
     return {"text": ctx.call("...")}
@@ -152,6 +158,7 @@ attempt 边界可见、不能把不确定执行静默当成可安全重试。map
 def prompt_slots(artifact):
     return {"title": artifact["title"], "summary": artifact["summary"]}
 
+
 @dag.node(
     "draft",
     deps=("outline",),
@@ -178,8 +185,8 @@ L3 缓存策略在注册时显式声明，非法值（包括 bool、别名和大
 ```python
 @dag.node(
     "inventory",
-    cache="refresh",                    # auto=读写；refresh=跳读后替换；off=不读不写
-    external_fingerprint={"etag": etag}, # 只把 sha(...) 作为 external 键成分
+    cache="refresh",  # auto=读写；refresh=跳读后替换；off=不读不写
+    external_fingerprint={"etag": etag},  # 只把 sha(...) 作为 external 键成分
 )
 def inventory(inputs, ctx): ...
 ```
@@ -194,7 +201,9 @@ unknown。普通节点、map item、scan item 都遵循同一策略，L1 `LLMCal
 
 ```python
 @dag.foreach(
-    "analyze_{chunk_id}", chunks, files=("fixtures/style.md",),
+    "analyze_{chunk_id}",
+    chunks,
+    files=("fixtures/style.md",),
     files_fn=lambda chunk: (chunk["clip"],),
 )
 def analyze(inputs, ctx): ...
@@ -218,13 +227,16 @@ from kigumi import Subgraph
 
 editorial = Subgraph(inputs=("source",), outputs={"result": "publish"})
 
+
 @editorial.node("draft", deps=("source",))
 def draft(inputs, ctx):
     return {"text": make_draft(inputs["source"])}  # 本地键，不是 qualified 名
 
+
 @editorial.node("publish", deps=("draft",), cache="auto")
 def publish(inputs, ctx):
     return {"text": publish_text(inputs["draft"])}
+
 
 mounted = dag.mount(editorial, "editorial", inputs={"source": "outline"})
 assert mounted == {"result": "editorial.publish"}
@@ -385,7 +397,7 @@ sidecar、trace 和 explain 取证。
 
 ```python
 plan = dag.plan(targets=("deliver",))
-assert len(plan.misses) <= 3       # 真实请求前的成本闸门
+assert len(plan.misses) <= 3  # 真实请求前的成本闸门
 assert len(plan.certain) <= len(plan.misses)
 result = dag.run(targets=("deliver",))
 ```
@@ -396,10 +408,10 @@ result = dag.run(targets=("deliver",))
 即可调用,不要求跑过:
 
 ```python
-description = dag.describe()          # 含 cache、外部指纹存在性、subgraph 边界
-print(dag.render_summary())           # Markdown 声明表,一节点一行
-print(dag.render_mermaid())           # Mermaid 图源,GitHub/编辑器直接渲染
-print(dag.render_mermaid(run_id))     # 叠加某次 run:hit/miss/挂起/跳过着色
+description = dag.describe()  # 含 cache、外部指纹存在性、subgraph 边界
+print(dag.render_summary())  # Markdown 声明表,一节点一行
+print(dag.render_mermaid())  # Mermaid 图源,GitHub/编辑器直接渲染
+print(dag.render_mermaid(run_id))  # 叠加某次 run:hit/miss/挂起/跳过着色
 ```
 
 声明表是缺声明洞的第一道人肉检查:某节点明明读文件,`files` 一栏却是空的——
@@ -505,14 +517,15 @@ GC 只管理 kigumi 的 run、节点缓存和 blob 数据，不删除外部 sour
 
 ```python
 @dag.foreach(
-    "workbench_{episode}", episodes,
+    "workbench_{episode}",
+    episodes,
     deps=lambda item: (
-        ("review_ledger",) if item["episode"] == 1
-        else (f"update_ledger_{item['episode'] - 1}",)
+        ("review_ledger",) if item["episode"] == 1 else (f"update_ledger_{item['episode'] - 1}",)
     ),
     params_fn=lambda item: {
         **item,
-        "ledger_dep": "review_ledger" if item["episode"] == 1
+        "ledger_dep": "review_ledger"
+        if item["episode"] == 1
         else f"update_ledger_{item['episode'] - 1}",
     },
 )
@@ -556,9 +569,7 @@ from kigumi import AdaptiveCapacity, FileSlots, LLMCaller
 from kigumi.transport import LiteLLMTransport
 
 capacity_path = Path(os.environ["KIGUMI_REQUEST_CAPACITY_FILE"])
-capacity = AdaptiveCapacity(
-    capacity_path, max_slots=32, min_slots=1, ramp_successes=8
-)
+capacity = AdaptiveCapacity(capacity_path, max_slots=32, min_slots=1, ramp_successes=8)
 transport = LiteLLMTransport(..., capacity=capacity)
 slots = FileSlots(os.environ["KIGUMI_REQUEST_LOCK_DIR"], slots=32, capacity_file=capacity_path)
 caller = LLMCaller(transport, cache_dir=..., slots=slots)
@@ -606,6 +617,7 @@ from kigumi.testing import CassetteTransport, FakeTransport
 ```python
 import pytest
 from kigumi.testing import skip_unless_env
+
 
 @pytest.mark.live
 @skip_unless_env("MODEL_API_KEY", "MODEL_BASE_URL")
@@ -686,6 +698,7 @@ def repair_proposal(inputs, ctx):
     prompt = ctx.render("repair", draft=inject(inputs["draft"]), review=inject(inputs["review"]))
     return ctx.call_validated(prompt, RepairProposal).model_dump()
 
+
 @dag.node("repair_gate", deps=("repair_proposal",))
 def repair_gate(inputs, ctx):
     """只做人工闸:不发调用,批准绑定提案内容本身。"""
@@ -706,12 +719,14 @@ def repair_gate(inputs, ctx):
 ```python
 from kigumi import Judgment, gated_metric, llm_judge, pairwise_judge
 
-def format_gate(example, output) -> Judgment:      # 合规轴:普通 Python 函数
+
+def format_gate(example, output) -> Judgment:  # 合规轴:普通 Python 函数
     ok = validate_screenplay_format(output)
     return Judgment(1.0 if ok else 0.0, feedback=..., tags=("format",))
 
+
 quality = pairwise_judge(caller, rubric=..., reference_key="reference")
-metric = gated_metric(format_gate, quality)         # 闸没过不烧评委调用
+metric = gated_metric(format_gate, quality)  # 闸没过不烧评委调用
 ```
 
 - 合规(格式、长度、必含要素)是硬闸,写成确定性函数,满分才放行品质评委。
@@ -730,14 +745,14 @@ from kigumi import evolve_prompt
 
 result = evolve_prompt(
     template=seed_text,
-    train_examples=train,      # 反思材料只来自这里
-    val_examples=val,          # 去留、前沿、胜出只看这里
+    train_examples=train,  # 反思材料只来自这里
+    val_examples=val,  # 去留、前沿、胜出只看这里
     task=lambda text, ex: run_pipeline(text, ex),
     metric=metric,
     caller=caller,
-    state_path=Path("artifacts/evolve_state.json"),   # 断点续跑
+    state_path=Path("artifacts/evolve_state.json"),  # 断点续跑
 )
-print(result.generalization_gap)   # train 均分 - val 均分,过拟合观测值
+print(result.generalization_gap)  # train 均分 - val 均分,过拟合观测值
 ```
 
 必须知道的机制(这些是代码闸门,不是建议):
@@ -855,6 +870,7 @@ from kigumi import (
 
 spec = AgentSpec.load("agents/writer")
 adapter = PiRpcAdapter(("pi",), expected_version="0.81.1")
+
 
 @dag.agent(
     "draft",
@@ -1003,6 +1019,6 @@ kigumi diff run-0041 run-0042 --json
 
 ```python
 report = dag.explain("p2_variants@E2S4")
-print(report)          # 中文可读报告:状态 + 变化成分 + 新旧摘要
-report.changed         # 如 ["item_files:fixtures/scenes/E2S4.txt"]
+print(report)  # 中文可读报告:状态 + 变化成分 + 新旧摘要
+report.changed  # 如 ["item_files:fixtures/scenes/E2S4.txt"]
 ```
