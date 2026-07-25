@@ -139,8 +139,8 @@ class PiRpcAdapter:
     def cache_identity(self) -> dict[str, Any]:
         return {
             "adapter": "pi-rpc",
-            "adapter_schema": 1,
-            "rpc": "strict-lf-jsonl",
+            "adapter_schema": 2,
+            "rpc": "strict-lf-jsonl+normalized-evidence-v2",
             "command": list(self.command),
             "expected_version": self.expected_version,
             "bridge_sha256": _bridge_digest(),
@@ -162,7 +162,7 @@ class PiRpcAdapter:
             raise AgentResultError("Pi env_resolver must return string keys and values")
         environment.update(resolved)
         secrets = tuple(value for value in resolved.values() if value)
-        raw_stdout = bytearray()
+        rpc_evidence = bytearray()
         stderr = bytearray()
         stderr_truncated = False
         process: subprocess.Popen[bytes] | None = None
@@ -295,11 +295,6 @@ class PiRpcAdapter:
                     if not settled:
                         raise _pi_failure(_PiFailureCode.PI_PROCESS_EXIT)
                     break
-                if len(raw_stdout) + len(chunk) > request.spec.limits.rpc_max_bytes:
-                    remaining_bytes = max(request.spec.limits.rpc_max_bytes - len(raw_stdout), 0)
-                    raw_stdout.extend(chunk[:remaining_bytes])
-                    raise AgentResultError("Pi RPC evidence exceeds rpc_max_bytes")
-                raw_stdout.extend(chunk)
                 buffer.extend(chunk)
                 while True:
                     newline = buffer.find(b"\n")
@@ -307,6 +302,8 @@ class PiRpcAdapter:
                         break
                     raw_line = bytes(buffer[:newline])
                     del buffer[: newline + 1]
+                    if len(raw_line) + 1 > request.spec.limits.rpc_max_bytes:
+                        raise AgentResultError("Pi RPC record exceeds rpc_max_bytes")
                     if raw_line.endswith(b"\r"):
                         raise AgentResultError("Pi RPC stdout must use strict LF framing")
                     if not raw_line:
@@ -318,7 +315,15 @@ class PiRpcAdapter:
                     ):
                         thinking_events += 1
                     redacted_event = _redact_payload(event, secrets)
-                    context.emit_event(normalize_pi_trajectory_event(redacted_event))
+                    normalized_event = normalize_pi_trajectory_event(redacted_event)
+                    evidence_line = _canonical_jsonl_record(normalized_event)
+                    if not _append_record_bounded(
+                        rpc_evidence,
+                        evidence_line,
+                        request.spec.limits.rpc_max_bytes,
+                    ):
+                        raise AgentResultError("Pi RPC evidence exceeds rpc_max_bytes")
+                    context.emit_event(normalized_event)
                     if request.spec.thinking == "off" and thinking_events:
                         raise AgentResultError(
                             "Pi emitted thinking content while AgentSpec thinking=off"
@@ -437,6 +442,8 @@ class PiRpcAdapter:
                                 usage = _merge_usage(usage, normalized)
                     elif event_type == "agent_settled":
                         settled = True
+                if len(buffer) > request.spec.limits.rpc_max_bytes:
+                    raise AgentResultError("Pi RPC record exceeds rpc_max_bytes")
             if not prompt_accepted:
                 raise _pi_failure(_PiFailureCode.MALFORMED_RESPONSE_ENVELOPE)
             if completion is None:
@@ -480,20 +487,13 @@ class PiRpcAdapter:
                     stdout_thread.join(timeout=0.5)
                 if stderr_thread is not None:
                     stderr_thread.join(timeout=0.5)
-            trailing_rpc_overflow = False
             if chunks is not None:
                 while True:
                     try:
-                        trailing = chunks.get_nowait()
+                        chunks.get_nowait()
                     except queue.Empty:
                         break
-                    if trailing is None:
-                        continue
-                    if isinstance(trailing, BaseException):
-                        continue
-                    if not _append_bounded(raw_stdout, trailing, request.spec.limits.rpc_max_bytes):
-                        trailing_rpc_overflow = True
-            rpc_data = _redact_bytes(bytes(raw_stdout), secrets)
+            rpc_data = bytes(rpc_evidence)
             stderr_data = _redact_bytes(bytes(stderr), secrets)
             if stderr_truncated:
                 stderr_data = _bounded_marker(
@@ -517,8 +517,6 @@ class PiRpcAdapter:
             )
             context.record_evidence("pi-rpc.jsonl", rpc_data, "application/x-ndjson")
             context.record_evidence("pi-stderr.txt", stderr_data, "text/plain")
-            if trailing_rpc_overflow:
-                raise AgentResultError("Pi RPC evidence exceeds rpc_max_bytes")
 
     def _probe_version(
         self, environment: Mapping[str, str], deadline: float
@@ -620,6 +618,18 @@ def normalize_pi_trajectory_event(event: Mapping[str, Any]) -> dict[str, Any]:
     return json.loads(canonical)
 
 
+def _canonical_jsonl_record(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
 def _contains_thinking_content(value: Any) -> bool:
     if isinstance(value, Mapping):
         if value.get("type") == "thinking":
@@ -684,6 +694,13 @@ def _append_bounded(target: bytearray, data: bytes, limit: int) -> bool:
     remaining = max(limit - len(target), 0)
     target.extend(data[:remaining])
     return len(data) <= remaining
+
+
+def _append_record_bounded(target: bytearray, data: bytes, limit: int) -> bool:
+    if len(target) + len(data) > limit:
+        return False
+    target.extend(data)
+    return True
 
 
 def _bounded_marker(data: bytes, limit: int, marker: bytes) -> bytes:

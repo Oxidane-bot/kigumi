@@ -2,6 +2,23 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [0.7.1] - 2026-07-25
+
+### 修复
+
+- Pi RPC evidence 不再重复保存 `message_update` 的累计完整消息。每个 update 改为保存
+  脱敏 canonical event 的 SHA-256、原始字节数和 thinking-content 标记；`message_end`、
+  tool、response 与 settled 等非累计事件仍保存完整脱敏记录。`rpc_max_bytes` 现在约束
+  规范化 JSONL evidence，同时继续作为单个 wire JSONL record 的硬上限。
+- `AgentLimits` 现在拒绝 `rpc_max_bytes > max_single_file_bytes`，避免 finally 阶段记录
+  `pi-rpc.jsonl` 时用第二个额度错误掩盖首个执行结果。
+
+### 变更
+
+- **硬切**：`agent_executor_schema` 从 3 升至 4，Pi adapter identity schema 从 1 升至 2，
+  RPC identity 改为 `strict-lf-jsonl+normalized-evidence-v2`。旧 Agent L3 cache 自然 miss，
+  不提供原始累计 RPC evidence 的兼容或恢复路径。
+
 ## [0.7.0] - 2026-07-24
 
 ### 新增

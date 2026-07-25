@@ -33,7 +33,7 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 1. `Dag.agent(..., spec=AgentSpec)` 无 `AgentConfig` 兼容入口；L3 lookup 在 builder/Pi 之前。
    miss 先运行 builder 以绑定可选 `ResolvedPrompt` instruction，再申请 slot。
 2. Agent 复用普通 node 的拓扑、cache lookup、seal、output claim、materialize、sidecar 和 run。
-3. `external` 摘要包含 `agent_executor_schema=3`、adapter/Pi expected version、bridge 与路径
+3. `external` 摘要包含 `agent_executor_schema=4`、adapter/Pi expected version、bridge 与路径
    policy digest、capsule digest、provider/model/thinking、工具和 limits；普通 L3
    `CACHE_SCHEMA=5`。
 4. miss 只 staging 声明文件、canonical upstream 和 capsule snapshot；scratch 不保留。
@@ -47,7 +47,10 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 9. bridge 的 `read/write/edit/grep/find/ls` 同名工具拒绝绝对路径和 `..`，且只以 staging
    workspace 为 root；这约束模型工具访问，但不是 OS sandbox，可信 Extension 仍有宿主权限。
 10. RPC 是严格 LF JSONL；stdout/stderr 并发排空；timeout/异常终止整个进程组；unknown UI、
-    Extension error、非零退出、超 turn/tool/evidence 额度均拒绝。
+    Extension error、非零退出、超 turn/tool/evidence 额度均拒绝。累计 `message_update`
+    在 RPC evidence 中只保留脱敏 canonical event 的 digest/bytes/thinking 标记；终态和
+    tool/response 事件保留完整脱敏记录。额度约束规范化 evidence 和单个 wire record，
+    不约束全部累计 wire bytes 的总和。
 11. env resolver 的值在写入 error、trajectory、RPC、stderr、Hook evidence 或 completion 前
     强制脱敏；workspace 完成前扫描 credential bytes，命中即 fail closed。
 12. `agent_schema=2` canonical artifact 只保留 task/completion、Agent identity、collected

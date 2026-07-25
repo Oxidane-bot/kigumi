@@ -1,6 +1,6 @@
 # EvidencePolicy 契约
 
-Status: Active (0.7.0)
+Status: Active (0.7.1)
 
 ## Purpose / source of truth
 
@@ -32,6 +32,9 @@ replay 的同一 origin。实现权威为 `kigumi/evidence.py`、`kigumi/calling
 8. Prompt resolution receipt 在 `full`、`redacted`、`hash_only` 下结构同形且不保存原文；
    material 只保存来源、digest 与字节数。WorkflowProfile 默认不展开 CALL/Agent 内容；
    `include_content` 只能展示该 run 按 policy 已保留的 scrubbed evidence，不能绕过 policy。
+9. Pi 的 `pi-rpc.jsonl` 是规范化、脱敏的 RPC evidence，不是原始 wire transcript。
+   累计 `message_update` 保存 canonical event digest、原始字节数和 thinking-content 标记；
+   非累计事件保存完整脱敏结构。每个 update 仍逐事件绑定，不因压缩而合并或丢弃。
 
 ## Verification
 

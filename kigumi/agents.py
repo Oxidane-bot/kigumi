@@ -29,7 +29,7 @@ from .failures import (
     canonical_failure,
 )
 
-AGENT_EXECUTOR_SCHEMA = 3
+AGENT_EXECUTOR_SCHEMA = 4
 AGENT_SCHEMA = 2
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
@@ -88,6 +88,11 @@ class AgentLimits:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Agent {name} must be non-negative")
+        if self.rpc_max_bytes > self.max_single_file_bytes:
+            raise ValueError(
+                "Agent rpc_max_bytes may not exceed max_single_file_bytes "
+                "because normalized RPC evidence is one file"
+            )
 
     def identity(self) -> dict[str, Any]:
         return {

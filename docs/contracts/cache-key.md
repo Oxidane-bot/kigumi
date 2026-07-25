@@ -2,8 +2,9 @@
 
 Status: Active
 
-> 0.7.0：`CACHE_SCHEMA=5`，node cache envelope schema 3；
-> `agent_executor_schema=3` 保持不变。这是有意的完整 L3 cache 换族，不迁移 0.6.x 条目。
+> 0.7.1：`CACHE_SCHEMA=5`，node cache envelope schema 3 保持不变；
+> `agent_executor_schema=4`。这是 Pi normalized RPC evidence 的 Agent L3 cache 硬切，
+> 不迁移 0.7.0 Agent 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
 
 ## Purpose

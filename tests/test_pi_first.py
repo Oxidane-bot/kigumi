@@ -77,6 +77,14 @@ def test_pi_workspace_secret_scan_fails_before_candidate_collection(tmp_path: Pa
     pi_module._assert_workspace_secrets_absent(tmp_path, (secret,))
 
 
+def test_agent_limits_require_normalized_rpc_evidence_to_fit_one_file() -> None:
+    with pytest.raises(ValueError, match="rpc_max_bytes may not exceed"):
+        AgentLimits(
+            max_single_file_bytes=1024,
+            rpc_max_bytes=1025,
+        )
+
+
 def test_normalize_pi_trajectory_event_compacts_cumulative_message_updates() -> None:
     event = {
         "type": "message_update",
@@ -200,7 +208,7 @@ def _capsule(
             max_tool_calls = 8
             max_files = 10
             max_bytes = 100000
-            max_single_file_bytes = 50000
+            max_single_file_bytes = 100000
             inline_text_max_bytes = 10000
             trajectory_max_events = 100
             trajectory_max_bytes = 100000
@@ -332,6 +340,62 @@ def _fake_pi(path: Path) -> Path:
             print(json.dumps(update), flush=True)
             print(json.dumps(submitted), flush=True)
             print(json.dumps(message), flush=True)
+            print(json.dumps({"type": "agent_settled"}), flush=True)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _cumulative_update_pi(path: Path) -> Path:
+    path.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json
+            import pathlib
+            import sys
+
+            if "--version" in sys.argv:
+                print("1.2.3")
+                raise SystemExit(0)
+            command = json.loads(sys.stdin.readline())
+            pathlib.Path("draft.md").write_text("draft", encoding="utf-8")
+            print(json.dumps({
+                "id": command["id"], "type": "response",
+                "command": "prompt", "success": True,
+            }), flush=True)
+            for index in range(250):
+                print(json.dumps({
+                    "type": "message_update",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "x" * ((index + 1) * 100)}],
+                    },
+                }), flush=True)
+            print(json.dumps({
+                "type": "tool_execution_end", "toolName": "submit_result",
+                "result": {"details": {
+                    "completion": {
+                        "status": "completed", "summary": "done",
+                        "outputs": ["draft.md"], "metrics": {},
+                    },
+                    "evidence": [],
+                }},
+            }), flush=True)
+            print(json.dumps({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant", "stopReason": "toolUse",
+                    "model": "test-model",
+                    "usage": {
+                        "input": 3, "output": 2, "totalTokens": 5,
+                        "cost": {"total": 0.01},
+                    },
+                },
+            }), flush=True)
             print(json.dumps({"type": "agent_settled"}), flush=True)
             """
         ).lstrip(),
@@ -509,6 +573,51 @@ def _failing_pi(path: Path) -> Path:
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def test_pi_rpc_evidence_compacts_cumulative_updates_before_applying_quota(
+    tmp_path: Path,
+) -> None:
+    spec = AgentSpec.load(_capsule(tmp_path / "agent"))
+    fake = _cumulative_update_pi(tmp_path / "cumulative-update-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    captured: list[tuple[str, bytes, str]] = []
+
+    result = PiRpcAdapter((str(fake),), "1.2.3").run(
+        AgentRequest(
+            AgentTask("write", collect=(AgentFileSelector("draft.md"),)),
+            {},
+            spec,
+        ),
+        AgentRunContext(
+            workspace,
+            capsule_root,
+            time.monotonic() + 10,
+            lambda event: None,
+            lambda name, data, media: captured.append((name, data, media)),
+        ),
+    )
+
+    assert result.completion.outputs == ("draft.md",)
+    rpc_data = next(data for name, data, _ in captured if name == "pi-rpc.jsonl")
+    records = [json.loads(line) for line in rpc_data.splitlines()]
+    updates = [record for record in records if record["type"] == "message_update"]
+    assert len(updates) == 250
+    assert all(
+        set(update)
+        == {
+            "type",
+            "event_sha256",
+            "event_bytes",
+            "thinking_content",
+        }
+        for update in updates
+    )
+    assert not any("message" in update for update in updates)
+    assert len(rpc_data) < spec.limits.rpc_max_bytes
 
 
 def test_pi_rpc_adapter_parses_fixed_completion_and_redacts_raw_evidence(

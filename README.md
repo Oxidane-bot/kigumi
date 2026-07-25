@@ -72,7 +72,7 @@ with no further API cost.
 
 ## Status
 
-0.7.0, API not frozen. The Agent boundary is intentionally an execution adapter,
+0.7.1, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
 
 ## Layered Prompt example
