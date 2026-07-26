@@ -81,3 +81,46 @@ def test_real_pi_rpc_conformance(tmp_path: Path) -> None:
     for path in tmp_path.rglob("*"):
         if path.is_file():
             assert sentinel.encode() not in path.read_bytes()
+
+    session_dag = _make_dag(tmp_path)
+    session_adapter = PiRpcAdapter(
+        tuple(shlex.split(command)),
+        version,
+        env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": sentinel},
+        session_carry=True,
+    )
+
+    @session_dag.node("session-source")
+    def session_source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "a"}, {"id": "b"}]}
+
+    @session_dag.agent_scan(
+        "session-revise",
+        adapter=session_adapter,
+        spec=spec,
+        items_from=("session-source", "items"),
+        key_fn=lambda item: item["id"],
+        carry_fn=lambda artifact: artifact["session"],
+    )
+    def session_revise(
+        item: dict[str, str],
+        carry: dict[str, Any] | None,
+        inputs: dict[str, Any],
+        ctx: Any,
+    ) -> AgentTask:
+        del carry, inputs, ctx
+        output = f"{item['id']}.txt"
+        return AgentTask(
+            f"Write exactly '{item['id']}' to {output}, then submit_result with that file.",
+            collect=(AgentFileSelector(output),),
+        )
+
+    cold = session_dag.run()
+    warm = session_dag.run()
+    cold_items = cold.artifacts["session-revise"]["items"]
+
+    assert cold_items["a"]["session"]["bytes"] > 0
+    assert cold_items["b"]["session"]["bytes"] > cold_items["a"]["session"]["bytes"]
+    assert warm.map_items["session-revise"] == {"a": "hit", "b": "hit"}
+    assert warm.artifacts["session-revise"] == cold.artifacts["session-revise"]

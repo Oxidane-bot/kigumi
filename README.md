@@ -28,10 +28,11 @@ A foundation for building LLM pipelines with coding agents:
 - **DAG orchestration** (optional): explicit node/item cache policy, static
   reusable subgraphs, dynamic map/scan, owned materialized outputs, human
   checkpoints, durable retry/resume, and run diffs
-- **External Agent nodes**: provider-neutral staged execution with captured
+- **External Agent nodes and serial scans**: provider-neutral staged execution with captured
   attachments, exact publication, ordinary DAG caching, content-addressed
   `AgentSpec` capsules, global cross-process capacity, evidence retention
-  policies, and a native, exactly versioned Pi RPC adapter
+  policies, and a native, exactly versioned Pi RPC adapter with explicit
+  blob-backed session carry
 - **Typed failures and explicit recovery**: shared provider failure facts,
   deterministic retry schedules, persisted attempt receipts, and fail-closed
   handling of ambiguous side effects

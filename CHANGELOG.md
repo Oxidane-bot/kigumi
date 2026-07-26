@@ -2,6 +2,29 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [0.8.0] - 2026-07-26
+
+### 新增
+
+- 新增 `Dag.agent_scan()`：每个运行时 item 仍按 scan 的线性 carry 语义串行执行，但 miss
+  通过既有 Agent adapter、slot、evidence、retry/resume、attachment 与 exact publish 边界。
+  Agent builder 显式接收 `(item, carry, inputs, ctx)`；每项独立缓存，命中前缀可重建 carry。
+- `AgentRunContext` 新增可选 `session_in` 与 `record_session`。adapter 记录的 transcript 进入
+  内容寻址 blob store，canonical Agent artifact 以非物化 `session` attachment 引用它；
+  scan 使用 `carry_fn=lambda artifact: artifact["session"]` 将其传给下一项。
+- `PiRpcAdapter` 新增 `session_carry=False` 与 `session_max_bytes=2097152`。启用后使用显式
+  `--session <workspace>/.kigumi/pi-home/session.jsonl`，首轮自动创建、后续从 carry 恢复，
+  成功后完整回收；超限、空、损坏、未落盘或 credential 泄漏均失败，不静默截断。
+
+### 变更
+
+- Pi session header 的 `cwd` 在输入和输出边界规范化为 `"."`，避免上一 scan item 的临时
+  workspace 删除后导致下一项 RPC 启动失败，也避免临时绝对路径进入可缓存 transcript。
+- **0.8 硬切**：`CACHE_SCHEMA` 从 5 升至 6，`agent_schema` 从 2 升至 3，
+  `agent_executor_schema` 从 4 升至 5，Pi adapter identity schema 从 2 升至 3。
+  这是 canonical Agent session attachment 与 Agent scan 执行语义的有意完整 L3 缓存换族；
+  0.7 cache 自然 miss，不提供迁移或兼容 shim。
+
 ## [0.7.1] - 2026-07-25
 
 ### 修复

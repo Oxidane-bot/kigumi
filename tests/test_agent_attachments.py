@@ -13,7 +13,7 @@ def test_ordinary_materializer_ignores_attachment_and_view_verifies_it(tmp_path:
     blobs = BlobStore(tmp_path / "artifacts" / "_cache" / "blobs")
     digest = blobs.put(b"notes")
     artifact = {
-        "agent_schema": 2,
+        "agent_schema": 3,
         "task": {"instruction": "write", "collect": [], "publish": []},
         "completion": {
             "status": "completed",

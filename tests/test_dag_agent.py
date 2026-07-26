@@ -72,7 +72,7 @@ def test_dag_agent_uses_normal_cache_and_publishes_exact_attachments(tmp_path: P
 
     first = build().run()
     artifact = first.artifacts["draft"]
-    assert artifact["agent_schema"] == 2
+    assert artifact["agent_schema"] == 3
     assert artifact["task"]["instruction"] == "write a draft"
     assert artifact["completion"] == {
         "status": "completed",

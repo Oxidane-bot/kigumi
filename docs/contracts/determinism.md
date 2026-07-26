@@ -31,6 +31,9 @@ Status: Active
    material 只经 `inject()`；框架不自动补分隔符。
 7. snapshot 在 run 开始后不可变；中途文件修改不造成节点间漂移。下一 run 观察到新字节并
    按 selected-only 缓存规则决定 hit/miss。
+8. Agent session transcript 可以包含 provider/Pi 生成的非确定字段；框架不承诺 refresh/off
+   重算得到相同 transcript，只承诺首次 canonical bytes 进入 blob 后，item cache hit 与后继
+   carry 逐字节重放。Pi session header cwd 在边界确定性规范化为 `"."`。
 
 ## Failure behavior
 

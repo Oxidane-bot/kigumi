@@ -29,8 +29,8 @@ from .failures import (
     canonical_failure,
 )
 
-AGENT_EXECUTOR_SCHEMA = 4
-AGENT_SCHEMA = 2
+AGENT_EXECUTOR_SCHEMA = 5
+AGENT_SCHEMA = 3
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
@@ -490,6 +490,8 @@ class AgentRunContext:
     deadline: float
     emit_event: Callable[[Mapping[str, Any]], None]
     record_evidence: Callable[[str, bytes, str], None]
+    session_in: bytes | None = None
+    record_session: Callable[[bytes], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -639,6 +641,7 @@ def execute_agent_task(
     spec: AgentSpec,
     evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
     prompt_resolution: Mapping[str, Any] | None = None,
+    session_in: Mapping[str, Any] | None = None,
 ) -> AgentTaskExecution:
     expected_adapter = adapter_identity.get("adapter")
     unkeyed = isinstance(expected_adapter, Mapping) and expected_adapter.get("unkeyed") is True
@@ -677,6 +680,31 @@ def execute_agent_task(
     evidence: list[dict[str, Any]] = []
     evidence_names: set[str] = set()
     evidence_bytes = 0
+    session_reference: dict[str, Any] | None = None
+
+    session_bytes = (
+        None
+        if session_in is None
+        else _read_session_reference(
+            session_in,
+            blob_store,
+            max_bytes=limits.max_single_file_bytes,
+        )
+    )
+
+    def record_session(data: bytes) -> None:
+        nonlocal session_reference
+        if session_reference is not None:
+            raise AgentResultError("Agent session was recorded twice")
+        if not isinstance(data, bytes):
+            raise AgentResultError("Agent session must be bytes")
+        if len(data) > limits.max_single_file_bytes:
+            raise AgentResultError("Agent session exceeds max_single_file_bytes")
+        session_reference = {
+            "kigumi_attachment": blob_store.put(data),
+            "bytes": len(data),
+            "media_type": "application/x-ndjson",
+        }
 
     def record_evidence(name: str, data: bytes, media_type: str) -> None:
         nonlocal evidence_bytes
@@ -731,6 +759,8 @@ def execute_agent_task(
                 deadline=time.monotonic() + limits.timeout_seconds,
                 emit_event=emit_event,
                 record_evidence=record_evidence,
+                session_in=session_bytes,
+                record_session=record_session,
             ),
         )
         if not isinstance(result, AgentRunResult) or not isinstance(
@@ -791,6 +821,8 @@ def execute_agent_task(
         }
         if files:
             artifact["files"] = files
+        if session_reference is not None:
+            artifact["session"] = session_reference
         validate_agent_artifact(artifact, blob_store)
         duration_seconds = time.monotonic() - started
         trajectory = _capture_trajectory(
@@ -953,6 +985,7 @@ def validate_agent_artifact(artifact: Mapping[str, Any], blob_store: BlobStore) 
         "attachments",
         "published",
         "files",
+        "session",
     }
     if extra := set(artifact) - allowed:
         raise AgentResultError(
@@ -1022,6 +1055,33 @@ def validate_agent_artifact(artifact: Mapping[str, Any], blob_store: BlobStore) 
     actual_blobs = list(_materializable_blob_references(artifact))
     if actual_blobs != expected_blobs:
         raise AgentResultError("Agent artifact blobs must come only from exact publications")
+    session = artifact.get("session")
+    if session is not None:
+        _read_session_reference(session, blob_store)
+
+
+def _read_session_reference(
+    reference: Mapping[str, Any],
+    blob_store: BlobStore,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    if set(reference) != {"kigumi_attachment", "bytes", "media_type"}:
+        raise AgentResultError("Agent session attachment marker is malformed")
+    digest = reference.get("kigumi_attachment")
+    size = reference.get("bytes")
+    if (
+        not isinstance(digest, str)
+        or not isinstance(size, int)
+        or reference.get("media_type") != "application/x-ndjson"
+    ):
+        raise AgentResultError("Agent session attachment marker is malformed")
+    if max_bytes is not None and size > max_bytes:
+        raise AgentResultError("Agent session exceeds max_single_file_bytes")
+    data = blob_store.read_verified(digest)
+    if len(data) != size:
+        raise AgentResultError("Agent session byte count does not match")
+    return data
 
 
 def validate_agent_provenance(provenance: Mapping[str, Any], blob_store: BlobStore) -> None:

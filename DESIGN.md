@@ -75,15 +75,17 @@ SDK。LiteLLM 只是可选适配器；任意 SDK 都可实现 `Transport`，stdl
 
 ## 外部 Agent 边界
 
-`Dag.agent` 是普通静态 node 的执行器 façade，不是第二套 scheduler。cache lookup 先于
-builder；builder 只能看到 canonical upstream、params、声明文件和声明 prompt。miss 时框架
+`Dag.agent` 与 `Dag.agent_scan` 是普通静态 node/scan 的执行器 façade，不是第二套 scheduler。
+cache lookup 先于 builder；builder 只能看到 canonical upstream/item/carry、params、声明文件和
+声明 prompt。miss 时框架
 创建 staging workspace、运行 adapter、collect attachment、执行 exact publish 转换，然后继续
 走同一 seal/materialize/sidecar；hit 时不启动 builder/adapter，但会重新校验 attachment。
 
 三个概念不得混用：scratch 只活在 workspace；attachment 是无项目目标路径的内容引用；
 published output 才受既有输出所有权约束并写项目。`AgentSpec` 把 manifest、SYSTEM、Skill、
-Hook、model/tool/limits 作为内容寻址 capsule；`PiRpcAdapter` 固定关闭隐式发现、session、context
-和 built-in tools，只加载 staged capsule 与 wheel 内 bridge。bridge 提供 workspace-rooted
+Hook、model/tool/limits 作为内容寻址 capsule；`PiRpcAdapter` 固定关闭隐式发现、context
+和 built-in tools，session 默认关闭且只能通过显式 `session_carry` 作为 scan carry 开启；
+只加载 staged capsule 与 wheel 内 bridge。bridge 提供 workspace-rooted
 `read/write/edit/grep/find/ls` 与终止工具 `submit_result`，但 workspace root 和关闭 shell 都不
 构成 OS sandbox，可信 Extension 仍有宿主权限。v1 不提供 Agent factory、自进化、多 Agent
 动态拓扑、winner 或自动 promotion；这些角色只能由静态 DAG 组合。
@@ -360,6 +362,9 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 勾兑——P1 曾带着 4 处对旧实现的退化过审,教训在此。
 
 ## 修订记录
+
+- 2026-07-26 发布 0.8.0：新增 Agent scan 与 blob-backed Pi session carry；
+  `CACHE_SCHEMA=6`、`agent_executor_schema=5`、`agent_schema=3`。
 
 - 2026-07-24 发布 0.6.0：统一 typed failure、EvidencePolicy、默认单 slot 的全局 Agent
   容量与 durable retry/resume；`CACHE_SCHEMA=4`、`agent_executor_schema=3`、

@@ -2,7 +2,8 @@
 
 Status: Active
 
-> retained run 中的 `kigumi_attachment`（含 trajectory evidence）与 `kigumi_blob` 分别扫描、
+> retained run 中的 `kigumi_attachment`（含 trajectory evidence 与 Agent session）和
+> `kigumi_blob` 分别扫描、
 > 共同保护同一内容寻址 blob 仓；这不改变 materializable blob 语义。
 
 ## Purpose
@@ -32,7 +33,7 @@ Status: Active
    node cache/blob，不删除 run 目录、项目物化路径，也不移动/删除 `ctx.ingest_file` 的外部 source。
 8. blob reachability 递归扫描 retained run 的 schema-2 sidecar、origin、failure、
    schema-2 attempt receipt、manual resolution 与 schema-2 success candidate JSON。
-   `kigumi_attachment` 和 `kigumi_blob` 引用都保护同一 blob；
+   `kigumi_attachment`（包含 canonical Agent session）和 `kigumi_blob` 引用都保护同一 blob；
    `hash_only` descriptor 没有 blob 引用，因此不会虚构 retained 内容。
 
 ## Failure behavior

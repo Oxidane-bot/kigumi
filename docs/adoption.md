@@ -961,7 +961,7 @@ from kigumi import (
 )
 
 spec = AgentSpec.load("agents/writer")
-adapter = PiRpcAdapter(("pi",), expected_version="0.81.1")
+adapter = PiRpcAdapter(("pi",), expected_version="0.82.1")
 
 
 @dag.agent(
@@ -987,17 +987,48 @@ def draft(inputs, ctx):
 ```
 
 Pi 由用户显式安装。adapter 先运行 `pi --version` 并与 `expected_version` 精确匹配，不自动安装
-或升级 Node/Pi。运行参数关闭 session、project context、隐式资源发现和 built-in tools，只加载
-staged capsule 与 Kigumi bridge。bridge 的同名文件工具把模型访问限定到 workspace；可信
-Extension 仍有宿主进程权限，因此这些限制与 staging workspace 都**不是 OS sandbox**。
+或升级 Node/Pi。运行参数默认关闭 session，并始终关闭 project context、隐式资源发现和
+built-in tools，只加载 staged capsule 与 Kigumi bridge。bridge 的同名文件工具把模型访问限定
+到 workspace；可信 Extension 仍有宿主进程权限，因此这些限制与 staging workspace 都
+**不是 OS sandbox**。
+
+需要线性多轮修订时使用 `agent_scan`，把 session 当作 carry 值：
+
+```python
+session_adapter = PiRpcAdapter(
+    ("pi",),
+    expected_version="0.82.1",
+    session_carry=True,
+    session_max_bytes=2 * 1024 * 1024,
+)
+
+
+@dag.agent_scan(
+    "revise",
+    adapter=session_adapter,
+    spec=spec,
+    items_from=("drafts", "items"),
+    key_fn=lambda item: item["id"],
+    carry_fn=lambda artifact: artifact["session"],
+)
+def revise(item, carry, inputs, ctx):
+    return AgentTask(f"修订 {item['id']}，并用 submit_result 提交。")
+```
+
+首项 carry 为 `None`，Pi 创建空 session；成功后完整 transcript 进入 blob store，下一项收到
+session attachment 描述符，框架在 Agent 边界验证摘要并解出 bytes。同一 item 与同一 carry
+命中同一 L3 item cache；顺序或 transcript 改变会自然换键。`carry_from` 只用于来自其他节点的
+可选初始 session，后继 session 必须用 `carry_fn` 投影；不能把 scan 自身写进
+`carry_from`。session header cwd 固定规范化为 `"."`，防止临时 workspace 路径泄漏或失效。
+超出 `session_max_bytes` 会报错，不会静默截断。
 
 默认同一 `agent_lock_dir` 只有一个 Agent miss 可进入 staging/Pi；cache hit 不申请 slot。
 排队时间不消耗 `AgentLimits.timeout_seconds`，slot timeout 在 spawn/provider side effect 前
 产生 typed capacity failure。需要并发时显式提高 `agent_slots`，不要依赖每个 Python 进程各自
 的线程池上限。
 
-`agent_schema=2` 的 canonical artifact 只保留 task/completion、Agent identity、
-attachments、published outputs 与 `files`。usage、duration、workspace manifest、
+`agent_schema=3` 的 canonical artifact 只保留 task/completion、Agent identity、
+attachments、published outputs、`files` 与可选 session attachment。usage、duration、workspace manifest、
 RPC/stderr/trajectory/Hook evidence、queue/slot 和退出原因在 sidecar 的 immutable origin
 provenance。cold 与 warm cache hit 暴露同一个 origin，`AgentSubject` 也从这里取 usage/evidence。
 

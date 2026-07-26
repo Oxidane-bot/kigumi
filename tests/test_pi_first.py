@@ -24,6 +24,7 @@ from kigumi.agents import (
     AgentLimits,
     AgentPublish,
     AgentRequest,
+    AgentResultError,
     AgentRunContext,
     AgentSpec,
     AgentTask,
@@ -302,6 +303,13 @@ def _fake_pi(path: Path) -> Path:
                 pathlib.Path(os.environ["ARGS_FILE"]).write_text(
                     json.dumps(sys.argv[1:]), encoding="utf-8"
                 )
+            if "--session" in sys.argv:
+                session_path = pathlib.Path(sys.argv[sys.argv.index("--session") + 1])
+                if not session_path.exists():
+                    session_path.write_text(json.dumps({
+                        "type": "session", "version": 3, "id": "fake-session",
+                        "timestamp": "2026-01-01T00:00:00Z", "cwd": str(pathlib.Path.cwd()),
+                    }) + "\\n", encoding="utf-8")
             command = json.loads(sys.stdin.readline())
             assert command["type"] == "prompt"
             pathlib.Path("draft.md").write_text("draft", encoding="utf-8")
@@ -711,6 +719,96 @@ def test_pi_rpc_adapter_parses_fixed_completion_and_redacts_raw_evidence(
     extensions = [args[index + 1] for index, value in enumerate(args) if value == "--extension"]
     assert extensions[0].endswith("hooks/policy.ts")
     assert extensions[-1].endswith("kigumi/_pi_bridge.ts")
+
+
+def test_pi_rpc_adapter_session_carry_uses_explicit_file_and_normalizes_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = AgentSpec.load(_capsule(tmp_path / "agent", thinking="off"))
+    fake = _fake_pi(tmp_path / "fake-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    args_file = tmp_path / "args.json"
+    monkeypatch.setenv("ARGS_FILE", str(args_file))
+    adapter = PiRpcAdapter((str(fake),), "1.2.3", session_carry=True)
+    sessions: list[bytes] = []
+
+    adapter.run(
+        AgentRequest(AgentTask("write"), {}, spec),
+        AgentRunContext(
+            workspace=workspace,
+            capsule_root=capsule_root,
+            deadline=10**9,
+            emit_event=lambda event: None,
+            record_evidence=lambda name, data, media: None,
+            session_in=(b'{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"old"}\n'),
+            record_session=sessions.append,
+        ),
+    )
+
+    args = json.loads(args_file.read_text(encoding="utf-8"))
+    session_path = Path(args[args.index("--session") + 1])
+    assert "--no-session" not in args
+    assert session_path.name == "session.jsonl"
+    assert json.loads(sessions[0].splitlines()[0])["cwd"] == "."
+    assert adapter.cache_identity()["session_carry"] is True
+
+
+def test_pi_rpc_adapter_session_carry_creates_first_session_and_enforces_limit(
+    tmp_path: Path,
+) -> None:
+    spec = AgentSpec.load(_capsule(tmp_path / "agent", thinking="off"))
+    fake = _fake_pi(tmp_path / "fake-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    sessions: list[bytes] = []
+    adapter = PiRpcAdapter(
+        (str(fake),),
+        "1.2.3",
+        session_carry=True,
+        session_max_bytes=256,
+    )
+
+    adapter.run(
+        AgentRequest(AgentTask("write"), {}, spec),
+        AgentRunContext(
+            workspace=workspace,
+            capsule_root=capsule_root,
+            deadline=10**9,
+            emit_event=lambda event: None,
+            record_evidence=lambda name, data, media: None,
+            record_session=sessions.append,
+        ),
+    )
+
+    assert json.loads(sessions[0].splitlines()[0])["cwd"] == "."
+    assert len(sessions[0]) <= 256
+
+    workspace2 = tmp_path / "workspace-2"
+    workspace2.mkdir()
+    capsule_root2 = workspace2 / ".kigumi" / "agent"
+    spec.stage(capsule_root2)
+    with pytest.raises(AgentResultError, match="session input exceeds"):
+        adapter.run(
+            AgentRequest(AgentTask("write"), {}, spec),
+            AgentRunContext(
+                workspace=workspace2,
+                capsule_root=capsule_root2,
+                deadline=10**9,
+                emit_event=lambda event: None,
+                record_evidence=lambda name, data, media: None,
+                session_in=(
+                    b'{"type":"session","version":3,"id":"s","timestamp":"'
+                    + b"x" * 300
+                    + b'","cwd":"."}\n'
+                ),
+                record_session=sessions.append,
+            ),
+        )
 
 
 def test_pi_rpc_adapter_fails_closed_on_version_mismatch(tmp_path: Path) -> None:

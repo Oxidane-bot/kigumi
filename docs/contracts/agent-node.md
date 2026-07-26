@@ -2,14 +2,14 @@
 
 ## Purpose
 
-让原生 Pi Agent 成为 Kigumi 静态 DAG 中可缓存、可重放、可审计的普通节点执行器，同时保留
-provider-neutral `AgentAdapter` 边界。
+让原生 Pi Agent 成为 Kigumi 静态 DAG 中可缓存、可重放、可审计的普通节点或线性 scan item
+执行器，同时保留 provider-neutral `AgentAdapter` 边界。
 
 ## Scope / source of truth
 
 公开 capsule、task、completion 与 staging 语义以 `kigumi/agents.py` 为准；Pi RPC 以
 `kigumi/pi.py` 和随 wheel 分发的 `kigumi/_pi_bridge.ts` 为准；调度、物化与保留分别以
-`Dag.agent` / `Dag.run` 和 `kigumi/store.py` 为准。
+`Dag.agent` / `Dag.agent_scan` / `Dag.run` 和 `kigumi/store.py` 为准。
 
 ## Capsule schema v1
 
@@ -30,20 +30,22 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 
 ## Invariants
 
-1. `Dag.agent(..., spec=AgentSpec)` 无 `AgentConfig` 兼容入口；L3 lookup 在 builder/Pi 之前。
+1. `Dag.agent(..., spec=AgentSpec)` 与 `Dag.agent_scan(..., spec=AgentSpec)` 无
+   `AgentConfig` 兼容入口；L3 lookup 在 builder/Pi 之前。
    miss 先运行 builder 以绑定可选 `ResolvedPrompt` instruction，再申请 slot。
 2. Agent 复用普通 node 的拓扑、cache lookup、seal、output claim、materialize、sidecar 和 run。
-3. `external` 摘要包含 `agent_executor_schema=4`、adapter/Pi expected version、bridge 与路径
+3. `external` 摘要包含 `agent_executor_schema=5`、adapter/Pi expected version、bridge 与路径
    policy digest、capsule digest、provider/model/thinking、工具和 limits；普通 L3
-   `CACHE_SCHEMA=5`。
+   `CACHE_SCHEMA=6`。
 4. miss 只 staging 声明文件、canonical upstream 和 capsule snapshot；scratch 不保留。
 5. collect 产生无项目目标路径的 `kigumi_attachment`；`AgentCompletion.outputs` 必须全部来自
    本次 collect，并覆盖全部 publish source；只有 exact publish 进入普通物化。
 6. `submit_result` 的固定结果只有 `status="completed"`、`summary`、`outputs`、`metrics`。
    未提交、重复提交、Hook 拒绝、schema 错误或输出缺失均 fail closed。
 7. Pi 启动前以 `--version` 与 `expected_version` 精确匹配；Kigumi 不安装、升级 Node/Pi。
-8. Pi 固定关闭 session、project context、隐式 Extension/Skill/Prompt/Theme 发现和 built-in
-   tools，只显式加载 staged capsule 与 Kigumi bridge。
+8. Pi 固定关闭 project context、隐式 Extension/Skill/Prompt/Theme 发现和 built-in tools；
+   session 默认关闭。仅 `session_carry=True` 可用显式 `--session` 开启，输入/输出都是
+   blob-backed carry，header cwd 规范化为 `"."`，超限或损坏 fail closed。
 9. bridge 的 `read/write/edit/grep/find/ls` 同名工具拒绝绝对路径和 `..`，且只以 staging
    workspace 为 root；这约束模型工具访问，但不是 OS sandbox，可信 Extension 仍有宿主权限。
 10. RPC 是严格 LF JSONL；stdout/stderr 并发排空；timeout/异常终止整个进程组；unknown UI、
@@ -53,9 +55,10 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
     不约束全部累计 wire bytes 的总和。
 11. env resolver 的值在写入 error、trajectory、RPC、stderr、Hook evidence 或 completion 前
     强制脱敏；workspace 完成前扫描 credential bytes，命中即 fail closed。
-12. `agent_schema=2` canonical artifact 只保留 task/completion、Agent identity、collected
-    attachments、published outputs 与 `files`。RPC、stderr、trajectory、Hook/policy evidence、
-    usage/cost、duration、workspace manifest、queue/slot 与退出原因只进 hash-bound origin。
+12. `agent_schema=3` canonical artifact只保留 task/completion、Agent identity、collected
+    attachments、published outputs、`files` 与可选非物化 `session` attachment。RPC、stderr、
+    trajectory、Hook/policy evidence、usage/cost、duration、workspace manifest、queue/slot
+    与退出原因只进 hash-bound origin。
 13. `EvidencePolicy` 控制证据 retention；普通 materializer 不解释 evidence attachment，GC 从
     retained sidecar/failure/attempt receipt 追踪引用。
 14. Pi 固定关闭 hidden Agent/provider retry；`auto_retry_start/end`、thinking-off 仍出现 thinking
@@ -68,6 +71,9 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
     unmanaged。
 17. v1 capsule 没有自动进化、winner/promotion、Agent factory、动态多 Agent 拓扑；
     writer/reviewer/arbiter 由用户用静态 DAG 组合。
+18. `Dag.agent_scan` builder 接收 `(item, carry, inputs, AgentBuildContext)`；每项复用 scan
+    的 item/carry 键、串行调度、逐项 cache、retry/resume 与输出所有权。session 的后继投影
+    必须显式声明为 `carry_fn=lambda artifact: artifact["session"]`，不得使用隐藏文件状态。
 
 ## Failure behavior
 

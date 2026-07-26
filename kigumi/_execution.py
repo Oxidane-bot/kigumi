@@ -219,7 +219,7 @@ def _origin_provenance(
         )
         usage = primary.get("usage") if isinstance(primary, dict) else None
         retained_agent_provenance = None
-    elif artifact.get("agent_schema") == 2 and isinstance(spec, dict):
+    elif artifact.get("agent_schema") == 3 and isinstance(spec, dict):
         kind = "agent"
         prompt_sha256 = (
             agent_provenance.get("instruction_sha256")

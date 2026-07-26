@@ -46,6 +46,7 @@ class _Transport:
 def main() -> int:
     expected = os.environ["KIGUMI_EXPECTED_VERSION"]
     assert kigumi.__version__ == expected
+    assert callable(getattr(Dag, "agent_scan", None))
     assert all(
         symbol is not None
         for symbol in (

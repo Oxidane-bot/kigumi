@@ -118,6 +118,8 @@ class PiRpcAdapter:
     command: tuple[str, ...]
     expected_version: str
     env_resolver: Callable[[], Mapping[str, str]] | None = field(default=None, repr=False)
+    session_carry: bool = False
+    session_max_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if (
@@ -135,11 +137,19 @@ class PiRpcAdapter:
             raise ValueError("Pi credentials must come from env_resolver, never command arguments")
         if not isinstance(self.expected_version, str) or not self.expected_version.strip():
             raise ValueError("Pi expected_version must be a non-empty exact version")
+        if not isinstance(self.session_carry, bool):
+            raise TypeError("Pi session_carry must be a bool")
+        if (
+            isinstance(self.session_max_bytes, bool)
+            or not isinstance(self.session_max_bytes, int)
+            or self.session_max_bytes <= 0
+        ):
+            raise ValueError("Pi session_max_bytes must be positive")
 
     def cache_identity(self) -> dict[str, Any]:
         return {
             "adapter": "pi-rpc",
-            "adapter_schema": 2,
+            "adapter_schema": 3,
             "rpc": "strict-lf-jsonl+normalized-evidence-v2",
             "command": list(self.command),
             "expected_version": self.expected_version,
@@ -147,6 +157,8 @@ class PiRpcAdapter:
             "settings_sha256": hashlib.sha256(_pi_rpc_settings_bytes()).hexdigest(),
             "failure_contract": "typed-agent-execution-failure-v2",
             "unclassified_provider_failure_terminal": True,
+            "session_carry": self.session_carry,
+            "session_max_bytes": self.session_max_bytes,
         }
 
     def capabilities(self) -> AgentCapabilities:
@@ -204,14 +216,23 @@ class PiRpcAdapter:
                     "KIGUMI_MAX_TURNS": str(request.spec.limits.max_turns),
                 }
             )
-            args = [
-                *self.command,
-                "--mode",
-                "rpc",
-                "--no-session",
-                "--no-approve",
-                "--no-extensions",
-            ]
+            args = [*self.command, "--mode", "rpc"]
+            session_file: Path | None = None
+            if self.session_carry:
+                if context.record_session is None:
+                    raise AgentResultError("Pi session_carry requires a session recorder")
+                session_file = pi_home / "session.jsonl"
+                if context.session_in is not None:
+                    if len(context.session_in) > self.session_max_bytes:
+                        raise AgentResultError("Pi session input exceeds session_max_bytes")
+                    normalized_input = _normalize_session_bytes(context.session_in)
+                    if len(normalized_input) > self.session_max_bytes:
+                        raise AgentResultError("Pi session input exceeds session_max_bytes")
+                    session_file.write_bytes(normalized_input)
+                args.extend(("--session", str(session_file)))
+            else:
+                args.append("--no-session")
+            args.extend(("--no-approve", "--no-extensions"))
             for hook in request.spec.hooks:
                 args.extend(("--extension", str(context.capsule_root / hook)))
             args.extend(("--extension", str(_bridge_path()), "--no-skills"))
@@ -457,6 +478,18 @@ class PiRpcAdapter:
             if return_code not in {None, 0}:
                 raise _pi_failure(_PiFailureCode.PI_PROCESS_EXIT)
             _assert_workspace_secrets_absent(context.workspace, secrets)
+            if session_file is not None:
+                if not session_file.is_file():
+                    raise AgentResultError("Pi did not persist the requested session")
+                if session_file.stat().st_size > self.session_max_bytes:
+                    raise AgentResultError("Pi session output exceeds session_max_bytes")
+                session_data = _normalize_session_bytes(session_file.read_bytes())
+                if len(session_data) > self.session_max_bytes:
+                    raise AgentResultError("Pi session output exceeds session_max_bytes")
+                if any(secret.encode("utf-8") in session_data for secret in secrets):
+                    raise AgentResultError("Pi session contains provider credential bytes")
+                assert context.record_session is not None
+                context.record_session(session_data)
             return AgentRunResult(
                 completion=completion,
                 usage=usage,
@@ -732,6 +765,28 @@ def _redact_bytes(value: bytes, secrets: tuple[str, ...]) -> bytes:
     for secret in secrets:
         redacted = redacted.replace(secret.encode("utf-8"), b"***")
     return redacted
+
+
+def _normalize_session_bytes(value: bytes) -> bytes:
+    if not value:
+        raise AgentResultError("Pi session is empty")
+    lines = value.splitlines()
+    if not lines:
+        raise AgentResultError("Pi session is empty")
+    try:
+        header = json.loads(lines[0])
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AgentResultError("Pi session header is invalid") from error
+    if not isinstance(header, dict) or header.get("type") != "session":
+        raise AgentResultError("Pi session header is invalid")
+    header["cwd"] = "."
+    normalized_header = json.dumps(
+        header,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return b"\n".join((normalized_header, *lines[1:])) + b"\n"
 
 
 def _redact_text(value: str, secrets: tuple[str, ...]) -> str:

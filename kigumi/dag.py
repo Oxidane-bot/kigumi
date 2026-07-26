@@ -40,6 +40,7 @@ from .agents import (
     AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
     AgentBuildContext,
+    AgentResultError,
     AgentResultView,
     AgentSpec,
     AgentTask,
@@ -84,7 +85,7 @@ PostNodeHook = Callable[[str, dict[str, Any], bool], None]
 _NO_CARRY = object()
 _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
-CACHE_SCHEMA = 5
+CACHE_SCHEMA = 6
 SUCCESS_CANDIDATE_SCHEMA = 2
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
@@ -528,6 +529,95 @@ class Dag:
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
                 consumes=consumes,
+                cache=node_cache,
+                external_fingerprint_digest=external_fingerprint_digest(identity),
+                metadata=metadata,
+                executor="agent",
+                agent_adapter=adapter,
+                agent_spec=spec,
+                agent_identity=copy.deepcopy(identity),
+                evidence_policy=evidence_policy,
+                retry=retry_policy,
+            )
+            return function
+
+        return register
+
+    def agent_scan(
+        self,
+        name: str,
+        *,
+        adapter: AgentAdapter,
+        spec: AgentSpec,
+        items_from: tuple[str, str],
+        key_fn: Callable[[Any], str] | None = None,
+        carry_from: tuple[str, str] | None = None,
+        carry_fn: Callable[[dict[str, Any]], Any] | None = None,
+        deps: Iterable[str] = (),
+        prompts: Iterable[str] = (),
+        prompt_specs: Iterable[PromptSpec] = (),
+        files: Iterable[str | Path] = (),
+        files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
+        params: dict[str, Any] | None = None,
+        aggregate_fn: AggregateFunction | None = None,
+        consumes: Mapping[str, ConsumeFunction] | None = None,
+        cache: CachePolicy = "auto",
+        evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+        retry: RetryPolicy | None = None,
+    ) -> Callable[[Any], Any]:
+        """Register a serial carry-dependent scan whose items execute through an Agent."""
+        _validate_name(name, "Agent scan")
+        _validate_artifact_locator(items_from, "items_from")
+        if carry_from is not None:
+            _validate_artifact_locator(carry_from, "carry_from")
+        if name in self._nodes:
+            raise ValueError(f"Node {name!r} is already registered")
+        if not isinstance(evidence_policy, EvidencePolicy):
+            raise TypeError("evidence_policy must be EvidencePolicy")
+        node_cache = validate_cache_policy(cache)
+        retry_policy = _validate_retry_policy(retry)
+        node_prompts = tuple(prompts)
+        node_prompt_specs = validate_prompt_specs(
+            tuple(prompt_specs),
+            legacy_prompts=node_prompts,
+            dynamic_kind="scan",
+        )
+        try:
+            identity = agent_external_identity(adapter, spec)
+        except (TypeError, ValueError) as error:
+            if node_cache == "auto":
+                raise ValueError(
+                    "cache='auto' requires an Agent adapter with a stable identity; "
+                    "use cache='refresh' or cache='off' only for intentionally unkeyed runs"
+                ) from error
+            identity = {
+                "agent_executor_schema": AGENT_EXECUTOR_SCHEMA,
+                "adapter": {"unkeyed": True},
+                "spec": spec.identity(),
+            }
+        source_name = items_from[0]
+        all_deps = (*deps, source_name)
+        if carry_from is not None:
+            all_deps = (*all_deps, carry_from[0])
+
+        def register(function: Any) -> Any:
+            metadata = _validate_registration(function)
+            self._register_node(
+                name,
+                function,
+                deps=tuple(dict.fromkeys(all_deps)),
+                prompts=node_prompts,
+                prompt_specs=node_prompt_specs,
+                files=tuple(Path(path) for path in files),
+                params=copy.deepcopy(params) if params is not None else {},
+                consumes=consumes,
+                items_from=items_from,
+                key_fn=key_fn,
+                files_fn=files_fn,
+                aggregate_fn=aggregate_fn,
+                scan=True,
+                carry_from=carry_from,
+                carry_fn=carry_fn,
                 cache=node_cache,
                 external_fingerprint_digest=external_fingerprint_digest(identity),
                 metadata=metadata,
@@ -1416,7 +1506,7 @@ class Dag:
                                 agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
                             )
-                    if node.executor == "agent":
+                    if node.executor == "agent" and node.items_from is None:
                         validate_agent_artifact(artifact, self.blob_store)
                         if isinstance(agent_provenance, dict):
                             validate_agent_provenance(
@@ -3195,6 +3285,12 @@ class Dag:
         for item_id, item in entries:
             started = time.monotonic()
             target = f"{node.name}@{item_id}"
+            evidence_policy = (
+                node.evidence_policy
+                if node.executor == "agent" and node.evidence_policy is not None
+                else self._caller_evidence_policy()
+            )
+            agent_provenance: dict[str, Any] | None = None
             try:
                 with observe() as calls:
                     item_files = (
@@ -3228,7 +3324,7 @@ class Dag:
                     declaration_digest = self._attempt_declaration_digest(
                         node,
                         key_components,
-                        self._caller_evidence_policy(),
+                        evidence_policy,
                     )
                     resumed_completed = False
                     run_root = envelope.artifacts_path / "runs" / run_id
@@ -3240,8 +3336,12 @@ class Dag:
                             target,
                             key_components,
                             cache_key,
+                            validate_agent=node.executor == "agent",
                             prompt_resolutions=prompt_resolution_records,
                         )
+                        origin = prior_metadata.get("origin_provenance")
+                        if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                            agent_provenance = copy.deepcopy(origin["agent"])
                         cache_hit = prior_metadata.get("cache") == "hit"
                         resumed_completed = True
                     elif attempt_store.state_for(target) is not None:
@@ -3251,7 +3351,7 @@ class Dag:
                             cache_key,
                             forced=forced_all or item_id in forced_items,
                             cache_policy=node.cache,
-                            evidence_policy_digest=self._caller_evidence_policy().digest,
+                            evidence_policy_digest=evidence_policy.digest,
                         )
                     if artifact is None:
                         prepared = attempt_store.prepare(
@@ -3268,13 +3368,17 @@ class Dag:
                                 f"Scan target {target!r} is already terminally failed"
                             )
                         if action == "completed":
-                            artifact, _metadata = self._resume_completed_artifact(
+                            artifact, prior_metadata = self._resume_completed_artifact(
                                 envelope.artifacts_path / "runs" / run_id,
                                 target,
                                 key_components,
                                 cache_key,
+                                validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
                             )
+                            origin = prior_metadata.get("origin_provenance")
+                            if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                                agent_provenance = copy.deepcopy(origin["agent"])
                             resumed_completed = True
                         elif action == "candidate":
                             candidate = prepared["candidate"]
@@ -3293,6 +3397,12 @@ class Dag:
                                     f"Success candidate calls for {target!r} are invalid"
                                 )
                             calls.extend(copy.deepcopy(saved_calls))
+                            saved_agent = candidate.get("agent_provenance")
+                            agent_provenance = (
+                                copy.deepcopy(saved_agent)
+                                if isinstance(saved_agent, dict)
+                                else None
+                            )
                             checkpoint_used = candidate.get("checkpoint_used") is True
                             started = time.monotonic() - float(candidate.get("seconds", 0.0))
                         else:
@@ -3311,17 +3421,120 @@ class Dag:
                                         attempt_store.mark_side_effect(attempt_target, effect)
                                     )
                                 )
-                                if node.retry is not None
+                                if node.retry is not None and node.executor != "agent"
                                 else nullcontext()
                             )
                             try:
                                 with boundary:
-                                    artifact = node.function(  # type: ignore[call-arg]
-                                        item,
-                                        copy.deepcopy(carry),
-                                        copy.deepcopy(shared_inputs),
-                                        context,
-                                    )
+                                    if node.executor == "agent":
+                                        build_context = AgentBuildContext(
+                                            node.params,
+                                            context.read_text,
+                                            context.read_bytes,
+                                            context.render,
+                                            context.resolve_prompt,
+                                        )
+                                        task = node.function(  # type: ignore[call-arg]
+                                            item,
+                                            copy.deepcopy(carry),
+                                            copy.deepcopy(shared_inputs),
+                                            build_context,
+                                        )
+                                        if not isinstance(task, AgentTask):
+                                            raise TypeError(
+                                                f"Agent scan {node.name!r} builder "
+                                                "must return AgentTask"
+                                            )
+                                        instruction_resolution = (
+                                            task.instruction.resolution.canonical()
+                                            if isinstance(task.instruction, ResolvedPrompt)
+                                            else None
+                                        )
+                                        try:
+                                            lease_context = self.agent_slots.acquire(
+                                                timeout_seconds=(
+                                                    self.config.agent_slot_timeout_seconds
+                                                )
+                                            )
+                                            with lease_context as lease:
+                                                assert node.agent_adapter is not None
+                                                assert node.agent_spec is not None
+                                                assert node.agent_identity is not None
+                                                if node.retry is not None:
+                                                    attempt_store.mark_side_effect(
+                                                        target,
+                                                        {
+                                                            "active_effect_schema": 1,
+                                                            "kind": "agent",
+                                                            "instruction_sha256": sha(
+                                                                str(task.instruction)
+                                                            ),
+                                                            "managed": (
+                                                                instruction_resolution is not None
+                                                            ),
+                                                            "prompt_resolution": (
+                                                                instruction_resolution
+                                                            ),
+                                                        },
+                                                    )
+                                                session_in = None
+                                                if getattr(
+                                                    node.agent_adapter,
+                                                    "session_carry",
+                                                    False,
+                                                ):
+                                                    if carry is not None and (
+                                                        not isinstance(carry, Mapping)
+                                                        or set(carry)
+                                                        != {
+                                                            "kigumi_attachment",
+                                                            "bytes",
+                                                            "media_type",
+                                                        }
+                                                    ):
+                                                        raise AgentResultError(
+                                                            "Agent session carry must be a "
+                                                            "session attachment; declare "
+                                                            "carry_fn=lambda artifact: "
+                                                            'artifact["session"]'
+                                                        )
+                                                    session_in = carry
+                                                outcome = execute_agent_task(
+                                                    node_name=target,
+                                                    run_id=run_id,
+                                                    task=task,
+                                                    inputs=copy.deepcopy(shared_inputs),
+                                                    declared_files=(
+                                                        *node.files,
+                                                        *item_files,
+                                                    ),
+                                                    resolve=self.config.resolve,
+                                                    artifacts_path=self.config.artifacts_path,
+                                                    blob_store=self.blob_store,
+                                                    adapter=node.agent_adapter,
+                                                    adapter_identity=node.agent_identity,
+                                                    spec=node.agent_spec,
+                                                    evidence_policy=evidence_policy,
+                                                    prompt_resolution=instruction_resolution,
+                                                    session_in=session_in,
+                                                )
+                                        except SlotTimeoutError:
+                                            raise AgentExecutionFailure(
+                                                runtime_code=AgentRuntimeFailureCode.CAPACITY
+                                            ) from None
+                                        artifact = outcome.artifact
+                                        agent_provenance = {
+                                            **outcome.provenance,
+                                            "queue_wait_seconds": lease.wait_seconds,
+                                            "slot_identity": lease.slot_identity,
+                                        }
+                                    else:
+                                        artifact = node.function(  # type: ignore[call-arg]
+                                            item,
+                                            copy.deepcopy(carry),
+                                            copy.deepcopy(shared_inputs),
+                                            context,
+                                        )
                             except CheckpointPending as pending:
                                 envelope.record_pending(pending.name, pending.payload)
                                 attempt_store.mark_checkpoint(target, pending.name)
@@ -3362,7 +3575,7 @@ class Dag:
                                     "cache_key": cache_key,
                                     "key_components": key_components,
                                     "calls": copy.deepcopy(calls),
-                                    "agent_provenance": None,
+                                    "agent_provenance": copy.deepcopy(agent_provenance),
                                     "seconds": time.monotonic() - started,
                                     "checkpoint_used": checkpoint_used,
                                     "prompt_resolutions": prompt_resolution_records,
@@ -3375,9 +3588,14 @@ class Dag:
                                 label=(f"Scan node {node.name!r} item {item_id!r}"),
                                 calls=calls,
                                 cache_policy=("off" if checkpoint_used else node.cache),
-                                evidence_policy=self._caller_evidence_policy(),
+                                evidence_policy=evidence_policy,
+                                agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
                             )
+                    if node.executor == "agent":
+                        validate_agent_artifact(artifact, self.blob_store)
+                        if isinstance(agent_provenance, dict):
+                            validate_agent_provenance(agent_provenance, self.blob_store)
                     completed[item_id] = artifact
                     cache_keys.append(cache_key)
                     item_cache_statuses[item_id] = "hit" if cache_hit else "miss"
@@ -3394,7 +3612,8 @@ class Dag:
                             key_components=key_components,
                             outputs=outputs,
                             cache_policy=node.cache,
-                            evidence_policy=self._caller_evidence_policy(),
+                            evidence_policy=evidence_policy,
+                            agent_provenance=agent_provenance,
                             prompt_resolutions=prompt_resolution_records,
                         )
                     if not cache_hit and not resumed_completed:
@@ -3408,7 +3627,7 @@ class Dag:
             except OutputOwnershipError:
                 raise
             except Exception as error:
-                if isinstance(error, (RetryExhausted, ProviderFailure)):
+                if isinstance(error, (RetryExhausted, ProviderFailure, AgentExecutionFailure)):
                     raise
                 raise RuntimeError(
                     f"Scan node {node.name!r} failed item {item_id!r}: "

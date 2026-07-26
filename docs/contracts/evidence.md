@@ -1,6 +1,6 @@
 # EvidencePolicy 契约
 
-Status: Active (0.7.1)
+Status: Active (0.8.0)
 
 ## Purpose / source of truth
 
@@ -16,10 +16,10 @@ replay 的同一 origin。实现权威为 `kigumi/evidence.py`、`kigumi/calling
    secret。`full` 保存清理后的内容；`redacted` 将 prompt/content/text/thinking/reasoning/
    arguments/input/output 值替换为摘要与字节数；`hash_only` 只留 SHA-256、字节数、
    media type 和必要执行 metadata。
-3. `agent_schema=2` canonical artifact 只含 task/completion、Agent identity、collected
-   attachments、published outputs 和可选 `files`。usage、duration、workspace manifest、
-   RPC、stderr、trajectory、Hook/policy evidence 和 queue/slot metadata 属于 origin
-   provenance，不得回流 canonical artifact。
+3. `agent_schema=3` canonical artifact 只含 task/completion、Agent identity、collected
+   attachments、published outputs、可选 `files` 与可选非物化 session attachment。usage、
+   duration、workspace manifest、RPC、stderr、trajectory、Hook/policy evidence 和 queue/slot
+   metadata 属于 origin provenance，不得回流 canonical artifact。
 4. node cache envelope schema 3 保存 artifact、artifact digest 与 hash-bound immutable
    origin；schema-2 cold/warm sidecar 同时保存当前 run 重新解析的 Prompt selection 和同一
    immutable origin。policy canonical digest 写入 origin 与 run manifest。
@@ -35,6 +35,9 @@ replay 的同一 origin。实现权威为 `kigumi/evidence.py`、`kigumi/calling
 9. Pi 的 `pi-rpc.jsonl` 是规范化、脱敏的 RPC evidence，不是原始 wire transcript。
    累计 `message_update` 保存 canonical event digest、原始字节数和 thinking-content 标记；
    非累计事件保存完整脱敏结构。每个 update 仍逐事件绑定，不因压缩而合并或丢弃。
+10. session transcript 是模型下一项的声明输入，不是 evidence；它以完整 blob attachment
+    进入 canonical artifact 和 retention reachability。命中重放同一字节，超限或 credential
+    命中失败，EvidencePolicy 不得截断或改写它。
 
 ## Verification
 

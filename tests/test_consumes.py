@@ -367,4 +367,4 @@ def test_subgraph_consumes_uses_local_dependency_names_after_mount(tmp_path: Pat
 
 
 def test_consumes_cache_schema_is_five() -> None:
-    assert dag_module.CACHE_SCHEMA == 5
+    assert dag_module.CACHE_SCHEMA == 6
