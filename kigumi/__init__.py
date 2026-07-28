@@ -1,4 +1,20 @@
-"""kigumi: load-bearing joinery for LLM content pipelines."""
+"""kigumi: load-bearing joinery for LLM content pipelines.
+
+Capability index (need -> symbol, grouped by domain):
+
+  Prompt: inject, load_template, PromptSpec, PromptAxis, section, clip
+  Call+cache: LLMCaller(cache_dir, seed), call_validated, repair_loop, Budget
+  DAG: Dag, @dag.node/map/scan/foreach, Subgraph, dag.plan/explain/diff
+  Binary: files=/files_fn=, ctx.read_text, ctx.emit_file, BlobStore
+  Agent: @dag.agent/agent_scan, AgentSpec, PiRpcAdapter, EvidencePolicy
+  Eval: bench, llm_judge, pairwise_judge, evolve_prompt
+  Test: ScriptedTransport, FakeTransport, @pytest.mark.live, kigumi guard
+  Ops: kigumi init/doctor/trace/approve/gc, dag.run/resume
+
+Full index with "I need X" phrasing: docs/capabilities.md (112 lines) or
+kigumi/docs/capabilities.md in site-packages. Narrative guide: docs/adoption.md.
+Signatures and failure: docs/api.md. Promises: docs/contracts/README.md.
+"""
 
 from ._declarations import CachePolicy
 from ._version import __version__
