@@ -306,32 +306,15 @@ source_dirs 级扫描只属于 dag check、测试环与提交环。raw-io 在这
 `kigumi init` 不派发预设。
 
 ### 契约层
-可验证不变式的权威文本在 [docs/contracts/](docs/contracts/)；这里保留设计哲学、模块边界与
+可验证不变式的权威文本在 [契约索引](docs/contracts/README.md)；这里保留设计哲学、模块边界与
 止损线，不复制可由测试锁定的实现细节。改动缓存键、确定性字节、守卫、检查点或保留语义时，
 必须先更新对应契约和锁定测试，再记录发布影响。
 
 ### CLI
-```
-kigumi init [--hooks]  # 脚手架:[tool.kigumi] 配置块 + prompts/ artifacts/(_llm)
-                       # nodes/ lib/ 目录与 .gitignore;--hooks 才写 pre-commit
-kigumi guard [--changed]
-kigumi doctor          # 路径 / env key / litellm / 模板体检
-kigumi runs list / show <id>
-kigumi diff <runA> <runB>
-kigumi trace <run_id> [--node <name>]
-kigumi call <key_prefix> [--field messages|response|reasoning|meta]
-kigumi gc --keep <N>
-kigumi render <template> [--slot name=value]
-
-# 需要已注册图
-dag resume <run_id> [--workers N]
-dag retry-resolve <run_id> <target> --attempt N --action retry|fail --reason TEXT
-dag profile [--run-id RUN_ID] [--format json|md] [--include-content]
-dag graph [--run-id RUN_ID] --prompts
-```
 `kigumi`(cli.py) 是不需要图注册表的项目运维入口:init、guard、doctor、render、runs、
 approve、diff、trace、call、gc。`dag.cli()` 是需要注册表的图入口:check、plan、graph、
-profile、explain、describe、resume、retry-resolve;两者不互相代替。schema-1
+profile、explain、describe、resume、retry-resolve;两者不互相代替。完整命令、参数、
+默认值与退出码见 [CLI 参考](docs/cli.md)。schema-1
 `WorkflowProfile` 是 profile、describe、Prompt Mermaid/Markdown、trace 与 runs show 的
 共同 IR；0.7 receipt digest 损坏一律 fail closed。
 `kigumi init` 是 developing-ai-workflows skill 的落地点:新项目起步从
@@ -339,7 +322,7 @@ profile、explain、describe、resume、retry-resolve;两者不互相代替。sc
 
 ## 构建顺序
 
-1. 仓库 + L0/L1 + artifacts ✅(commit b42bc1b)
+1. 仓库 + L0/L1 + artifacts（commit b42bc1b）
    1.1 评审修正包:空响应耗尽即抛+拒缓存、resolved model 进缓存键、
        params 契约、Stdlib 超时、溯源先于记账、线程安全+in-flight 去重、
        litellm 降 extra、File 引用接口预留

@@ -1,6 +1,6 @@
 # 缓存与产物保留契约
 
-Status: Active
+Status: Active (0.8.0)
 
 > retained run 中的 `kigumi_attachment`（含 trajectory evidence 与 Agent session）和
 > `kigumi_blob` 分别扫描、

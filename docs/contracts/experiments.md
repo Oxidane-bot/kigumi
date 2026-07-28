@@ -1,5 +1,7 @@
 # Experiments 契约
 
+Status: Active (0.5.0)
+
 ## Purpose
 
 用同一证据网格比较函数、Caller、普通 DAG 与 Agent-backed DAG，而不把实验器变成优化器。

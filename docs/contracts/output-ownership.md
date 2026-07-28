@@ -1,6 +1,6 @@
 # 输出所有权契约
 
-Status: Active
+Status: Active (0.8.0)
 
 > Agent collect 与 session 的 `kigumi_attachment` 没有项目目标路径，不参与认领；只有 exact publish
 > 转出的既有 `files` / `kigumi_blob.path` 进入本契约。ordinary materializer 不解释 attachment。

@@ -21,9 +21,9 @@
 - **确定性重放**:内容寻址缓存,同输入逐字节同输出
 - **DAG 编排**(可选):显式节点/item 缓存策略、静态可复用子图、动态 map/scan、
   物化输出所有权、人工检查点、durable retry/resume 与 run diff
-- **外部 Agent 节点**:provider-neutral staging、attachment、exact publish、普通 DAG 缓存，
+- **外部 Agent 节点与串行 scan**:provider-neutral staging、attachment、exact publish、普通 DAG 缓存，
   内容寻址 `AgentSpec` 胶囊、跨进程全局容量、证据保留策略与原生、精确版本锁定的
-  Pi RPC adapter
+  Pi RPC adapter，以及显式、blob-backed 的 session carry
 - **Typed failure 与显式恢复**:CALL/Agent 共用 provider failure 事实、确定性 retry schedule、
   durable attempt receipt，以及对 ambiguous side effect 的 fail-closed 裁决
 - **工作流画像**:一份 canonical 静态/运行 IR 同时供应 Prompt-aware Mermaid、Markdown、
@@ -58,7 +58,10 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 
 ## 状态
 
-0.7.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
+0.8.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
+
+内置 judge、pairwise 与 reflection prompt 默认使用中文文本，三者都可覆盖；参数与槽位契约见
+[评估与提示词进化](docs/adoption.md#四评估与提示词进化evals--optimize)。
 
 ## 分层 Prompt 示例
 
@@ -109,14 +112,20 @@ pending，不在进程内 sleep；外部 supervisor 到期调用 `Dag.resume()`�
 在强制 secret scrub 后控制保留形态，但不是加密或访问控制。0.6 run 在 0.7 中仍可作为
 legacy profile 查看，不可 resume。
 
+想先零真实请求跑通一遍，可从[客服工单抽取 DAG](examples/ticket_extract/README.md)或
+[提示词进化环](examples/prompt_evolve/README.md)开始。两者都记录了实际接入时遇到的框架摩擦；
+工单示例还保留了本地实测数字。
+
 ## 文档地图
 
 | 文档 | 回答的问题 |
 | --- | --- |
 | [DESIGN.md](DESIGN.md) | 为什么这样设计;分层、边界与已裁决的取舍 |
 | [docs/adoption.md](docs/adoption.md) | 怎么接入;从单 caller 到 DAG 的路径与排障 |
-| [docs/contracts/](docs/contracts/) | 哪些行为是承诺;不变式、失效行为与验证坐标 |
-| [docs/reviews/](docs/reviews/) | 某个时点审查出了什么;实然记录,不是规范 |
+| [docs/cli.md](docs/cli.md) | 两套 CLI 怎么分工;全部命令、参数、默认值与有意义的退出码 |
+| [docs/api.md](docs/api.md) | 公开名称是什么意思;签名、结果类型、策略、异常与工具函数速查 |
+| [docs/contracts/README.md](docs/contracts/README.md) | 哪些行为是承诺;索引化的不变式、失效行为与验证坐标 |
+| [设计审查](docs/reviews/2026-07-13-design-review.md) / [consumes 审查](docs/reviews/2026-07-14-consumes-projection-design.md) | 某个时点审查出了什么;实然记录,不是规范 |
 | [CHANGELOG.md](CHANGELOG.md) | 什么变了;缓存换族与破坏性变更必录 |
 | [AGENTS.md](AGENTS.md) | agent 进场先读什么;红线与验证命令 |
 

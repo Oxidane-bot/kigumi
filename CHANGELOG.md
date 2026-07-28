@@ -2,6 +2,35 @@
 
 本项目遵循 Keep a Changelog 体例记录面向使用者的变更。
 
+## [Unreleased]
+
+### 新增
+
+- 新增 `docs/cli.md`：`kigumi` 与 `dag` 两套 CLI 的全部子命令、参数、默认值与退出码，
+  并说明两者不互相替代的分工。
+- 新增 `docs/api.md`：公开导出速查，覆盖此前无处可查的异常、枚举与策略值、结果与视图
+  类型和工具函数。
+- 新增 `docs/contracts/README.md`：15 份契约的分组索引，并明确 `Status: Active (X.Y.Z)`
+  表示该契约文本最后一次实质修订所在的 release。
+- 新增 `tests/test_docs.py`：锁定 README 状态版本与 `kigumi.__version__` 一致、每份契约
+  都有版本化 `Status:` 且在索引中、相对 Markdown 链接可解析、`__all__` 全部出现在用户
+  文档中。
+- `docs/adoption.md` 补齐环境变量总表(14 个 `KIGUMI_*`,含 `FileSlots.from_env` 的三项
+  与 Pi Extension 协议的四项)、pytest 插件自动生成的 `kigumi_dry_render[...]` /
+  `kigumi_guard` 测试项与 `kigumi_cassette` fixture、`ctx.agent_result`、两个零请求示例
+  入口,以及"工作流只用 Python 声明,没有 declarative loader"这条设计边界。
+- `README.md` 与 `README.zh-CN.md` 说明内置 judge、pairwise 与 reflection prompt 默认为
+  中文文本且三者均可覆盖;`docs/adoption.md` 记录对应常量、参数与槽位契约。
+- `AGENTS.md` 补入三条已经生效但未成文的硬规矩:`EvidencePolicy` 只控制保留形态、
+  Agent session carry 默认关闭、摘要损坏一律 fail closed。
+
+### 修复
+
+- 修正版本漂移:`README.md` 状态由 0.7.1、`README.zh-CN.md` 由 0.7.0 更新至 0.8.0;
+  中文 README 补齐英文版已有的 blob-backed session carry 描述。
+- 规范化全部 `docs/contracts/*.md` 的 `Status:` 行:此前 7 份缺版本、2 份完全缺失、
+  5 份停留在 0.7.0。
+
 ## [0.8.0] - 2026-07-26
 
 ### 新增

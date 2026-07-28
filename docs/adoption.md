@@ -3,8 +3,12 @@
 本文回答三个问题:怎么把一个项目接到 kigumi 上;用的时候要注意什么;
 我们推荐的写法是什么。设计动机见 [DESIGN.md](../DESIGN.md)。
 
-可验证不变式的权威文本见 [契约层](contracts/)，面向使用者的发布变化见
+可验证不变式的权威文本见 [契约索引](contracts/README.md)，面向使用者的发布变化见
 [CHANGELOG.md](../CHANGELOG.md)。
+
+想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](../examples/ticket_extract/README.md)
+或[提示词进化环](../examples/prompt_evolve/README.md)。前者用 150 张固定 seed 合成工单测量
+map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
 
 ## 一、接入步骤
 
@@ -33,6 +37,34 @@ agent_slot_timeout_seconds = 300
 `KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
 `KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS` 可覆盖容量配置；跨项目共享容量时把 lock dir
 显式指到同一个机器级目录。
+
+### 环境变量总表
+
+这是 `KIGUMI_*` 环境变量的单一索引。Agent capacity 的进程环境值覆盖
+`[tool.kigumi]` TOML；`load_env()` 从配置的 `.env` 读取时，只补进程中尚未存在的键，
+绝不覆盖已经设置的 process variable。显式传给 transport 的 `aliases=` 则不读取
+`KIGUMI_MODEL_*`。
+
+| 变量 | 读取方与值 | 缺省/作用 |
+| --- | --- | --- |
+| `KIGUMI_MODEL_DEFAULT` | `LiteLLMTransport` / `StdlibTransport`；具体模型名 | `aliases=None` 时定义 `default` alias；未设置时使用该 alias 会报错。 |
+| `KIGUMI_MODEL_PRO` | 同上；具体模型名 | `aliases=None` 时定义 `pro` alias；未设置时使用该 alias 会报错。 |
+| `KIGUMI_AGENT_SLOTS` | `KigumiConfig`；至少为 1 的整数 | 覆盖 `agent_slots=1`。 |
+| `KIGUMI_AGENT_LOCK_DIR` | `KigumiConfig`；非空路径 | 覆盖 `agent_lock_dir="artifacts/_locks/agents"`。 |
+| `KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS` | `KigumiConfig`；正数 | 覆盖 `agent_slot_timeout_seconds=300.0`。 |
+| `KIGUMI_LIVE` | pytest 插件；必须精确等于 `"1"` | 其他值或缺席时自动 skip `live` 测试。 |
+| `KIGUMI_REQUEST_LOCK_DIR` | `FileSlots.from_env()`；去空白后的 lock 目录 | 默认 prefix 下的名称；空值使 limiter 不具备 lock root。 |
+| `KIGUMI_REQUEST_CAPACITY_FILE` | `FileSlots.from_env()`；去空白后的容量文件 | 可选；设置后动态限制有效 slots。 |
+| `KIGUMI_REQUEST_SLOTS` | `FileSlots.from_env()`；整数 | 缺席或无法解析时为 `0`；只有 lock dir 存在且 slots 至少为 1 才启用。 |
+| `KIGUMI_WORKSPACE` | `PiRpcAdapter` 注入 Pi 子进程；staged workspace 绝对路径 | Kigumi/Pi Extension 协议值，不是用户配置入口。 |
+| `KIGUMI_ALLOWED_TOOLS` | `PiRpcAdapter` 注入；逗号连接的 `AgentSpec.tools` | Extension 据此限制已声明工具。 |
+| `KIGUMI_MAX_TOOL_CALLS` | `PiRpcAdapter` 注入；`AgentLimits.max_tool_calls` 的十进制文本 | Extension 的工具调用上限。 |
+| `KIGUMI_MAX_TURNS` | `PiRpcAdapter` 注入；`AgentLimits.max_turns` 的十进制文本 | Extension 的 turn 上限。 |
+
+`FileSlots.from_env(prefix="KIGUMI_REQUEST")` 的 prefix 是调用方参数；传
+`prefix="ACME_LLM"` 时读取 `ACME_LLM_LOCK_DIR`、`ACME_LLM_CAPACITY_FILE`、
+`ACME_LLM_SLOTS`，不是固定读取默认三项。后四个 Pi 变量由 adapter 在 spawn 前覆盖写入，
+Extension 只应读取，不应要求操作者手工设置。
 
 ### 2. 组装调用栈
 
@@ -542,7 +574,7 @@ extra 字段剥壳、有界修复(默认 2 轮)、stuck 检测全部内置。不
 ### 设计边界(明说的选择,不是没做完)
 
 kigumi 只服务一类任务:**可缓存、DAG 形状、批处理式的 LLM 流水线**。类内它是
-任务无关的;类外有三条刻意边界,撞上时请换工具,不要指望后续版本"补齐":
+任务无关的;类外有四条刻意边界,撞上时请换工具,不要指望后续版本"补齐":
 
 1. **跑批,不做在线服务。**run 有始有终,挂起等审批是正常返回而非异常;
    没有常驻进程、没有请求路由、没有流式输出。需要在线服务时,kigumi 的
@@ -555,6 +587,9 @@ kigumi 只服务一类任务:**可缓存、DAG 形状、批处理式的 LLM 流�
 3. **大二进制走引用,不进 artifact。**artifact dict 全量参与内容寻址,大字节
    放进去会把哈希与序列化成本放大到不可用。输入侧用 `files=`/`files_fn`/
    `kigumi_file`(内容哈希进键),输出侧用 `emit_file`/blob 引用;见下节。
+4. **工作流只用 Python 声明。**没有 YAML 或其他 declarative workflow loader；节点函数、
+   类型、静态 Subgraph 与 map/scan 边界都在 Python 注册。需要非 Python 配置时，把它作为
+   已声明输入读取，不要期待配置文件生成可执行拓扑。
 
 ### 二进制交付物
 
@@ -669,6 +704,8 @@ caller = LLMCaller(transport, cache_dir=..., slots=slots)
 
 429/5xx 每次将共享容量折半（不低于 `min_slots`）；连续 `ramp_successes` 次成功才加一。
 容量文件始终是纯整数，因而现有跨进程 `FileSlots` 会立刻读取新容量。
+也可用 `FileSlots.from_env()` 读取默认的三项 `KIGUMI_REQUEST_*`；完整名称、启用条件和
+自定义 prefix 规则见[环境变量总表](#环境变量总表)。
 
 ## 三、测试与运行纪律
 
@@ -700,6 +737,25 @@ from kigumi.testing import CassetteTransport, FakeTransport
   `KeyError`，不会悄悄回退到网络模型。
 - **dry-run**:`LLMCaller(dry=True)` 下任何会打真实请求的路径直接抛
   `DryRunError`——排练整条流水线的缓存命中情况而不花一分钱。
+
+本包通过 `pyproject.toml` 的 `pytest11` entry point 自动加载插件，但只有从当前目录向上发现
+带 `[tool.kigumi]` 的 `pyproject.toml` 时才激活。激活后，它会追加调用方没有手写的测试项：
+
+- 每个 `prompts/**/*.md` 追加一个 `kigumi_dry_render[<file>]`（`<file>` 是
+  `prompt_path.name`，例如 `kigumi_dry_render[extract.md]`）。该项读取模板，以
+  `<槽位名>` 填满 `slot_names()` 发现的全部槽位，经严格 `render_template()` 渲染，并断言
+  不残留 `{{` 语法；全程不调用模型。
+- 每次 collection 追加一个 `kigumi_guard`。它扫描配置的 `source_dirs`，对未豁免的循环裸
+  LLM 调用或节点原始文件读取失败；有理由的 `raw-llm-ok` / `raw-io-ok` 以 pytest warning
+  保持可见。
+
+插件同时注册 `live` marker，并提供 `kigumi_cassette` fixture。fixture 是一个
+`Callable[[str], CassetteTransport]`：`kigumi_cassette("review")` 解析到项目根下
+`tests/cassettes/review.json`，传入已带 `.json` 的名称则不再追加扩展名。
+
+源码没有 Kigumi 专属的 collection opt-out 或按目录缩窄开关；只要项目保留
+`[tool.kigumi]`，上述生成项都会收集。标准 pytest 的 `-k` 等选择器可以只执行匹配项，但
+不会阻止它们被创建；移除 `[tool.kigumi]` 会让整个插件变成 no-op，也同时关闭项目集成。
 
 ### 真实请求测试(live tests)
 
@@ -829,6 +885,43 @@ metric = gated_metric(format_gate, quality)  # 闸没过不烧评委调用
   "复写测评集"。不要自己往品质轴里加相似度。
 - `Judgment.tags` 认真填:它是反思材料按错误类型归并的分组键,空 tags 会
   让同类失败无法压缩。
+
+### 内置中文提示词与覆盖
+
+三份内置措辞当前都是中文，这是公开默认值，不随调用语言自动切换：
+
+- `kigumi.evals.JUDGE_WORDING_DEFAULT` 供 `llm_judge(..., wording=None)` 使用；传
+  `wording="..."` 完整替换。
+- `kigumi.evals.PAIRWISE_WORDING_DEFAULT` 供 `pairwise_judge(..., wording=None)` 使用；
+  同样传 `wording="..."` 完整替换。
+- `kigumi.optimize.REFLECTION_TEMPLATE_DEFAULT` 供
+  `evolve_prompt(..., reflection_template=None)` 使用；传 `reflection_template="..."`
+  完整替换。
+
+```python
+quality = llm_judge(caller, rubric=rubric, wording=english_judge_instructions)
+pairwise = pairwise_judge(
+    caller,
+    rubric=rubric,
+    reference_key="reference",
+    wording=english_pairwise_instructions,
+)
+result = evolve_prompt(
+    seed_text,
+    train,
+    val,
+    task,
+    metric,
+    caller,
+    reflection_template=english_reflection_template,
+)
+```
+
+自定义 reflection template 的槽位集合必须**严格等于**
+`current_template`、`merged_feedback`、`max_chars`：少一个或多一个都会在反思调用前报错。
+pairwise verdict 的固定分数映射是
+`PAIRWISE_SCORES = {"better": 1.0, "comparable": 0.8, "worse": 0.3}`；该映射不由
+`wording` 改写。
 
 ### 进化怎么跑
 
@@ -1038,6 +1131,23 @@ provenance。cold 与 warm cache hit 暴露同一个 origin，`AgentSubject` 也
 权限、磁盘加密和 artifact 生命周期另行承担。policy digest 改变不会换内容键，但会造成
 evidence miss；普通 CALL 可由 L1 重建 evidence，Agent 必须重新执行。
 
+Pi Extension 与 adapter 之间的环境协议是 `KIGUMI_WORKSPACE`、
+`KIGUMI_ALLOWED_TOOLS`、`KIGUMI_MAX_TOOL_CALLS`、`KIGUMI_MAX_TURNS`；值均由
+`PiRpcAdapter` 从 staged workspace、`AgentSpec.tools` 和 `AgentLimits` 注入，不由 Extension
+自行推断。精确值形态见[环境变量总表](#环境变量总表)。
+
+普通下游节点读取 Agent attachment 时先调用 `ctx.agent_result(artifact)`，得到已验证、
+只读的 `AgentResultView`；构造时会校验 canonical artifact 与 blob digest，之后再用
+`list()` / `select()` / `read_bytes()` / `read_text()` / `publish()`。这避免下游直接相信
+artifact 中的 attachment 描述符：
+
+```python
+@dag.node("consume_agent", deps=("draft",))
+def consume_agent(inputs, ctx):
+    result = ctx.agent_result(inputs["draft"])
+    return {"draft": result.read_text("draft.md")}
+```
+
 单 Agent 可直接进入 bench；每格 target 固定 `cache="off"`，重复 seed 不会被 L3 hit 吞掉：
 
 ```python
@@ -1095,6 +1205,7 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
 不需要读 sidecar 或拼 L1 缓存路径。先从一次 run 取节点、map 项和每次调用的
 完整证据链；输出中的 `key` 可以直接交给 `call`，`payload_path` 是已解析的绝对路径，
 仅用于可见性而非要求手工读取。
+全部命令参数、默认值与退出码见 [CLI 参考](cli.md)。
 
 ```bash
 # 1. 定位:节点、map 项、缓存策略、物化输出、键成分和每次 LLM 调用

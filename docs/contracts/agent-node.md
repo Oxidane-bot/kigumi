@@ -1,5 +1,7 @@
 # Agent node 契约
 
+Status: Active (0.8.0)
+
 ## Purpose
 
 让原生 Pi Agent 成为 Kigumi 静态 DAG 中可缓存、可重放、可审计的普通节点或线性 scan item

@@ -73,8 +73,12 @@ with no further API cost.
 
 ## Status
 
-0.7.1, API not frozen. The Agent boundary is intentionally an execution adapter,
+0.8.0, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
+
+The built-in judge, pairwise, and reflection prompts default to Chinese text;
+all three are overridable. See the
+[evaluation and prompt-evolution guide](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md#%E5%9B%9B%E8%AF%84%E4%BC%B0%E4%B8%8E%E6%8F%90%E7%A4%BA%E8%AF%8D%E8%BF%9B%E5%8C%96evals--optimize).
 
 ## Layered Prompt example
 
@@ -131,6 +135,13 @@ retention after mandatory secret scrubbing, but is not encryption or access
 control. 0.6 runs remain inspectable as legacy profiles but cannot be resumed
 under the 0.7 manifest.
 
+For a zero-request first run, try the
+[ticket-extraction DAG](https://github.com/Oxidane-bot/kigumi/tree/master/examples/ticket_extract)
+or the
+[prompt-evolution loop](https://github.com/Oxidane-bot/kigumi/tree/master/examples/prompt_evolve).
+Both examples record the framework friction found while putting the workflow into practice;
+the ticket example also includes measured local-run numbers.
+
 ## Documentation map
 
 Documentation is currently written in Chinese.
@@ -139,7 +150,9 @@ Documentation is currently written in Chinese.
 | --- | --- |
 | [DESIGN.md](https://github.com/Oxidane-bot/kigumi/blob/master/DESIGN.md) | Why it is designed this way; layers, boundaries, settled trade-offs |
 | [docs/adoption.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md) | How to adopt it; the path from a single caller to a DAG, plus troubleshooting |
-| [docs/contracts/](https://github.com/Oxidane-bot/kigumi/blob/master/docs/contracts/) | Which behaviors are promises; invariants, failure behavior, verification coordinates |
+| [docs/cli.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/cli.md) | Which CLI owns an operation; every command, flag, default, and meaningful exit code |
+| [docs/api.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/api.md) | What the public names mean; terse signatures, result types, policies, exceptions, and utilities |
+| [docs/contracts/README.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/contracts/README.md) | Which behaviors are promises; indexed invariants, failure behavior, verification coordinates |
 | [docs/reviews/](https://github.com/Oxidane-bot/kigumi/blob/master/docs/reviews/) | What a review found at a point in time; descriptive records, not specs |
 | [CHANGELOG.md](https://github.com/Oxidane-bot/kigumi/blob/master/CHANGELOG.md) | What changed; cache-family rotations and breaking changes are always recorded |
 | [AGENTS.md](https://github.com/Oxidane-bot/kigumi/blob/master/AGENTS.md) | What an agent reads before entering; red lines and verification commands |

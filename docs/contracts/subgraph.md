@@ -1,6 +1,6 @@
 # 静态子图契约
 
-Status: Active
+Status: Active (0.8.0)
 
 > v1 没有 `Subgraph.agent`，也不允许 Agent 返回可执行拓扑。Agent/Agent scan 仅作为顶层
 > `Dag.agent` 静态节点；运行时动态展开仍限既有 map/scan。
