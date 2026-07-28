@@ -99,6 +99,53 @@ def test_every_public_export_appears_in_user_facing_docs() -> None:
     assert not (UNDOCUMENTED_EXPORT_ALLOWLIST - missing), "Remove stale documentation allowlist"
 
 
+def test_capability_index_points_only_at_real_symbols() -> None:
+    """教训 dead_pointer:能力索引是入口,指向不存在的符号比不写更糟。"""
+    import importlib
+
+    from kigumi.dag import Dag, NodeContext
+
+    text = (ROOT / "docs" / "capabilities.md").read_text(encoding="utf-8")
+    # Names that are not importable symbols: env vars, CLI words, pytest item
+    # names, config keys, decorators and message-dict keys.
+    ignored = {
+        "kigumi",
+        "kigumi_file",
+        "kigumi_guard",
+        "kigumi_dry_render",
+        "session_carry",
+        "consumes",
+        "files",
+        "files_fn",
+        "external_fingerprint",
+        "cache_dir",
+        "seed",
+        "dry",
+        "DryRunError",
+        "pytest.mark.live",
+    }
+    unresolved: list[str] = []
+    for token in sorted(set(re.findall(r"`([A-Za-z_][A-Za-z0-9_.]*)`", text))):
+        if token in ignored or token.isupper() or token.startswith("KIGUMI_"):
+            continue
+        if token.startswith("ctx."):
+            holder, attribute = NodeContext, token[4:]
+        elif token.startswith("dag."):
+            holder, attribute = Dag, token[4:]
+        elif "." in token:
+            module_path, attribute = token.rsplit(".", 1)
+            try:
+                holder = importlib.import_module(module_path)
+            except ImportError:
+                unresolved.append(token)
+                continue
+        else:
+            holder, attribute = kigumi, token
+        if not hasattr(holder, attribute):
+            unresolved.append(token)
+    assert not unresolved, "Capability index points at missing symbols:\n" + "\n".join(unresolved)
+
+
 def _markdown_link_target(raw_target: str) -> str:
     stripped = raw_target.strip()
     if stripped.startswith("<") and ">" in stripped:

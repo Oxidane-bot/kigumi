@@ -148,6 +148,7 @@ Documentation is currently written in Chinese.
 
 | Document | The question it answers |
 | --- | --- |
+| [docs/capabilities.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/capabilities.md) | **Start here.** What can this library do; one grep-able line per capability, need on the left, symbol on the right |
 | [DESIGN.md](https://github.com/Oxidane-bot/kigumi/blob/master/DESIGN.md) | Why it is designed this way; layers, boundaries, settled trade-offs |
 | [docs/adoption.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md) | How to adopt it; the path from a single caller to a DAG, plus troubleshooting |
 | [docs/cli.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/cli.md) | Which CLI owns an operation; every command, flag, default, and meaningful exit code |

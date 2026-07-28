@@ -29,6 +29,7 @@ uv run kigumi call <key_prefix> --field response
 
 文档地图：
 
+- [docs/capabilities.md](docs/capabilities.md) 是能力索引:动手前先扫一遍,避免重造已有能力。
 - [DESIGN.md](DESIGN.md) 说明设计哲学、边界和止损线。
 - [docs/adoption.md](docs/adoption.md) 说明接入方式与使用约定。
 - [docs/cli.md](docs/cli.md) 说明两套 CLI 的命令、参数与退出码。

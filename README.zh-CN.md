@@ -120,6 +120,7 @@ legacy profile 查看，不可 resume。
 
 | 文档 | 回答的问题 |
 | --- | --- |
+| [docs/capabilities.md](docs/capabilities.md) | **先看这个。**这个库能做什么;一行一个能力,左边是需求、右边是符号 |
 | [DESIGN.md](DESIGN.md) | 为什么这样设计;分层、边界与已裁决的取舍 |
 | [docs/adoption.md](docs/adoption.md) | 怎么接入;从单 caller 到 DAG 的路径与排障 |
 | [docs/cli.md](docs/cli.md) | 两套 CLI 怎么分工;全部命令、参数、默认值与有意义的退出码 |
