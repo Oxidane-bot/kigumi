@@ -10,7 +10,29 @@
 或[提示词进化环](../examples/prompt_evolve/README.md)。前者用 150 张固定 seed 合成工单测量
 map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
 
-## 一、接入步骤
+## 进场协议（改节点前先做这三步）
+
+改节点之前，先用框架自己的工具看清楚状态，再动手。这三步不会发真实请求，不花钱：
+
+```bash
+# 1. 看现在的状态：节点、map 项、缓存策略与每次 LLM 调用的证据链
+kigumi trace <run_id>
+kigumi trace <run_id> --node <name> --json   # 只看某个节点，适合 json 消费
+
+# 2. 预览改动之后哪些会重算（哪些会花钱）
+#    certain = 确定会 miss；at_risk = 可能 miss；pending_on = 因 unknown 上游待定
+dag plan
+
+# 3. 查某个节点上次为什么命中或失效
+dag explain <node>
+dag explain <node@item>   # map/scan 的单个 item
+```
+
+`dag.plan()` 与 `dag.explain()` 需要已注册的 `Dag` 实例；找到应用里的 `Dag` 对象后调用，
+或用 `dag.cli()` 绑定它。完整命令参数见 [CLI 参考](cli.md)；
+所有症状的排查流程见[六、排障](#六排障按症状查)。
+
+
 
 ### 1. 安装与配置
 

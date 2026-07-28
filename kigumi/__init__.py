@@ -1,5 +1,10 @@
 """kigumi: load-bearing joinery for LLM content pipelines.
 
+Before modifying nodes in a kigumi project:
+  kigumi trace <run_id>    # current state: nodes, map items, every LLM call
+  dag plan                 # what would recompute (and cost money) after your change
+  dag explain <node>       # why will this node miss the cache?
+
 Capability index (need -> symbol, grouped by domain):
 
   Prompt: inject, load_template, PromptSpec, PromptAxis, section, clip

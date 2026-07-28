@@ -6,6 +6,11 @@
 
 ### 新增
 
+- `kigumi/__init__.py` docstring 开头加入三行进场协议：改节点前先运行
+  `kigumi trace`、`dag plan`、`dag explain`，明确"看清楚再动"的主动工作流。
+- `docs/adoption.md` 开头新增「进场协议」段落（在接入步骤之前），把「改节点前做这
+  三步」从排障末尾提到文档最显眼的位置，并说明 `dag.plan` / `dag.explain` 需要已注册
+  `Dag` 实例的查找方式。
 - 新增 `docs/capabilities.md`:扁平、可 grep 的能力索引,左列是"我要做什么"、右列是
   符号名,覆盖 Prompt、调用缓存、DAG、二进制、Agent、实验、测试守卫与运维八组。这是
   面向 coding agent 的第一入口——它的失败形状不是不知道库存在,而是不知道能力面有多宽;
