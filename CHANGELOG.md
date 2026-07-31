@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-30
+
 ### 修复
 
 - 修正 `kigumi describe` 与 `Dag.render_summary()`:0.10.0 起 `describe()` 只投影
