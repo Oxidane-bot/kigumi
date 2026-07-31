@@ -120,6 +120,7 @@ class PiRpcAdapter:
     env_resolver: Callable[[], Mapping[str, str]] | None = field(default=None, repr=False)
     session_carry: bool = False
     session_max_bytes: int = 2 * 1024 * 1024
+    extra_config_files: Mapping[str, bytes] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -145,9 +146,29 @@ class PiRpcAdapter:
             or self.session_max_bytes <= 0
         ):
             raise ValueError("Pi session_max_bytes must be positive")
+        if not isinstance(self.extra_config_files, Mapping):
+            raise TypeError("Pi extra_config_files must be a mapping")
+        reserved_config_names = {"settings.json", "session.jsonl", "sessions"}
+        for name, contents in self.extra_config_files.items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or "\0" in name
+                or Path(name).name != name
+            ):
+                raise ValueError(
+                    "Pi extra_config_files names must be non-empty single path segments"
+                )
+            if name in reserved_config_names:
+                raise ValueError("Pi extra_config_files names may not override Pi-owned files")
+            if not isinstance(contents, bytes):
+                raise TypeError("Pi extra_config_files values must be bytes")
 
     def cache_identity(self) -> dict[str, Any]:
-        return {
+        identity: dict[str, Any] = {
             "adapter": "pi-rpc",
             "adapter_schema": 3,
             "rpc": "strict-lf-jsonl+normalized-evidence-v2",
@@ -160,6 +181,12 @@ class PiRpcAdapter:
             "session_carry": self.session_carry,
             "session_max_bytes": self.session_max_bytes,
         }
+        if self.extra_config_files:
+            identity["extra_config_files_sha256"] = {
+                name: hashlib.sha256(self.extra_config_files[name]).hexdigest()
+                for name in sorted(self.extra_config_files)
+            }
+        return identity
 
     def capabilities(self) -> AgentCapabilities:
         return AgentCapabilities(filesystem=True, terminal=False)
@@ -203,6 +230,17 @@ class PiRpcAdapter:
             settings_path = pi_home / "settings.json"
             settings_path.write_bytes(_pi_rpc_settings_bytes())
             settings_path.chmod(0o600)
+            for name in sorted(self.extra_config_files):
+                contents = self.extra_config_files[name]
+                if any(secret.encode() in contents for secret in secrets):
+                    raise AgentResultError(
+                        f"Pi extra config file {name!r} contains a resolved env value"
+                    )
+            for name in sorted(self.extra_config_files):
+                contents = self.extra_config_files[name]
+                config_path = pi_home / name
+                config_path.write_bytes(contents)
+                config_path.chmod(0o600)
             environment.update(
                 {
                     "PI_CODING_AGENT_DIR": str(pi_home),

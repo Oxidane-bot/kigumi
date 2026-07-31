@@ -6,6 +6,9 @@
 
 ### 新增
 
+- `PiRpcAdapter` 新增 `extra_config_files`：调用方可向其独占的临时 Pi home 放入额外的
+  单段配置文件；内容仅以 SHA-256 纳入非空 adapter identity，拒绝 Pi 自有文件名和已解析
+  环境变量值，避免配置覆盖或 credential 进入缓存/证据。
 - `kigumi/__init__.py` docstring 开头加入三行进场协议：改节点前先运行
   `kigumi trace`、`dag plan`、`dag explain`，明确"看清楚再动"的主动工作流。
 - `docs/adoption.md` 开头新增「进场协议」段落（在接入步骤之前），把「改节点前做这
