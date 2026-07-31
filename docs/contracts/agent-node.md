@@ -46,8 +46,10 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
    未提交、重复提交、Hook 拒绝、schema 错误或输出缺失均 fail closed。
 7. Pi 启动前以 `--version` 与 `expected_version` 精确匹配；Kigumi 不安装、升级 Node/Pi。
 8. Pi 固定关闭 project context、隐式 Extension/Skill/Prompt/Theme 发现和 built-in tools；
-   session 默认关闭。仅 `session_carry=True` 可用显式 `--session` 开启，输入/输出都是
-   blob-backed carry，header cwd 规范化为 `"."`，超限或损坏 fail closed。
+   每次运行独占的 `pi-home` 固定写入 `settings.json`，可由 `extra_config_files` 再放入经
+   校验的单段配置文件，session 默认关闭。仅 `session_carry=True` 可用显式 `--session`
+   开启，输入/输出都是 blob-backed carry，header cwd 规范化为 `"."`，超限或损坏 fail
+   closed。
 9. bridge 的 `read/write/edit/grep/find/ls` 同名工具拒绝绝对路径和 `..`，且只以 staging
    workspace 为 root；这约束模型工具访问，但不是 OS sandbox，可信 Extension 仍有宿主权限。
 10. RPC 是严格 LF JSONL；stdout/stderr 并发排空；timeout/异常终止整个进程组；unknown UI、

@@ -721,6 +721,100 @@ def test_pi_rpc_adapter_parses_fixed_completion_and_redacts_raw_evidence(
     assert extensions[-1].endswith("kigumi/_pi_bridge.ts")
 
 
+@pytest.mark.parametrize(
+    "extra_config_files",
+    (
+        [],
+        {"nested/file.json": b"{}"},
+        {"nested\\file.json": b"{}"},
+        {"..": b"{}"},
+        {".": b"{}"},
+        {"": b"{}"},
+        {"config.json": "{}"},
+        {"settings.json": b"{}"},
+        {"session.jsonl": b"{}"},
+        {"sessions": b"{}"},
+    ),
+)
+def test_pi_rpc_adapter_rejects_unsafe_extra_config_files(
+    extra_config_files: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=r"^Pi extra_config_files "):
+        PiRpcAdapter(
+            ("pi",),
+            "1.2.3",
+            extra_config_files=extra_config_files,  # type: ignore[arg-type]
+        )
+
+
+def test_pi_rpc_adapter_extra_config_files_write_identity_and_secret_guard(
+    tmp_path: Path,
+) -> None:
+    default = PiRpcAdapter(("pi",), "1.2.3")
+    empty = PiRpcAdapter(("pi",), "1.2.3", extra_config_files={})
+    first = PiRpcAdapter(("pi",), "1.2.3", extra_config_files={"endpoint.json": b'{"a":1}'})
+    changed = PiRpcAdapter(("pi",), "1.2.3", extra_config_files={"endpoint.json": b'{"a":2}'})
+
+    assert empty.cache_identity() == default.cache_identity()
+    assert first.cache_identity() != changed.cache_identity()
+    assert first.cache_identity()["extra_config_files_sha256"] == {
+        "endpoint.json": hashlib.sha256(b'{"a":1}').hexdigest()
+    }
+
+    spec = AgentSpec.load(_capsule(tmp_path / "agent", thinking="off"))
+    fake = _fake_pi(tmp_path / "fake-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    adapter = PiRpcAdapter(
+        (str(fake),),
+        "1.2.3",
+        env_resolver=lambda: {"FAKE_KEY": "fake-secret-value-not-real"},
+        extra_config_files={"endpoint.json": b'{"apiKey":"$FAKE_KEY"}'},
+    )
+
+    adapter.run(
+        AgentRequest(AgentTask("write"), {}, spec),
+        AgentRunContext(
+            workspace,
+            capsule_root,
+            10**9,
+            lambda event: None,
+            lambda name, data, media: None,
+        ),
+    )
+
+    config_path = workspace / ".kigumi" / "pi-home" / "endpoint.json"
+    assert config_path.read_bytes() == b'{"apiKey":"$FAKE_KEY"}'
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    secret_workspace = tmp_path / "secret-workspace"
+    secret_workspace.mkdir()
+    secret_capsule_root = secret_workspace / ".kigumi" / "agent"
+    spec.stage(secret_capsule_root)
+    secret_adapter = PiRpcAdapter(
+        (str(fake),),
+        "1.2.3",
+        env_resolver=lambda: {"FAKE_KEY": "fake-secret-value-not-real"},
+        extra_config_files={"endpoint.json": b'{"apiKey":"fake-secret-value-not-real"}'},
+    )
+
+    with pytest.raises(AgentResultError) as raised:
+        secret_adapter.run(
+            AgentRequest(AgentTask("write"), {}, spec),
+            AgentRunContext(
+                secret_workspace,
+                secret_capsule_root,
+                10**9,
+                lambda event: None,
+                lambda name, data, media: None,
+            ),
+        )
+    assert "endpoint.json" in str(raised.value)
+    assert "fake-secret-value-not-real" not in str(raised.value)
+
+
 def test_pi_rpc_adapter_session_carry_uses_explicit_file_and_normalizes_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
