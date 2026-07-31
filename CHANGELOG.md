@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-31
+
 ### 新增
 
 - 全部 8 条图命令新增 `--graph-arg KEY=VALUE`（可重复）：把参数按名传给 `dag_entry`

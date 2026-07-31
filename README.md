@@ -73,7 +73,7 @@ with no further API cost.
 
 ## Status
 
-0.9.0, API not frozen. The Agent boundary is intentionally an execution adapter,
+0.10.0, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
 
 The built-in judge, pairwise, and reflection prompts default to Chinese text;
