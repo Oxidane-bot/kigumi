@@ -1,6 +1,6 @@
 # 缓存键契约
 
-Status: Active (0.8.0)
+Status: Active (0.9.0)
 
 > 0.8.0：`CACHE_SCHEMA=6`，node cache envelope schema 3 保持不变；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache

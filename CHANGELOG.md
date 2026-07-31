@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-31
+
 ### 新增
 
 - `PiRpcAdapter` 新增 `extra_config_files`：调用方可向其独占的临时 Pi home 放入额外的

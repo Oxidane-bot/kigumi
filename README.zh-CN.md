@@ -58,7 +58,7 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 
 ## 状态
 
-0.8.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
+0.9.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
 
 内置 judge、pairwise 与 reflection prompt 默认使用中文文本，三者都可覆盖；参数与槽位契约见
 [评估与提示词进化](docs/adoption.md#四评估与提示词进化evals--optimize)。

@@ -1,6 +1,6 @@
 # Agent node 契约
 
-Status: Active (0.8.0)
+Status: Active (0.9.0)
 
 ## Purpose
 
