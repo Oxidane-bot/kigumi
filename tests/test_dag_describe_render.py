@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+from kigumi import PromptRef, PromptSpec
 from tests._dag_helpers import _make_dag
 
 
@@ -19,6 +20,32 @@ class _DescribedReview(BaseModel):
     score: float = Field(description="置信分数")
     tags: list[str] = Field(description="标签列表")
     notes: str
+
+
+def test_render_summary_shows_prompt_spec_names(tmp_path: Path) -> None:
+    """教训 summary_prompt_specs: 摘要必须把结构化 PromptSpec 压成名称单元格。"""
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "base.md").write_text("review", encoding="utf-8")
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, list[dict[str, str]]]:
+        del inputs, ctx
+        return {"items": [{"id": "one"}]}
+
+    @dag.map(
+        "review",
+        items_from=("source", "items"),
+        prompt_specs=(PromptSpec("review_prompt", PromptRef("base")),),
+    )
+    def review(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return item
+
+    rendered = dag.render_summary()
+
+    assert "| review | - | auto |  | map | source | source.items |  | review_prompt |" in rendered
 
 
 def test_describe_and_summary_expose_registered_declarations(tmp_path: Path) -> None:

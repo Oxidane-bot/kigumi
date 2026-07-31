@@ -34,7 +34,7 @@ def render_summary(description: Mapping[str, Any]) -> str:
                     ", ".join(entry["deps"]),
                     _format_locator(entry["items_from"]),
                     _format_locator(entry["carry_from"]),
-                    ", ".join(entry["prompt_specs"]),
+                    ", ".join(spec["name"] for spec in entry["prompt_specs"]),
                     ", ".join(entry["files"]),
                     ", ".join(f"{key}={value}" for key, value in entry["params"].items()),
                     node_models,

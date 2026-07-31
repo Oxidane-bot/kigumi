@@ -608,6 +608,21 @@ def test_cli_describe_md(tmp_path: Path, capsys) -> None:
     assert "| 节点 |" in capsys.readouterr().out
 
 
+def test_cli_describe_md_shows_prompt_spec_name(tmp_path: Path, capsys) -> None:
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "base.md").write_text("source", encoding="utf-8")
+    dag = _cli_dag(tmp_path)
+
+    @dag.node("source", prompt_specs=(PromptSpec("source_prompt", PromptRef("base")),))
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    assert _run_dag_cli(dag, ["describe"]) == 0
+    assert "| source | - | auto |  | node |  |  |  | source_prompt |" in capsys.readouterr().out
+
+
 def test_cli_describe_json(tmp_path: Path, capsys) -> None:
     dag = _cli_dag(tmp_path)
 

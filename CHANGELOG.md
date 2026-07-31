@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 修正 `kigumi describe` 与 `Dag.render_summary()`:0.10.0 起 `describe()` 只投影
+  结构化的 `prompt_specs`(dict),而摘要渲染仍按扁平字符串拼接,于是任何一个节点声明了
+  `prompt_specs=` 就让整张表以 `TypeError: sequence item 0: expected str instance,
+  dict found` 崩掉——发布前的图审阅对声明了提示词的项目完全不可用。现在按 `name` 压成
+  单元格。
+
 ## [0.10.0] - 2026-07-31
 
 ### 新增
