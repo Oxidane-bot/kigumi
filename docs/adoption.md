@@ -6,11 +6,18 @@
 可验证不变式的权威文本见 [契约索引](contracts/README.md)，面向使用者的发布变化见
 [CHANGELOG.md](../CHANGELOG.md)。
 
-想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](../examples/ticket_extract/README.md)
-或[提示词进化环](../examples/prompt_evolve/README.md)。前者用 150 张固定 seed 合成工单测量
+想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](https://github.com/Oxidane-bot/kigumi/blob/master/examples/ticket_extract/README.md)
+或[提示词进化环](https://github.com/Oxidane-bot/kigumi/blob/master/examples/prompt_evolve/README.md)（示例只在仓库里，不随 wheel 交付）。前者用 150 张固定 seed 合成工单测量
 map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
 
 ## 进场协议（改节点前先做这三步）
+
+不熟悉这个库时，先读两页；装好之后不必回仓库，两页都随 wheel 交付：
+
+```bash
+kigumi brief          # 已有能力、别重造什么、CLI 命令说明（见 brief.md）
+kigumi docs           # 列出全部交付页，再 kigumi docs <name> 读其中一页
+```
 
 改节点之前，先用框架自己的工具看清楚状态，再动手。这三步不会发真实请求，不花钱：
 
@@ -21,15 +28,16 @@ kigumi trace <run_id> --node <name> --json   # 只看某个节点，适合 json 
 
 # 2. 预览改动之后哪些会重算（哪些会花钱）
 #    certain = 确定会 miss；at_risk = 可能 miss；pending_on = 因 unknown 上游待定
-dag plan
+kigumi plan
 
 # 3. 查某个节点上次为什么命中或失效
-dag explain <node>
-dag explain <node@item>   # map/scan 的单个 item
+kigumi explain <node>
+kigumi explain <node@item>   # map/scan 的单个 item
 ```
 
-`dag.plan()` 与 `dag.explain()` 需要已注册的 `Dag` 实例；找到应用里的 `Dag` 对象后调用，
-或用 `dag.cli()` 绑定它。完整命令参数见 [CLI 参考](cli.md)；
+这三条里后两条要读内存里的图，因此需要 `[tool.kigumi]` 声明 `dag_entry`
+（`kigumi init` 会写好）；未声明时命令以 2 退出并告诉你补哪个键。程序内可以直接调用
+`dag.plan()` 与 `dag.explain()`。完整命令参数见 [CLI 参考](cli.md)；
 所有症状的排查流程见[六、排障](#六排障按症状查)。
 
 
@@ -53,7 +61,16 @@ env_file = ".env"                # KIGUMI_MODEL_DEFAULT / KIGUMI_MODEL_PRO / api
 agent_slots = 1                  # 外部 Agent 默认全局串行
 agent_lock_dir = "artifacts/_locks/agents"
 agent_slot_timeout_seconds = 300
+dag_entry = "nodes.graph:build_dag"  # 图命令的入口；不声明则只有项目运维命令可用
 ```
+
+`dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
+`check` / `graph` / `profile` / `resume` / `retry-resolve` 要读内存里的图，而节点是靠
+装饰器在 import 时注册的，所以这些命令必须 import 一个返回 `Dag` 的工厂函数。指向它，
+这组命令就能在项目里直接敲；不指向，其余命令照常工作。`kigumi init` 会生成
+`nodes/graph.py` 骨架并写好这个键。
+
+工厂函数被 import 时必须只注册节点、不产生副作用——图命令只读拓扑，不应触发任何执行。
 
 `.env` 里放模型别名与密钥(密钥永远不进 git,`kigumi doctor` 只报键名不报值)。
 `KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
@@ -115,7 +132,7 @@ caller = LLMCaller(  # L1:缓存/预算/dry-run/溯源
 ### 3. 声明节点(DAG 项目)
 
 ```python
-from kigumi import Dag
+from kigumi import Dag, PromptRef, PromptSpec
 from kigumi.config import KigumiConfig
 
 
@@ -126,10 +143,12 @@ def observe(node_name, artifact, cache_hit):
 dag = Dag(KigumiConfig(project_root=Path(__file__).parent), caller, post_node=observe)
 
 
-@dag.node("outline", prompts=("outline",), files=("fixtures/style.md",))
+OUTLINE = PromptSpec(name="outline", base=PromptRef("outline"))
+
+
+@dag.node("outline", prompt_specs=(OUTLINE,), files=("fixtures/style.md",))
 def outline(inputs, ctx):
-    prompt = ctx.render("outline", material=...)  # 严格渲染,槽位不符即炸
-    return {"text": ctx.call(prompt)}
+    return {"text": ctx.call(ctx.resolve_prompt("outline"))}
 
 
 @dag.node("review", deps=("outline",))
@@ -144,8 +163,8 @@ result = dag.run(workers=4)
 节点需要项目内绝对路径时使用只读的 `ctx.project_root`，它始终是配置项目根的已解析
 `Path`；不要为此把 `root` 通过 `build_dag` 闭包传进节点体。
 
-节点必须把**所有会影响输出的东西声明出来**:上游用 `deps`、模板用
-`prompts`、数据文件用 `files`、标量参数用 `params`。缓存键由这些声明 +
+节点必须把**所有会影响输出的东西声明出来**:上游用 `deps`、Prompt 用
+`prompt_specs`、数据文件用 `files`、标量参数用 `params`。缓存键由这些声明 +
 节点函数源码 + source_dirs 全部源码共同决定——没声明的输入 = 缓存不知道
 它变了 = 陈旧结果静默复用。这是接入时最容易犯的错。
 
@@ -166,8 +185,9 @@ result = dag.run(workers=4)
 
 ### 分层 Prompt：有限选择、统一材料与 selected-only cache
 
-新工作流优先用 `prompt_specs` 声明 Prompt 的完整输入面；既有 `prompts=()` 与
-`ctx.render()` 仍保留：
+节点只能用 `prompt_specs=()` 声明 Prompt；节点体内用 `ctx.resolve_prompt()` 取得
+managed `ResolvedPrompt`。`load_template` / `render_template` 仍可用于生成 Markdown
+报告或配置文件等非 LLM 输出，不用于构造传给 `ctx.call()` 的 prompt：
 
 ```python
 from kigumi import (
@@ -223,7 +243,9 @@ def process(item, inputs, ctx):
 `PromptRef("base/task")` 对应 `prompts/base/task.md`。base 的槽位必须与
 layer/material 完全一致；fragment 不得再含槽位；selector path 必须写成严格 tuple。
 `InputRef` 读取的是节点实际函数输入，因此会服从 `consumes` 投影；`ItemRef` 只用于
-map/scan，`CarryRef` 只用于 scan，`ParamRef` 读取 `params`。
+map/scan，`CarryRef` 只用于 scan，`ParamRef` 读取 `params`。若材料来自节点已经通过
+`files=` / `files_fn=` 声明的文件，用 `FileRef`；它读取框架注入的 UTF-8 文件字节，
+不把原文写入下游 artifact，也不会绕过 raw-io 守卫。
 
 每次 run 在任何节点执行前一次 snapshot 所有声明 Prompt 文件。当前 axis selection、所选
 fragment 和 material digest 进入 L3 key，未选中 variant 的内容不进入；但完整候选 universe
@@ -260,15 +282,15 @@ def outline(inputs, ctx):
 失败后 Kigumi 写 `due_at` 并返回 `RunResult(run_status="pending_retry")`，不会在进程内 sleep；
 外部 supervisor 到期调用 `dag.resume(run_id)`。同 run 的 graph、targets、force、源码/libs、
 retry/evidence policy、完整 Prompt 候选与 WorkflowProfile 都由 schema-2 `_run.json` 固定，
-任何变化 fail closed；0.6/schema-1 run 只能查看，不能 resume。
+任何变化 fail closed；缺少 schema-2 manifest 的旧 run 不能 resume。
 
 durable CALL 的 transport/length/empty internal retry 必须全为 0，Pi hidden retry 也必须关闭。
 若进程在 provider call/Pi spawn 后崩溃且没有 terminal receipt，状态为 ambiguous，必须人工：
 
 ```bash
-dag retry-resolve run-0042 outline --attempt 1 --action retry \
+kigumi retry-resolve run-0042 outline --attempt 1 --action retry \
   --reason "provider logs confirm no accepted result"
-dag resume run-0042
+kigumi resume run-0042
 ```
 
 `retry|fail` 都要求 reason 并进入 trace。Kigumi 不承诺外部 effect exactly-once；它保证的是
@@ -290,8 +312,7 @@ def prompt_slots(artifact):
     consumes={"outline": prompt_slots},
 )
 def draft(inputs, ctx):
-    slots = inputs["outline"]  # 只含 title、summary，不再暴露完整 outline
-    return {"text": ctx.call(ctx.render("draft", **slots))}
+    return {"text": ctx.call(ctx.resolve_prompt("draft"))}
 ```
 
 投影必须是“完整上游 artifact → JSON 可序列化 `dict`”的纯函数。框架先做 canonical JSON
@@ -386,13 +407,13 @@ namespace、端口、本地节点名都只能是单个非空段（不能含 `.`�
     items_from=("scan", "items"),
     key_fn=lambda item: item["id"],
     deps=("style_guide",),
-    prompts=("describe",),
+    prompt_specs=(DESCRIBE,),
     files=("fixtures/rubric.md",),
     files_fn=lambda item: (item["clip"],),
     params={"tone": "brief"},
 )
 def process(item, inputs, ctx):
-    return {"text": ctx.call(ctx.render("describe", item=str(item)))}
+    return {"text": ctx.call(ctx.resolve_prompt("describe"))}
 ```
 
 `items_from` 的上游会自动成为调度依赖，但其整体 artifact 不进入任何 item
@@ -473,11 +494,10 @@ assert result.map_items["process"] == {"chunk-a": "hit", "chunk-b": "miss"}
     key_fn=lambda scene: scene["id"],
     carry_from=("review_ledger", "ledger"),
     carry_fn=lambda artifact: artifact["delta"],
-    prompts=("draft_scene",),
+    prompt_specs=(DRAFT_SCENE,),
 )
 def draft_scene(scene, carry, inputs, ctx):
-    prompt = ctx.render("draft_scene", material=inject({"scene": scene, "carry": carry}))
-    return {"delta": ctx.call(prompt)}
+    return {"delta": ctx.call(ctx.resolve_prompt("draft_scene"))}
 ```
 
 `carry_from` 缺省时首项 carry 为 `None`，`carry_fn` 缺省时下一项接收完整项 artifact。
@@ -555,16 +575,16 @@ redacted_runtime = dag.profile(run_id, include_content=True)
 ```
 
 ```bash
-dag profile --format md
-dag profile --run-id run-0042 --format json
-dag graph --run-id run-0042 --prompts
+kigumi profile --format md
+kigumi profile --run-id run-0042 --format json
+kigumi graph --run-id run-0042 --prompts
 ```
 
 静态画像不执行节点；运行画像不重跑 provider，只读取 schema-2 manifest、sidecar/origin、
 attempt、candidate 与 failure receipt。warm hit 分别显示本 run 的 current selection 和 cache
 artifact 的 immutable origin selection。默认不展开 CALL/Agent 内容；
 `--include-content` 也只能展示该 run 按 EvidencePolicy 已保留并 scrub 的 evidence。
-0.7 digest 损坏 fail closed；0.6 run 明确显示 `resolution_status=unavailable_legacy`。
+0.8 digest 损坏 fail closed；缺少 schema-2 manifest 的旧 run 直接拒绝读取。
 
 ## 二、核心心智模型
 
@@ -576,7 +596,7 @@ artifact 的 immutable origin selection。默认不展开 CALL/Agent 内容；
 - 改了节点函数源码或 source_dirs 里任何 .py 的代码 → 相关节点全部重算
   (故意的,代码就是配方的一部分)。注释与 docstring 不算代码:source 与
   libs 两个成分都按剥离后的 AST 哈希,修文档注不换族。
-- 改了 legacy 模板、PromptSpec base、固定/已选 layer、selector/binding 或 material →
+- 改了 Prompt 模板、PromptSpec base、固定/已选 layer、selector/binding 或 material →
   节点重算；只改未选中 variant 内容 → selected-only L3 key 不变，但旧 run 不可 resume。
 - 想强制重算单个节点用 `dag.run(force=["node_name"])`;名字打错会直接报错,
   不会静默全量命中。
@@ -584,9 +604,9 @@ artifact 的 immutable origin selection。默认不展开 CALL/Agent 内容；
   L1 缓存(`caller` 级)与 L3 缓存(节点/item 级)是两层:节点命中时根本不会
   执行函数体;节点未命中但函数内的 `ctx.llm` 命中时,只省模型调用。
 
-**材料注入只有一个入口。**任何进 prompt 的动态内容都走 `prompt.inject`
-(自动围栏、防破界)或 `ctx.render`(严格槽位模板)。手写 f-string 拼
-prompt 是本库要消灭的第一号事故来源。
+**材料注入只有一个入口。**任何进 prompt 的动态内容都在 `PromptSpec` 的
+`PromptMaterial` 中声明并由框架注入；节点只取 `ctx.resolve_prompt()` 的结果。手写
+f-string 拼 prompt 是本库要消灭的第一号事故来源。
 
 **结构化输出走 `ctx.call_validated`。**pydantic 模型进,校验实例出;围栏剥离、
 extra 字段剥壳、有界修复(默认 2 轮)、stuck 检测全部内置。不要自己写
@@ -862,11 +882,10 @@ L3,同体意味着昂贵的生成也放弃节点缓存;更重要的是"补批准
 只能靠约定维持。拆成两个节点后,这条不变式是结构性的:
 
 ```python
-@dag.node("repair_proposal", deps=("draft", "review"), prompts=("repair",))
+@dag.node("repair_proposal", deps=("draft", "review"), prompt_specs=(REPAIR,))
 def repair_proposal(inputs, ctx):
     """纯生成:正常进 L3 缓存,批准与否不影响本节点的键与产物。"""
-    prompt = ctx.render("repair", draft=inject(inputs["draft"]), review=inject(inputs["review"]))
-    return ctx.call_validated(prompt, RepairProposal).model_dump()
+    return ctx.call_validated(ctx.resolve_prompt("repair"), RepairProposal).model_dump()
 
 
 @dag.node("repair_gate", deps=("repair_proposal",))
@@ -1262,13 +1281,13 @@ kigumi diff run-0041 run-0042 --json
 | 想在花钱前看改动爆炸半径 | `dag.plan()`;`certain` 是下界、加 `at_risk` 是上界,`pending_on` 追 unknown 的原因链 |
 | 图形状/声明想整体过目 | `dag.render_mermaid(run_id)` 叠加运行态,挂起与被跳过节点会着色标出 |
 | retry 到期前 resume 没动作 | 这是正确行为；看 `pending_retries[].due_at`，由外部 supervisor 到期再调用 |
-| resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `dag retry-resolve ... retry|fail` 裁决 |
+| resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `kigumi retry-resolve ... retry|fail` 裁决 |
 | 同 run 报 declaration changed | 0.6 manifest 禁止覆盖；用原声明 resume，或为新声明创建新 run_id |
 
 `explain` 的判定语义与 `plan` 完全一致:上游 miss 导致成分无法诚实计算时报
 `unknown`(并给 `pending_on`),不猜测原因;对照的 run 没有该节点 sidecar 报
-`no_entry`;旧格式 sidecar 缺成分记录报 `legacy`,重跑一次即可获得。成分标签
-固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<模板>`、`files:<路径>`、
+`no_entry`;sidecar 缺少或损坏成分记录直接 fail closed。成分标签
+固定为 `source`、`libs`、`upstream:<dep>`、`prompt_specs:<spec>`、`files:<路径>`、
 `params`、`item`、`item_files:<路径>`、`carry`、`kigumi`，声明外部指纹时额外且仅额外
 出现 `external=sha(external_fingerprint)`。缓存策略不入键；`kigumi` 由 prompt 生成字节、
 `CACHE_SCHEMA` 与 Pydantic 版本组成，不直接使用发行版本号。

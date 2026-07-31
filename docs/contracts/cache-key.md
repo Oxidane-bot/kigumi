@@ -53,8 +53,8 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。同节点声明的所有 PromptSpec 都保守入键，即使本次函数未调用。
    未选中候选的完整字节 universe 只进入 run manifest graph identity，因此改它可复用相同
-   selected-only L3 条目，但旧 run 因声明 identity 漂移拒绝 resume。legacy `prompts=()`
-   仍按全部模板内容入键。
+   selected-only L3 条目，但旧 run 因声明 identity 漂移拒绝 resume。未声明的字符串 CALL
+   不伪造 PromptSpec 成分，receipt 只记录为 unmanaged。
 10. node cache envelope schema 3 固定保存 canonical artifact、artifact SHA-256、首次执行的
     immutable origin provenance 与 origin digest。warm hit 不得以 replay metadata 覆盖 origin。
 11. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy

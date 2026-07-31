@@ -66,7 +66,7 @@ def _write_fixtures(root: Path) -> dict[str, dict[str, str]]:
             "severity": rng.choice(SEVERITIES),
             "request_category": rng.choice(categories),
         }
-        ticket_text = _ticket_text(**labels, variant=index)
+        ticket_text = f"工单编号：{ticket_id}\n" + _ticket_text(**labels, variant=index)
         source = f"fixtures/tickets/{ticket_id}.txt"
         (root / source).write_text(ticket_text, encoding="utf-8")
         manifest.append({"id": ticket_id, "source": source, "truth": labels})
@@ -84,11 +84,10 @@ def _fixture_root(temporary: Path) -> tuple[Path, dict[str, dict[str, str]]]:
 
 
 def _parse_ticket_request(text: str) -> tuple[str, str]:
-    match = re.search(r"```json\n(.*?)\n```", text, flags=re.DOTALL)
+    match = re.search(r"工单编号：([^\n]+)", text)
     if match is None:
-        raise AssertionError("脚本化 responder 未找到工单材料")
-    payload = json.loads(match.group(1))
-    return str(payload["id"]), str(payload["text"])
+        raise AssertionError("脚本化 responder 未找到工单编号")
+    return match.group(1).strip(), text
 
 
 def _answer_from_text(ticket_text: str) -> dict[str, str]:

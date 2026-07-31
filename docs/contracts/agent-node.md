@@ -91,3 +91,15 @@ capsule、版本、RPC、交互、quota、completion、attachment 或 publish �
 必须递增 `agent_executor_schema` 并记入 CHANGELOG；改变普通键或 canonical artifact 语义必须
 递增 `CACHE_SCHEMA`。Evidence、capacity 与 retry 的专门契约分别见 `evidence.md`、
 `agent-capacity.md`、`retry-resume.md`。
+
+### 未完成的验证
+
+Pi session carry 的 live 腿尚未跑过。2026-07-26 交付 `agent_scan` session carry 时，
+应跑而未跑的是 `KIGUMI_PI_LIVE=1` 下配真实、已配置凭据的 Pi 0.82.1 的一致性测试
+（含两项 `agent_scan`，持久化并恢复一个显式 session）；实际只跑了确定性 fake-Pi RPC
+测试（覆盖缺失文件创建、显式 `--session`、header cwd 规范化、blob carry/cache 重放、
+大小上限与失败行为），并审读了 Pi 0.82.1 `SessionManager` 与 RPC 持久化路径。
+
+残留风险：真实 Pi/provider 组合可能存在 fake 进程未表达的运行时 session 格式、
+持久化时序或 extension 交互。把 live Pi session carry 当作 provider-conformant 之前，
+必须按文档环境跑 `tests/test_pi_live.py::test_real_pi_rpc_conformance`。

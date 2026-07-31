@@ -52,7 +52,7 @@
 - `AmbiguousAttemptError(run_id: str, target: str, attempt: int) -> None`
   （`kigumi.retry`，顶层导出）：崩溃 attempt 已越过外部 side-effect 边界，但没有可信成功
   candidate，框架无法判断 effect 是否发生。先核对 provider/Pi 证据，再用
-  `dag retry-resolve ... --action retry|fail --reason ...` 明确裁决。
+  `kigumi retry-resolve ... --action retry|fail --reason ...` 明确裁决。
 - `class UndeclaredInputError(RuntimeError)`（`kigumi.dag`，顶层导出）：节点通过
   `ctx.read_text` / `ctx.read_bytes` 访问了 `files` 与当前 `files_fn` 之外的路径。补声明并让
   缓存自然换键；不要改回裸文件读取。见 [缓存键契约](contracts/cache-key.md)。

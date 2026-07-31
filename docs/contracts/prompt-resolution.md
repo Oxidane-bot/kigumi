@@ -10,7 +10,7 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
 
 ## Public surface
 
-顶层导出 `PromptRef`、`InputRef`、`ParamRef`、`ItemRef`、`CarryRef`、`PromptAxis`、
+顶层导出 `PromptRef`、`InputRef`、`ParamRef`、`ItemRef`、`CarryRef`、`FileRef`、`PromptAxis`、
 `PromptLayer`、`PromptMaterial`、`PromptSpec`、`ResolvedPrompt`、`PromptResolution`、
 `PromptDefinitionError` 与 `PromptResolutionError`。`Dag.node/agent/map/scan/foreach` 和
 `Subgraph.node/map/scan` 接受 `prompt_specs=()`；执行时通过
@@ -28,14 +28,16 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
    不得重复。fragment 不得含槽位；片段逐字插入，不自动添加换行或分隔符。
 4. selector/material path 必须是 `tuple[str | int, ...]`，逐层严格读取，不解析点号字符串、
    不转换类型、不 fallback。`InputRef` 读取节点实际函数输入并服从 `consumes` 投影；
-   `ParamRef` 读取声明参数；`ItemRef` 只用于 map/scan；`CarryRef` 只用于 scan。
+   `ParamRef` 读取声明参数；`ItemRef` 只用于 map/scan；`CarryRef` 只用于 scan。`FileRef`
+   只能读取节点已通过 `files=` / `files_fn=` 声明并已注入的 UTF-8 文件字节。
 5. axis selector 结果必须是字符串并精确匹配声明 variant key。缺失、路径类型不符、非字符串
    或未知值在 L3 lookup、CALL、Agent spawn、文件物化和其他副作用前失败。
 6. material 必须经 `inject()` 定界；没有 raw material、隐式 override、默认 variant、嵌套
    fragment、宏、Jinja 或模型生成 variant。首版只组合单个文本 Prompt；chat message list
    保持 legacy/unmanaged。
-7. 同一节点的 legacy `prompts` 与 `PromptSpec` name 不得冲突。未采用新声明的字符串
-   `ctx.call()` 和字符串 Agent instruction 继续可用，但 receipt 明确为 unmanaged。
+7. 节点只能通过 `prompt_specs=()` 声明 Prompt；节点内 `ctx.resolve_prompt()` 返回 managed
+   `ResolvedPrompt`。字符串直接传给 `ctx.call()` 或作为 Agent instruction 标记为 unmanaged，
+   应当豁免或迁移到 `PromptSpec`。
 8. `ResolvedPrompt` 是不可变 `str` 子类。只有对象本身携带 resolution；拼接、格式化、切片或
    `str()` 后元数据自然丢失，后续 CALL 必须记为 unmanaged，不得猜测或误归因。
 9. `PromptResolution` 只保存 spec 结构摘要、base/layer/axis 来源、实际 selection、material

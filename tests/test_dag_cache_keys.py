@@ -14,6 +14,7 @@ from kigumi.artifacts import sha
 from kigumi.calling import LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.prompt import PromptRef, PromptSpec
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 from tests._dag_helpers import _load_work, _make_dag
@@ -133,7 +134,11 @@ def test_prompt_upstream_and_params_changes_invalidate_caches(tmp_path: Path) ->
         def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
             return {"value": ctx.params["value"]}
 
-        @dag.node("leaf", deps=("source",), prompts=("draft",))
+        @dag.node(
+            "leaf",
+            deps=("source",),
+            prompt_specs=(PromptSpec("draft", PromptRef("draft")),),
+        )
         def leaf(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
             return {"value": inputs["source"]["value"]}
 

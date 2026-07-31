@@ -4,6 +4,9 @@
 [接入指南](adoption.md),签名与失效见 [API 速查](api.md),承诺见
 [契约索引](contracts/README.md),命令见 [CLI 参考](cli.md)。
 
+装了这个库之后,本页与上述各页都能用 `kigumi docs <name>` 离线读;
+`kigumi brief` 是更短的 agent 进场页(见 [brief.md](brief.md))。
+
 先扫这张表再动手。撞不到需要的行,大概率是这个库不做那件事——边界见
 adoption.md 的"设计边界"一节。
 
@@ -15,13 +18,13 @@ adoption.md 的"设计边界"一节。
 | 版本化提示词模板 + 严格槽位渲染 | `load_template` / `render_template` / `slot_names` |
 | 声明式组合的多层 prompt | `PromptSpec` / `PromptLayer` |
 | A/B 或多分支提示词(有限选择轴) | `PromptAxis` |
-| 运行期材料进 prompt 但保留 lineage | `PromptMaterial` |
+| 运行期材料进 prompt 但保留 lineage | `PromptMaterial` / `FileRef` |
 | 让选择轴读上游/参数/item/carry | `InputRef` / `ParamRef` / `ItemRef` / `CarryRef` |
 | 具名条件段(值为 None 整段不渲染) | `section` |
 | 从 pydantic model 生成输出格式说明段 | `schema_format_section` |
 | 安全边界截断长文本 | `clip` |
 | 渲染列表为 JSON 或 bullets | `render_items` |
-| 节点内取已解析 prompt | `ctx.resolve_prompt` / `ctx.render` |
+| 节点内取已解析 prompt | `ctx.resolve_prompt` |
 
 ## 调用、缓存与校验
 
@@ -104,6 +107,8 @@ adoption.md 的"设计边界"一节。
 | 需要 | 用 |
 | --- | --- |
 | 脚手架一个新项目 | `kigumi init [--hooks]` |
+| 让 agent 一眼看清这个库已有什么(别重造) | `kigumi brief` |
+| 离线读随 wheel 交付的文档页 | `kigumi docs [name]` |
 | 路径/密钥/模板体检 | `kigumi doctor` |
 | 看一次 run 的完整证据链 | `kigumi trace <run_id>` / `kigumi runs show` |
 | 取某次 LLM 调用的载荷 | `kigumi call <key_prefix> --field messages\|response` |

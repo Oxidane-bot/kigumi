@@ -12,6 +12,9 @@ from .failures import canonical_failure
 from .retry import AmbiguousAttemptError, RetryPolicy
 
 RUN_MANIFEST_SCHEMA = 2
+RUN_SIDECAR_SCHEMA = 2
+FAILURE_SCHEMA = 2
+SUCCESS_CANDIDATE_SCHEMA = 2
 ATTEMPT_RECEIPT_SCHEMA = 2
 
 

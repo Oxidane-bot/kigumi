@@ -20,6 +20,13 @@ class KigumiConfig:
     agent_slots: int = 1
     agent_lock_dir: str = "artifacts/_locks/agents"
     agent_slot_timeout_seconds: float = 300.0
+    dag_entry: str | None = None
+    """``module:callable`` returning the project's ``Dag``, enabling ``kigumi plan``.
+
+    Optional on purpose: without it every project-operations command still works,
+    because those read artifacts from disk and never import project code. Only the
+    graph commands need the in-memory graph, so only they require this key.
+    """
     project_root: Path = field(default_factory=Path.cwd, repr=False)
 
     def __post_init__(self) -> None:
@@ -58,6 +65,17 @@ class KigumiConfig:
             raise ValueError("agent_slot_timeout_seconds must be positive")
         if not isinstance(self.agent_lock_dir, str) or not self.agent_lock_dir:
             raise ValueError("agent_lock_dir must be a non-empty path")
+        if self.dag_entry is not None:
+            if not isinstance(self.dag_entry, str) or not self.dag_entry.strip():
+                raise ValueError("dag_entry must be a non-empty string")
+            self.dag_entry = self.dag_entry.strip()
+            # Fail here rather than at import time: a malformed target is a config
+            # error, and the message should name the expected shape.
+            module, separator, attribute = self.dag_entry.partition(":")
+            if not separator or not module.strip() or not attribute.strip():
+                raise ValueError(
+                    f"dag_entry must look like 'module:callable', got {self.dag_entry!r}"
+                )
 
     def resolve(self, path: str | Path) -> Path:
         """Resolve a configured project-relative path to an absolute path."""
@@ -132,6 +150,7 @@ def load_config(project_root: Path) -> KigumiConfig | None:
         "agent_slots",
         "agent_lock_dir",
         "agent_slot_timeout_seconds",
+        "dag_entry",
     }
     unknown = sorted(set(values) - known)
     if unknown:

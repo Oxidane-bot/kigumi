@@ -13,7 +13,7 @@ def render_summary(description: Mapping[str, Any]) -> str:
     """渲染每节点一行的 Markdown 声明表，不读取运行状态。"""
     rows = [
         (
-            "| 节点 | 子图 | cache | 说明 | 类型 | 依赖 | items_from | carry_from | prompts | "
+            "| 节点 | 子图 | cache | 说明 | 类型 | 依赖 | items_from | carry_from | prompt_specs | "
             "files | params | 校验模型 | 检查点 |"
         ),
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -34,7 +34,7 @@ def render_summary(description: Mapping[str, Any]) -> str:
                     ", ".join(entry["deps"]),
                     _format_locator(entry["items_from"]),
                     _format_locator(entry["carry_from"]),
-                    ", ".join(entry["prompts"]),
+                    ", ".join(entry["prompt_specs"]),
                     ", ".join(entry["files"]),
                     ", ".join(f"{key}={value}" for key, value in entry["params"].items()),
                     node_models,

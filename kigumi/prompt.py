@@ -8,6 +8,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Literal, Union, get_args, get_origin
@@ -169,6 +170,25 @@ PromptValueRef = InputRef | ParamRef | ItemRef | CarryRef
 
 
 @dataclass(frozen=True)
+class FileRef:
+    """Read file bytes supplied by the DAG from a path resolved out of runtime data."""
+
+    path_from: PromptValueRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path_from, (InputRef, ParamRef, ItemRef, CarryRef)):
+            raise PromptDefinitionError(
+                "FileRef path_from must be InputRef, ParamRef, ItemRef, or CarryRef"
+            )
+
+    def canonical(self) -> dict[str, Any]:
+        return {"kind": "file_ref", "path_from": self.path_from.canonical()}
+
+
+PromptMaterialRef = PromptValueRef | FileRef
+
+
+@dataclass(frozen=True)
 class PromptAxis:
     """Select exactly one Prompt fragment from a declared finite variant universe."""
 
@@ -227,14 +247,14 @@ class PromptMaterial:
     """Bind one base-template slot to deterministically fenced runtime material."""
 
     slot: str
-    source: PromptValueRef
+    source: PromptMaterialRef
     title: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "slot", _validate_prompt_name(self.slot, "PromptMaterial slot"))
-        if not isinstance(self.source, (InputRef, ParamRef, ItemRef, CarryRef)):
+        if not isinstance(self.source, (InputRef, ParamRef, ItemRef, CarryRef, FileRef)):
             raise PromptDefinitionError(
-                "PromptMaterial source must be InputRef, ParamRef, ItemRef, or CarryRef"
+                "PromptMaterial source must be InputRef, ParamRef, ItemRef, CarryRef, or FileRef"
             )
         if self.title is not None and (not isinstance(self.title, str) or not self.title.strip()):
             raise PromptDefinitionError("PromptMaterial title must be non-empty when supplied")
@@ -303,7 +323,6 @@ class PromptSpec:
 def validate_prompt_specs(
     prompt_specs: Any,
     *,
-    legacy_prompts: tuple[str, ...] = (),
     dynamic_kind: Literal["node", "map", "scan"] = "node",
 ) -> tuple[PromptSpec, ...]:
     """Freeze one node's declarations and enforce context-source restrictions."""
@@ -317,16 +336,8 @@ def validate_prompt_specs(
     names = [spec.name for spec in prompt_specs]
     if len(set(names)) != len(names):
         raise PromptDefinitionError("PromptSpec names must be unique within one node")
-    conflicts = sorted(set(names) & set(legacy_prompts))
-    if conflicts:
-        raise PromptDefinitionError(
-            "legacy prompts and PromptSpec names conflict: " + ", ".join(conflicts)
-        )
     for spec in prompt_specs:
-        sources: list[PromptValueRef] = [material.source for material in spec.materials]
-        sources.extend(
-            layer.source.selector for layer in spec.layers if isinstance(layer.source, PromptAxis)
-        )
+        sources = _prompt_value_refs(spec)
         if dynamic_kind == "node" and any(isinstance(source, ItemRef) for source in sources):
             raise PromptDefinitionError(f"PromptSpec {spec.name!r} uses ItemRef outside map/scan")
         if dynamic_kind != "scan" and any(isinstance(source, CarryRef) for source in sources):
@@ -342,10 +353,7 @@ def validate_prompt_bindings(
 ) -> None:
     """Validate top-level InputRef/ParamRef names against a node's function boundary."""
     for spec in prompt_specs:
-        sources: list[PromptValueRef] = [material.source for material in spec.materials]
-        sources.extend(
-            layer.source.selector for layer in spec.layers if isinstance(layer.source, PromptAxis)
-        )
+        sources = _prompt_value_refs(spec)
         for source in sources:
             if isinstance(source, InputRef) and source.input not in inputs:
                 raise PromptDefinitionError(
@@ -357,6 +365,19 @@ def validate_prompt_bindings(
                     f"PromptSpec {spec.name!r} ParamRef {source.param!r} "
                     "is not a declared node parameter"
                 )
+
+
+def _prompt_value_refs(spec: PromptSpec) -> list[PromptValueRef]:
+    sources: list[PromptValueRef] = []
+    for material in spec.materials:
+        if isinstance(material.source, FileRef):
+            sources.append(material.source.path_from)
+        else:
+            sources.append(material.source)
+    sources.extend(
+        layer.source.selector for layer in spec.layers if isinstance(layer.source, PromptAxis)
+    )
+    return sources
 
 
 @dataclass(frozen=True)
@@ -494,10 +515,9 @@ class PromptCatalogSnapshot:
         root: Path,
         *,
         prompt_specs: tuple[PromptSpec, ...] = (),
-        legacy_prompts: tuple[str, ...] = (),
     ) -> PromptCatalogSnapshot:
         resolved_root = root.resolve()
-        names = set(legacy_prompts)
+        names: set[str] = set()
         for spec in prompt_specs:
             names.update(reference.name for reference in spec.references())
         entries: dict[str, _CatalogEntry] = {}
@@ -580,6 +600,7 @@ class PromptCatalogSnapshot:
         carry: Any = None,
         has_item: bool = False,
         has_carry: bool = False,
+        file_contents: Mapping[str | Path, bytes] | None = None,
     ) -> ResolvedPrompt:
         slots: dict[str, str] = {}
         layers: list[dict[str, Any]] = []
@@ -632,28 +653,43 @@ class PromptCatalogSnapshot:
                 layer_record["selected"] = axis_record["selected"]
             layers.append(layer_record)
         for material in spec.materials:
-            value = _resolve_value(
-                material.source,
-                inputs=inputs,
-                params=params,
-                item=item,
-                carry=carry,
-                has_item=has_item,
-                has_carry=has_carry,
-                context=f"material {material.slot!r}",
-            )
+            file_record = None
+            if isinstance(material.source, FileRef):
+                value, file_record = _resolve_file_ref(
+                    material.source,
+                    file_contents=file_contents,
+                    inputs=inputs,
+                    params=params,
+                    item=item,
+                    carry=carry,
+                    has_item=has_item,
+                    has_carry=has_carry,
+                    context=f"material {material.slot!r}",
+                )
+            else:
+                value = _resolve_value(
+                    material.source,
+                    inputs=inputs,
+                    params=params,
+                    item=item,
+                    carry=carry,
+                    has_item=has_item,
+                    has_carry=has_carry,
+                    context=f"material {material.slot!r}",
+                )
             rendered_material = inject(value, title=material.title)
             encoded = rendered_material.encode("utf-8")
             slots[material.slot] = rendered_material
-            materials.append(
-                {
-                    "slot": material.slot,
-                    "source": material.source.canonical(),
-                    "title": material.title,
-                    "sha256": sha(rendered_material),
-                    "bytes": len(encoded),
-                }
-            )
+            material_record = {
+                "slot": material.slot,
+                "source": material.source.canonical(),
+                "title": material.title,
+                "sha256": sha(rendered_material),
+                "bytes": len(encoded),
+            }
+            if file_record is not None:
+                material_record["file_ref"] = file_record
+            materials.append(material_record)
         base = self._entries[spec.base.name]
         rendered = render_template(base.text, slots)
         resolution = PromptResolution(
@@ -667,6 +703,54 @@ class PromptCatalogSnapshot:
             rendered_bytes=len(rendered.encode("utf-8")),
         )
         return ResolvedPrompt(rendered, resolution)
+
+
+def _resolve_file_ref(
+    source: FileRef,
+    *,
+    file_contents: Mapping[str | Path, bytes] | None,
+    inputs: Mapping[str, Any],
+    params: Mapping[str, Any],
+    item: Any,
+    carry: Any,
+    has_item: bool,
+    has_carry: bool,
+    context: str,
+) -> tuple[str, dict[str, Any]]:
+    path_value = _resolve_value(
+        source.path_from,
+        inputs=inputs,
+        params=params,
+        item=item,
+        carry=carry,
+        has_item=has_item,
+        has_carry=has_carry,
+        context=f"{context} FileRef path_from",
+    )
+    if not isinstance(path_value, str | Path):
+        raise PromptResolutionError(f"{context} FileRef path_from must resolve to a path string")
+    path = str(path_value)
+    if file_contents is None:
+        raise PromptResolutionError(f"{context} FileRef requires injected file_contents")
+    normalized = {str(key): value for key, value in file_contents.items()}
+    try:
+        raw = normalized[path]
+    except KeyError as error:
+        raise PromptResolutionError(
+            f"{context} FileRef path {path!r} is missing from injected file_contents"
+        ) from error
+    if not isinstance(raw, bytes):
+        raise PromptResolutionError(f"{context} FileRef file_contents values must be bytes")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PromptResolutionError(f"{context} FileRef path {path!r} must be UTF-8") from error
+    return text, {
+        "path": path,
+        "path_from": source.path_from.canonical(),
+        "sha256": sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
 
 
 def _resolve_value(

@@ -22,8 +22,8 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 3. retry digest 属于 run execution identity 与 attempt receipt，不进入 L3 内容键。durable
    CALL 要求 transport/length/empty hidden retry 全为 0；Pi hidden retry 事件立即失败。
 4. `_run.json` schema 2 绑定 graph identity、targets、force、source/libs、retry/evidence
-   digests、完整 Prompt 候选 universe、WorkflowProfile 及其 digest。schema-1/0.6 run
-   只读，不可 resume；任何声明或未选中候选变化都 fail closed。
+   digests、完整 Prompt 候选 universe、WorkflowProfile 及其 digest。缺少 schema-2 manifest
+   的 run 不可 resume；任何声明或未选中候选变化都 fail closed。
 5. 每个 `runs/<run>/attempts/<target_digest>/state.json` 与 `attempt-NNNN.json` 使用 receipt
    schema 2，并绑定当前 target 的全部 Prompt resolution。执行前写 running；每次 live
    provider CALL 或 Agent spawn 前原子写 `side_effect_started=true`、active effect、

@@ -11,7 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .profile import load_run_profile
+from ._runstate import ATTEMPT_RECEIPT_SCHEMA, RUN_MANIFEST_SCHEMA
+from .profile import WorkflowProfileError, load_run_profile
 from .store import run_directory
 
 
@@ -65,8 +66,11 @@ def trace_run(
     durable = durable_run_state(run_path)
     if durable:
         result.update(durable)
-    manifest = _read_json(run_path / "_run.json")
-    if manifest.get("run_manifest_schema") in {1, 2}:
+    manifest_path = run_path / "_run.json"
+    manifest = _read_json(manifest_path)
+    if manifest_path.is_file():
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
         result["workflow_profile"] = load_run_profile(run_path)
     if warnings:
         result["warnings"] = warnings
@@ -75,16 +79,18 @@ def trace_run(
 
 def durable_run_state(run_path: Path) -> dict[str, Any]:
     """Read supported durable run/attempt state without importing an executable DAG."""
-    manifest = _read_json(run_path / "_run.json")
+    manifest_path = run_path / "_run.json"
+    manifest = _read_json(manifest_path)
     manifest_schema = manifest.get("run_manifest_schema")
-    if manifest_schema not in {1, 2}:
+    if not manifest_path.is_file():
         return {}
-    attempt_schema = int(manifest_schema)
+    if manifest_schema != RUN_MANIFEST_SCHEMA:
+        raise WorkflowProfileError(f"Run {run_path.name!r} has an unsupported manifest schema")
     attempts: list[dict[str, Any]] = []
     for state_path in sorted((run_path / "attempts").glob("*/state.json")):
         state = _read_json(state_path)
-        if state.get("attempt_receipt_schema") != attempt_schema:
-            continue
+        if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
+            raise WorkflowProfileError(f"Attempt receipt {state_path} has unsupported schema")
         attempts.append(
             {
                 key: state[key]
@@ -111,7 +117,7 @@ def durable_run_state(run_path: Path) -> dict[str, Any]:
         "evidence_policy_digests": manifest.get("evidence_policy_digests", {}),
         "pending_retries": manifest.get("pending_retries", []),
         "ambiguous_attempts": manifest.get("ambiguous_attempts", []),
-        "resolution_status": ("available" if manifest_schema == 2 else "unavailable_legacy"),
+        "resolution_status": "available",
     }
 
 

@@ -1,18 +1,35 @@
 # CLI 参考
 
-kigumi 有两套刻意分开的 CLI：
+全部命令都由 `kigumi`（`kigumi.cli:main`）提供。按"回答问题需要什么"分成两组：
 
-- `kigumi` 是项目运维入口，由 `kigumi.cli:main` 提供；它从当前目录向上发现
-  `pyproject.toml` 与 `[tool.kigumi]`，不导入图注册表。
-- `dag` 是已注册图的入口，由应用中的 `Dag.cli(argv)` 提供；它操作当前 Python 代码已经
-  注册好的图，不会替代项目运维命令。
+- **项目运维命令**读落盘 artifacts。它们从当前目录向上发现 `pyproject.toml` 与
+  `[tool.kigumi]`，从不导入项目代码。
+- **图命令**需要内存里的图——节点靠装饰器在 import 时注册，所以必须执行项目的构图代码。
+  它们 import `[tool.kigumi] dag_entry` 指向的工厂函数（`"module:callable"`，返回 `Dag`），
+  在其结果上作业。
 
-除 `kigumi init` 外，`kigumi` 命令若没有发现有效的 `[tool.kigumi]`，以 2 退出。
-`dag` 不做项目发现：调用它之前，应用必须已经构造 `Dag` 并注册节点。两套 parser 及其
-子命令都提供 argparse 自动生成的 `-h` / `--help`；下表列出其余全部参数。环境变量集中见
-[接入指南的环境变量总表](adoption.md#环境变量总表)。
+除 `kigumi init`、`kigumi brief` 与 `kigumi docs` 外，命令若没有发现有效的
+`[tool.kigumi]`，以 2 退出（这三条在未 init 的目录里同样可用）。图命令另外要求
+`dag_entry`：未声明时以 2 退出并给出要补的键。`kigumi init` 会生成
+`nodes/graph.py` 骨架并写入该键。
 
-## A. `kigumi`：项目运维
+图命令也可以有一个独立的 `dag` 命令——`Dag.cli(argv)` 是同一套 dispatch，但需要项目
+自己在 `[project.scripts]` 注册（`kigumi init` 的骨架里 `main()` 就是给它用的），
+此时不经过 `dag_entry`：
+
+```toml
+[project.scripts]
+dag = "nodes.graph:main"
+```
+
+这条路径要求项目本身是可安装的（有 build backend、包目录声明正确，并已 install），
+console script 才会出现。`kigumi` 走 `dag_entry`，只需要 `pyproject.toml` 与可 import
+的模块，不要求项目被打包安装——所以脚本化、CI 与 agent 用前者更省事。
+
+parser 及其子命令都提供 argparse 自动生成的 `-h` / `--help`；下表列出其余全部参数。
+环境变量集中见[接入指南的环境变量总表](adoption.md#环境变量总表)。
+
+## A. 项目运维命令
 
 ### `kigumi init`
 
@@ -25,6 +42,26 @@ kigumi 有两套刻意分开的 CLI：
 
 成功为 0。没有 `pyproject.toml`、TOML 无效、配置块已存在、`--hooks` 不在 Git 仓库内，
 或目标 hook 已存在时为 1；命令不会覆盖既有 hook。
+
+### `kigumi brief`
+
+把 [brief.md](brief.md) 原样打印到 stdout。它是 agent 进场页：说明这个库已经拥有哪些
+能力、不要另写什么、改节点前先跑哪几条只读命令、统一 CLI 与可选 `dag` 脚本的边界。
+
+无参数。成功为 0；安装缺失该页时为 1。与 `kigumi docs` 一样，**不需要**有效的
+`[tool.kigumi]`：未 init 的目录里也能读。
+
+### `kigumi docs`
+
+列出随 wheel 交付的文档页，或把其中一页原样打印到 stdout。仓库 `docs/` 是唯一
+source of truth，wheel 通过 hatch `force-include` 映射而非复制，因此 site-packages
+里的文本与仓库一致。
+
+| 参数 | 必需 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `name` | 否 | 无 | 页名；缺省时打印清单。取值：`brief`、`capabilities`、`adoption`、`api`、`cli`、`contracts`、`design`、`changelog`。 |
+
+成功为 0；安装缺失该页时为 1；页名不在上表时由 argparse 判 2。
 
 ### `kigumi guard`
 
@@ -132,19 +169,23 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 
 负数等无效保留值为 1；成功输出删除总数并以 0 退出。
 
-## B. `dag`：已注册图
+## B. 图命令
 
-应用通常在构造和注册图后调用 `dag.cli()`；下列 `dag` 是 argparse 显示的程序名。
-参数缺失、choice 无效等 parser 错误统一为 2。除特别说明外，命令成功为 0；未捕获的图声明、
-文件或画像错误会直接传播给宿主应用。
+这一组需要构造好的图。经 `kigumi <命令>` 时由 `dag_entry` 提供，经独立 `dag` 命令时
+由应用自己的 `Dag.cli()` 提供；两条路径共用 `Dag.run_command`，同名命令参数完全一致，
+下表两种写法都适用。
 
-### `dag check`
+参数缺失、choice 无效等 parser 错误统一为 2；`dag_entry` 缺失、模块不可导入、属性不存在、
+不可调用或返回值不是 `Dag` 时也是 2，stderr 指出错在哪一段。除特别说明外，命令成功为 0；
+未捕获的图声明、文件或画像错误会直接传播给宿主应用。
+
+### `kigumi check`
 
 只读检查图声明、声明文件、source guards、节点 docstring 与 Pydantic 字段说明。
 无命令专属参数。存在 error（包括未豁免 guard violation 或声明文件缺失）时为 1；
 只有 warning 时仍为 0。
 
-### `dag plan`
+### `kigumi plan`
 
 只读预告目标闭包的 `certain`、`at_risk` 与 hit，不运行节点。
 
@@ -152,7 +193,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 | --- | --- | --- | --- |
 | `--targets A,B` | 否 | `None` | 逗号分隔的目标名；缺省规划整张图。 |
 
-### `dag graph`
+### `kigumi graph`
 
 输出终端图、Prompt-aware Mermaid，或写入自包含 HTML。
 
@@ -162,7 +203,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 | `--run-id RUN_ID` | 否 | `None` | 叠加指定 run 的运行态。 |
 | `--prompts` | 否 | `False` | 输出带 Prompt 声明的 Mermaid；该模式优先于 `--html`。 |
 
-### `dag profile`
+### `kigumi profile`
 
 输出 canonical WorkflowProfile 的静态视图或指定 run 视图。
 
@@ -175,7 +216,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 这里的 JSON 使用带缩进的普通 JSON 输出，不承诺 `kigumi ... --json` 的
 `canonical_json` 字节格式。
 
-### `dag explain NODE_NAME`
+### `kigumi explain NODE_NAME`
 
 对照最近或指定 run，解释一个节点或 `map@item` 当前缓存判断的变化成分。
 
@@ -184,7 +225,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 | `NODE_NAME` | 是 | 无 | 节点名或动态 item 名。 |
 | `--run-id RUN_ID` | 否 | `None` | 指定对照 run；缺省选择实现定义的现有对照。 |
 
-### `dag describe`
+### `kigumi describe`
 
 输出注册图的节点、边、模型、Prompt 与检查点声明摘要。
 
@@ -192,7 +233,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 | --- | --- | --- | --- |
 | `--format {md,json}` | 否 | `md` | 输出 Markdown 或带缩进的普通 JSON。 |
 
-### `dag resume RUN_ID`
+### `kigumi resume RUN_ID`
 
 按原 manifest 绑定恢复一个 durable run。
 
@@ -203,7 +244,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 
 恢复成功（包括返回 pending 状态）为 0；恢复抛错时捕获并以 1 退出。
 
-### `dag retry-resolve RUN_ID TARGET`
+### `kigumi retry-resolve RUN_ID TARGET`
 
 为一个 ambiguous attempt 持久化人工裁决。
 
@@ -222,5 +263,5 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 带 `--json` 的 `kigumi trace`、`kigumi diff`、`kigumi runs list` 与
 `kigumi runs show` 都使用稳定 `canonical_json`，适合 `json.loads` 消费。
 `kigumi call` 没有 `--json`：除 `--field response` 的裸文本外，它的输出同样是
-`canonical_json`。`dag profile --format json` 与 `dag describe --format json` 是可读的
+`canonical_json`。`kigumi profile --format json` 与 `kigumi describe --format json` 是可读的
 缩进 JSON，不属于这项字节稳定承诺。

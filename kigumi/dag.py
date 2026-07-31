@@ -35,7 +35,14 @@ from ._declarations import (
     validate_segment,
 )
 from ._execution import ExecutionEnvelope
-from ._runstate import RUN_MANIFEST_SCHEMA, AttemptStore, RunManifestError
+from ._runstate import (
+    FAILURE_SCHEMA,
+    RUN_MANIFEST_SCHEMA,
+    RUN_SIDECAR_SCHEMA,
+    SUCCESS_CANDIDATE_SCHEMA,
+    AttemptStore,
+    RunManifestError,
+)
 from .agents import (
     AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
@@ -68,7 +75,6 @@ from .prompt import (
     PromptResolutionError,
     PromptSpec,
     ResolvedPrompt,
-    render_template,
     validate_prompt_bindings,
     validate_prompt_resolution_record,
     validate_prompt_specs,
@@ -86,7 +92,6 @@ _NO_CARRY = object()
 _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
 CACHE_SCHEMA = 6
-SUCCESS_CANDIDATE_SCHEMA = 2
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 
@@ -200,8 +205,6 @@ class ExplainResult:
             )
         if self.pending_on:
             lines.append("等待上游：" + "、".join(self.pending_on))
-        if self.status == "legacy":
-            lines.append("该运行缺少成分记录；重跑一次即可获得解释。")
         if self.status == "no_entry":
             lines.append("所选运行没有该节点的 sidecar 记录。")
         return "\n".join(lines)
@@ -221,7 +224,6 @@ class _Node:
     name: str
     function: NodeFunction | MapFunction | ScanFunction
     deps: tuple[str, ...]
-    prompts: tuple[str, ...]
     prompt_specs: tuple[PromptSpec, ...]
     files: tuple[Path, ...]
     params: dict[str, Any]
@@ -261,7 +263,6 @@ class NodeContext:
         *,
         checkpoint_suffix: str | None = None,
         item_files: tuple[Path, ...] = (),
-        prompt_snapshot: PromptCatalogSnapshot | None = None,
         prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
     ) -> None:
         self._dag = dag
@@ -270,7 +271,6 @@ class NodeContext:
         self._checkpoint_suffix = checkpoint_suffix
         self._item_files = item_files
         self._checkpoint_used = False
-        self._prompt_snapshot = prompt_snapshot
         self._prompt_resolutions = dict(prompt_resolutions or {})
 
     @property
@@ -338,19 +338,6 @@ class NodeContext:
         from .repair import repair_loop
 
         return repair_loop(self, messages, validate, **kwargs)
-
-    def render(self, template_name: str, **slots: str) -> str:
-        """Strictly render a template declared on this node."""
-        if template_name not in self._node.prompts:
-            raise ValueError(
-                f"Template {template_name!r} is not declared for node {self._node.name!r}"
-            )
-        template = (
-            self._prompt_snapshot.text(template_name)
-            if self._prompt_snapshot is not None
-            else self._dag._prompt_snapshot((self._node,)).text(template_name)
-        )
-        return render_template(template, slots)
 
     def resolve_prompt(self, spec_name: str) -> ResolvedPrompt:
         """Return one PromptSpec resolved before this target's L3 lookup."""
@@ -427,7 +414,6 @@ class Dag:
         self,
         name: str,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
         *,
@@ -442,10 +428,8 @@ class Dag:
         if name in self._nodes:
             raise ValueError(f"Node {name!r} is already registered")
         node_deps = tuple(deps)
-        node_prompts = tuple(prompts)
         node_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=node_prompts,
             dynamic_kind="node",
         )
         node_files = tuple(Path(path) for path in files)
@@ -460,7 +444,6 @@ class Dag:
                 name,
                 function,
                 deps=node_deps,
-                prompts=node_prompts,
                 prompt_specs=node_prompt_specs,
                 files=node_files,
                 params=node_params,
@@ -481,7 +464,6 @@ class Dag:
         adapter: AgentAdapter,
         spec: AgentSpec,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
@@ -498,10 +480,8 @@ class Dag:
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
         retry_policy = _validate_retry_policy(retry)
-        node_prompts = tuple(prompts)
         node_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=node_prompts,
             dynamic_kind="node",
         )
         try:
@@ -524,7 +504,6 @@ class Dag:
                 name,
                 function,
                 deps=tuple(deps),
-                prompts=node_prompts,
                 prompt_specs=node_prompt_specs,
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
@@ -554,7 +533,6 @@ class Dag:
         carry_from: tuple[str, str] | None = None,
         carry_fn: Callable[[dict[str, Any]], Any] | None = None,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -576,10 +554,8 @@ class Dag:
             raise TypeError("evidence_policy must be EvidencePolicy")
         node_cache = validate_cache_policy(cache)
         retry_policy = _validate_retry_policy(retry)
-        node_prompts = tuple(prompts)
         node_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=node_prompts,
             dynamic_kind="scan",
         )
         try:
@@ -606,7 +582,6 @@ class Dag:
                 name,
                 function,
                 deps=tuple(dict.fromkeys(all_deps)),
-                prompts=node_prompts,
                 prompt_specs=node_prompt_specs,
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
@@ -639,7 +614,6 @@ class Dag:
         items_from: tuple[str, str],
         key_fn: Callable[[Any], str] | None = None,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -659,10 +633,8 @@ class Dag:
         _validate_artifact_locator(items_from, "items_from")
         source_name, artifact_key = items_from
         map_deps = tuple(dict.fromkeys((*deps, source_name)))
-        map_prompts = tuple(prompts)
         map_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=map_prompts,
             dynamic_kind="map",
         )
         map_files = tuple(Path(path) for path in files)
@@ -677,7 +649,6 @@ class Dag:
                 name,
                 function,
                 deps=map_deps,
-                prompts=map_prompts,
                 prompt_specs=map_prompt_specs,
                 files=map_files,
                 params=map_params,
@@ -704,7 +675,6 @@ class Dag:
         carry_from: tuple[str, str] | None = None,
         carry_fn: Callable[[dict[str, Any]], Any] | None = None,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -726,10 +696,8 @@ class Dag:
         if carry_source is not None:
             all_deps = (*all_deps, carry_source)
         scan_deps = tuple(dict.fromkeys(all_deps))
-        scan_prompts = tuple(prompts)
         scan_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=scan_prompts,
             dynamic_kind="scan",
         )
         scan_files = tuple(Path(path) for path in files)
@@ -744,7 +712,6 @@ class Dag:
                 name,
                 function,
                 deps=scan_deps,
-                prompts=scan_prompts,
                 prompt_specs=scan_prompt_specs,
                 files=scan_files,
                 params=scan_params,
@@ -771,7 +738,6 @@ class Dag:
         items: Iterable[Any],
         *,
         deps: Iterable[str] | Callable[[Any], Iterable[str]] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -785,10 +751,8 @@ class Dag:
         """Register one node per item, fixing names, dependencies, and params immediately."""
         # 生成器只能消费一次;不先固定,第二个 item 起声明就静默变空。
         fixed_deps = deps if callable(deps) else tuple(deps)
-        fixed_prompts = tuple(prompts)
         fixed_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
-            legacy_prompts=fixed_prompts,
             dynamic_kind="node",
         )
         fixed_files = tuple(Path(path) for path in files)
@@ -823,7 +787,6 @@ class Dag:
                     node_name,
                     function,
                     deps=item_deps,
-                    prompts=fixed_prompts,
                     prompt_specs=fixed_prompt_specs,
                     files=item_files,
                     params=item_params,
@@ -843,7 +806,6 @@ class Dag:
         function: NodeFunction | MapFunction | ScanFunction,
         *,
         deps: tuple[str, ...],
-        prompts: tuple[str, ...],
         prompt_specs: tuple[PromptSpec, ...],
         files: tuple[Path, ...],
         params: dict[str, Any],
@@ -895,7 +857,6 @@ class Dag:
             name=name,
             function=function,
             deps=deps,
-            prompts=prompts,
             prompt_specs=prompt_specs,
             files=files,
             params=params,
@@ -1019,7 +980,6 @@ class Dag:
                 name=qualified[local_name],
                 function=declaration.function,
                 deps=actual_deps,
-                prompts=declaration.prompts,
                 prompt_specs=declaration.prompt_specs,
                 files=declaration.files,
                 params=copy.deepcopy(declaration.params),
@@ -1160,11 +1120,13 @@ class Dag:
             function_inputs: dict[str, dict[str, Any]] = {}
             if node.items_from is None:
                 function_inputs = self._function_inputs(node, inputs)
+                file_contents = self._file_contents(node)
                 prompt_resolutions = self._resolve_prompt_specs(
                     node,
                     prompt_snapshot,
                     inputs,
                     function_inputs=function_inputs,
+                    file_contents=file_contents,
                 )
                 prompt_resolution_records = {
                     name: resolved.resolution.canonical()
@@ -1178,6 +1140,7 @@ class Dag:
                     prompt_snapshot=prompt_snapshot,
                     prompt_resolutions=prompt_resolutions,
                     projected_inputs=function_inputs,
+                    file_contents=file_contents,
                 )
                 cache_key = sha(key_components)
                 prior_state = (
@@ -1321,7 +1284,6 @@ class Dag:
                                 self,
                                 node,
                                 current_run_id,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             try:
@@ -1341,7 +1303,6 @@ class Dag:
                                             node.params,
                                             context.read_text,
                                             context.read_bytes,
-                                            context.render,
                                             context.resolve_prompt,
                                         )
                                         task = node.function(  # type: ignore[call-arg]
@@ -1406,7 +1367,7 @@ class Dag:
                                             atomic_write_json(
                                                 run_dir / "failures" / f"{node.name}.json",
                                                 {
-                                                    "failure_schema": 2,
+                                                    "failure_schema": FAILURE_SCHEMA,
                                                     "node": node.name,
                                                     "task_sha256": sha(task.canonical()),
                                                     "instruction_sha256": sha(
@@ -1668,15 +1629,14 @@ class Dag:
             manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
             raise RunManifestError(
-                f"Run {run_id!r} has no valid 0.7 run manifest and cannot be resumed"
+                f"Run {run_id!r} has no valid schema-2 run manifest and cannot be resumed"
             ) from error
         if (
             not isinstance(manifest, dict)
             or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
         ):
             raise RunManifestError(
-                f"Run {run_id!r} is legacy/read-only or has no valid 0.7 manifest; "
-                "it cannot be resumed"
+                f"Run {run_id!r} has no valid schema-2 manifest; it cannot be resumed"
             )
         targets = manifest.get("targets")
         force = manifest.get("force")
@@ -1750,10 +1710,6 @@ class Dag:
             declarations[name] = {
                 "source": _source_hash(node.function),
                 "deps": list(node.deps),
-                "prompts": {
-                    prompt_name: sha(prompt_snapshot.text(prompt_name))
-                    for prompt_name in node.prompts
-                },
                 "prompt_specs": {
                     spec.name: prompt_snapshot.declaration(spec) for spec in node.prompt_specs
                 },
@@ -1834,7 +1790,7 @@ class Dag:
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")
         if (
-            metadata.get("run_sidecar_schema") != 2
+            metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
             or metadata.get("artifact_sha256") != artifact_digest
             or not isinstance(origin, dict)
             or origin.get("artifact_sha256") != artifact_digest
@@ -2083,7 +2039,7 @@ class Dag:
         if not isinstance(previous, dict) or not all(
             isinstance(label, str) and isinstance(digest, str) for label, digest in previous.items()
         ):
-            return ExplainResult("legacy", [], {})
+            raise ValueError(f"Run sidecar for {name!r} has invalid key_components")
         if status == "unknown":
             return ExplainResult(
                 "unknown",
@@ -2319,7 +2275,6 @@ class Dag:
             "deps": list(node.deps),
             "items_from": _locator_description(node.items_from),
             "carry_from": _locator_description(node.carry_from),
-            "prompts": list(node.prompts),
             "prompt_specs": [spec.canonical() for spec in node.prompt_specs],
             "files": [str(path) for path in node.files],
             "params": {
@@ -2417,11 +2372,14 @@ class Dag:
                 _name: str = name,
                 **details: Any,
             ) -> None:
-                source_kind = source["kind"]
+                path_source = source.get("path_from", source)
+                if not isinstance(path_source, dict):
+                    raise ValueError(f"Invalid Prompt material source: {source!r}")
+                source_kind = path_source["kind"]
                 source_node: str | None
                 binding: dict[str, Any]
                 if source_kind == "input":
-                    local = source["name"]
+                    local = path_source["name"]
                     source_node = _bindings.get(local, local)
                     binding = {"input": local}
                 elif source_kind == "item":
@@ -2436,14 +2394,18 @@ class Dag:
                     }
                 else:
                     source_node = None
-                    binding = {"param": source["name"]}
+                    binding = {"param": path_source["name"]}
+                if source_kind not in {"input", "item", "carry", "param"}:
+                    raise ValueError(f"Unsupported Prompt material source: {source!r}")
+                if source.get("kind") == "file_ref":
+                    binding["file_ref"] = True
                 edges.append(
                     {
                         "from": source_node,
                         "to": _name,
                         "role": role,
                         "prompt_spec": prompt_spec,
-                        "path": copy.deepcopy(source.get("path", [])),
+                        "path": copy.deepcopy(path_source.get("path", [])),
                         "source": copy.deepcopy(source),
                         "binding": binding,
                         **details,
@@ -2595,8 +2557,16 @@ class Dag:
         }
 
     def cli(self, argv: list[str] | None = None) -> None:
-        """Run the read-only DAG inspection CLI and exit with its status code."""
-        args = _build_cli_parser().parse_args(argv)
+        """Run the graph CLI and exit with its status code."""
+        sys.exit(self.run_command(_build_cli_parser().parse_args(argv)))
+
+    def run_command(self, args: argparse.Namespace) -> int:
+        """Dispatch one already-parsed graph command and return its exit code.
+
+        Both entry points land here: ``dag <command>`` via :meth:`cli`, and
+        ``kigumi <command>`` after it imports the configured ``dag_entry``. Neither
+        owns a second copy of the dispatch table.
+        """
         handlers = {
             "check": self._cli_check,
             "plan": self._cli_plan,
@@ -2607,7 +2577,7 @@ class Dag:
             "resume": self._cli_resume,
             "retry-resolve": self._cli_retry_resolve,
         }
-        sys.exit(handlers[args.command](args))
+        return handlers[args.command](args)
 
     def _cli_check(self, args: argparse.Namespace) -> int:
         """Print static declaration and source-guard findings without running nodes."""
@@ -2945,12 +2915,14 @@ class Dag:
                     item_files = (
                         tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                     )
+                    file_contents = self._file_contents(node, item_files)
                     prompt_resolutions = self._resolve_prompt_specs(
                         node,
                         prompt_snapshot,
                         inputs,
                         item=item,
                         function_inputs=shared_inputs,
+                        file_contents=file_contents,
                     )
                     prompt_resolution_records = {
                         name: resolved.resolution.canonical()
@@ -2966,6 +2938,7 @@ class Dag:
                         prompt_snapshot=prompt_snapshot,
                         prompt_resolutions=prompt_resolutions,
                         projected_inputs=shared_inputs,
+                        file_contents=file_contents,
                     )
                     cache_key = sha(key_components)
                     declaration_digest = self._attempt_declaration_digest(
@@ -3049,7 +3022,6 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
@@ -3296,6 +3268,7 @@ class Dag:
                     item_files = (
                         tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                     )
+                    file_contents = self._file_contents(node, item_files)
                     prompt_resolutions = self._resolve_prompt_specs(
                         node,
                         prompt_snapshot,
@@ -3303,6 +3276,7 @@ class Dag:
                         item=item,
                         carry=carry,
                         function_inputs=shared_inputs,
+                        file_contents=file_contents,
                     )
                     prompt_resolution_records = {
                         name: resolved.resolution.canonical()
@@ -3319,6 +3293,7 @@ class Dag:
                         prompt_snapshot=prompt_snapshot,
                         prompt_resolutions=prompt_resolutions,
                         projected_inputs=shared_inputs,
+                        file_contents=file_contents,
                     )
                     cache_key = sha(key_components)
                     declaration_digest = self._attempt_declaration_digest(
@@ -3412,7 +3387,6 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
@@ -3431,7 +3405,6 @@ class Dag:
                                             node.params,
                                             context.read_text,
                                             context.read_bytes,
-                                            context.render,
                                             context.resolve_prompt,
                                         )
                                         task = node.function(  # type: ignore[call-arg]
@@ -3657,6 +3630,7 @@ class Dag:
         prompt_snapshot: PromptCatalogSnapshot | None = None,
         prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
         projected_inputs: Mapping[str, dict[str, Any]] | None = None,
+        file_contents: Mapping[str, bytes] | None = None,
     ) -> dict[str, str]:
         """从注入的上游摘要推导普通节点、map 或 scan 项的精确键成分。
 
@@ -3674,6 +3648,11 @@ class Dag:
         if node.external_fingerprint_digest is not None:
             components["external"] = node.external_fingerprint_digest
         snapshot = prompt_snapshot or self._prompt_snapshot((node,))
+        captured_files = (
+            dict(file_contents)
+            if file_contents is not None
+            else self._file_contents(node, item_files)
+        )
         resolutions = (
             dict(prompt_resolutions)
             if prompt_resolutions is not None
@@ -3683,6 +3662,8 @@ class Dag:
                 upstream_artifacts or {},
                 item=item,
                 carry=carry,
+                item_files=item_files,
+                file_contents=captured_files,
             )
         )
         excluded_upstreams: set[str] = set()
@@ -3717,18 +3698,16 @@ class Dag:
                 for name in upstream_shas
                 if name not in excluded_upstreams
             )
-        components.update((f"prompts:{name}", sha(snapshot.text(name))) for name in node.prompts)
         components.update(
             (f"prompt_specs:{name}", resolved.resolution.digest)
             for name, resolved in resolutions.items()
         )
         components.update(
-            (f"files:{path}", _bytes_hash(self.config.resolve(path).read_bytes()))
-            for path in node.files
+            (f"files:{path}", _bytes_hash(captured_files[str(path)])) for path in node.files
         )
         if item is not _NO_ITEM:
             components.update(
-                (f"item_files:{path}", _bytes_hash(self.config.resolve(path).read_bytes()))
+                (f"item_files:{path}", _bytes_hash(captured_files[str(path)]))
                 for path in item_files
             )
         if carry is not _NO_CARRY:
@@ -3739,11 +3718,9 @@ class Dag:
     def _prompt_snapshot(self, nodes: Iterable[_Node] | None = None) -> PromptCatalogSnapshot:
         selected = tuple(self._nodes.values()) if nodes is None else tuple(nodes)
         specs = tuple(spec for node in selected for spec in node.prompt_specs)
-        legacy = tuple(name for node in selected for name in node.prompts)
         return PromptCatalogSnapshot.capture(
             self.config.prompts_path,
             prompt_specs=specs,
-            legacy_prompts=legacy,
         )
 
     def _resolve_prompt_specs(
@@ -3755,6 +3732,8 @@ class Dag:
         item: Any = _NO_ITEM,
         carry: Any = _NO_CARRY,
         function_inputs: Mapping[str, dict[str, Any]] | None = None,
+        item_files: tuple[Path, ...] = (),
+        file_contents: Mapping[str, bytes] | None = None,
     ) -> dict[str, ResolvedPrompt]:
         if not node.prompt_specs:
             return {}
@@ -3773,6 +3752,11 @@ class Dag:
                 omitted_local=omitted_local,
             )
         )
+        captured_files = (
+            dict(file_contents)
+            if file_contents is not None
+            else self._file_contents(node, item_files)
+        )
         return {
             spec.name: snapshot.resolve(
                 spec,
@@ -3782,8 +3766,19 @@ class Dag:
                 carry=None if carry is _NO_CARRY else carry,
                 has_item=item is not _NO_ITEM,
                 has_carry=carry is not _NO_CARRY,
+                file_contents=captured_files,
             )
             for spec in node.prompt_specs
+        }
+
+    def _file_contents(
+        self,
+        node: _Node,
+        item_files: tuple[Path, ...] = (),
+    ) -> dict[str, bytes]:
+        """Capture each declared file once for prompt resolution and cache keying."""
+        return {
+            str(path): self.config.resolve(path).read_bytes() for path in (*node.files, *item_files)
         }
 
     def _libs_hash(self) -> str:
@@ -3803,44 +3798,69 @@ class Dag:
         return store.checkpoint_path(store.runs_root(self.config.artifacts_path), run_id, name)
 
 
+GRAPH_COMMAND_HELP: dict[str, str] = {
+    "check": "validate declarations, declared files, guards and docstrings",
+    "plan": "show which nodes would recompute (and cost money) on the next run",
+    "explain": "explain why one node or map/scan item hit or missed the cache",
+    "describe": "describe the registered graph: nodes, edges, models, prompts",
+    "graph": "render the graph shape as Mermaid or standalone HTML",
+    "profile": "emit the canonical workflow IR for the graph or a past run",
+    "resume": "continue a run that stopped for retry or approval",
+    "retry-resolve": "rule on an ambiguous retry attempt",
+}
+"""One line per graph command, shared by both entry points' help output."""
+
+
 def _build_cli_parser() -> argparse.ArgumentParser:
     """Build the stdlib parser shared by every ``Dag.cli`` invocation."""
     parser = argparse.ArgumentParser(prog="dag")
     commands = parser.add_subparsers(dest="command", required=True)
+    register_graph_commands(commands)
+    return parser
 
-    commands.add_parser("check")
 
-    plan = commands.add_parser("plan")
+def register_graph_commands(commands: argparse._SubParsersAction) -> None:
+    """Register the graph subcommands onto an existing subparser action.
+
+    The ``dag`` and ``kigumi`` parsers both call this, so a flag added here reaches
+    both entry points and cannot drift between them.
+    """
+
+    def add(name: str) -> argparse.ArgumentParser:
+        return commands.add_parser(name, help=GRAPH_COMMAND_HELP[name])
+
+    add("check")
+
+    plan = add("plan")
     plan.add_argument("--targets")
 
-    graph = commands.add_parser("graph")
+    graph = add("graph")
     graph.add_argument("--html")
     graph.add_argument("--run-id")
     graph.add_argument("--prompts", action="store_true")
 
-    profile = commands.add_parser("profile")
+    profile = add("profile")
     profile.add_argument("--run-id")
     profile.add_argument("--format", choices=("json", "md"), default="md")
     profile.add_argument("--include-content", action="store_true")
 
-    explain = commands.add_parser("explain")
+    explain = add("explain")
     explain.add_argument("node_name")
     explain.add_argument("--run-id")
 
-    describe = commands.add_parser("describe")
+    describe = add("describe")
     describe.add_argument("--format", choices=("md", "json"), default="md")
 
-    resume = commands.add_parser("resume")
+    resume = add("resume")
     resume.add_argument("run_id")
     resume.add_argument("--workers", type=int, default=1)
 
-    resolve = commands.add_parser("retry-resolve")
+    resolve = add("retry-resolve")
     resolve.add_argument("run_id")
     resolve.add_argument("target")
     resolve.add_argument("--attempt", type=int, required=True)
     resolve.add_argument("--action", choices=("retry", "fail"), required=True)
     resolve.add_argument("--reason", required=True)
-    return parser
 
 
 def _cli_display_path(root: Path, path: Path) -> str:

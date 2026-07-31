@@ -4,7 +4,7 @@ Status: Active (0.7.0)
 
 ## Purpose / source of truth
 
-用一个 `workflow_profile_schema=1` canonical IR 同时表达静态图、Prompt 声明和持久化运行证据，
+用一个 `workflow_profile_schema=2` canonical IR 同时表达静态图、Prompt 声明和持久化运行证据，
 避免 profile、describe、图渲染、trace 与 runs show 各自猜测。构建与验证权威为
 `Dag._static_workflow_profile()` 和 `kigumi.profile.load_run_profile()`。
 
@@ -35,21 +35,19 @@ dag graph [--run-id RUN_ID] --prompts
 5. warm L3 hit 的 `current_prompt_resolutions` 是本 run 重新解析和验证的 selection；
    `origin_prompt_resolutions`/`origin_calls` 来自不可变 cache origin。Agent cache hit 明确
    `executed=false`，但仍可展示 origin instruction resolution。
-6. 0.7 profile 必须验证 manifest profile digest、artifact/origin/sidecar digest、
+6. 0.8 profile 必须验证 manifest profile digest、artifact/origin/sidecar digest、
    Prompt resolution digest、attempt schema、candidate digest 与 candidate resolution。
    任一不一致抛 `WorkflowProfileError`，不得降级为“未知”继续展示。
 7. `include_content=False` 不展开 CALL request/response 或 Agent instruction evidence。
    `include_content=True` 只展示该 run 已按 `EvidencePolicy` 保留和强制 scrub 后的 evidence；
    不从 L1 或 provider 重新取原文。EvidencePolicy 不是访问控制。
-8. 0.6/schema-1 run 可只读展示持久信息，并固定
-   `resolution_status=unavailable_legacy`；不可伪造 Prompt lineage，不可 resume。
-9. JSON 字段和排序来源稳定；Markdown 固定含 Mermaid 总图和 Prompt 总表。图与表不得各自
+8. JSON 字段和排序来源稳定；Markdown 固定含 Mermaid 总图和 Prompt 总表。图与表不得各自
    重解析 Prompt 声明。
 
 ## Failure behavior
 
-缺失/损坏的 0.7 manifest、sidecar、origin、artifact、attempt、candidate 或 resolution
-一律 fail closed。缺少 0.7 manifest 的旧 run 只进入 legacy 投影；不存在的 run 抛
+缺失/损坏的 schema-2 manifest、sidecar、origin、artifact、attempt、candidate 或 resolution
+一律 fail closed。缺少 schema-2 manifest 的旧 run 不进入降级投影；不存在的 run 抛
 `ValueError`/`FileNotFoundError`。
 
 ## Verification
@@ -59,6 +57,5 @@ dag graph [--run-id RUN_ID] --prompts
 
 ## Change policy
 
-改变 IR 字段、receipt 验证、内容展开或 legacy 降级语义时，必须先更新锁定测试，再同步本
-契约、adoption、README 与 CHANGELOG。破坏既有 schema-1 profile 读取时必须递增
-`workflow_profile_schema`。
+改变 IR 字段、receipt 验证或内容展开时，必须先更新锁定测试，再同步本契约、adoption、
+README 与 CHANGELOG，并递增 `workflow_profile_schema`。

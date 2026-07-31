@@ -11,6 +11,7 @@ from typing import Any
 
 from . import store
 from ._declarations import CachePolicy
+from ._runstate import RUN_SIDECAR_SCHEMA
 from .artifacts import atomic_write_json, canonical_json, sha
 from .errors import OutputOwnershipError
 from .evidence import EvidencePolicy
@@ -165,7 +166,7 @@ class ExecutionEnvelope:
         if origin is None or origin.get("artifact_sha256") != sha(artifact):
             raise ValueError("run sidecar cannot resolve hash-bound origin provenance")
         metadata: dict[str, Any] = {
-            "run_sidecar_schema": 2,
+            "run_sidecar_schema": RUN_SIDECAR_SCHEMA,
             "node": label,
             "cache_key": cache_key,
             "cache": "hit" if cache_hit else "miss",
