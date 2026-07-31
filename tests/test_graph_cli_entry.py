@@ -36,6 +36,16 @@ def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
     return {string for action in parser._actions for string in action.option_strings}  # noqa: SLF001
 
 
+KIGUMI_ONLY_OPTIONS = {"--graph-arg"}
+"""Flags that belong to `kigumi <command>` alone, with the reason they cannot drift.
+
+`kigumi` constructs the graph by importing `dag_entry`, so only it can forward
+runtime arguments to the factory. `Dag.cli` is called on an already-built graph,
+where `--graph-arg` could not do anything. Every other flag must stay identical on
+both entry points; see `test_both_entry_points_expose_identical_graph_commands`.
+"""
+
+
 EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
     "check": ([], set()),
     "plan": ([], {"--targets"}),
@@ -79,9 +89,12 @@ def test_both_entry_points_expose_identical_graph_commands() -> None:
     for name in GRAPH_COMMAND_HELP:
         assert name in dag_commands, f"dag CLI is missing {name}"
         assert name in kigumi_commands, f"kigumi CLI is missing {name}"
-        assert _option_strings(dag_commands[name]) == _option_strings(kigumi_commands[name]), (
-            f"{name} accepts different flags depending on which CLI you use"
+        dag_options = _option_strings(dag_commands[name])
+        kigumi_options = _option_strings(kigumi_commands[name])
+        assert kigumi_options - dag_options == KIGUMI_ONLY_OPTIONS, (
+            f"{name}: kigumi's extra flags are not exactly the ones it alone can honour"
         )
+        assert not dag_options - kigumi_options, f"{name} accepts flags on dag that kigumi does not"
         assert _positionals(dag_commands[name]) == _positionals(kigumi_commands[name]), (
             f"{name} takes different arguments depending on which CLI you use"
         )

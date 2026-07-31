@@ -68,6 +68,24 @@ you to add it. Importing your module is the cost of asking about the graph.
 dag_entry = "nodes.graph:build_dag"   # kigumi init scaffolds this
 ```
 
+If the graph's shape or params depend on runtime input, give the factory
+keyword parameters and pass them per invocation with `--graph-arg`, which every
+graph command accepts:
+
+```python
+def build_dag(episode: str) -> Dag: ...
+```
+
+```bash
+kigumi plan --graph-arg episode=E2S4
+```
+
+Do not default those parameters to placeholder values to keep the commands quiet.
+A node's `params` is a cache-key component, so placeholders make `kigumi plan`
+forecast a key space no real run will use, make `kigumi explain` report every node as
+changed, and make `kigumi resume` execute under a graph identity that does not match
+the run. Pass the values a real run uses.
+
 The same commands are also available as a standalone `dag` command if the project
 registers one — `Dag.cli(argv)` is the same dispatch, reached without the config key:
 

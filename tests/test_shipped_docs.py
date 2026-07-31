@@ -108,6 +108,7 @@ def test_brief_points_only_at_real_symbols_and_shipped_pages() -> None:
         "CHANGELOG.md",
         "consumes",
         "files",
+        "params",
         "cache_dir",
         "seed",
         "open",

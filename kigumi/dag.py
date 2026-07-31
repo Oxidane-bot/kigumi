@@ -3819,15 +3819,40 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def register_graph_commands(commands: argparse._SubParsersAction) -> None:
+GRAPH_ARG_HELP = (
+    "pass one key=value to the dag_entry factory; repeat per parameter. "
+    "Use it when the graph's shape or params depend on runtime input, so that "
+    "plan/explain/check report the same graph a real run would build"
+)
+
+
+def register_graph_commands(
+    commands: argparse._SubParsersAction,
+    *,
+    graph_args: bool = False,
+) -> None:
     """Register the graph subcommands onto an existing subparser action.
 
     The ``dag`` and ``kigumi`` parsers both call this, so a flag added here reaches
     both entry points and cannot drift between them.
+
+    ``graph_args`` adds ``--graph-arg`` to every command. Only ``kigumi`` sets it:
+    that entry point constructs the graph from ``dag_entry``, so it is the only one
+    that can forward arguments. ``Dag.cli`` is handed an already-built graph, where
+    the flag could not do anything.
     """
 
     def add(name: str) -> argparse.ArgumentParser:
-        return commands.add_parser(name, help=GRAPH_COMMAND_HELP[name])
+        parser = commands.add_parser(name, help=GRAPH_COMMAND_HELP[name])
+        if graph_args:
+            parser.add_argument(
+                "--graph-arg",
+                action="append",
+                default=[],
+                metavar="KEY=VALUE",
+                help=GRAPH_ARG_HELP,
+            )
+        return parser
 
     add("check")
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import subprocess
 import sys
@@ -44,6 +45,17 @@ it, so they always inspect the same topology:
 
 Importing this module must register every node and stay free of side effects: the
 graph commands import it to read the topology without running anything.
+
+If the graph's shape or params depend on runtime input, give `build_dag` keyword
+parameters and pass them per invocation, so the graph commands inspect the same
+graph a real run builds:
+
+    def build_dag(episode: str) -> Dag: ...
+    kigumi plan --graph-arg episode=E2S4
+
+Do not default them to placeholder values to keep the commands quiet: params are
+cache-key components, so a placeholder makes `plan` forecast a key space nothing
+will ever run in and `explain` report every node as changed.
 """
 
 from __future__ import annotations
@@ -186,7 +198,9 @@ def _parser() -> argparse.ArgumentParser:
     # [tool.kigumi] declares dag_entry. They are always listed: an agent must be able
     # to discover that `kigumi plan` exists from --help alone, and get a message that
     # names the missing key rather than "unknown command".
-    register_graph_commands(subcommands)
+    # graph_args only makes sense here: this entry point builds the graph, so it is the
+    # one that can forward runtime arguments to the factory.
+    register_graph_commands(subcommands, graph_args=True)
 
     gc = subcommands.add_parser("gc")
     gc.add_argument("--keep", type=int, required=True)
@@ -195,13 +209,111 @@ def _parser() -> argparse.ArgumentParser:
 
 def _graph_command(config: KigumiConfig, args: argparse.Namespace) -> int:
     """Import the project's graph and dispatch one graph command onto it."""
-    dag = _load_dag(config)
+    try:
+        graph_args = _parse_graph_args(getattr(args, "graph_arg", []))
+    except ValueError as error:
+        _error(str(error))
+        return 2
+    dag = _load_dag(config, graph_args)
     if dag is None:
         return 2
     return dag.run_command(args)
 
 
-def _load_dag(config: KigumiConfig) -> Any | None:
+class GraphEntryParameters:
+    """What a ``dag_entry`` factory accepts, and how to bind ``--graph-arg`` to it."""
+
+    def __init__(
+        self,
+        required: tuple[str, ...],
+        optional: tuple[str, ...],
+        variadic: bool,
+    ) -> None:
+        self.required = required
+        self.optional = optional
+        self.variadic = variadic
+
+    @property
+    def accepted(self) -> tuple[str, ...]:
+        return self.required + self.optional
+
+    def bind(self, provided: dict[str, str]) -> dict[str, str]:
+        """Return the keyword arguments to call the factory with, or explain the gap."""
+        # A factory taking **kwargs decides its own parameter names; second-guessing it
+        # here would reject arguments it is willing to accept.
+        if not self.variadic:
+            unknown = sorted(set(provided) - set(self.accepted))
+            if unknown:
+                raise ValueError(
+                    f"does not accept --graph-arg {', '.join(repr(name) for name in unknown)}; "
+                    f"it accepts {_render_names(self.accepted)}"
+                )
+        missing = [name for name in self.required if name not in provided]
+        if missing:
+            raise ValueError(
+                f"needs {_render_names(tuple(missing))} to build the graph; pass "
+                + " ".join(f"--graph-arg {name}=<value>" for name in missing)
+                + ". Pass the same values a real run uses: params are cache-key "
+                "components, so a placeholder makes plan and explain describe a graph "
+                "that will never run"
+            )
+        return {name: provided[name] for name in provided}
+
+
+def _render_names(names: tuple[str, ...]) -> str:
+    return ", ".join(repr(name) for name in names) if names else "no arguments"
+
+
+def graph_entry_parameters(factory: Any) -> GraphEntryParameters:
+    """Describe a graph factory's keyword-passable parameters, refusing shapes CLI cannot fill."""
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"signature cannot be inspected: {error}") from error
+    required: list[str] = []
+    optional: list[str] = []
+    variadic = False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            variadic = True
+            continue
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            continue
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            # There is no key=value spelling for these, so failing here names the real
+            # problem instead of reporting the parameter as merely missing.
+            raise ValueError(
+                f"has positional-only parameter {parameter.name!r}, which --graph-arg "
+                "cannot fill; make it keyword-passable"
+            )
+        if parameter.default is inspect.Parameter.empty:
+            required.append(parameter.name)
+        else:
+            optional.append(parameter.name)
+    return GraphEntryParameters(tuple(required), tuple(optional), variadic)
+
+
+def _parse_graph_args(specifications: list[str]) -> dict[str, str]:
+    """Parse ``key=value`` graph arguments, rejecting shapes that hide intent."""
+    parsed: dict[str, str] = {}
+    for specification in specifications:
+        key, separator, value = specification.partition("=")
+        if not separator or not key.strip():
+            raise ValueError(
+                f"invalid --graph-arg {specification!r}; expected key=value "
+                "(the first '=' separates them, later ones belong to the value)"
+            )
+        name = key.strip()
+        if name in parsed:
+            raise ValueError(
+                f"--graph-arg {name!r} was given more than once; "
+                "silently keeping one of them would build a graph you cannot reason about"
+            )
+        parsed[name] = value
+    return parsed
+
+
+def _load_dag(config: KigumiConfig, graph_args: dict[str, str] | None = None) -> Any | None:
     """Build the project's ``Dag`` from ``dag_entry``, reporting setup errors."""
     if config.dag_entry is None:
         _error(
@@ -228,7 +340,20 @@ def _load_dag(config: KigumiConfig) -> Any | None:
     if not callable(factory):
         _error(f"dag_entry {config.dag_entry!r} is not callable; it must return a Dag")
         return None
-    dag = factory()
+    # Bind against the real signature rather than calling and catching TypeError: a
+    # factory that raises TypeError from its own body must not be reported as a CLI
+    # usage error, and a missing parameter must be named before anything is built.
+    try:
+        accepted = graph_entry_parameters(factory)
+    except ValueError as error:
+        _error(f"dag_entry {config.dag_entry!r} {error}")
+        return None
+    try:
+        call_arguments = accepted.bind(graph_args or {})
+    except ValueError as error:
+        _error(f"dag_entry {config.dag_entry!r} {error}")
+        return None
+    dag = factory(**call_arguments)
     if not isinstance(dag, Dag):
         _error(f"dag_entry {config.dag_entry!r} returned {type(dag).__name__}, expected a Dag")
         return None
@@ -445,6 +570,9 @@ def _doctor(config: KigumiConfig) -> int:
         print(f"source: {source_path} ({_existence(source_path)})")
     print(f"env: {config.env_path} ({_existence(config.env_path)})")
     print(f"loaded env keys: {', '.join(loaded) if loaded else 'none'}")
+    # Reported as configured text, not resolved: doctor stays disk-only, and importing
+    # the project to introspect the factory is the graph commands' cost, not this one's.
+    print(f"dag entry: {config.dag_entry or 'not set (graph commands unavailable)'}")
     try:
         importlib.import_module("litellm")
     except ImportError:

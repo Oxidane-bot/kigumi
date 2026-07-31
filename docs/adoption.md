@@ -72,6 +72,27 @@ dag_entry = "nodes.graph:build_dag"  # 图命令的入口；不声明则只有�
 
 工厂函数被 import 时必须只注册节点、不产生副作用——图命令只读拓扑，不应触发任何执行。
 
+工厂可以带**按名传入**的参数，供图形状或 `params` 依赖运行时输入的项目使用：
+
+```python
+def build_dag(episode: str) -> Dag:  # dag_entry = "nodes.graph:build_dag"
+    ...
+```
+
+```bash
+kigumi plan --graph-arg episode=E2S4
+```
+
+`--graph-arg` 可重复，值一律以 `str` 传入，由工厂自己转成 `Path` / `int` 并校验。
+零参工厂不需要它。缺必需参数、给了工厂不接受的名字、同名给两次、参数是
+positional-only 时都以 2 退出并指名问题所在，完整规则见
+[CLI 参考的 `--graph-arg`](cli.md#--graph-arg-keyvalue)。
+
+**不要为了让图命令能跑而给占位默认值。** `params` 是缓存键成分，占位值下 `plan`
+预告的是一个不会被任何真实运行使用的键空间、`explain` 把每个节点都报成 `params`
+变化，而 `resume` 会带着错误的 `graph_identity` 真的执行。传真实值，或者接受这组
+命令在该项目里给不出可信结论。
+
 `.env` 里放模型别名与密钥(密钥永远不进 git,`kigumi doctor` 只报键名不报值)。
 `KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
 `KIGUMI_AGENT_SLOT_TIMEOUT_SECONDS` 可覆盖容量配置；跨项目共享容量时把 lock dir

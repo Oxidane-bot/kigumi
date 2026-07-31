@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 全部 8 条图命令新增 `--graph-arg KEY=VALUE`（可重复）：把参数按名传给 `dag_entry`
+  工厂。此前 `dag_entry` 只能是零参 callable，图形状或 `params` 依赖运行时输入的项目
+  （按 episode 展开 `foreach`、按输入文件声明 `files`）因此只有两条路：不声明
+  `dag_entry`，让这 8 条命令全部没有入口；或者用占位参数构图，让结论失真——`params`
+  是 L3 键成分，占位值下 `plan` 预告的是不会被任何真实运行使用的键空间、`explain` 把
+  每个节点都报成 `params` 变化，而 `resume` 会带着错误的 `graph_identity` 真的执行节点。
+  现在传真实值即可，`plan` / `explain` / `check` 检视的就是真实运行会构出的图。
+  缓存键成分与键序未变，不换缓存族。
+- `--graph-arg` 的绑定按工厂真实签名进行，不靠调用后捕获 `TypeError`：否则工厂自身
+  抛的 `TypeError` 会被误报成 CLI 用法错误。缺必需参数时以 2 退出并指名缺哪几个、给出
+  要敲的 `--graph-arg`；给了工厂不接受的名字时列出它实际接受的参数名（静默丢弃会构出
+  另一个图）；同名给两次、缺 `=`、positional-only 参数各自报出可执行的修复动作。
+  声明 `**kwargs` 的工厂自行裁决参数名，CLI 不代为拒绝；值一律以 `str` 传入，
+  只按首个 `=` 切分。零参工厂行为不变。
+- `--graph-arg` 只出现在 `kigumi <命令>` 一侧：它才负责构图，而 `Dag.cli()` 拿到的是
+  已构好的图，一个不起作用的旗标比没有更糟。`register_graph_commands(graph_args=...)`
+  仍是唯一一份子命令定义，`tests/test_graph_cli_entry.py` 把这处不对称钉成"恰好只有
+  `--graph-arg`"，其余参数面继续禁止漂移。
+- `kigumi doctor` 现在报告配置的 `dag_entry`（未声明时明说图命令不可用）。按配置原文
+  报告、不解析工厂：项目运维命令从不 import 项目代码，该边界由测试守住。
+- `kigumi init` 骨架说明如何给 `build_dag` 加运行时参数，并写明不要用占位默认值
+  换取命令能跑。
+- 新增 `tests/test_graph_entry_args.py`：钉住参数真的到达工厂、每种错误形状各自报出
+  可执行修复、零参与默认值工厂不回归、`dag` 一侧不提供该旗标、`doctor` 不 import
+  项目代码。
+
 ## [0.9.0] - 2026-07-31
 
 ### 新增
