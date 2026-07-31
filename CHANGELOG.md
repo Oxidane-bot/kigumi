@@ -6,6 +6,9 @@
 
 ### 新增
 
+- 新增 `FileRef` 作为 `PromptMaterial` 的第四种来源：读取节点已通过 `files=` / `files_fn=`
+  声明的文件内容。声明文件字节本就是 L3 键成分，因此不改变缓存语义，也不绕过 raw-io
+  守卫；它补上了“节点内读文件再拼 prompt”这一处声明式缺口。
 - 8 个图命令（`check`、`plan`、`graph`、`profile`、`explain`、`describe`、`resume`、
   `retry-resolve`）现在可以经 `kigumi <命令>` 直接使用。此前它们只挂在 `Dag.cli` 上，
   而 `dag` 从来不是一个真实可执行文件——它只是 argparse 的 `prog` 名，`[project.scripts]`
@@ -75,6 +78,17 @@
   中文 README 补齐英文版已有的 blob-backed session carry 描述。
 - 规范化全部 `docs/contracts/*.md` 的 `Status:` 行:此前 7 份缺版本、2 份完全缺失、
   5 份停留在 0.7.0。
+
+### 变更
+
+- **硬切**：移除 schema-1/0.6 run 的只读降级投影。`profile.py`、`inspect.py` 与 `cli.py`
+  现在要求 `run_manifest_schema == 2`；旧 run 以 unsupported manifest 失败，不再伪造
+  `unavailable_legacy`。
+- **硬切**：移除 `prompts=()` 参数与 `ctx.render()` 方法。节点现在只能通过
+  `prompt_specs=()` 声明 Prompt 输入面，以获得注册期可见的完整输入面、managed lineage
+  与 selected-only cache；`load_template` / `render_template` 仍用于非 LLM 输出。
+- 修复 schema 常量分散和损坏 sidecar 的解释降级：run sidecar、failure、candidate 与
+  attempt receipt 都由集中常量校验，缺少或损坏 `key_components` 的 sidecar 直接 fail closed。
 
 ## [0.8.0] - 2026-07-26
 

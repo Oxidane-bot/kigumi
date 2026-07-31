@@ -155,7 +155,7 @@ def test_render_summary_adds_doc_column_after_node_column(tmp_path: Path) -> Non
     rendered = dag.render_summary()
 
     assert (
-        "| 节点 | 子图 | cache | 说明 | 类型 | 依赖 | items_from | carry_from | prompts | "
+        "| 节点 | 子图 | cache | 说明 | 类型 | 依赖 | items_from | carry_from | prompt_specs | "
         "files | params | 校验模型 | 检查点 |"
     ) in rendered
     assert "| source | - | auto | 生成 A\\|B 输入。 | node |" in rendered

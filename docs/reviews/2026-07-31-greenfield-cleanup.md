@@ -3,6 +3,7 @@
 **Date**: 2026-07-31  
 **Context**: 0.8.0, API not frozen, pure greenfield (no external users)  
 **Goal**: Remove legacy compatibility shims, fix schema constant duplication bugs, unify CLI documentation, and improve repository hygiene.
+**Status**: Completed 2026-07-31; full suite passes with 513 tests and 2 skips.
 
 ---
 
@@ -332,7 +333,7 @@ from 2026-07-13 and 2026-07-14). Move it to
    That is exactly the shape of `examples/ticket_extract`'s `extract` node:
 
    ```python
-   raw_text = ctx.read_text(str(ticket["source"]))   # declared via files_fn
+   raw_text = ctx.read_text(str(ticket["source"]))  # declared via files_fn
    prompt = ctx.render("extract", ticket=inject({"id": ticket["id"], "text": raw_text}))
    ```
 
@@ -431,57 +432,57 @@ Both are written as literal `1` and `3` respectively, but each only appears in 1
 ## 8. Execution Plan
 
 ### Phase 1: Critical bugs (1 commit)
-- [ ] Add `RUN_SIDECAR_SCHEMA`, `FAILURE_SCHEMA` constants
-- [ ] Replace 10+ literal `2` sites with constants
-- [ ] Add mutation test verifying mismatch detection
-- [ ] Run `uv run pytest -q && uv run ruff check .`
+- [x] Add `RUN_SIDECAR_SCHEMA`, `FAILURE_SCHEMA` constants
+- [x] Replace 10+ literal `2` sites with constants
+- [x] Add mutation test verifying mismatch detection
+- [x] Run `uv run pytest -q && uv run ruff check .`
 - Commit: `fix: centralize run_sidecar_schema and failure_schema constants`
 
 ### Phase 2: Fail-closed on corrupted sidecar (1 commit)
-- [ ] Replace `ExplainResult("legacy", ...)` with `raise ValueError`
-- [ ] Update test to expect exception
-- [ ] Remove `.status == "legacy"` branch from `__str__`
-- [ ] Update `docs/adoption.md` and `docs/api.md`
-- [ ] Run tests
+- [x] Replace `ExplainResult("legacy", ...)` with `raise ValueError`
+- [x] Update test to expect exception
+- [x] Remove `.status == "legacy"` branch from `__str__`
+- [x] Update `docs/adoption.md` and `docs/api.md`
+- [x] Run tests
 - Commit: `fix: fail closed on corrupted sidecar (ExplainResult.legacy → exception)`
 
 ### Phase 3: Hard-cut schema-1 legacy path (1 commit, large)
-- [ ] Delete `profile.py` schema-1 branches and `_legacy_nodes()`
-- [ ] Update `inspect.py`, `cli.py`, `dag.py` to require schema 2
-- [ ] Delete `test_legacy_profile_is_read_only_and_marks_resolution_unavailable`
-- [ ] Fix `test_runs_show_and_trace_include_durable_attempt_state` to use schema 2
-- [ ] Update 3 contracts (`workflow-profile.md`, `retry-resume.md`, `checkpoint.md`)
-- [ ] Update both READMEs (remove 0.6 legacy prose)
-- [ ] Add `CHANGELOG.md` entry under `[Unreleased]` → `变更`
-- [ ] Run full test suite
+- [x] Delete `profile.py` schema-1 branches and `_legacy_nodes()`
+- [x] Update `inspect.py`, `cli.py`, `dag.py` to require schema 2
+- [x] Delete `test_legacy_profile_is_read_only_and_marks_resolution_unavailable`
+- [x] Fix `test_runs_show_and_trace_include_durable_attempt_state` to use schema 2
+- [x] Update 3 contracts (`workflow-profile.md`, `retry-resume.md`, `checkpoint.md`)
+- [x] Update both READMEs (remove 0.6 legacy prose)
+- [x] Add `CHANGELOG.md` entry under `[Unreleased]` → `变更`
+- [x] Run full test suite
 - Commit: `Hard-cut: remove schema-1/0.6 legacy read path (greenfield)`
 
 ### Phase 3b: Hard-cut prompts=() for LLM input (1 commit, large)
-- [ ] Remove `prompts` parameter from all `dag.node/map/scan/foreach` and `Subgraph.node/map/scan`
-- [ ] Delete `ctx.render()` method from `dag.py`
-- [ ] Simplify `validate_prompt_specs()` (remove `legacy_prompts` param and conflict check)
-- [ ] Migrate 3 test uses + 1 example (`examples/ticket_extract`) to `PromptSpec`
-- [ ] Update `kigumi init` scaffold to use `prompt_specs=()`
-- [ ] Update `docs/contracts/prompt-resolution.md` (remove legacy prompts prose)
-- [ ] Update `docs/adoption.md` (only show PromptSpec, note load_template for non-LLM output)
-- [ ] Check `docs/brief.md` for ctx.render mentions
-- [ ] Add `CHANGELOG.md` entry under `[Unreleased]` → `变更`
-- [ ] Run full test suite + verify ticket_extract example runs
+- [x] Remove `prompts` parameter from all `dag.node/map/scan/foreach` and `Subgraph.node/map/scan`
+- [x] Delete `ctx.render()` method from `dag.py`
+- [x] Simplify `validate_prompt_specs()` (remove `legacy_prompts` param and conflict check)
+- [x] Migrate 3 test uses + 1 example (`examples/ticket_extract`) to `PromptSpec`
+- [x] Update `kigumi init` scaffold to use `prompt_specs=()`
+- [x] Update `docs/contracts/prompt-resolution.md` (remove legacy prompts prose)
+- [x] Update `docs/adoption.md` (only show PromptSpec, note load_template for non-LLM output)
+- [x] Check `docs/brief.md` for ctx.render mentions
+- [x] Add `CHANGELOG.md` entry under `[Unreleased]` → `变更`
+- [x] Run full test suite + verify ticket_extract example runs
 - Commit: `Hard-cut: remove prompts=() and ctx.render() for LLM input (greenfield API)`
 
 ### Phase 4: Documentation unification (1 commit)
-- [ ] Fix `kigumi/docs.py:64` summary
-- [ ] Update 6 "两套 CLI" prose sites
-- [ ] Run `uv run pytest tests/test_shipped_docs.py -v` (brief test will catch stale prose)
+- [x] Fix `kigumi/docs.py:64` summary
+- [x] Update 6 "两套 CLI" prose sites
+- [x] Run `uv run pytest tests/test_shipped_docs.py -v` (brief test will catch stale prose)
 - Commit: `docs: update stale "two CLIs" prose after unification`
 
 ### Phase 5: Repository hygiene (1 commit)
-- [ ] `rm -rf downloads`
-- [ ] Delete `examples/layered_prompts/` from `.gitignore`
-- [ ] Add comment to `uv.lock` gitignore line recording the deliberate library-project choice
-- [ ] Fold `DEGRADATION.md` into `docs/contracts/agent-node.md` (see 5.4), delete the root file
-- [ ] Move this plan to `docs/reviews/2026-07-31-greenfield-cleanup.md` (matches the two existing review docs)
-- [ ] Run `git status` to verify clean state
+- [x] Confirm no `downloads/` directory remains
+- [x] Delete `examples/layered_prompts/` from `.gitignore`
+- [x] Add comment to `uv.lock` gitignore line recording the deliberate library-project choice
+- [x] Fold `DEGRADATION.md` into `docs/contracts/agent-node.md` (see 5.4), delete the root file
+- [x] Move this plan to `docs/reviews/2026-07-31-greenfield-cleanup.md` (matches the two existing review docs)
+- [x] Run `git status` to verify clean state
 - Commit: `chore: fold degradation record into agent-node contract, clean stray files`
 
 ### Pre-commit gate (every phase)
@@ -496,7 +497,7 @@ uv run ruff format --check .
 uv run pytest -q  # all tests green
 uv run ruff check . && uv run ruff format --check .  # clean
 uv build
-uv run python scripts/verify_dist.py --expected-version 0.8.0
+uv run python scripts/verify_dist.py --expected-version 0.9.0
 uv run python scripts/smoke_installed.py
 git log --oneline -6  # 6 commits (Phases 1, 2, 3, 3b, 4, 5)
 ```

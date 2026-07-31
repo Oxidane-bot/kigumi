@@ -109,8 +109,8 @@ runtime：由用户自行安装、固定版本，并把命令与精确版本交�
 
 DAG 自动重试默认关闭。节点显式声明 `RetryPolicy` 后，Kigumi 持久化 run/attempt 并返回
 pending，不在进程内 sleep；外部 supervisor 到期调用 `Dag.resume()`。`EvidencePolicy`
-在强制 secret scrub 后控制保留形态，但不是加密或访问控制。0.6 run 在 0.7 中仍可作为
-legacy profile 查看，不可 resume。
+在强制 secret scrub 后控制保留形态，但不是加密或访问控制。缺少 schema-2 manifest 的旧
+run 直接 fail closed，不能 resume。
 
 想先零真实请求跑通一遍，可从[客服工单抽取 DAG](examples/ticket_extract/README.md)或
 [提示词进化环](examples/prompt_evolve/README.md)开始。两者都记录了实际接入时遇到的框架摩擦；
@@ -128,7 +128,7 @@ wheel 只做映射不做复制。
 | [docs/capabilities.md](docs/capabilities.md) | **先看这个。**这个库能做什么;一行一个能力,左边是需求、右边是符号 |
 | [DESIGN.md](DESIGN.md) | 为什么这样设计;分层、边界与已裁决的取舍 |
 | [docs/adoption.md](docs/adoption.md) | 怎么接入;从单 caller 到 DAG 的路径与排障 |
-| [docs/cli.md](docs/cli.md) | 两套 CLI 怎么分工;全部命令、参数、默认值与有意义的退出码 |
+| [docs/cli.md](docs/cli.md) | `kigumi` 统一 CLI 与可选 `dag` 脚本;全部命令、参数、默认值与退出码 |
 | [docs/api.md](docs/api.md) | 公开名称是什么意思;签名、结果类型、策略、异常与工具函数速查 |
 | [docs/contracts/README.md](docs/contracts/README.md) | 哪些行为是承诺;索引化的不变式、失效行为与验证坐标 |
 | [设计审查](docs/reviews/2026-07-13-design-review.md) / [consumes 审查](docs/reviews/2026-07-14-consumes-projection-design.md) | 某个时点审查出了什么;实然记录,不是规范 |

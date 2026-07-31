@@ -9,7 +9,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kigumi import Dag, KigumiConfig, LLMCaller, inject
+from kigumi import (
+    Dag,
+    FileRef,
+    InputRef,
+    ItemRef,
+    KigumiConfig,
+    LLMCaller,
+    PromptMaterial,
+    PromptRef,
+    PromptSpec,
+)
 
 Severity = Literal["低", "中", "高", "紧急"]
 RequestCategory = Literal["登录故障", "账单咨询", "配送查询", "功能咨询", "退款申请"]
@@ -24,6 +34,31 @@ class TicketExtraction(BaseModel):
     product: str = Field(description="工单涉及的产品或服务名称")
     severity: Severity = Field(description="工单问题的紧急程度")
     request_category: RequestCategory = Field(description="客户请求所属的业务类别")
+
+
+EXTRACT_SPEC = PromptSpec(
+    name="extract",
+    base=PromptRef("extract"),
+    materials=(
+        PromptMaterial(
+            slot="ticket",
+            source=FileRef(ItemRef(("source",))),
+            title="工单原文",
+        ),
+    ),
+)
+
+REPORT_SPEC = PromptSpec(
+    name="report",
+    base=PromptRef("report"),
+    materials=(
+        PromptMaterial(
+            slot="stats",
+            source=InputRef("stats"),
+            title="统计数据",
+        ),
+    ),
+)
 
 
 def build_dag(root: Path, caller: LLMCaller) -> Dag:
@@ -59,7 +94,7 @@ def build_dag(root: Path, caller: LLMCaller) -> Dag:
         "extract",
         items_from=("ingest", "tickets"),
         key_fn=lambda ticket: str(ticket["id"]),
-        prompts=("extract",),
+        prompt_specs=(EXTRACT_SPEC,),
         files_fn=lambda ticket: (str(ticket["source"]),),
     )
     def extract(
@@ -67,9 +102,11 @@ def build_dag(root: Path, caller: LLMCaller) -> Dag:
     ) -> dict[str, Any]:
         """从单张工单抽取字段；原文不进入下游 artifact。"""
         del inputs
-        raw_text = ctx.read_text(str(ticket["source"]))
-        prompt = ctx.render("extract", ticket=inject({"id": ticket["id"], "text": raw_text}))
-        extraction = ctx.call_validated(prompt, TicketExtraction, max_repairs=1)
+        extraction = ctx.call_validated(
+            ctx.resolve_prompt("extract"),
+            TicketExtraction,
+            max_repairs=1,
+        )
         return extraction.model_dump()
 
     @dag.node("validate", deps=("ingest", "extract"))
@@ -122,10 +159,10 @@ def build_dag(root: Path, caller: LLMCaller) -> Dag:
             "errors_by_severity": dict(sorted(severity_errors.items())),
         }
 
-    @dag.node("report", deps=("stats",), prompts=("report",))
+    @dag.node("report", deps=("stats",), prompt_specs=(REPORT_SPEC,))
     def report(inputs: dict[str, dict[str, Any]], ctx: Any) -> dict[str, Any]:
         """唯一集合级 LLM 调用，只将统计摘要交给模型。"""
-        prompt = ctx.render("report", stats=inject(inputs["stats"]))
-        return {"text": ctx.call(prompt)}
+        del inputs
+        return {"text": ctx.call(ctx.resolve_prompt("report"))}
 
     return dag

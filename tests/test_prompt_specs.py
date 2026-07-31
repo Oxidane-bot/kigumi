@@ -512,6 +512,26 @@ def test_file_ref_material_resolves_from_injected_bytes_without_reading_files(
     }
 
 
+def test_file_ref_is_represented_in_static_workflow_profile(tmp_path: Path) -> None:
+    _write_prompts(tmp_path, {"base": "{{file}}"})
+    (tmp_path / "source.txt").write_text("declared source", encoding="utf-8")
+    dag = _make_dag(tmp_path)
+    spec = PromptSpec(
+        "managed",
+        PromptRef("base"),
+        materials=(PromptMaterial("file", FileRef(ParamRef("path"))),),
+    )
+
+    @dag.node("work", files=("source.txt",), params={"path": "source.txt"}, prompt_specs=(spec,))
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return {"prompt": ctx.resolve_prompt("managed")}
+
+    profile = dag.profile()
+    material_edges = [edge for edge in profile["graph"]["edges"] if edge.get("role") == "material"]
+    assert material_edges[0]["source"]["kind"] == "file_ref"
+    assert material_edges[0]["binding"] == {"param": "path", "file_ref": True}
+
+
 def test_file_ref_requires_injected_bytes(tmp_path: Path) -> None:
     _write_prompts(tmp_path, {"base": "{{file}}"})
     spec = PromptSpec(

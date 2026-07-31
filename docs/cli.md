@@ -46,7 +46,7 @@ parser 及其子命令都提供 argparse 自动生成的 `-h` / `--help`；下�
 ### `kigumi brief`
 
 把 [brief.md](brief.md) 原样打印到 stdout。它是 agent 进场页：说明这个库已经拥有哪些
-能力、不要另写什么、改节点前先跑哪几条只读命令、两套 CLI 各自负责什么。
+能力、不要另写什么、改节点前先跑哪几条只读命令、统一 CLI 与可选 `dag` 脚本的边界。
 
 无参数。成功为 0；安装缺失该页时为 1。与 `kigumi docs` 一样，**不需要**有效的
 `[tool.kigumi]`：未 init 的目录里也能读。

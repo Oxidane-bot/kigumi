@@ -11,8 +11,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .artifacts import atomic_write_text, canonical_json
 from ._runstate import RUN_MANIFEST_SCHEMA
+from .artifacts import atomic_write_text, canonical_json
 from .config import KigumiConfig, find_project_root, load_config, load_env
 from .dag import GRAPH_COMMAND_HELP, Dag, register_graph_commands
 from .docs import SHIPPED_DOCS, read_doc
@@ -64,7 +64,7 @@ def build_dag() -> Dag:
     )
     dag = Dag(config, caller)
 
-    @dag.node("example", prompts=())
+    @dag.node("example", prompt_specs=())
     def example(ctx) -> dict[str, str]:
         """Replace this with a real node; the docstring is required by `check`."""
         return {"ok": "replace me"}
@@ -533,9 +533,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
     if manifest_path.is_file():
         try:
             if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
-                raise WorkflowProfileError(
-                    f"Run {run_id!r} has an unsupported manifest schema"
-                )
+                raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
             workflow = load_run_profile(run_path)
         except WorkflowProfileError as error:
             _error(str(error))

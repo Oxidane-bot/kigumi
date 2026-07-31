@@ -13,8 +13,8 @@ from kigumi.testing import FakeTransport
 from tests._dag_helpers import _make_dag
 
 
-def test_context_render_requires_declared_template(tmp_path: Path) -> None:
-    """教训 prompt_declaration: 未声明模板不能绕过节点缓存键。"""
+def test_context_no_longer_exposes_imperative_render(tmp_path: Path) -> None:
+    """Prompt 输入只能通过注册期 PromptSpec 声明。"""
     prompts = tmp_path / "prompts"
     prompts.mkdir()
     (prompts / "hidden.md").write_text("{{value}}", encoding="utf-8")
@@ -24,7 +24,7 @@ def test_context_render_requires_declared_template(tmp_path: Path) -> None:
     def bad(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
         return {"text": ctx.render("hidden", value="x")}
 
-    with pytest.raises(ValueError, match="not declared"):
+    with pytest.raises(AttributeError, match="render"):
         dag.run()
 
 

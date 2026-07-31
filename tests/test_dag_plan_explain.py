@@ -87,10 +87,13 @@ def test_explain_reports_unknown_and_no_entry_without_guessing(tmp_path: Path) -
     assert unknown.pending_on == ("source",)
 
 
-
 @pytest.mark.parametrize(
     "key_components",
-    [pytest.param(None, id="missing"), pytest.param([], id="non-object"), pytest.param({"x": 1}, id="invalid-digest")],
+    [
+        pytest.param(None, id="missing"),
+        pytest.param([], id="non-object"),
+        pytest.param({"x": 1}, id="invalid-digest"),
+    ],
 )
 def test_explain_rejects_corrupt_key_components(
     tmp_path: Path,

@@ -61,7 +61,7 @@ SHIPPED_DOCS: tuple[ShippedDoc, ...] = (
         "cli",
         "docs/cli.md",
         "docs/cli.md",
-        "both CLIs: every command, flag, default and exit code",
+        "unified kigumi CLI; optional standalone dag script",
     ),
     ShippedDoc(
         "contracts",

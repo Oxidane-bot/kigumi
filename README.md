@@ -132,8 +132,7 @@ Automatic DAG retry is off by default. When a node declares `RetryPolicy`,
 Kigumi persists run/attempt state and returns pending instead of sleeping;
 an external supervisor calls `Dag.resume()` when due. `EvidencePolicy` controls
 retention after mandatory secret scrubbing, but is not encryption or access
-control. 0.6 runs remain inspectable as legacy profiles but cannot be resumed
-under the 0.7 manifest.
+ control. Runs without a schema-2 manifest fail closed and cannot be resumed.
 
 For a zero-request first run, try the
 [ticket-extraction DAG](https://github.com/Oxidane-bot/kigumi/tree/master/examples/ticket_extract)

@@ -1284,7 +1284,6 @@ class Dag:
                                 self,
                                 node,
                                 current_run_id,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             try:
@@ -1630,15 +1629,14 @@ class Dag:
             manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
             raise RunManifestError(
-                f"Run {run_id!r} has no valid 0.7 run manifest and cannot be resumed"
+                f"Run {run_id!r} has no valid schema-2 run manifest and cannot be resumed"
             ) from error
         if (
             not isinstance(manifest, dict)
             or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
         ):
             raise RunManifestError(
-                f"Run {run_id!r} is legacy/read-only or has no valid 0.7 manifest; "
-                "it cannot be resumed"
+                f"Run {run_id!r} has no valid schema-2 manifest; it cannot be resumed"
             )
         targets = manifest.get("targets")
         force = manifest.get("force")
@@ -2374,11 +2372,14 @@ class Dag:
                 _name: str = name,
                 **details: Any,
             ) -> None:
-                source_kind = source["kind"]
+                path_source = source.get("path_from", source)
+                if not isinstance(path_source, dict):
+                    raise ValueError(f"Invalid Prompt material source: {source!r}")
+                source_kind = path_source["kind"]
                 source_node: str | None
                 binding: dict[str, Any]
                 if source_kind == "input":
-                    local = source["name"]
+                    local = path_source["name"]
                     source_node = _bindings.get(local, local)
                     binding = {"input": local}
                 elif source_kind == "item":
@@ -2393,14 +2394,18 @@ class Dag:
                     }
                 else:
                     source_node = None
-                    binding = {"param": source["name"]}
+                    binding = {"param": path_source["name"]}
+                if source_kind not in {"input", "item", "carry", "param"}:
+                    raise ValueError(f"Unsupported Prompt material source: {source!r}")
+                if source.get("kind") == "file_ref":
+                    binding["file_ref"] = True
                 edges.append(
                     {
                         "from": source_node,
                         "to": _name,
                         "role": role,
                         "prompt_spec": prompt_spec,
-                        "path": copy.deepcopy(source.get("path", [])),
+                        "path": copy.deepcopy(path_source.get("path", [])),
                         "source": copy.deepcopy(source),
                         "binding": binding,
                         **details,
@@ -3017,7 +3022,6 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
@@ -3383,7 +3387,6 @@ class Dag:
                                 run_id,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
-                                prompt_snapshot=prompt_snapshot,
                                 prompt_resolutions=prompt_resolutions,
                             )
                             boundary = (
@@ -3700,8 +3703,7 @@ class Dag:
             for name, resolved in resolutions.items()
         )
         components.update(
-            (f"files:{path}", _bytes_hash(captured_files[str(path)]))
-            for path in node.files
+            (f"files:{path}", _bytes_hash(captured_files[str(path)])) for path in node.files
         )
         if item is not _NO_ITEM:
             components.update(
@@ -3776,8 +3778,7 @@ class Dag:
     ) -> dict[str, bytes]:
         """Capture each declared file once for prompt resolution and cache keying."""
         return {
-            str(path): self.config.resolve(path).read_bytes()
-            for path in (*node.files, *item_files)
+            str(path): self.config.resolve(path).read_bytes() for path in (*node.files, *item_files)
         }
 
     def _libs_hash(self) -> str:

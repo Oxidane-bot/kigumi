@@ -560,7 +560,7 @@ def test_cli_profile_and_prompt_graph_share_canonical_ir(tmp_path: Path, capsys)
 
     assert _run_dag_cli(dag, ["profile", "--format", "json"]) == 0
     profile = json.loads(capsys.readouterr().out)
-    assert profile["workflow_profile_schema"] == 1
+    assert profile["workflow_profile_schema"] == 2
     assert profile["prompts"]["specs"][0]["name"] == "managed"
 
     assert _run_dag_cli(dag, ["graph", "--prompts"]) == 0
