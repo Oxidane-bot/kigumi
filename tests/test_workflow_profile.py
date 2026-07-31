@@ -60,7 +60,7 @@ def test_static_profile_reads_declarations_without_executing_nodes(tmp_path: Pat
 
     profile = dag.profile()
 
-    assert profile["workflow_profile_schema"] == 1
+    assert profile["workflow_profile_schema"] == 2
     assert profile["mode"] == "static"
     assert profile["prompts"]["specs"][0]["resolution_status"] == "unresolved"
     assert any(edge["role"] == "selector" for edge in profile["graph"]["edges"])
@@ -213,7 +213,7 @@ def test_runtime_profile_validates_candidate_prompt_resolutions(tmp_path: Path) 
         dag.profile(result.run_id)
 
 
-def test_legacy_profile_is_read_only_and_marks_resolution_unavailable(tmp_path: Path) -> None:
+def test_schema_one_profile_is_rejected(tmp_path: Path) -> None:
     dag = _make_dag(tmp_path)
     run = tmp_path / "artifacts" / "runs" / "legacy"
     run.mkdir(parents=True)
@@ -222,10 +222,49 @@ def test_legacy_profile_is_read_only_and_marks_resolution_unavailable(tmp_path: 
         encoding="utf-8",
     )
 
-    profile = dag.profile("legacy")
+    with pytest.raises(WorkflowProfileError, match="supported manifest"):
+        dag.profile("legacy")
 
-    assert profile["mode"] == "legacy"
-    assert profile["resolution_status"] == "unavailable_legacy"
+
+@pytest.mark.parametrize(
+    "receipt",
+    ["sidecar", "attempt", "candidate", "failure"],
+)
+def test_runtime_profile_rejects_unsupported_receipt_schema(
+    tmp_path: Path,
+    receipt: str,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return {"value": "ok"}
+
+    result = dag.run()
+    run = tmp_path / "artifacts" / "runs" / result.run_id
+    attempt_root = next((run / "attempts").iterdir())
+    state_path = attempt_root / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if receipt == "sidecar":
+        path = run / "work.json.meta.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["run_sidecar_schema"] = 999
+    elif receipt == "attempt":
+        path = state_path
+        value = state
+        value["attempt_receipt_schema"] = 999
+    elif receipt == "candidate":
+        path = attempt_root / state["candidate_file"]
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["candidate_schema"] = 999
+    else:
+        path = run / "failures" / "work.json"
+        value = {"failure_schema": 999}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(WorkflowProfileError, match="schema|receipt|corrupt"):
+        dag.profile(result.run_id)
 
 
 def test_runtime_profile_reports_resume_count_without_reexecuting_provider(

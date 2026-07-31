@@ -1,7 +1,8 @@
 # 契约索引
 
 本目录是 kigumi 可验证不变式的权威文本。每份契约说明承诺的行为、失效方式、实现
-Source of truth（公开入口见 [`kigumi/__init__.py`](../../kigumi/__init__.py)）和验证坐标；
+Source of truth（公开入口见
+[`kigumi/__init__.py`](https://github.com/Oxidane-bot/kigumi/blob/master/kigumi/__init__.py)）和验证坐标；
 它不是教程，也不以示例代替
 约束。修改实现前先读对应契约。
 

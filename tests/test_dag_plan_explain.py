@@ -62,8 +62,8 @@ def test_explain_map_item_uses_its_own_sidecar(tmp_path: Path) -> None:
     assert changed.changed == ["params"]
 
 
-def test_explain_reports_unknown_no_entry_and_legacy_without_guessing(tmp_path: Path) -> None:
-    """教训 explain_honesty: 无法取得上游或旧记录时不能伪造变化原因。"""
+def test_explain_reports_unknown_and_no_entry_without_guessing(tmp_path: Path) -> None:
+    """教训 explain_honesty: 无法取得上游时不能伪造变化原因。"""
 
     def build(value: int) -> Dag:
         dag = _make_dag(tmp_path)
@@ -86,11 +86,33 @@ def test_explain_reports_unknown_no_entry_and_legacy_without_guessing(tmp_path: 
     assert unknown.status == "unknown"
     assert unknown.pending_on == ("source",)
 
+
+
+@pytest.mark.parametrize(
+    "key_components",
+    [pytest.param(None, id="missing"), pytest.param([], id="non-object"), pytest.param({"x": 1}, id="invalid-digest")],
+)
+def test_explain_rejects_corrupt_key_components(
+    tmp_path: Path,
+    key_components: object,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        return {"value": 1}
+
+    run = dag.run()
     sidecar = tmp_path / "artifacts" / "runs" / run.run_id / "source.json.meta.json"
     metadata = json.loads(sidecar.read_text(encoding="utf-8"))
-    metadata.pop("key_components")
+    if key_components is None:
+        metadata.pop("key_components")
+    else:
+        metadata["key_components"] = key_components
     sidecar.write_text(json.dumps(metadata), encoding="utf-8")
-    assert first.explain("source", run.run_id).status == "legacy"
+
+    with pytest.raises(ValueError, match="key_components"):
+        dag.explain("source", run.run_id)
 
 
 def test_explain_without_run_id_uses_numeric_latest_run(tmp_path: Path) -> None:

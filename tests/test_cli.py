@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from kigumi import PromptRef, PromptSpec
-from kigumi.artifacts import atomic_write_json, canonical_json, write_artifact
+from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.cli import main
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
@@ -317,11 +317,21 @@ def test_runs_show_and_trace_include_durable_attempt_state(
 ) -> None:
     root = _project(tmp_path)
     run = root / "artifacts" / "runs" / "durable"
+    workflow_profile = {
+        "workflow_profile_schema": 2,
+        "mode": "static",
+        "resolution_status": "unresolved",
+        "graph": {"nodes": [], "edges": [], "mounts": [], "models": {}},
+        "prompts": {"specs": []},
+        "run": None,
+    }
     atomic_write_json(
         run / "_run.json",
         {
-            "run_manifest_schema": 1,
+            "run_manifest_schema": 2,
             "status": "pending_retry",
+            "workflow_profile": workflow_profile,
+            "workflow_profile_digest": sha(workflow_profile),
             "evidence_policy_digests": {"ask": "evidence-digest"},
             "retry_policy_digests": {"ask": "retry-digest"},
             "pending_retries": [{"target": "ask", "due_at": "2030-01-01T00:00:00+00:00"}],
@@ -331,8 +341,9 @@ def test_runs_show_and_trace_include_durable_attempt_state(
     atomic_write_json(
         run / "attempts" / "digest" / "state.json",
         {
-            "attempt_receipt_schema": 1,
+            "attempt_receipt_schema": 2,
             "target": "ask",
+            "target_digest": sha("ask"),
             "attempt": 1,
             "status": "retry_scheduled",
             "side_effect_started": True,
@@ -341,6 +352,7 @@ def test_runs_show_and_trace_include_durable_attempt_state(
                 "failure_type": "provider",
                 "kind": "rate_limit",
             },
+            "prompt_resolutions": {},
         },
     )
     monkeypatch.chdir(root)
@@ -350,7 +362,7 @@ def test_runs_show_and_trace_include_durable_attempt_state(
     assert shown["status"] == "pending_retry"
     assert shown["attempts"][0]["failure"]["kind"] == "rate_limit"
     assert shown["evidence_policy_digests"]["ask"] == "evidence-digest"
-    assert shown["workflow_profile"]["resolution_status"] == "unavailable_legacy"
+    assert shown["workflow_profile"]["resolution_status"] == "available"
 
     assert main(["trace", "durable", "--json"]) == 0
     traced = json.loads(capsys.readouterr().out)

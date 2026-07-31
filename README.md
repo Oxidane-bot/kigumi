@@ -41,7 +41,7 @@ A foundation for building LLM pipelines with coding agents:
 - **Experiment subjects**: one isolated evidence grid for functions, callers,
   ordinary workflows, and Agent-backed DAGs—without automatic winner selection
 - **Four guard rings**: registration-time refusal plus three outer rings
-  (`dag check` / pytest auto-collection / git hooks), so the rules enforce
+  (`kigumi check` / pytest auto-collection / git hooks), so the rules enforce
   themselves
 
 ## Quick start
@@ -112,8 +112,8 @@ def write(inputs, ctx):
 Kigumi snapshots all declared Prompt files once per run. The selected variant
 enters the L3 key; unselected variant bytes remain in run identity, so editing
 one can reuse the selected cache but cannot silently resume an old run. Inspect
-the complete declaration or persisted selections with `dag profile` and
-`dag graph --prompts`.
+the complete declaration or persisted selections with `kigumi profile` and
+`kigumi graph --prompts`.
 
 ## Install
 
@@ -144,10 +144,17 @@ the ticket example also includes measured local-run numbers.
 
 ## Documentation map
 
-Documentation is currently written in Chinese.
+Documentation is currently written in Chinese, except `docs/brief.md`, which is
+English because coding agents read it in downstream projects.
+
+Once kigumi is installed you do not need this repository to read any of it. Run
+`kigumi brief` for the agent entry page, `kigumi docs` to list every page shipped
+inside the wheel, and `kigumi docs <name>` to print one. `docs/` stays the single
+source of truth; the wheel maps those files in rather than copying them.
 
 | Document | The question it answers |
 | --- | --- |
+| [docs/brief.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/brief.md) | **Agents start here** (`kigumi brief`). What kigumi already owns so you do not reimplement it; the read-only commands to run before editing a node |
 | [docs/capabilities.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/capabilities.md) | **Start here.** What can this library do; one grep-able line per capability, need on the left, symbol on the right |
 | [DESIGN.md](https://github.com/Oxidane-bot/kigumi/blob/master/DESIGN.md) | Why it is designed this way; layers, boundaries, settled trade-offs |
 | [docs/adoption.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md) | How to adopt it; the path from a single caller to a DAG, plus troubleshooting |

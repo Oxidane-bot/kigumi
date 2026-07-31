@@ -26,7 +26,9 @@ from kigumi import (
     ResolvedPrompt,
     RetryPolicy,
 )
+from kigumi.cli import main as cli_main
 from kigumi.config import KigumiConfig
+from kigumi.docs import SHIPPED_DOCS, read_doc
 from kigumi.transport import Response
 
 
@@ -68,6 +70,14 @@ def main() -> int:
     package = files("kigumi")
     assert package.joinpath("_pi_bridge.ts").read_bytes()
     assert package.joinpath("_pi_bridge_policy.mjs").read_bytes()
+
+    # Every documented page must be readable from the wheel with no checkout present,
+    # and both doc commands must run without a configured project.
+    for doc in SHIPPED_DOCS:
+        assert read_doc(doc.name).strip(), f"shipped doc {doc.name} is empty"
+    assert cli_main(["brief"]) == 0
+    assert cli_main(["docs"]) == 0
+    assert cli_main(["docs", "capabilities"]) == 0
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

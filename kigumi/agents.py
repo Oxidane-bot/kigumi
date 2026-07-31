@@ -19,6 +19,7 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
 
+from ._runstate import FAILURE_SCHEMA
 from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
 from .evidence import EvidenceMode, EvidencePolicy, capture_evidence, scrub_evidence
@@ -517,13 +518,11 @@ class AgentBuildContext:
         params: Mapping[str, Any],
         read_text: Callable[[str | Path, str], str],
         read_bytes: Callable[[str | Path], bytes],
-        render: Callable[..., str],
         resolve_prompt: Callable[[str], str] | None = None,
     ) -> None:
         self._params = copy.deepcopy(dict(params))
         self._read_text = read_text
         self._read_bytes = read_bytes
-        self._render = render
         self._resolve_prompt = resolve_prompt
 
     @property
@@ -535,9 +534,6 @@ class AgentBuildContext:
 
     def read_bytes(self, path: str | Path) -> bytes:
         return self._read_bytes(path)
-
-    def render(self, template_name: str, **slots: str) -> str:
-        return self._render(template_name, **slots)
 
     def resolve_prompt(self, spec_name: str) -> str:
         if self._resolve_prompt is None:
@@ -866,7 +862,7 @@ def execute_agent_task(
         else:
             typed_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.PROTOCOL)
         failure = {
-            "failure_schema": 2,
+            "failure_schema": FAILURE_SCHEMA,
             "node": node_name,
             "task_sha256": sha(task.canonical()),
             "instruction_sha256": sha(task.instruction),

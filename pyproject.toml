@@ -47,6 +47,20 @@ path = "kigumi/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["kigumi"]
 
+# Agent-facing docs ship inside the wheel so a coding agent working in a
+# downstream project can read them from site-packages. docs/ stays the single
+# source of truth; these are mapped, never copied. Keep in sync with
+# kigumi.docs.SHIPPED_DOCS (tests/test_shipped_docs.py enforces it).
+[tool.hatch.build.targets.wheel.force-include]
+"docs/brief.md" = "kigumi/docs/brief.md"
+"docs/capabilities.md" = "kigumi/docs/capabilities.md"
+"docs/adoption.md" = "kigumi/docs/adoption.md"
+"docs/api.md" = "kigumi/docs/api.md"
+"docs/cli.md" = "kigumi/docs/cli.md"
+"docs/contracts" = "kigumi/docs/contracts"
+"DESIGN.md" = "kigumi/DESIGN.md"
+"CHANGELOG.md" = "kigumi/CHANGELOG.md"
+
 [tool.hatch.build.targets.sdist]
 exclude = ["docs/assets", "examples", ".github", "scripts", "tmp"]
 

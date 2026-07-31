@@ -6,6 +6,42 @@
 
 ### 新增
 
+- 8 个图命令（`check`、`plan`、`graph`、`profile`、`explain`、`describe`、`resume`、
+  `retry-resolve`）现在可以经 `kigumi <命令>` 直接使用。此前它们只挂在 `Dag.cli` 上，
+  而 `dag` 从来不是一个真实可执行文件——它只是 argparse 的 `prog` 名，`[project.scripts]`
+  里没有它，仓库与两个 examples 里也没有任何地方调用 `Dag.cli()`。结果是下游项目装完
+  kigumi 之后，`plan` 与 `describe` 这类能力没有任何入口可敲。
+- 新增 `[tool.kigumi] dag_entry`（`"module:callable"`，返回 `Dag`）：图命令据此 import
+  项目的构图工厂。这是唯一一个"打开一组命令"的配置键，可选；不声明时其余命令照常工作，
+  图命令以 2 退出并指名要补的键。模块不可导入、属性不存在、不可调用或返回值不是 `Dag`
+  时同样是 2，stderr 指出错在哪一段。
+- `kigumi init` 现在生成 `nodes/graph.py` 骨架（`build_dag()` 加可选 `main()`）并写入
+  `dag_entry`，同时提示如何注册独立 `dag` 命令。骨架可直接运行：新建项目 `init` 之后
+  立刻能跑 `kigumi describe` / `check` / `plan`。
+- 新增 `Dag.run_command(args)`：接收已解析的 args 并返回退出码。`Dag.cli()` 与
+  `kigumi <命令>` 都经由它 dispatch，`register_graph_commands()` 提供唯一一份子命令定义，
+  两条入口不会各自漂移。独立 `dag` 命令仍然可用，且不需要 `dag_entry`。
+- 新增 `tests/test_graph_cli_entry.py`：钉住两条入口共享定义与 dispatch、参数面与独立
+  写死的期望表一致（避免"对比彼此"在共享 builder 下失效）、`init` 骨架可编译且只 import
+  真实导出的名字、缺失与配错 `dag_entry` 各自报出可执行的修复动作。
+- 新增 `kigumi brief` 与 `kigumi docs [name]`：把 agent 进场页与全部交付文档随 wheel
+  发出，装完即可离线读，不需要回到仓库。两条命令都**不要求**有效 `[tool.kigumi]`，
+  因为 agent 需要在项目配好之前就看清能力面；其余命令的 exit 2 行为不变。
+- 新增 `docs/brief.md`（英文，`kigumi brief` 打印）：一张"别重造什么"对照表把常见的
+  手写实现映射到已有符号，改节点前的只读命令，`kigumi` 与 `dag` 两套 CLI 的完整分工
+  （含 `dag describe` / `plan` / `explain` / `check` / `graph` / `profile`），以及节点
+  返回值、守卫豁免、静态拓扑、blob 引用等工作纪律。它是下游 coding agent 的第一入口，
+  失败形状是不知道库已经拥有什么而另写一份。
+- 打包改为用 hatch `force-include` 把 `docs/`、`DESIGN.md` 与 `CHANGELOG.md` 映射进
+  wheel，`docs/` 仍是唯一 source of truth。此前 `kigumi/docs/` 是手抄副本且只含四页，
+  安装后 `api.md` 的 13 条与 `contracts/README.md` 的 15 条相对链接全部指空；现在
+  adoption 与 15 份契约一并交付，链接在两种布局下都可解析。
+- 新增 `kigumi/docs.py`（`SHIPPED_DOCS` / `resolve_doc` / `read_doc`）：优先读 wheel 内
+  副本，源码树回退到仓库路径，缺页报错而非静默返回空。
+- 新增 `tests/test_shipped_docs.py`：锁定 `SHIPPED_DOCS` 与 `force-include` 双向一致、
+  仓库里不得再出现手抄的 `kigumi/docs/`、brief 只指向真实符号与已交付页、每个
+  `kigumi`/`dag` 子命令都在 brief 中有据可查、按 wheel 布局复现后页间相对链接可达。
+  `scripts/verify_dist.py` 与 `scripts/smoke_installed.py` 把交付文档纳入 release 契约。
 - `kigumi/__init__.py` docstring 开头加入三行进场协议：改节点前先运行
   `kigumi trace`、`dag plan`、`dag explain`，明确"看清楚再动"的主动工作流。
 - `docs/adoption.md` 开头新增「进场协议」段落（在接入步骤之前），把「改节点前做这

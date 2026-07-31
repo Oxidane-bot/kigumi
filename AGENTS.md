@@ -14,6 +14,7 @@ uv run kigumi call <key_prefix> --field response
 ```
 
 `kigumi` CLI 负责项目运维（guard、runs、approve、diff、gc 等）；`dag.cli()` 负责已注册图的 check、plan、graph、explain、describe。
+`kigumi brief` 与 `kigumi docs` 不需要有效配置即可运行。
 
 硬规矩：
 
@@ -27,8 +28,10 @@ uv run kigumi call <key_prefix> --field response
 - Agent session carry 默认关闭，只能通过显式 `session_carry` 启用。
 - receipt、manifest、candidate、artifact 或 blob 摘要损坏一律 fail closed，不按 miss 重跑。
 
-文档地图：
+文档地图（下游项目里用 `kigumi docs <name>` 离线读同样的文本）：
 
+- [docs/brief.md](docs/brief.md) 是 agent 进场页(`kigumi brief`):已有能力、别重造什么、
+  改节点前的只读命令、两套 CLI 分工。
 - [docs/capabilities.md](docs/capabilities.md) 是能力索引:动手前先扫一遍,避免重造已有能力。
 - [DESIGN.md](DESIGN.md) 说明设计哲学、边界和止损线。
 - [docs/adoption.md](docs/adoption.md) 说明接入方式与使用约定。

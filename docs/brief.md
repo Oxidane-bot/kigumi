@@ -1,0 +1,140 @@
+# kigumi brief (read this first)
+
+This project depends on kigumi. Read this page before writing code against it.
+
+kigumi is load-bearing joinery for LLM content pipelines: deterministic calls,
+content-addressed caching, validated repair loops, DAG orchestration and external
+Agent nodes. It already owns the plumbing below. Do not write your own.
+
+Print this page any time with `kigumi brief`. Other shipped pages: `kigumi docs`.
+
+## Do not reimplement
+
+| If you are about to write | Use instead |
+| --- | --- |
+| String-concatenate dynamic content into a prompt | `inject` (the only entry point; auto-fences) |
+| An f-string prompt template with manual slots | `load_template` / `render_template` |
+| A/B or multi-branch prompt selection | `PromptSpec` / `PromptLayer` / `PromptAxis` |
+| A response cache, hash key, or "skip if already done" check | `LLMCaller(cache_dir=..., seed=...)` |
+| A retry-until-JSON-parses loop | `call_validated` / `repair_loop` |
+| A token counter and spend guard | `Budget` |
+| A loop over items calling the model | `@dag.map` (bare loops are rejected by the guard) |
+| A sequential loop threading state forward | `@dag.scan` |
+| Step ordering, "which steps need rerunning", progress state | `Dag` / `@dag.node` |
+| A subprocess wrapper around a coding agent | `@dag.agent` / `AgentSpec` |
+| Writing binary output with `open(..., "wb")` | `ctx.emit_file` / `ctx.ingest_file` |
+| Reading a file inside a node with `open()` | `ctx.read_text` / `ctx.read_bytes` plus `files=` |
+| A prompt A/B harness with per-variant bookkeeping | `bench` / `Variant` |
+| An LLM-grades-output scorer | `llm_judge` / `pairwise_judge` |
+| A fake transport or recorded HTTP fixture for tests | `ScriptedTransport` / `kigumi.testing.CassetteTransport` |
+| 429 backoff and concurrency limiting | `AdaptiveCapacity` / `FileSlots` / `RetryPolicy` |
+
+Full index with one grep-able line per capability: `kigumi docs capabilities`.
+If nothing there matches, kigumi likely does not do it on purpose — see the
+design boundaries in `kigumi docs adoption`.
+
+## Before you edit a node
+
+These are read-only. They send no requests and cost nothing.
+
+```bash
+kigumi trace <run_id>              # current state: nodes, map items, every LLM call
+kigumi trace <run_id> --node NAME --json
+kigumi plan                        # what would recompute (and cost money) next run
+kigumi explain <node>              # why this node hit or missed the cache
+kigumi explain <node@item>         # one map/scan item
+```
+
+Skipping `kigumi plan` before a change to a shared upstream node is how an agent
+turns a one-node edit into a full-graph rerun that spends real money.
+
+## Project commands and graph commands
+
+Everything runs under `kigumi`. The split that matters is what a command needs to
+answer you.
+
+Project commands read artifacts from disk. They find `pyproject.toml` and
+`[tool.kigumi]` upward from the working directory and never import your code.
+Without a valid `[tool.kigumi]` they exit 2 — except `kigumi init`, `kigumi brief`
+and `kigumi docs`, which work anywhere.
+
+Graph commands need the graph itself, which only exists once your Python has run.
+They import the factory named by `[tool.kigumi] dag_entry` (`"module:callable"`,
+returning a `Dag`) and inspect what it builds. Without that key they exit 2 and tell
+you to add it. Importing your module is the cost of asking about the graph.
+
+```toml
+[tool.kigumi]
+dag_entry = "nodes.graph:build_dag"   # kigumi init scaffolds this
+```
+
+The same commands are also available as a standalone `dag` command if the project
+registers one — `Dag.cli(argv)` is the same dispatch, reached without the config key:
+
+```toml
+[project.scripts]
+dag = "nodes.graph:main"              # then: dag describe
+```
+
+That requires the project to be installable and installed. `kigumi <command>` only
+needs `pyproject.toml` and an importable module, so prefer it in scripts and CI.
+If a project has both, they inspect the same graph.
+
+| Question | Command |
+| --- | --- |
+| What is in this graph: nodes, edges, models, prompts, checkpoints | `kigumi describe` (add `--format json`) |
+| Are declarations, declared files, guards and docstrings sound | `kigumi check` (exit 1 on errors) |
+| What will recompute if I run now | `kigumi plan` (`--targets A,B` to scope) |
+| Why is this node recomputing | `kigumi explain NODE [--run-id ID]` |
+| Show me the shape | `kigumi graph` (`--prompts` for Mermaid, `--html PATH`) |
+| Give me the canonical IR | `kigumi profile [--run-id ID] [--format json]` |
+| Continue a run that stopped for retry or approval | `kigumi resume RUN_ID` |
+| Rule on an ambiguous attempt | `kigumi retry-resolve RUN_ID TARGET --attempt N --action retry\|fail --reason TEXT` |
+| Which run IDs exist, what happened in one | `kigumi runs list` / `kigumi runs show ID` |
+| The payload of one LLM call | `kigumi call <key_prefix> --field messages\|response` |
+| Approve a human checkpoint | `kigumi approve RUN_ID NAME` |
+| What changed between two runs | `kigumi diff RUN_A RUN_B` |
+| Are paths, keys and templates healthy | `kigumi doctor` |
+| Reject bare LLM loops and undeclared file reads | `kigumi guard [--changed]` |
+| Drop old caches and artifacts | `kigumi gc --keep N` |
+| Render a template with explicit slots | `kigumi render TEMPLATE --slot k=v` |
+| Scaffold `[tool.kigumi]` into a fresh project | `kigumi init [--hooks]` |
+| Re-read this page, or list every shipped page | `kigumi brief` / `kigumi docs` |
+
+`--json` on `kigumi trace`, `kigumi diff`, `kigumi runs list` and `kigumi runs show` is stable
+`canonical_json`, safe to parse. `kigumi profile --format json` and
+`kigumi describe --format json` are readable indented JSON, not byte-stable.
+Every flag, default and exit code: `kigumi docs cli`.
+
+## Working rules
+
+- Node functions take `(inputs, ctx)` and must return a dict. Text deliverables go in
+  `{"files": {"relative/path": "text"}}` so the framework writes them atomically.
+- Never call a model outside `ctx.call` / `ctx.call_validated`, and never read a
+  project file inside a node without declaring it. Both are guard violations.
+- A waiver must state a reason: `# kigumi: raw-llm-ok <why>` or
+  `# kigumi: raw-io-ok <why>`. The two are not interchangeable.
+- Use `consumes=` to depend on part of an upstream artifact instead of all of it.
+  That shrinks the blast radius when the upstream changes.
+- Topology is declared in Python at registration time. A model decides content,
+  never which node runs. Runtime fan-out is only `@dag.map` (independent items)
+  and `@dag.scan` (linear carry).
+- Large binaries go through blob references, never into artifact dicts.
+- Behavior change means writing a failing test first, then making it pass. Docs
+  are not a substitute for a regression test.
+- Touching any cache-key component is a cache family change: update `CHANGELOG.md`
+  in the same commit.
+- Corrupt receipts, manifests, candidates, artifacts or blob digests fail closed.
+  Never treat them as a cache miss and rerun.
+
+## Where to read more
+
+| Need | Page |
+| --- | --- |
+| One line per capability, need on the left, symbol on the right | `kigumi docs capabilities` |
+| How to adopt it, recommended shapes, troubleshooting by symptom | `kigumi docs adoption` |
+| Signatures, result types, exceptions and what to do about each | `kigumi docs api` |
+| Every command, flag, default and exit code | `kigumi docs cli` |
+| Promises you must not break while changing the implementation | `kigumi docs contracts` |
+
+Zero-request end-to-end examples live in the repository under `examples/`.

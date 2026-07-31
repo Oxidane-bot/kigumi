@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write_text, canonical_json
+from ._runstate import RUN_MANIFEST_SCHEMA
 from .config import KigumiConfig, find_project_root, load_config, load_env
+from .dag import GRAPH_COMMAND_HELP, Dag, register_graph_commands
+from .docs import SHIPPED_DOCS, read_doc
 from .enforce import (
     Finding,
     RawIOFinding,
@@ -28,6 +31,56 @@ from .profile import WorkflowProfileError, load_run_profile
 from .prompt import TemplateSlotError, load_template, render_template, slot_names
 from .store import approve_checkpoint, diff_runs, gc_artifacts, run_directory, run_sort_key
 
+DAG_ENTRY_MODULE = "nodes.graph"
+"""Module `kigumi init` scaffolds, matching the default ``source_dirs`` entry."""
+
+DAG_ENTRY_TEMPLATE = '''"""Build this project's DAG.
+
+`build_dag()` is the single place that constructs the graph. Both entry points call
+it, so they always inspect the same topology:
+
+    kigumi describe          # via [tool.kigumi] dag_entry
+    dag describe             # via [project.scripts], if you register main below
+
+Importing this module must register every node and stay free of side effects: the
+graph commands import it to read the topology without running anything.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from kigumi import Dag, KigumiConfig, LLMCaller, LiteLLMTransport, find_project_root
+
+
+def build_dag() -> Dag:
+    """Return the fully registered DAG."""
+    root = find_project_root(Path(__file__)) or Path.cwd()
+    config = KigumiConfig(project_root=root)
+    caller = LLMCaller(
+        LiteLLMTransport(),
+        cache_dir=config.llm_cache_path,
+        seed=0,
+    )
+    dag = Dag(config, caller)
+
+    @dag.node("example", prompts=())
+    def example(ctx) -> dict[str, str]:
+        """Replace this with a real node; the docstring is required by `check`."""
+        return {"ok": "replace me"}
+
+    return dag
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entry point for a standalone `dag` command."""
+    build_dag().cli(argv)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 
 def main(argv: list[str] | None = None) -> int:
     """Run the stdlib-only kigumi command-line interface."""
@@ -35,6 +88,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "init":
         return _init(Path.cwd(), hooks=args.hooks)
+    # Documentation is readable without a configured project: an agent exploring an
+    # unfamiliar repository needs the capability surface before anything is set up.
+    if args.command == "brief":
+        return _print_doc("brief")
+    if args.command == "docs":
+        return _docs(args.name)
 
     root = find_project_root(Path.cwd())
     try:
@@ -69,6 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         return _call(config, args.key_prefix, args.field)
     if args.command == "gc":
         return _gc(config, args.keep)
+    if args.command in GRAPH_COMMAND_HELP:
+        return _graph_command(config, args)
     parser.error("unknown command")
     return 2
 
@@ -79,6 +140,11 @@ def _parser() -> argparse.ArgumentParser:
 
     init = subcommands.add_parser("init")
     init.add_argument("--hooks", action="store_true")
+
+    subcommands.add_parser("brief", help="print the agent brief: what kigumi already owns")
+
+    docs = subcommands.add_parser("docs", help="list or print shipped documentation")
+    docs.add_argument("name", nargs="?", choices=[doc.name for doc in SHIPPED_DOCS])
 
     guard = subcommands.add_parser("guard")
     guard.add_argument("--changed", action="store_true")
@@ -116,9 +182,78 @@ def _parser() -> argparse.ArgumentParser:
     call.add_argument("key_prefix")
     call.add_argument("--field", choices=("messages", "response", "reasoning", "meta"))
 
+    # The graph commands need the in-memory Dag, so they are only reachable when
+    # [tool.kigumi] declares dag_entry. They are always listed: an agent must be able
+    # to discover that `kigumi plan` exists from --help alone, and get a message that
+    # names the missing key rather than "unknown command".
+    register_graph_commands(subcommands)
+
     gc = subcommands.add_parser("gc")
     gc.add_argument("--keep", type=int, required=True)
     return parser
+
+
+def _graph_command(config: KigumiConfig, args: argparse.Namespace) -> int:
+    """Import the project's graph and dispatch one graph command onto it."""
+    dag = _load_dag(config)
+    if dag is None:
+        return 2
+    return dag.run_command(args)
+
+
+def _load_dag(config: KigumiConfig) -> Any | None:
+    """Build the project's ``Dag`` from ``dag_entry``, reporting setup errors."""
+    if config.dag_entry is None:
+        _error(
+            "[tool.kigumi] dag_entry is not set, so the graph is not reachable from "
+            'this CLI; add dag_entry = "module:callable" pointing at a function that '
+            "returns your Dag (see: kigumi docs cli)"
+        )
+        return None
+    module_name, _, attribute = config.dag_entry.partition(":")
+    # The project's own modules are importable relative to its root, which is not
+    # guaranteed to be on sys.path when kigumi is invoked as an installed script.
+    root = str(config.project_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as error:
+        _error(f"dag_entry module {module_name!r} is not importable: {error}")
+        return None
+    factory = getattr(module, attribute, None)
+    if factory is None:
+        _error(f"dag_entry {config.dag_entry!r} not found: {module_name} has no {attribute!r}")
+        return None
+    if not callable(factory):
+        _error(f"dag_entry {config.dag_entry!r} is not callable; it must return a Dag")
+        return None
+    dag = factory()
+    if not isinstance(dag, Dag):
+        _error(f"dag_entry {config.dag_entry!r} returned {type(dag).__name__}, expected a Dag")
+        return None
+    return dag
+
+
+def _docs(name: str | None) -> int:
+    """List the shipped documentation pages, or print one of them."""
+    if name is not None:
+        return _print_doc(name)
+    width = max(len(doc.name) for doc in SHIPPED_DOCS)
+    print("shipped documentation (print one with: kigumi docs <name>)\n")
+    for doc in SHIPPED_DOCS:
+        print(f"  {doc.name.ljust(width)}  {doc.summary}")
+    return 0
+
+
+def _print_doc(name: str) -> int:
+    """Print one shipped page, reporting a broken installation as an error."""
+    try:
+        print(read_doc(name), end="")
+    except (FileNotFoundError, KeyError) as error:
+        _error(str(error).strip("'"))
+        return 1
+    return 0
 
 
 def _init(root: Path, *, hooks: bool) -> int:
@@ -153,6 +288,7 @@ def _init(root: Path, *, hooks: bool) -> int:
         "agent_slots = 1\n"
         'agent_lock_dir = "artifacts/_locks/agents"\n'
         "agent_slot_timeout_seconds = 300\n"
+        f'dag_entry = "{DAG_ENTRY_MODULE}:build_dag"\n'
     )
     existing = pyproject.read_text(encoding="utf-8")
     atomic_write_text(pyproject, existing.rstrip() + block)
@@ -166,12 +302,29 @@ def _init(root: Path, *, hooks: bool) -> int:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / ".gitkeep").touch(exist_ok=True)
     _append_gitignore(root / ".gitignore", f"{config.artifacts_dir.rstrip('/')}/")
+    entry_path = _write_dag_entry(root)
     if hooks:
         hook_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n")
         hook_path.chmod(0o755)
     print("initialized kigumi project")
+    if entry_path is not None:
+        relative = entry_path.relative_to(root)
+        print(f"  wrote {relative} (fill in build_dag, then: kigumi describe)")
+        print(f'  optional standalone command: [project.scripts] dag = "{DAG_ENTRY_MODULE}:main"')
     return 0
+
+
+def _write_dag_entry(root: Path) -> Path | None:
+    """Write the graph entry-point skeleton, never overwriting existing project code."""
+    package = root / DAG_ENTRY_MODULE.split(".")[0]
+    entry_path = root / (DAG_ENTRY_MODULE.replace(".", "/") + ".py")
+    if entry_path.exists():
+        return None
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").touch(exist_ok=True)
+    atomic_write_text(entry_path, DAG_ENTRY_TEMPLATE)
+    return entry_path
 
 
 def _append_gitignore(path: Path, entry: str) -> None:
@@ -337,7 +490,11 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             hits = sum(1 for item in metadata if item.get("cache") == "hit")
             misses = sum(1 for item in metadata if item.get("cache") == "miss")
             pending = _pending_names(run_path)
-            durable = durable_run_state(run_path)
+            try:
+                durable = durable_run_state(run_path)
+            except WorkflowProfileError as error:
+                _error(str(error))
+                return 1
             runs.append(
                 {
                     "run_id": run_path.name,
@@ -345,7 +502,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                     "hits": hits,
                     "misses": misses,
                     "pending": len(pending),
-                    "status": durable.get("run_status", "legacy"),
+                    "status": durable.get("run_status", "unknown"),
                     "pending_retries": len(durable.get("pending_retries", [])),
                     "ambiguous_attempts": len(durable.get("ambiguous_attempts", [])),
                 }
@@ -371,8 +528,14 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
         _error(f"run not found: {run_id}")
         return 1
     workflow: dict[str, Any] | None = None
-    if _read_json(run_path / "_run.json").get("run_manifest_schema") in {1, 2}:
+    manifest_path = run_path / "_run.json"
+    manifest = _read_json(manifest_path)
+    if manifest_path.is_file():
         try:
+            if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+                raise WorkflowProfileError(
+                    f"Run {run_id!r} has an unsupported manifest schema"
+                )
             workflow = load_run_profile(run_path)
         except WorkflowProfileError as error:
             _error(str(error))
@@ -406,7 +569,11 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             }
         )
     pending = _pending_names(run_path)
-    durable = durable_run_state(run_path)
+    try:
+        durable = durable_run_state(run_path)
+    except WorkflowProfileError as error:
+        _error(str(error))
+        return 1
     approvals = run_path / "approvals"
     approved: list[str] = []
     if approvals.is_dir():
@@ -420,7 +587,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                 "nodes": nodes,
                 "pending": pending,
                 "approved": approved,
-                "status": durable.get("run_status", "legacy"),
+                "status": durable.get("run_status", "unknown"),
                 "attempts": durable.get("attempts", []),
                 "retry_policy_digests": durable.get("retry_policy_digests", {}),
                 "evidence_policy_digests": durable.get("evidence_policy_digests", {}),
@@ -430,7 +597,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             }
         )
     else:
-        print(f"status: {durable.get('run_status', 'legacy')}")
+        print(f"status: {durable.get('run_status', 'unknown')}")
         for entry in nodes:
             print(
                 f"{entry['name']} cache={entry['cache']} seconds={entry['seconds']} "
@@ -527,7 +694,7 @@ def _diff(config: KigumiConfig, run_a: str, run_b: str, *, json_output: bool) ->
 def _trace(config: KigumiConfig, run_id: str, node: str | None, *, json_output: bool) -> int:
     try:
         result = trace_run(config.artifacts_path, config.llm_cache_path, run_id, node)
-    except (FileNotFoundError, ValueError) as error:
+    except (FileNotFoundError, ValueError, WorkflowProfileError) as error:
         _error(str(error))
         return 1
     if json_output:

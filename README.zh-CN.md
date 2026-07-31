@@ -29,7 +29,7 @@
 - **工作流画像**:一份 canonical 静态/运行 IR 同时供应 Prompt-aware Mermaid、Markdown、
   JSON、`describe`、trace 与 runs show
 - **统一实验主体**:函数、Caller、workflow 与 Agent DAG 使用同一隔离证据网格，不自动选赢家
-- **守卫四环**:注册环拒载,外加 dag check / pytest 自动收集 / git hook 三个外环,让规矩自动执行
+- **守卫四环**:注册环拒载,外加 kigumi check / pytest 自动收集 / git hook 三个外环,让规矩自动执行
 
 ## 快速上手
 
@@ -94,7 +94,7 @@ def write(inputs, ctx):
 
 Kigumi 在每次 run 开始时一次 snapshot 全部声明 Prompt 文件。实际选中 variant 进入 L3 key；
 未选中候选字节仍进入 run identity，因此修改它可复用当前 selected cache，却不能静默恢复
-旧 run。使用 `dag profile` 和 `dag graph --prompts` 查看完整声明与持久化实际选择。
+旧 run。使用 `kigumi profile` 和 `kigumi graph --prompts` 查看完整声明与持久化实际选择。
 
 ## 安装
 
@@ -118,8 +118,13 @@ legacy profile 查看，不可 resume。
 
 ## 文档地图
 
+装好之后不必回到这个仓库：`kigumi brief` 打印 agent 进场页，`kigumi docs` 列出随 wheel
+交付的全部页，`kigumi docs <name>` 打印其中一页。仓库 `docs/` 是唯一 source of truth，
+wheel 只做映射不做复制。
+
 | 文档 | 回答的问题 |
 | --- | --- |
+| [docs/brief.md](docs/brief.md) | **agent 先看这个**(`kigumi brief`)。这个库已经拥有什么、别另写什么;改节点前先跑哪几条只读命令。英文写成,因为下游项目里的 agent 要读它 |
 | [docs/capabilities.md](docs/capabilities.md) | **先看这个。**这个库能做什么;一行一个能力,左边是需求、右边是符号 |
 | [DESIGN.md](DESIGN.md) | 为什么这样设计;分层、边界与已裁决的取舍 |
 | [docs/adoption.md](docs/adoption.md) | 怎么接入;从单 caller 到 DAG 的路径与排障 |

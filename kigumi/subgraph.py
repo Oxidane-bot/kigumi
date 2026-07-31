@@ -31,7 +31,6 @@ class _SubgraphNode:
     name: str
     function: Callable[..., dict[str, Any]]
     deps: tuple[str, ...]
-    prompts: tuple[str, ...]
     prompt_specs: tuple[PromptSpec, ...]
     files: tuple[Path, ...]
     params: dict[str, Any]
@@ -68,7 +67,6 @@ class Subgraph:
         self,
         name: str,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         files: Iterable[str | Path] = (),
         params: dict[str, Any] | None = None,
         *,
@@ -78,14 +76,11 @@ class Subgraph:
         external_fingerprint: Any | None = None,
     ) -> Callable[[Callable[..., dict[str, Any]]], Callable[..., dict[str, Any]]]:
         """Declare one ordinary local node."""
-        fixed_prompts = tuple(prompts)
         return self._decorator(
             name,
             deps=tuple(deps),
-            prompts=fixed_prompts,
             prompt_specs=validate_prompt_specs(
                 tuple(prompt_specs),
-                legacy_prompts=fixed_prompts,
                 dynamic_kind="node",
             ),
             files=tuple(Path(path) for path in files),
@@ -102,7 +97,6 @@ class Subgraph:
         items_from: tuple[str, str],
         key_fn: Callable[[Any], str] | None = None,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -115,14 +109,11 @@ class Subgraph:
         """Declare a local runtime map expansion."""
         _validate_locator(items_from, "items_from")
         source, path = items_from
-        fixed_prompts = tuple(prompts)
         return self._decorator(
             name,
             deps=tuple(dict.fromkeys((*deps, source))),
-            prompts=fixed_prompts,
             prompt_specs=validate_prompt_specs(
                 tuple(prompt_specs),
-                legacy_prompts=fixed_prompts,
                 dynamic_kind="map",
             ),
             files=tuple(Path(file) for file in files),
@@ -145,7 +136,6 @@ class Subgraph:
         carry_from: tuple[str, str] | None = None,
         carry_fn: Callable[[dict[str, Any]], Any] | None = None,
         deps: Iterable[str] = (),
-        prompts: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
         files_fn: Callable[[Any], Iterable[str | Path]] | None = None,
@@ -160,17 +150,14 @@ class Subgraph:
         if carry_from is not None:
             _validate_locator(carry_from, "carry_from")
         source, path = items_from
-        fixed_prompts = tuple(prompts)
         refs = (*deps, source)
         if carry_from is not None:
             refs = (*refs, carry_from[0])
         return self._decorator(
             name,
             deps=tuple(dict.fromkeys(refs)),
-            prompts=fixed_prompts,
             prompt_specs=validate_prompt_specs(
                 tuple(prompt_specs),
-                legacy_prompts=fixed_prompts,
                 dynamic_kind="scan",
             ),
             files=tuple(Path(file) for file in files),
@@ -192,7 +179,6 @@ class Subgraph:
         name: str,
         *,
         deps: tuple[str, ...],
-        prompts: tuple[str, ...],
         prompt_specs: tuple[PromptSpec, ...],
         files: tuple[Path, ...],
         params: dict[str, Any],
@@ -245,7 +231,6 @@ class Subgraph:
                 local_name,
                 function,
                 deps,
-                prompts,
                 prompt_specs,
                 files,
                 params,

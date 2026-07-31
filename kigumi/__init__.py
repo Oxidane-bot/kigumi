@@ -1,9 +1,13 @@
 """kigumi: load-bearing joinery for LLM content pipelines.
 
+Working in a project that depends on kigumi? Start here:
+  kigumi brief             # what this library already owns; do not reimplement it
+  kigumi docs              # list every page shipped inside the wheel
+
 Before modifying nodes in a kigumi project:
   kigumi trace <run_id>    # current state: nodes, map items, every LLM call
-  dag plan                 # what would recompute (and cost money) after your change
-  dag explain <node>       # why will this node miss the cache?
+  kigumi plan              # what would recompute (and cost money) after your change
+  kigumi explain <node>    # why will this node miss the cache?
 
 Capability index (need -> symbol, grouped by domain):
 
@@ -16,9 +20,9 @@ Capability index (need -> symbol, grouped by domain):
   Test: ScriptedTransport, FakeTransport, @pytest.mark.live, kigumi guard
   Ops: kigumi init/doctor/trace/approve/gc, dag.run/resume
 
-Full index with "I need X" phrasing: docs/capabilities.md (112 lines) or
-kigumi/docs/capabilities.md in site-packages. Narrative guide: docs/adoption.md.
-Signatures and failure: docs/api.md. Promises: docs/contracts/README.md.
+Every page below is readable offline from the installed wheel via `kigumi docs <name>`:
+brief, capabilities (full "I need X" index), adoption (narrative guide), api
+(signatures and failure handling), cli, contracts (promises), design, changelog.
 """
 
 from ._declarations import CachePolicy
@@ -85,6 +89,7 @@ from .pi import PiRpcAdapter
 from .prompt import (
     CarryRef,
     Clipped,
+    FileRef,
     InputRef,
     ItemRef,
     KigumiPromptWarning,
@@ -163,6 +168,7 @@ __all__ = [
     "ExperimentSubject",
     "EvolveResult",
     "FileSlots",
+    "FileRef",
     "FunctionSubject",
     "Judgment",
     "InputRef",

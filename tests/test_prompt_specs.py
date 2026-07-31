@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import FrozenInstanceError
+from hashlib import sha256 as hash_sha256
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +11,7 @@ from pydantic import BaseModel
 
 from kigumi import (
     CarryRef,
+    FileRef,
     InputRef,
     ItemRef,
     ParamRef,
@@ -26,6 +29,7 @@ from kigumi.artifacts import sha
 from kigumi.calling import LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.prompt import PromptCatalogSnapshot, validate_prompt_bindings, validate_prompt_specs
 from kigumi.testing import FakeTransport
 from tests._dag_helpers import _make_dag
 
@@ -459,6 +463,105 @@ def test_item_and_carry_refs_are_restricted_to_dynamic_node_kinds(tmp_path: Path
         @dag.node("bad", prompt_specs=(spec,))
         def bad(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
             return {"value": "bad"}
+
+
+def test_file_ref_is_frozen_public_material_source_with_nested_canonical_form() -> None:
+    ref = FileRef(InputRef("source", ("path",)))
+
+    assert ref.canonical() == {
+        "kind": "file_ref",
+        "path_from": {"kind": "input", "name": "source", "path": ["path"]},
+    }
+    with pytest.raises(FrozenInstanceError):
+        ref.path_from = ParamRef("other")  # type: ignore[misc]
+
+
+def test_file_ref_material_resolves_from_injected_bytes_without_reading_files(
+    tmp_path: Path,
+) -> None:
+    _write_prompts(tmp_path, {"base": "before{{file}}after"})
+    spec = PromptSpec(
+        "managed",
+        PromptRef("base"),
+        materials=(
+            PromptMaterial("file", FileRef(InputRef("source", ("path",))), title="Source File"),
+        ),
+    )
+    snapshot = PromptCatalogSnapshot.capture(tmp_path / "prompts", prompt_specs=(spec,))
+
+    rendered = snapshot.resolve(
+        spec,
+        inputs={"source": {"path": "docs/source.md"}},
+        params={},
+        file_contents={"docs/source.md": b"hello from snapshot\n"},
+    )
+
+    assert rendered == "before## Source File\n\n```\nhello from snapshot\n\n```\nafter"
+    material = rendered.resolution.materials[0]
+    assert material["source"]["kind"] == "file_ref"
+    assert material["source"]["path_from"] == {
+        "kind": "input",
+        "name": "source",
+        "path": ("path",),
+    }
+    assert material["file_ref"] == {
+        "path": "docs/source.md",
+        "path_from": {"kind": "input", "name": "source", "path": ("path",)},
+        "sha256": hash_sha256(b"hello from snapshot\n").hexdigest(),
+        "bytes": len(b"hello from snapshot\n"),
+    }
+
+
+def test_file_ref_requires_injected_bytes(tmp_path: Path) -> None:
+    _write_prompts(tmp_path, {"base": "{{file}}"})
+    spec = PromptSpec(
+        "managed",
+        PromptRef("base"),
+        materials=(PromptMaterial("file", FileRef(ParamRef("path"))),),
+    )
+    snapshot = PromptCatalogSnapshot.capture(tmp_path / "prompts", prompt_specs=(spec,))
+    real_file = tmp_path / "exists.txt"
+    real_file.write_text("must not be read by FileRef", encoding="utf-8")
+
+    with pytest.raises(PromptResolutionError, match="requires injected file_contents"):
+        snapshot.resolve(spec, inputs={}, params={"path": str(real_file)})
+
+
+def test_file_ref_nested_path_from_participates_in_dynamic_kind_validation() -> None:
+    item_spec = PromptSpec(
+        "item_file",
+        PromptRef("base"),
+        materials=(PromptMaterial("file", FileRef(ItemRef(("path",)))),),
+    )
+    carry_spec = PromptSpec(
+        "carry_file",
+        PromptRef("base"),
+        materials=(PromptMaterial("file", FileRef(CarryRef(("path",)))),),
+    )
+
+    with pytest.raises(PromptDefinitionError, match="ItemRef"):
+        validate_prompt_specs((item_spec,), dynamic_kind="node")
+    assert validate_prompt_specs((item_spec,), dynamic_kind="map") == (item_spec,)
+    with pytest.raises(PromptDefinitionError, match="CarryRef"):
+        validate_prompt_specs((carry_spec,), dynamic_kind="map")
+    assert validate_prompt_specs((carry_spec,), dynamic_kind="scan") == (carry_spec,)
+
+
+def test_file_ref_nested_path_from_participates_in_input_and_param_binding_validation() -> None:
+    spec = PromptSpec(
+        "managed",
+        PromptRef("base"),
+        materials=(
+            PromptMaterial("input_file", FileRef(InputRef("source", ("path",)))),
+            PromptMaterial("param_file", FileRef(ParamRef("asset_path"))),
+        ),
+    )
+
+    validate_prompt_bindings((spec,), inputs={"source"}, params={"asset_path"})
+    with pytest.raises(PromptDefinitionError, match="InputRef 'source'"):
+        validate_prompt_bindings((spec,), inputs=set(), params={"asset_path"})
+    with pytest.raises(PromptDefinitionError, match="ParamRef 'asset_path'"):
+        validate_prompt_bindings((spec,), inputs={"source"}, params=set())
 
 
 def test_resolved_prompt_loses_lineage_on_string_operations(tmp_path: Path) -> None:

@@ -7,35 +7,28 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ._runstate import (
+    ATTEMPT_RECEIPT_SCHEMA,
+    FAILURE_SCHEMA,
+    RUN_MANIFEST_SCHEMA,
+    RUN_SIDECAR_SCHEMA,
+    SUCCESS_CANDIDATE_SCHEMA,
+)
 from .artifacts import sha
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
 
-WORKFLOW_PROFILE_SCHEMA = 1
+WORKFLOW_PROFILE_SCHEMA = 2
 
 
 class WorkflowProfileError(RuntimeError):
-    """Raised when a schema-1 WorkflowProfile or 0.7 receipt fails closed."""
+    """Raised when a WorkflowProfile or durable receipt fails closed."""
 
 
 def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[str, Any]:
     """Load a runtime profile without importing or executing the registered DAG."""
     manifest = _read_object(run_path / "_run.json")
     schema = manifest.get("run_manifest_schema")
-    if schema == 1:
-        return {
-            "workflow_profile_schema": WORKFLOW_PROFILE_SCHEMA,
-            "mode": "legacy",
-            "resolution_status": "unavailable_legacy",
-            "graph": {"nodes": [], "edges": [], "mounts": [], "models": {}},
-            "prompts": {"specs": []},
-            "run": {
-                "run_id": run_path.name,
-                "status": manifest.get("status", "unknown"),
-                "nodes": _legacy_nodes(run_path),
-                "attempts": [],
-            },
-        }
-    if schema != 2:
+    if schema != RUN_MANIFEST_SCHEMA:
         raise WorkflowProfileError(
             f"Run {run_path.name!r} has no supported manifest for WorkflowProfile"
         )
@@ -196,7 +189,7 @@ def _runtime_nodes(run_path: Path, *, include_content: bool) -> list[dict[str, A
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")
         if (
-            metadata.get("run_sidecar_schema") != 2
+            metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
             or metadata.get("artifact_sha256") != artifact_digest
             or not isinstance(origin, dict)
             or origin.get("artifact_sha256") != artifact_digest
@@ -264,7 +257,7 @@ def _attempts(
     attempts: list[dict[str, Any]] = []
     for path in sorted((run_path / "attempts").glob("*/state.json")):
         state = _read_object(path)
-        if state.get("attempt_receipt_schema") != 2:
+        if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
             raise WorkflowProfileError(f"Attempt receipt {path} has unsupported schema")
         target = state.get("target")
         if not isinstance(target, str) or state.get("target_digest") != sha(target):
@@ -279,7 +272,7 @@ def _attempts(
         if candidate_file is not None:
             candidate = _read_object(path.parent / str(candidate_file))
             if (
-                candidate.get("candidate_schema") != 2
+                candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
                 or state.get("candidate_sha256") != sha(candidate)
                 or not isinstance(candidate.get("artifact"), dict)
             ):
@@ -323,7 +316,7 @@ def _failures(run_path: Path, *, include_content: bool) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     for path in sorted((run_path / "failures").glob("*.json")):
         receipt = _read_object(path)
-        if receipt.get("failure_schema") != 2:
+        if receipt.get("failure_schema") != FAILURE_SCHEMA:
             raise WorkflowProfileError(f"Failure receipt {path} has unsupported schema")
         resolution = receipt.get("prompt_resolution")
         if resolution is not None:
@@ -350,35 +343,6 @@ def _failures(run_path: Path, *, include_content: bool) -> list[dict[str, Any]]:
             entry["instruction_evidence"] = copy.deepcopy(receipt.get("instruction_evidence"))
         failures.append(entry)
     return failures
-
-
-def _legacy_nodes(run_path: Path) -> list[dict[str, Any]]:
-    nodes: list[dict[str, Any]] = []
-    for sidecar in sorted(run_path.glob("*.json.meta.json")):
-        try:
-            metadata = _read_object(sidecar)
-        except WorkflowProfileError:
-            continue
-        calls = metadata.get("calls", [])
-        safe_calls = (
-            _profile_calls(
-                [call for call in calls if isinstance(call, dict)],
-                include_content=False,
-            )
-            if isinstance(calls, list)
-            else []
-        )
-        nodes.append(
-            {
-                "name": sidecar.name.removesuffix(".json.meta.json").partition("@")[0],
-                "target": sidecar.name.removesuffix(".json.meta.json"),
-                "cache": metadata.get("cache", "unknown"),
-                "seconds": metadata.get("seconds", 0),
-                "calls": safe_calls,
-                "resolution_status": "unavailable_legacy",
-            }
-        )
-    return nodes
 
 
 def _validated_resolutions(value: Any, context: str) -> dict[str, Any]:

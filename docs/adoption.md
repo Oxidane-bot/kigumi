@@ -6,11 +6,18 @@
 可验证不变式的权威文本见 [契约索引](contracts/README.md)，面向使用者的发布变化见
 [CHANGELOG.md](../CHANGELOG.md)。
 
-想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](../examples/ticket_extract/README.md)
-或[提示词进化环](../examples/prompt_evolve/README.md)。前者用 150 张固定 seed 合成工单测量
+想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](https://github.com/Oxidane-bot/kigumi/blob/master/examples/ticket_extract/README.md)
+或[提示词进化环](https://github.com/Oxidane-bot/kigumi/blob/master/examples/prompt_evolve/README.md)（示例只在仓库里，不随 wheel 交付）。前者用 150 张固定 seed 合成工单测量
 map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
 
 ## 进场协议（改节点前先做这三步）
+
+不熟悉这个库时，先读两页；装好之后不必回仓库，两页都随 wheel 交付：
+
+```bash
+kigumi brief          # 已有能力、别重造什么、两套 CLI 分工（见 brief.md）
+kigumi docs           # 列出全部交付页，再 kigumi docs <name> 读其中一页
+```
 
 改节点之前，先用框架自己的工具看清楚状态，再动手。这三步不会发真实请求，不花钱：
 
@@ -21,15 +28,16 @@ kigumi trace <run_id> --node <name> --json   # 只看某个节点，适合 json 
 
 # 2. 预览改动之后哪些会重算（哪些会花钱）
 #    certain = 确定会 miss；at_risk = 可能 miss；pending_on = 因 unknown 上游待定
-dag plan
+kigumi plan
 
 # 3. 查某个节点上次为什么命中或失效
-dag explain <node>
-dag explain <node@item>   # map/scan 的单个 item
+kigumi explain <node>
+kigumi explain <node@item>   # map/scan 的单个 item
 ```
 
-`dag.plan()` 与 `dag.explain()` 需要已注册的 `Dag` 实例；找到应用里的 `Dag` 对象后调用，
-或用 `dag.cli()` 绑定它。完整命令参数见 [CLI 参考](cli.md)；
+这三条里后两条要读内存里的图，因此需要 `[tool.kigumi]` 声明 `dag_entry`
+（`kigumi init` 会写好）；未声明时命令以 2 退出并告诉你补哪个键。程序内可以直接调用
+`dag.plan()` 与 `dag.explain()`。完整命令参数见 [CLI 参考](cli.md)；
 所有症状的排查流程见[六、排障](#六排障按症状查)。
 
 
@@ -53,7 +61,16 @@ env_file = ".env"                # KIGUMI_MODEL_DEFAULT / KIGUMI_MODEL_PRO / api
 agent_slots = 1                  # 外部 Agent 默认全局串行
 agent_lock_dir = "artifacts/_locks/agents"
 agent_slot_timeout_seconds = 300
+dag_entry = "nodes.graph:build_dag"  # 图命令的入口；不声明则只有项目运维命令可用
 ```
+
+`dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
+`check` / `graph` / `profile` / `resume` / `retry-resolve` 要读内存里的图，而节点是靠
+装饰器在 import 时注册的，所以这些命令必须 import 一个返回 `Dag` 的工厂函数。指向它，
+这组命令就能在项目里直接敲；不指向，其余命令照常工作。`kigumi init` 会生成
+`nodes/graph.py` 骨架并写好这个键。
+
+工厂函数被 import 时必须只注册节点、不产生副作用——图命令只读拓扑，不应触发任何执行。
 
 `.env` 里放模型别名与密钥(密钥永远不进 git,`kigumi doctor` 只报键名不报值)。
 `KIGUMI_AGENT_SLOTS`、`KIGUMI_AGENT_LOCK_DIR`、
@@ -266,9 +283,9 @@ durable CALL 的 transport/length/empty internal retry 必须全为 0，Pi hidde
 若进程在 provider call/Pi spawn 后崩溃且没有 terminal receipt，状态为 ambiguous，必须人工：
 
 ```bash
-dag retry-resolve run-0042 outline --attempt 1 --action retry \
+kigumi retry-resolve run-0042 outline --attempt 1 --action retry \
   --reason "provider logs confirm no accepted result"
-dag resume run-0042
+kigumi resume run-0042
 ```
 
 `retry|fail` 都要求 reason 并进入 trace。Kigumi 不承诺外部 effect exactly-once；它保证的是
@@ -555,9 +572,9 @@ redacted_runtime = dag.profile(run_id, include_content=True)
 ```
 
 ```bash
-dag profile --format md
-dag profile --run-id run-0042 --format json
-dag graph --run-id run-0042 --prompts
+kigumi profile --format md
+kigumi profile --run-id run-0042 --format json
+kigumi graph --run-id run-0042 --prompts
 ```
 
 静态画像不执行节点；运行画像不重跑 provider，只读取 schema-2 manifest、sidecar/origin、
@@ -1262,7 +1279,7 @@ kigumi diff run-0041 run-0042 --json
 | 想在花钱前看改动爆炸半径 | `dag.plan()`;`certain` 是下界、加 `at_risk` 是上界,`pending_on` 追 unknown 的原因链 |
 | 图形状/声明想整体过目 | `dag.render_mermaid(run_id)` 叠加运行态,挂起与被跳过节点会着色标出 |
 | retry 到期前 resume 没动作 | 这是正确行为；看 `pending_retries[].due_at`，由外部 supervisor 到期再调用 |
-| resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `dag retry-resolve ... retry|fail` 裁决 |
+| resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `kigumi retry-resolve ... retry|fail` 裁决 |
 | 同 run 报 declaration changed | 0.6 manifest 禁止覆盖；用原声明 resume，或为新声明创建新 run_id |
 
 `explain` 的判定语义与 `plan` 完全一致:上游 miss 导致成分无法诚实计算时报

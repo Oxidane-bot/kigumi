@@ -17,6 +17,34 @@ REQUIRED_RESOURCES = frozenset(
         "kigumi/_pi_bridge_policy.mjs",
     }
 )
+# Agent-facing documentation is part of the release contract: `kigumi brief` and
+# `kigumi docs` must work from the wheel alone, with no checkout present. The wheel
+# gets these paths from force-include; the sdist carries the repository sources that
+# force-include maps, so each target is checked against its own layout.
+REQUIRED_WHEEL_DOCS = frozenset(
+    {
+        "kigumi/DESIGN.md",
+        "kigumi/CHANGELOG.md",
+        "kigumi/docs/brief.md",
+        "kigumi/docs/capabilities.md",
+        "kigumi/docs/adoption.md",
+        "kigumi/docs/api.md",
+        "kigumi/docs/cli.md",
+        "kigumi/docs/contracts/README.md",
+    }
+)
+REQUIRED_SDIST_DOCS = frozenset(
+    {
+        "DESIGN.md",
+        "CHANGELOG.md",
+        "docs/brief.md",
+        "docs/capabilities.md",
+        "docs/adoption.md",
+        "docs/api.md",
+        "docs/cli.md",
+        "docs/contracts/README.md",
+    }
+)
 
 
 def _dependency_name(requirement: str) -> str:
@@ -33,7 +61,7 @@ def verify(dist: Path, expected_version: str) -> None:
 
     with zipfile.ZipFile(wheels[0]) as archive:
         wheel_names = set(archive.namelist())
-        missing = REQUIRED_RESOURCES - wheel_names
+        missing = (REQUIRED_RESOURCES | REQUIRED_WHEEL_DOCS) - wheel_names
         if missing:
             raise RuntimeError(f"wheel is missing resources: {sorted(missing)}")
         _reject_acp(wheel_names, "wheel")
@@ -55,7 +83,7 @@ def verify(dist: Path, expected_version: str) -> None:
         sdist_names = {member.name for member in archive.getmembers()}
         missing = {
             resource
-            for resource in REQUIRED_RESOURCES
+            for resource in REQUIRED_RESOURCES | REQUIRED_SDIST_DOCS
             if not any(name.endswith(f"/{resource}") for name in sdist_names)
         }
         if missing:

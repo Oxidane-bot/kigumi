@@ -4,6 +4,9 @@
 [接入指南](adoption.md),签名与失效见 [API 速查](api.md),承诺见
 [契约索引](contracts/README.md),命令见 [CLI 参考](cli.md)。
 
+装了这个库之后,本页与上述各页都能用 `kigumi docs <name>` 离线读;
+`kigumi brief` 是更短的 agent 进场页(见 [brief.md](brief.md))。
+
 先扫这张表再动手。撞不到需要的行,大概率是这个库不做那件事——边界见
 adoption.md 的"设计边界"一节。
 
@@ -104,6 +107,8 @@ adoption.md 的"设计边界"一节。
 | 需要 | 用 |
 | --- | --- |
 | 脚手架一个新项目 | `kigumi init [--hooks]` |
+| 让 agent 一眼看清这个库已有什么(别重造) | `kigumi brief` |
+| 离线读随 wheel 交付的文档页 | `kigumi docs [name]` |
 | 路径/密钥/模板体检 | `kigumi doctor` |
 | 看一次 run 的完整证据链 | `kigumi trace <run_id>` / `kigumi runs show` |
 | 取某次 LLM 调用的载荷 | `kigumi call <key_prefix> --field messages\|response` |
