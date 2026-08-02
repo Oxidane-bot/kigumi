@@ -42,6 +42,9 @@
 - `class PromptResolutionError(ValueError)`（`kigumi.prompt`，顶层导出）：运行时绑定不存在、
   路径类型不符，或持久化 resolution schema/digest 不可信。修正输入/参数/item/carry 绑定；
   digest 损坏时新建可信 run，不能猜测恢复。
+- `class RequestTooLarge(ValueError)`（`kigumi.prompt`，顶层导出）：`preflight` 发现估算 token、
+  附件数量或附件总字节超过 `PreflightPolicy` 上限；读取 `.report` 拿到每一项
+  `PreflightViolation`。在缓存查找和 provider 请求之前抛出，因此超大请求不会先计费再失败。
 - `class KigumiPromptWarning(UserWarning)`（`kigumi.prompt`，顶层导出）：`inject` 发现 dict 的
   键全是数字字符串，`canonical_json(sort_keys=True)` 可能破坏调用方想表达的数值顺序。把
   有序数据改为 list。
@@ -219,9 +222,23 @@
 
 ### Prompt
 
-- `PromptResolution(spec_name: str, structure_digest: str, base: Mapping[str, Any], layers: tuple[Mapping[str, Any], ...], axes: tuple[Mapping[str, Any], ...], materials: tuple[Mapping[str, Any], ...], rendered_sha256: str, rendered_bytes: int, schema: int = 1) -> None`：
-  不含 Prompt 原文的不可变解析 provenance。见
+- `Attachment(path: str, content_hash: str, mime_type: str, size_bytes: int) -> None`：内容寻址的
+  附件 manifest。只记录路径、内容摘要、MIME 与字节数，不保存文件字节本身，因此可以进
+  provenance 而不把二进制内容拖进 artifacts。
+- `Message(role: str, parts: list[str | dict[str, Any]]) -> None`：类型化请求消息。`parts` 里
+  的 dict 表示非文本部件（如附件引用），provider 看到的顺序就是列表顺序。
+- `ResponseSpec(schema_sha256: str | None = None, format: str = "text") -> None`：响应格式与
+  schema identity；`format` 取 `text`、`json` 或 `structured`。schema 变化会改变缓存键，
+  因此换 schema 不会复用旧的结构化响应。
+- `PromptResolution(spec_name: str, structure_digest: str, base: Mapping[str, Any], layers: tuple[Mapping[str, Any], ...], axes: tuple[Mapping[str, Any], ...], materials: tuple[Mapping[str, Any], ...], rendered_sha256: str, rendered_bytes: int, schema: int = 1, messages: list[Message] = [], attachments: list[Attachment] = [], response_spec: ResponseSpec = ResponseSpec()) -> None`：
+  不含 Prompt 原文、但携带完整请求 manifest 的不可变解析 provenance。见
   [分层 Prompt 解析契约](contracts/prompt-resolution.md)。
+- `PreflightPolicy(max_tokens: int = 200_000, max_attachments: int = 50, max_attachment_bytes: int = 104_857_600) -> None`：
+  请求预检上限。
+- `PreflightViolation(check: str, limit: int, actual: int, message: str) -> None`：单条超限事实，
+  `check` 为 `token_count` / `attachment_count` / `byte_size`。
+- `PreflightReport(violations: list[PreflightViolation], estimated_tokens: int, total_bytes: int) -> None`：
+  预检结论；`is_valid()` 在没有任何 violation 时为真。
 - `ResolvedPrompt(value: str, resolution: PromptResolution) -> ResolvedPrompt`：携带
   `PromptResolution` lineage 的不可变 `str` 子类；普通字符串运算可能抹去 lineage。
 - `Clipped(text: str, clipped: bool, original_chars: int, kept_chars: int, event: dict[str, int | str] | None) -> None`：
@@ -250,6 +267,9 @@
   提前闭合的确定性 fence。见[核心心智模型](adoption.md#二核心心智模型)。
 - `clip(text: str, limit: int, *, boundary: Literal["line", "sentence"] = "line") -> Clipped`：
   在安全边界截断并返回公开的截断事件。
+- `preflight(resolution: PromptResolution, policy: PreflightPolicy = PreflightPolicy()) -> PreflightReport`：
+  在缓存查找与 provider 请求之前估算 token、统计附件数量与总字节。返回报告而不抛异常；
+  调用层在 `is_valid()` 为假时抛 `RequestTooLarge`。
 
 ### 评估
 

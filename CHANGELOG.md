@@ -6,11 +6,20 @@
 
 ### 重大变更
 
+- **缓存族轮换**:`CACHE_SCHEMA` 升至 7。提示摘要现纳入附件内容哈希与响应 schema 标识,
+  L1 调用缓存条目也开始写 `response_sha256`,因此旧缓存整体失效,首次运行会重新计费。
+- 附件成为 `PromptResolution` 的一等成员(`Attachment` / `Message` / `ResponseSpec`),
+  `FileRef` 端到端可用:换掉一个附件的内容就换缓存键,不再复用按旧文件算出的响应。
+- 新增请求预检:超过 `PreflightPolicy` 上限时抛 `RequestTooLarge`,不静默截断。
 - map 与 parent 节点现共享同一并发平面,嵌套 map 线程池已移除:既有图的实际并发度可能变化。
   此前每个 map 在调度器 worker 里再开一个 `workers` 大小的池,总线程数是 workers 的平方。
 
 ### 新增
 
+- `Attachment` / `Message` / `ResponseSpec`:类型化的请求表示。`Attachment` 只记录路径、
+  内容哈希、MIME 与字节数,不把文件字节拖进 provenance。
+- `preflight()` 与 `PreflightPolicy` / `PreflightReport` / `PreflightViolation`:在缓存查找
+  和 provider 请求之前估算 token、统计附件数量与总字节,超限请求不会先计费再失败。
 - `ResourceRequest` 与 `Dag.run(resource_limits=...)`:按节点声明资源(GPU、供应商配额等),
   运行时分别限流;未声明的节点走 `None` 默认池。多资源按名字确定序获取,不会互等。
 - `BudgetPermit` 与 `Budget.reserve()` / `commit()` / `cancel()` 预算 admission API:
@@ -28,6 +37,8 @@
   只按输出额度计算,输入 token 不设防。
 - 副作用边界改按 executor 类型安装,不再要求节点声明 `retry`:此前未声明重试策略的节点
   在付费调用后崩溃不会留下 `side_effect_started`,恢复时会误判为「未产生副作用」。
+- 附件一致性由框架保证:附件哈希进提示摘要,消费者不必再手动核对「已声明」与「已发送」
+  的附件是否一致。
 - 损坏与缺失现被区分:损坏的 attempt 状态抛 `StateIntegrityError`,损坏的缓存条目按
   `CORRUPT` 上报而非静默当作 miss 重新调用供应商。新增 `CacheLookup` 三态读取结果与
   `CacheIntegrityError`。

@@ -28,10 +28,13 @@ Status: Active (0.8.0)
 5. 截断处理：`finish_reason=length` 时只有调用方设了 `max_tokens` 才加倍重试，至多 2 次；否则直接抛 `TruncatedResponseError`；截断永不静默。
 6. 同一 Prompt snapshot、spec、projected inputs、params、item 与 carry 必须得到逐字节相同
    `ResolvedPrompt` 和 resolution digest。base 控制插入顺序，fragment 原文逐字插入，
-   material 只经 `inject()`；框架不自动补分隔符。
-7. snapshot 在 run 开始后不可变；中途文件修改不造成节点间漂移。下一 run 观察到新字节并
+   material 只经 `inject()`；框架不自动补分隔符。managed request digest 还绑定 typed
+   message 内容、附件 content hash 与 `ResponseSpec`，不绑定附件路径或 transport base64。
+7. `preflight()` 在缓存查找和 provider 请求前估算 token、附件数量和总字节；违规抛
+   `RequestTooLarge`，不得静默调用 `clip()`。
+8. snapshot 在 run 开始后不可变；中途文件修改不造成节点间漂移。下一 run 观察到新字节并
    按 selected-only 缓存规则决定 hit/miss。
-8. Agent session transcript 可以包含 provider/Pi 生成的非确定字段；框架不承诺 refresh/off
+9. Agent session transcript 可以包含 provider/Pi 生成的非确定字段；框架不承诺 refresh/off
    重算得到相同 transcript，只承诺首次 canonical bytes 进入 blob 后，item cache hit 与后继
    carry 逐字节重放。Pi session header cwd 在边界确定性规范化为 `"."`。
 

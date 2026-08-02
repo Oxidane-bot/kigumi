@@ -1254,8 +1254,12 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
   哈希而非路径;发送前会重验哈希,文件中途被改会拒发而不是发错的。
 - **磁带(cassette)按顺序 + 请求指纹重放**:改了 prompt 措辞、模型名或
   参数,磁带会报 mismatch——这是提醒你重录,不是 bug。
-- **`Budget` 超限抛 `BudgetExceeded` 时,触发的那次调用已经完成并计入
-  缓存**;下一次同 key 调用会命中缓存,不再花钱。
+- **`Budget` 在 miss 发 provider 请求前先预留额度**:显式 `max_tokens` 优先作为预估值,
+  否则按 prompt 长度保守估算。成功调用把 provider 实际用量 commit 到 `Budget.spent`,
+  失败调用释放预留；实际用量可能超过预估值,因此 commit 仍可能抛 `BudgetExceeded`,但该次
+  调用已经完成并进入缓存。缓存命中不做预留。预留与同 key single-flight 都只在当前进程
+  内协调；多个进程可能同时为同一个 key 预留并请求 provider,需要 file lock 或分布式协调
+  时由应用层另行提供。
 - **缓存/磁带损坏可按 miss 或拒绝重放，但 durable run state 不可猜**：
   `_run.json`、attempt state、candidate 或已完成 artifact 摘要不一致时 fail closed；
   不能把可能已经产生外部 side effect 的损坏状态当成“从头开始”。

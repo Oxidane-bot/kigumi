@@ -6,11 +6,13 @@ import json
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from .calling import Caller, prompt_resolution_boundary
+from .artifacts import sha
+from .calling import Caller, prompt_resolution_boundary, response_spec_boundary
 from .prompt import (
     WORDING_REPAIR_ECHO,
     WORDING_REPAIR_PREAMBLE,
@@ -18,6 +20,7 @@ from .prompt import (
     WORDING_REPAIR_STUCK,
     PromptResolution,
     ResolvedPrompt,
+    ResponseSpec,
     schema_format_section,
 )
 
@@ -153,7 +156,10 @@ def call_validated(
     **params: Any,
 ) -> Model:
     """Call for a Pydantic model, applying deterministic JSON normalization first."""
+    response_spec = ResponseSpec(schema_sha256=sha(model_cls.model_json_schema()), format="json")
     base_resolution = prompt.resolution if isinstance(prompt, ResolvedPrompt) else None
+    if base_resolution is not None:
+        base_resolution = replace(base_resolution, response_spec=response_spec)
     completed_prompt = prompt
     if include_format_section:
         completed_prompt = f"{prompt}\n\n{schema_format_section(model_cls)}"
@@ -172,19 +178,20 @@ def call_validated(
             extra_check(instance)
         return instance
 
-    return repair_loop(
-        caller,
-        completed_prompt,
-        validate,
-        model=model,
-        mode=mode,
-        max_repairs=max_repairs,
-        reminder=reminder,
-        sink=sink,
-        on_event=on_event,
-        _base_resolution=base_resolution,
-        **params,
-    )
+    with response_spec_boundary(response_spec):
+        return repair_loop(
+            caller,
+            completed_prompt,
+            validate,
+            model=model,
+            mode=mode,
+            max_repairs=max_repairs,
+            reminder=reminder,
+            sink=sink,
+            on_event=on_event,
+            _base_resolution=base_resolution,
+            **params,
+        )
 
 
 def _normalize_messages(messages: list[dict[str, Any]] | str) -> list[dict[str, Any]]:

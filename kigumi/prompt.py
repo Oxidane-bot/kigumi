@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
@@ -45,6 +46,135 @@ class PromptDefinitionError(ValueError):
 
 class PromptResolutionError(ValueError):
     """Raised when runtime facts cannot deterministically resolve a Prompt declaration."""
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """File attachment with content-addressed identity."""
+
+    path: str
+    content_hash: str
+    mime_type: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.path, Path):
+            object.__setattr__(self, "path", str(self.path))
+        if not isinstance(self.path, str) or not self.path:
+            raise ValueError("Attachment path must be a non-empty string")
+        if not isinstance(self.content_hash, str) or not self.content_hash:
+            raise ValueError("Attachment content_hash must be a non-empty string")
+        if not isinstance(self.mime_type, str) or not self.mime_type:
+            raise ValueError("Attachment mime_type must be a non-empty string")
+        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int):
+            raise ValueError("Attachment size_bytes must be an integer")
+        if self.size_bytes < 0:
+            raise ValueError("Attachment size_bytes must be non-negative")
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "content_hash": self.content_hash,
+            "mime_type": self.mime_type,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class Message:
+    """Structured message with typed parts."""
+
+    role: str
+    parts: list[str | dict[str, Any]]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, str) or not self.role:
+            raise ValueError("Message role must be a non-empty string")
+        if not isinstance(self.parts, list):
+            raise ValueError("Message parts must be a list")
+        checked: list[str | dict[str, Any]] = []
+        for part in self.parts:
+            if not isinstance(part, (str, dict)):
+                raise ValueError("Message parts must contain only strings or dictionaries")
+            checked.append(dict(part) if isinstance(part, dict) else part)
+        object.__setattr__(self, "parts", checked)
+
+    def canonical(self) -> dict[str, Any]:
+        return {"role": self.role, "parts": list(self.parts)}
+
+
+@dataclass(frozen=True)
+class ResponseSpec:
+    """Response format specification."""
+
+    schema_sha256: str | None = None
+    format: str = "text"
+
+    def __post_init__(self) -> None:
+        if self.schema_sha256 is not None and (
+            not isinstance(self.schema_sha256, str) or not self.schema_sha256
+        ):
+            raise ValueError("ResponseSpec schema_sha256 must be a non-empty string or None")
+        if self.format not in {"text", "json", "structured"}:
+            raise ValueError("ResponseSpec format must be 'text', 'json', or 'structured'")
+
+    def canonical(self) -> dict[str, Any]:
+        return {"schema_sha256": self.schema_sha256, "format": self.format}
+
+
+@dataclass(frozen=True)
+class PreflightPolicy:
+    """Limits checked before a request can consult cache or reach a provider."""
+
+    max_tokens: int = 200_000
+    max_attachments: int = 50
+    max_attachment_bytes: int = 100 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        for name in ("max_tokens", "max_attachments", "max_attachment_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+    @property
+    def max_total_bytes(self) -> int:
+        """Compatibility alias for the total attachment byte limit."""
+        return self.max_attachment_bytes
+
+
+_DEFAULT_PREFLIGHT_POLICY = PreflightPolicy()
+
+
+@dataclass(frozen=True)
+class PreflightViolation:
+    """Single preflight check failure."""
+
+    check: str
+    limit: int
+    actual: int
+    message: str
+
+
+@dataclass(frozen=True)
+class PreflightReport:
+    """Result of input validation."""
+
+    violations: list[PreflightViolation]
+    estimated_tokens: int
+    total_bytes: int
+
+    def is_valid(self) -> bool:
+        return len(self.violations) == 0
+
+
+class RequestTooLarge(ValueError):
+    """Request exceeds input preflight limits."""
+
+    def __init__(self, report: PreflightReport) -> None:
+        if not isinstance(report, PreflightReport):
+            raise TypeError("RequestTooLarge requires a PreflightReport")
+        self.report = report
+        super().__init__(f"Request too large: {report.violations}")
 
 
 def _validate_prompt_name(value: Any, kind: str) -> str:
@@ -411,27 +541,80 @@ def validate_prompt_resolution_record(value: Any) -> None:
     """Validate one persisted schema-1 resolution without reconstructing Prompt text."""
     if not isinstance(value, Mapping) or value.get("prompt_resolution_schema") != 1:
         raise PromptResolutionError("persisted Prompt resolution has invalid schema")
-    keys = (
-        "prompt_resolution_schema",
-        "spec",
-        "structure_digest",
-        "base",
-        "layers",
-        "axes",
-        "materials",
-        "rendered",
-    )
-    body = {key: _thaw_value(value.get(key)) for key in keys}
     digest = value.get("resolution_digest")
-    if not isinstance(digest, str) or digest != sha(body):
+    if not isinstance(digest, str):
         raise PromptResolutionError("persisted Prompt resolution failed digest validation")
+
+    extension_keys = {"messages", "attachments", "response_spec"}
+    if not extension_keys & set(value):
+        # Accept schema-1 records written before managed request fields existed. They
+        # remain subject to the old digest check, while every newly written record
+        # uses the content-addressed request digest below.
+        legacy_keys = (
+            "prompt_resolution_schema",
+            "spec",
+            "structure_digest",
+            "base",
+            "layers",
+            "axes",
+            "materials",
+            "rendered",
+        )
+        legacy_body = {key: _thaw_value(value.get(key)) for key in legacy_keys}
+        if digest != sha(legacy_body):
+            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
+    else:
+        try:
+            messages = [
+                Message(
+                    role=record["role"],
+                    parts=list(record["parts"]),
+                )
+                for record in value.get("messages", [])
+            ]
+            attachments = [
+                Attachment(
+                    path=record["path"],
+                    content_hash=record["content_hash"],
+                    mime_type=record["mime_type"],
+                    size_bytes=record["size_bytes"],
+                )
+                for record in value.get("attachments", [])
+            ]
+            response_spec_value = value.get("response_spec", {})
+            if not isinstance(response_spec_value, Mapping):
+                raise TypeError("response_spec must be a mapping")
+            response_spec = ResponseSpec(
+                schema_sha256=response_spec_value.get("schema_sha256"),
+                format=response_spec_value.get("format", "text"),
+            )
+            resolution = PromptResolution(
+                spec_name=value["spec"],
+                structure_digest=value["structure_digest"],
+                base=value["base"],
+                layers=tuple(value["layers"]),
+                axes=tuple(value["axes"]),
+                materials=tuple(value["materials"]),
+                rendered_sha256=value["rendered"]["sha256"],
+                rendered_bytes=value["rendered"]["bytes"],
+                schema=value["prompt_resolution_schema"],
+                messages=messages,
+                attachments=attachments,
+                response_spec=response_spec,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PromptResolutionError(
+                "persisted Prompt resolution has invalid managed request fields"
+            ) from error
+        if digest != resolution.digest:
+            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
     if value.get("base_resolution_digest", digest) != digest:
         raise PromptResolutionError("persisted Prompt resolution has a mismatched base resolution")
 
 
 @dataclass(frozen=True)
 class PromptResolution:
-    """Content-free immutable provenance for one rendered Prompt."""
+    """Immutable provenance and managed request manifest for one rendered Prompt."""
 
     spec_name: str
     structure_digest: str
@@ -442,6 +625,9 @@ class PromptResolution:
     rendered_sha256: str
     rendered_bytes: int
     schema: int = PROMPT_RESOLUTION_SCHEMA
+    messages: list[Message] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
+    response_spec: ResponseSpec = field(default_factory=ResponseSpec)
 
     def __post_init__(self) -> None:
         if self.schema != PROMPT_RESOLUTION_SCHEMA:
@@ -462,6 +648,44 @@ class PromptResolution:
             "materials",
             tuple(_freeze_value(dict(material)) for material in self.materials),
         )
+        checked_messages: list[Message] = []
+        for message in self.messages:
+            if isinstance(message, Message):
+                checked_messages.append(message)
+            elif isinstance(message, Mapping):
+                checked_messages.append(Message(role=message["role"], parts=list(message["parts"])))
+            else:
+                raise PromptResolutionError("PromptResolution messages must contain Message values")
+        checked_attachments: list[Attachment] = []
+        for attachment in self.attachments:
+            if isinstance(attachment, Attachment):
+                checked_attachments.append(attachment)
+            elif isinstance(attachment, Mapping):
+                checked_attachments.append(
+                    Attachment(
+                        path=attachment["path"],
+                        content_hash=attachment["content_hash"],
+                        mime_type=attachment["mime_type"],
+                        size_bytes=attachment["size_bytes"],
+                    )
+                )
+            else:
+                raise PromptResolutionError(
+                    "PromptResolution attachments must contain Attachment values"
+                )
+        if not isinstance(self.response_spec, ResponseSpec):
+            if isinstance(self.response_spec, Mapping):
+                response_spec = ResponseSpec(
+                    schema_sha256=self.response_spec.get("schema_sha256"),
+                    format=self.response_spec.get("format", "text"),
+                )
+            else:
+                raise PromptResolutionError("PromptResolution response_spec must be ResponseSpec")
+        else:
+            response_spec = self.response_spec
+        object.__setattr__(self, "messages", checked_messages)
+        object.__setattr__(self, "attachments", checked_attachments)
+        object.__setattr__(self, "response_spec", response_spec)
 
     def _body(self) -> dict[str, Any]:
         return {
@@ -476,14 +700,100 @@ class PromptResolution:
                 "sha256": self.rendered_sha256,
                 "bytes": self.rendered_bytes,
             },
+            "messages": [message.canonical() for message in self.messages],
+            "attachments": [attachment.canonical() for attachment in self.attachments],
+            "response_spec": self.response_spec.canonical(),
         }
 
     @property
     def digest(self) -> str:
-        return sha(self._body())
+        return _prompt_digest(self)
 
     def canonical(self) -> dict[str, Any]:
         return {**self._body(), "resolution_digest": self.digest}
+
+
+def _prompt_digest(resolution: PromptResolution) -> str:
+    """Return the canonical request digest without transport-only base64 expansion."""
+    body = resolution._body()
+    # Preserve the original resolution provenance in the digest, but never make an
+    # attachment's source path part of content identity. FileRef records retain
+    # their binding and content hash while dropping only the resolved path.
+    body["attachments"] = [attachment.content_hash for attachment in resolution.attachments]
+    body["materials"] = [
+        {
+            **material,
+            "file_ref": {
+                key: value for key, value in material["file_ref"].items() if key != "path"
+            },
+        }
+        if isinstance(material.get("file_ref"), dict)
+        else material
+        for material in body["materials"]
+    ]
+    return sha(body)
+
+
+def _part_bytes(part: str | dict[str, Any]) -> int:
+    if isinstance(part, str):
+        return len(part.encode("utf-8"))
+    return len(json.dumps(part, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
+def _estimated_tokens(messages: list[Message]) -> int:
+    """Estimate tokens from canonical UTF-8 request parts at roughly four bytes each."""
+    total_bytes = sum(_part_bytes(part) for message in messages for part in message.parts)
+    return (total_bytes + 3) // 4
+
+
+def preflight(
+    resolution: PromptResolution,
+    policy: PreflightPolicy = _DEFAULT_PREFLIGHT_POLICY,
+) -> PreflightReport:
+    """Validate a managed request before cache lookup or provider work."""
+    if not isinstance(resolution, PromptResolution):
+        raise TypeError("preflight requires a PromptResolution")
+    if not isinstance(policy, PreflightPolicy):
+        raise TypeError("preflight policy must be PreflightPolicy")
+
+    estimated_tokens = _estimated_tokens(resolution.messages)
+    total_bytes = sum(attachment.size_bytes for attachment in resolution.attachments)
+    violations: list[PreflightViolation] = []
+    if estimated_tokens > policy.max_tokens:
+        violations.append(
+            PreflightViolation(
+                check="token_count",
+                limit=policy.max_tokens,
+                actual=estimated_tokens,
+                message=(
+                    f"Estimated prompt tokens {estimated_tokens} exceed limit {policy.max_tokens}"
+                ),
+            )
+        )
+    if len(resolution.attachments) > policy.max_attachments:
+        violations.append(
+            PreflightViolation(
+                check="attachment_count",
+                limit=policy.max_attachments,
+                actual=len(resolution.attachments),
+                message=(
+                    f"Attachment count {len(resolution.attachments)} exceeds limit "
+                    f"{policy.max_attachments}"
+                ),
+            )
+        )
+    if total_bytes > policy.max_attachment_bytes:
+        violations.append(
+            PreflightViolation(
+                check="byte_size",
+                limit=policy.max_attachment_bytes,
+                actual=total_bytes,
+                message=(
+                    f"Attachment bytes {total_bytes} exceed limit {policy.max_attachment_bytes}"
+                ),
+            )
+        )
+    return PreflightReport(violations, estimated_tokens, total_bytes)
 
 
 class ResolvedPrompt(str):
@@ -606,6 +916,7 @@ class PromptCatalogSnapshot:
         layers: list[dict[str, Any]] = []
         axes: list[dict[str, Any]] = []
         materials: list[dict[str, Any]] = []
+        attachments: list[Attachment] = []
         for layer in spec.layers:
             source = layer.source
             if isinstance(source, PromptRef):
@@ -655,7 +966,7 @@ class PromptCatalogSnapshot:
         for material in spec.materials:
             file_record = None
             if isinstance(material.source, FileRef):
-                value, file_record = _resolve_file_ref(
+                value, file_record, attachment = _resolve_file_ref(
                     material.source,
                     file_contents=file_contents,
                     inputs=inputs,
@@ -666,6 +977,7 @@ class PromptCatalogSnapshot:
                     has_carry=has_carry,
                     context=f"material {material.slot!r}",
                 )
+                attachments.append(attachment)
             else:
                 value = _resolve_value(
                     material.source,
@@ -701,6 +1013,9 @@ class PromptCatalogSnapshot:
             materials=tuple(materials),
             rendered_sha256=sha(rendered),
             rendered_bytes=len(rendered.encode("utf-8")),
+            messages=[Message(role="user", parts=[rendered])],
+            attachments=attachments,
+            response_spec=ResponseSpec(),
         )
         return ResolvedPrompt(rendered, resolution)
 
@@ -716,7 +1031,7 @@ def _resolve_file_ref(
     has_item: bool,
     has_carry: bool,
     context: str,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], Attachment]:
     path_value = _resolve_value(
         source.path_from,
         inputs=inputs,
@@ -745,12 +1060,22 @@ def _resolve_file_ref(
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise PromptResolutionError(f"{context} FileRef path {path!r} must be UTF-8") from error
-    return text, {
-        "path": path,
-        "path_from": source.path_from.canonical(),
-        "sha256": sha256(raw).hexdigest(),
-        "bytes": len(raw),
-    }
+    attachment = Attachment(
+        path=path,
+        content_hash=sha256(raw).hexdigest(),
+        mime_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
+        size_bytes=len(raw),
+    )
+    return (
+        text,
+        {
+            "path": path,
+            "path_from": source.path_from.canonical(),
+            "sha256": attachment.content_hash,
+            "bytes": len(raw),
+        },
+        attachment,
+    )
 
 
 def _resolve_value(
@@ -871,17 +1196,18 @@ def section(title: str, value: str | None) -> str:
 def schema_format_section(model_cls: type[BaseModel], *, with_example: bool = True) -> str:
     """Describe a Pydantic model and optionally include a recursive JSON skeleton."""
     field_lines = ["字段："]
-    for name, field in model_cls.model_fields.items():
-        required = "必填" if field.is_required() else "可选"
-        description = field.description or "无描述"
+    for name, model_field in model_cls.model_fields.items():
+        required = "必填" if model_field.is_required() else "可选"
+        description = model_field.description or "无描述"
         field_lines.append(
-            f"- `{name}`：`{_type_label(field.annotation)}`；{required}；{description}"
+            f"- `{name}`：`{_type_label(model_field.annotation)}`；{required}；{description}"
         )
 
     body = "\n".join(field_lines)
     if with_example:
         example = {
-            name: _example_value(field.annotation) for name, field in model_cls.model_fields.items()
+            name: _example_value(model_field.annotation)
+            for name, model_field in model_cls.model_fields.items()
         }
         example_json = json.dumps(example, ensure_ascii=False, indent=2)
         body = f"{body}\n\n示例：\n```json\n{example_json}\n```\n"

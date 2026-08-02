@@ -101,7 +101,7 @@ PostNodeHook = Callable[[str, dict[str, Any], bool], None]
 _NO_CARRY = object()
 _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
-CACHE_SCHEMA = 6
+CACHE_SCHEMA = 7
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 

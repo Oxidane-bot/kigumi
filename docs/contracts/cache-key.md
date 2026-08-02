@@ -2,7 +2,7 @@
 
 Status: Active (0.9.0)
 
-> 0.8.0：`CACHE_SCHEMA=6`，node cache envelope schema 3 保持不变；
+> Unreleased：`CACHE_SCHEMA=7`，node cache envelope schema 3 保持不变；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
 > 硬切，不迁移 0.7.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
@@ -23,7 +23,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 
 ## Invariants
 
-1. L1 键等于 `sha({messages, model=resolved 后模型, params(调用方原样,传输层归一化不回写), seed})`；`seed` 只是键命名空间，不发给供应商。
+1. L1 键等于 `sha({messages, model=resolved 后模型, params(调用方原样,传输层归一化不回写), seed})`；当请求带有非默认 `ResponseSpec` 时，键额外绑定其格式与 `schema_sha256`；`seed` 只是键命名空间，不发给供应商。
 2. L3 成分标签固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<t>`、
    `prompt_specs:<name>`、`files:<p>`、`params`、`item`、`item_files:<p>`、`carry`、
    `kigumi`，声明外部指纹时额外且仅额外出现
@@ -36,7 +36,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 的语法残破文件退回原文。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
-6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=6, pydantic})`；其中
+6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=7, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
 7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时必须递增
@@ -48,10 +48,12 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    origin provenance、Agent schema 2 和 evidence miss 语义。0.7.0 再从 4 升至 5，并把
    envelope 升至 schema 3，以引入声明式 Prompt resolution、selected-only L3 成分和
    hash-bound origin。0.8.0 从 5 升至 6，以引入 `agent_schema=3` 的 session attachment
-   与 Agent scan executor 语义。
+   与 Agent scan executor 语义。Unreleased 从 6 升至 7，以绑定 managed request 的
+   attachment content hash、typed message digest 和 response schema identity。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
-   variant 的内容 digest。同节点声明的所有 PromptSpec 都保守入键，即使本次函数未调用。
+   variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash
+   与 `ResponseSpec` schema identity，不绑定附件原始路径或 transport base64。 同节点声明的所有 PromptSpec 都保守入键，即使本次函数未调用。
    未选中候选的完整字节 universe 只进入 run manifest graph identity，因此改它可复用相同
    selected-only L3 条目，但旧 run 因声明 identity 漂移拒绝 resume。未声明的字符串 CALL
    不伪造 PromptSpec 成分，receipt 只记录为 unmanaged。

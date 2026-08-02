@@ -366,5 +366,5 @@ def test_subgraph_consumes_uses_local_dependency_names_after_mount(tmp_path: Pat
     assert "upstream:outer" not in metadata["key_components"]
 
 
-def test_consumes_cache_schema_is_five() -> None:
-    assert dag_module.CACHE_SCHEMA == 6
+def test_consumes_cache_schema_is_seven() -> None:
+    assert dag_module.CACHE_SCHEMA == 7

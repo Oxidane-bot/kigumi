@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import repeat
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,16 @@ from kigumi import __version__
 from kigumi.artifacts import sha
 from kigumi.calling import CacheIntegrityError, LLMCaller
 from kigumi.config import KigumiConfig
-from kigumi.dag import Dag
-from kigumi.prompt import PromptRef, PromptSpec
+from kigumi.dag import Dag, ResourceRequest
+from kigumi.prompt import (
+    Attachment,
+    Message,
+    PromptRef,
+    PromptResolution,
+    PromptSpec,
+    ResolvedPrompt,
+    ResponseSpec,
+)
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 from tests._dag_helpers import _load_work, _make_dag
@@ -69,7 +78,7 @@ def test_kigumi_component_tracks_repair_bytes_and_uses_schema(
     assert changed != baseline
     inputs = dag_module._kigumi_key_inputs()
     assert inputs["schema"] == dag_module.CACHE_SCHEMA
-    assert inputs["schema"] == 6
+    assert inputs["schema"] == 7
     assert "version" not in inputs
     assert __version__ not in inputs.values()
 
@@ -86,6 +95,90 @@ def test_key_components_lock_exact_label_set(tmp_path: Path) -> None:
     components = dag._key_components(dag._nodes["work"], {}, dag._libs_hash())
 
     assert set(components) == {"source", "libs", "params", "kigumi"}
+
+
+def test_cache_key_components(tmp_path: Path) -> None:
+    """Keep the exact cache-key smoke-test name used by the release checklist."""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ok"}
+
+    components = dag._key_components(dag._nodes["work"], {}, dag._libs_hash())
+
+    assert set(components) == {"source", "libs", "params", "kigumi"}
+
+
+def test_resource_declarations_do_not_change_cache_key(tmp_path: Path) -> None:
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ok"}
+
+    first = _make_dag(tmp_path)
+    first.node("work", resources=(ResourceRequest("gpu"),))(work)
+    second = _make_dag(tmp_path)
+    second.node("work", resources=(ResourceRequest("cpu"),))(work)
+
+    first_components = first._key_components(first._nodes["work"], {}, first._libs_hash())
+    second_components = second._key_components(second._nodes["work"], {}, second._libs_hash())
+
+    assert first_components == second_components
+
+
+def test_prompt_key_component_tracks_attachment_hash_and_response_schema(
+    tmp_path: Path,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ok"}
+
+    base = PromptResolution(
+        spec_name="managed",
+        structure_digest="structure",
+        base={},
+        layers=(),
+        axes=(),
+        materials=(),
+        rendered_sha256="rendered",
+        rendered_bytes=0,
+        messages=[Message("user", ["same prompt"])],
+        attachments=[Attachment("source.txt", "a" * 64, "text/plain", 4)],
+        response_spec=ResponseSpec("schema-a", "structured"),
+    )
+    changed_attachment = replace(
+        base,
+        attachments=[Attachment("source.txt", "b" * 64, "text/plain", 4)],
+    )
+    changed_schema = replace(base, response_spec=ResponseSpec("schema-b", "structured"))
+    node = dag._nodes["work"]
+
+    first = dag._key_components(
+        node,
+        {},
+        dag._libs_hash(),
+        prompt_resolutions={"managed": ResolvedPrompt("same prompt", base)},
+    )
+    attachment_changed = dag._key_components(
+        node,
+        {},
+        dag._libs_hash(),
+        prompt_resolutions={"managed": ResolvedPrompt("same prompt", changed_attachment)},
+    )
+    schema_changed = dag._key_components(
+        node,
+        {},
+        dag._libs_hash(),
+        prompt_resolutions={"managed": ResolvedPrompt("same prompt", changed_schema)},
+    )
+
+    assert first["prompt_specs:managed"] == base.digest
+    assert first["prompt_specs:managed"] != attachment_changed["prompt_specs:managed"]
+    assert first["prompt_specs:managed"] != schema_changed["prompt_specs:managed"]
 
 
 def test_kigumi_component_tracks_prompt_bytes_and_pydantic_version(
@@ -225,8 +318,8 @@ def test_declared_files_and_library_sources_invalidate_caches(tmp_path: Path) ->
     assert events == [False, False, False]
 
 
-def test_torn_node_cache_is_recomputed(tmp_path: Path) -> None:
-    """教训 torn_cache: 半截缓存文件按 miss 重算重写,不崩 run。"""
+def test_torn_node_cache_fails_authority_bound_run(tmp_path: Path) -> None:
+    """Authority-bound execution must not re-enter a provider path after cache corruption."""
 
     def run_once() -> Any:
         dag = _make_dag(tmp_path)

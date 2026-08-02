@@ -19,6 +19,7 @@ adoption.md 的"设计边界"一节。
 | 声明式组合的多层 prompt | `PromptSpec` / `PromptLayer` |
 | A/B 或多分支提示词(有限选择轴) | `PromptAxis` |
 | 运行期材料进 prompt 但保留 lineage | `PromptMaterial` / `FileRef` |
+| 类型化请求消息、附件与响应 schema | `Message` / `Attachment` / `ResponseSpec` |
 | 让选择轴读上游/参数/item/carry | `InputRef` / `ParamRef` / `ItemRef` / `CarryRef` |
 | 具名条件段(值为 None 整段不渲染) | `section` |
 | 从 pydantic model 生成输出格式说明段 | `schema_format_section` |
@@ -38,6 +39,7 @@ adoption.md 的"设计边界"一节。
 | 换 provider / 自实现传输层 | `Transport` 协议 / `LiteLLMTransport` / `StdlibTransport` |
 | 429 自适应并发 | `AdaptiveCapacity` / `FileSlots` |
 | 抓取每次调用的结构化事件 | `observe` |
+| 在 cache/provider 前检查请求大小 | `preflight` / `PreflightPolicy` / `RequestTooLarge` |
 
 ## DAG 编排
 

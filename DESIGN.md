@@ -143,17 +143,22 @@ agent_slot_timeout_seconds = 300
 - 内容寻址缓存:键 = messages + **resolved model**(经 transport.resolve,
   换 .env 模型 = 换缓存键,防跨模型回放旧答案)+ params + seed;
   撕裂缓存按 miss;**空响应拒入缓存**(transport 违约时的第二道闸)。
-- 溯源 meta 同记 model_alias 与 resolved model;**先记 calls 再 budget.record**
-  (超限异常不得吞掉最贵那次调用的溯源)。
+- 溯源 meta 同记 model_alias 与 resolved model;**先记 calls 再 permit.commit**,
+  以便实际用量超预算时仍保留最贵调用的溯源;`Budget.record` 保留为无预留的兼容入口
+  （超限异常不得吞掉最贵那次调用的溯源）。
 - dry-run 熔断:到达真调用即抛错;缓存命中时不熔断继续走(特性,非 bug:
   dry-run 的定义是"不发新请求",不是"不消费历史")。
-- 线程安全:Budget 加锁;calls 加锁;同键 in-flight 去重(并发同键只打一次)。
+- 线程安全:Budget 的 reserve/commit/cancel 加锁;calls 加锁;同键 in-flight 去重(并发同键只打一次)。
+  `_key_locks` 与预算预留都是进程内协调；跨进程同 key 仍可能同时 miss、预留和请求，跨进程
+  single-flight 需 file lock 或分布式协调（TODO: consider fcntl-based lock file）。
 - seed 仅是缓存命名空间,不传给 provider,不承诺采样可复现。
 - `EvidencePolicy` digest 不进 L1/L3 内容键；request/response evidence miss 可从 L1 replay
   payload 重建，不新增 provider side effect。L1 payload 仍保留重放所需原文。
 - 大块内容按引用:消息体里的大负载(视频/图像 base64)以
   `{"kigumi_file": 路径}` 内容件表示,缓存键取文件内容哈希,缓存 payload
   存引用不存字节(接口 P1.1 预留,实现随 P6a)。
+- managed request 解析为 `Message`、`Attachment` 与 `ResponseSpec`；`FileRef` 的文件哈希进入
+  `PromptResolution`，`preflight()` 在 cache lookup 前拒绝过大请求，绝不以 `clip()` 静默缩短。
 - 跨进程限流(fcntl.flock 请求槽,多进程共享 provider 配额)归 P6a。
 - token 预算记账,超限中止 run。
 
@@ -346,8 +351,8 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 
 ## 修订记录
 
-- 2026-07-26 发布 0.8.0：新增 Agent scan 与 blob-backed Pi session carry；
-  `CACHE_SCHEMA=6`、`agent_executor_schema=5`、`agent_schema=3`。
+- Unreleased：managed request attachment/schema lineage 与输入预检；`CACHE_SCHEMA=7`，
+  `agent_executor_schema=5`、`agent_schema=3` 保持不变。
 
 - 2026-07-24 发布 0.6.0：统一 typed failure、EvidencePolicy、默认单 slot 的全局 Agent
   容量与 durable retry/resume；`CACHE_SCHEMA=4`、`agent_executor_schema=3`、

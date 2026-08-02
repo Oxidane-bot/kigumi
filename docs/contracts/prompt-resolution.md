@@ -10,7 +10,8 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
 
 ## Public surface
 
-顶层导出 `PromptRef`、`InputRef`、`ParamRef`、`ItemRef`、`CarryRef`、`FileRef`、`PromptAxis`、
+顶层导出 `PromptRef`、`InputRef`、`ParamRef`、`ItemRef`、`CarryRef`、`FileRef`、`Attachment`、
+`Message`、`ResponseSpec`、`PromptAxis`、
 `PromptLayer`、`PromptMaterial`、`PromptSpec`、`ResolvedPrompt`、`PromptResolution`、
 `PromptDefinitionError` 与 `PromptResolutionError`。`Dag.node/agent/map/scan/foreach` 和
 `Subgraph.node/map/scan` 接受 `prompt_specs=()`；执行时通过
@@ -40,13 +41,16 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
    应当豁免或迁移到 `PromptSpec`。
 8. `ResolvedPrompt` 是不可变 `str` 子类。只有对象本身携带 resolution；拼接、格式化、切片或
    `str()` 后元数据自然丢失，后续 CALL 必须记为 unmanaged，不得猜测或误归因。
-9. `PromptResolution` 只保存 spec 结构摘要、base/layer/axis 来源、实际 selection、material
-   来源与摘要、渲染摘要和字节数，不保存 Prompt 或 material 原文。canonical
-   `resolution_digest` 绑定完整结构。
-10. `ctx.resolve_prompt()` 只返回预解析对象；只有 `ctx.call(resolved)` 或把该对象直接作为
+9. `PromptResolution` 保存 spec 结构摘要、base/layer/axis 来源、实际 selection、material
+   来源与摘要、typed `Message`、`Attachment` manifest、`ResponseSpec`、渲染摘要和字节数；不保存
+   Prompt 或 material 原文。`resolution_digest` 绑定消息内容、附件 content hash 与 schema
+   identity，不绑定附件路径或 transport 层 base64。
+10. `preflight()` 在缓存查找和 provider 请求前检查估算 token、附件数量和总字节数；违规抛
+    `RequestTooLarge`，不得静默调用 `clip()`。
+11. `ctx.resolve_prompt()` 只返回预解析对象；只有 `ctx.call(resolved)` 或把该对象直接作为
     `AgentTask.instruction` 才生成实际使用记录。一个节点可有多次 CALL；声明但未调用的 spec
     只属于节点输入，不伪装成实际 CALL。
-11. `call_validated`/repair 的 primary 与每轮 repair 保存共同
+12. `call_validated`/repair 的 primary 与每轮 repair 保存共同
     `base_resolution_digest`，并分别保存 `phase`、`repair_round` 和本轮实际 `prompt_sha`。
     L1 hit 必须使用当前调用的 lineage，不能回放缓存文件里的旧 lineage。
 

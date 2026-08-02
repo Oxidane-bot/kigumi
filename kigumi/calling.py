@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
@@ -30,7 +30,16 @@ from .failures import (
     canonical_failure,
     provider_failure_from_exception,
 )
-from .prompt import PromptResolution, ResolvedPrompt
+from .prompt import (
+    Attachment,
+    Message,
+    PreflightPolicy,
+    PromptResolution,
+    RequestTooLarge,
+    ResolvedPrompt,
+    ResponseSpec,
+    preflight,
+)
 from .slots import FileSlots
 from .store import CacheLookup
 from .transport import EmptyResponseError, Transport
@@ -44,7 +53,11 @@ _durable_side_effect: contextvars.ContextVar[Callable[[dict[str, Any]], None] | 
 _prompt_lineage: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "kigumi_prompt_lineage", default=None
 )
+_response_spec: contextvars.ContextVar[ResponseSpec | None] = contextvars.ContextVar(
+    "kigumi_response_spec", default=None
+)
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
+_DEFAULT_PREFLIGHT_POLICY = PreflightPolicy()
 
 
 @contextmanager
@@ -95,13 +108,25 @@ def prompt_resolution_boundary(
         _prompt_lineage.reset(token)
 
 
+@contextmanager
+def response_spec_boundary(response_spec: ResponseSpec) -> Iterator[None]:
+    """Bind a response schema to L1 cache identity without sending it as a provider param."""
+    if not isinstance(response_spec, ResponseSpec):
+        raise TypeError("response_spec must be ResponseSpec")
+    token = _response_spec.set(response_spec)
+    try:
+        yield
+    finally:
+        _response_spec.reset(token)
+
+
 def _data_url(data: bytes, mime: str) -> str:
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised after a call pushes its token budget past the configured ceiling."""
+    """Raised when a reservation or actual spend exceeds the configured ceiling."""
 
 
 class DryRunError(RuntimeError):
@@ -127,6 +152,7 @@ class _FileReference:
     path: Path
     mime: str
     digest: str
+    size_bytes: int
     detail: Any
     has_detail: bool
 
@@ -138,6 +164,7 @@ class _PreparedMessages:
     key_messages: list[dict[str, Any]]
     cache_messages: list[dict[str, Any]]
     transport_messages: list[dict[str, Any]]
+    attachments: list[Attachment]
 
 
 def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLookup:
@@ -292,6 +319,7 @@ class LLMCaller:
         dry: bool = False,
         slots: FileSlots | None = None,
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+        preflight_policy: PreflightPolicy = _DEFAULT_PREFLIGHT_POLICY,
     ) -> None:
         self.transport = transport
         self.cache_dir = Path(cache_dir)
@@ -301,25 +329,42 @@ class LLMCaller:
         self.slots = slots
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
+        if not isinstance(preflight_policy, PreflightPolicy):
+            raise TypeError("preflight_policy must be PreflightPolicy")
         self.evidence_policy = evidence_policy
+        self.preflight_policy = preflight_policy
         self.calls: list[dict[str, Any]] = []
         self._calls_lock = threading.Lock()
         # 键锁只增不减:caller 与一次 run 同生命周期,键集有界;若改成常驻服务需先加回收。
         self._key_locks: dict[str, threading.Lock] = {}
         self._key_locks_lock = threading.Lock()
+        # LIMITATION: _key_locks provides in-process concurrency control only.
+        # Multiple processes may simultaneously reserve budget for the same call key.
+        # For cross-process single-flight, replace with file-based locks or
+        # distributed coordination (TODO: consider fcntl-based lock file).
 
     def call(
         self,
-        messages: list[dict[str, Any]] | str,
+        messages: list[dict[str, Any]] | list[Message] | str,
         model: str = "default",
         **params: Any,
     ) -> str:
         """Return a cached or live completion for normalized chat messages."""
         prompt_lineage = _prompt_lineage.get()
-        if prompt_lineage is None and isinstance(messages, ResolvedPrompt):
+        base_resolution = messages.resolution if isinstance(messages, ResolvedPrompt) else None
+        response_spec = _response_spec.get()
+        if response_spec is None and base_resolution is not None:
+            response_spec = base_resolution.response_spec
+        if response_spec is None and isinstance(prompt_lineage, dict):
+            response_spec = self._response_spec_from_lineage(prompt_lineage)
+        if response_spec is None:
+            response_spec = ResponseSpec()
+        if base_resolution is not None and base_resolution.response_spec != response_spec:
+            base_resolution = replace(base_resolution, response_spec=response_spec)
+        if prompt_lineage is None and base_resolution is not None:
             prompt_lineage = {
-                **messages.resolution.canonical(),
-                "base_resolution_digest": messages.resolution.digest,
+                **base_resolution.canonical(),
+                "base_resolution_digest": base_resolution.digest,
                 "phase": "primary",
                 "repair_round": 0,
             }
@@ -327,16 +372,37 @@ class LLMCaller:
         prepared = self._prepare_file_references(normalized_messages)
         key_messages = prepared.key_messages if prepared is not None else normalized_messages
         cache_messages = prepared.cache_messages if prepared is not None else normalized_messages
+        request_resolution = self._request_resolution(
+            base_resolution=base_resolution,
+            prompt_lineage=prompt_lineage,
+            key_messages=key_messages,
+            attachments=prepared.attachments if prepared is not None else [],
+            response_spec=response_spec,
+        )
+        if prepared is not None and prepared.attachments:
+            existing_lineage = prompt_lineage or {}
+            prompt_lineage = {
+                **request_resolution.canonical(),
+                "base_resolution_digest": existing_lineage.get(
+                    "base_resolution_digest", request_resolution.digest
+                ),
+                "phase": existing_lineage.get("phase", "primary"),
+                "repair_round": existing_lineage.get("repair_round", 0),
+            }
+        report = preflight(request_resolution, self.preflight_policy)
+        if not report.is_valid():
+            raise RequestTooLarge(report)
         resolved_model = self.transport.resolve(model)
         # Cache keys preserve caller intent before transport parameter normalization.
-        key = sha(
-            {
-                "messages": key_messages,
-                "model": resolved_model,
-                "params": params,
-                "seed": self.seed,
-            }
-        )
+        key_inputs: dict[str, Any] = {
+            "messages": key_messages,
+            "model": resolved_model,
+            "params": params,
+            "seed": self.seed,
+        }
+        if response_spec != ResponseSpec():
+            key_inputs["response_spec"] = response_spec.canonical()
+        key = sha(key_inputs)
         cache_path = self.cache_dir / "llm" / f"{key}.json"
         cached = self._read_cached_response(cache_path)
         if cached is not None:
@@ -486,6 +552,7 @@ class LLMCaller:
                         prompt_lineage=prompt_lineage,
                     ),
                     "response": response.text,
+                    "response_sha256": sha(response.text),
                     "messages": cache_messages,
                     "reasoning": response.reasoning,
                 }
@@ -496,8 +563,10 @@ class LLMCaller:
                         permit.commit(response.usage)
                     finally:
                         permit = None
-                elif self.budget is not None:
-                    self.budget.record(response.usage)
+            except Exception:
+                if permit is not None:
+                    permit.cancel()
+                raise
             except BaseException:
                 if permit is not None:
                     permit.cancel()
@@ -505,11 +574,118 @@ class LLMCaller:
             return response.text
 
     @staticmethod
-    def _normalize_messages(messages: list[dict[str, Any]] | str) -> list[dict[str, Any]]:
+    def _normalize_messages(
+        messages: list[dict[str, Any]] | list[Message] | str,
+    ) -> list[dict[str, Any]]:
         if isinstance(messages, str):
             # Strip a ResolvedPrompt subclass only after its lineage was captured.
             return [{"role": "user", "content": str(messages)}]
-        return messages
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            if isinstance(message, Message):
+                parts = message.parts
+                if len(parts) == 1:
+                    content: Any = parts[0]
+                else:
+                    content = [
+                        {"type": "text", "text": part} if isinstance(part, str) else part
+                        for part in parts
+                    ]
+                normalized.append({"role": message.role, "content": content})
+            elif isinstance(message, dict):
+                normalized.append(message)
+            else:
+                raise TypeError("messages must contain dictionaries or Message values")
+        return normalized
+
+    @staticmethod
+    def _response_spec_from_lineage(lineage: dict[str, Any]) -> ResponseSpec | None:
+        value = lineage.get("response_spec")
+        if not isinstance(value, dict):
+            return None
+        try:
+            return ResponseSpec(
+                schema_sha256=value.get("schema_sha256"),
+                format=value.get("format", "text"),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _attachments_from_lineage(lineage: dict[str, Any] | None) -> list[Attachment]:
+        if lineage is None or not isinstance(lineage.get("attachments"), list):
+            return []
+        attachments: list[Attachment] = []
+        for value in lineage["attachments"]:
+            if not isinstance(value, dict):
+                continue
+            try:
+                attachments.append(
+                    Attachment(
+                        path=value["path"],
+                        content_hash=value["content_hash"],
+                        mime_type=value["mime_type"],
+                        size_bytes=value["size_bytes"],
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return attachments
+
+    @classmethod
+    def _request_resolution(
+        cls,
+        *,
+        base_resolution: PromptResolution | None,
+        prompt_lineage: dict[str, Any] | None,
+        key_messages: list[dict[str, Any]],
+        attachments: list[Attachment],
+        response_spec: ResponseSpec,
+    ) -> PromptResolution:
+        request_messages = [
+            Message(
+                role=message.get("role", "user"),
+                parts=cls._message_parts(message.get("content")),
+            )
+            for message in key_messages
+        ]
+        if base_resolution is not None:
+            return replace(
+                base_resolution,
+                messages=request_messages,
+                attachments=[*base_resolution.attachments, *attachments],
+                response_spec=response_spec,
+            )
+        lineage_attachments = cls._attachments_from_lineage(prompt_lineage)
+        return PromptResolution(
+            spec_name="unmanaged",
+            structure_digest="unmanaged",
+            base={},
+            layers=(),
+            axes=(),
+            materials=(),
+            rendered_sha256=sha(key_messages),
+            rendered_bytes=len(json.dumps(key_messages, ensure_ascii=False).encode("utf-8")),
+            messages=request_messages,
+            attachments=[*lineage_attachments, *attachments],
+            response_spec=response_spec,
+        )
+
+    @staticmethod
+    def _message_parts(content: Any) -> list[str | dict[str, Any]]:
+        if content is None:
+            return []
+        if isinstance(content, (str, dict)):
+            return [content]
+        if isinstance(content, list):
+            parts: list[str | dict[str, Any]] = []
+            for part in content:
+                if isinstance(part, (str, dict)):
+                    parts.append(part)
+                else:
+                    parts.append(str(part))
+            return parts
+        return [str(content)]
 
     @classmethod
     def _estimate_tokens(cls, messages: list[dict[str, Any]], params: dict[str, Any]) -> int:
@@ -538,6 +714,7 @@ class LLMCaller:
         key_messages: list[dict[str, Any]] = []
         cache_messages: list[dict[str, Any]] = []
         transport_messages: list[dict[str, Any]] = []
+        attachments: list[Attachment] = []
         found_reference = False
 
         for message in messages:
@@ -550,13 +727,28 @@ class LLMCaller:
 
             found_reference = True
             key_content, cache_content, transport_content = prepared_content
+            attachments.extend(cls._content_attachments(message.get("content")))
             key_messages.append({**message, "content": key_content})
             cache_messages.append({**message, "content": cache_content})
             transport_messages.append({**message, "content": transport_content})
 
         if not found_reference:
             return None
-        return _PreparedMessages(key_messages, cache_messages, transport_messages)
+        return _PreparedMessages(key_messages, cache_messages, transport_messages, attachments)
+
+    @classmethod
+    def _content_attachments(cls, content: Any) -> list[Attachment]:
+        if cls._is_file_reference(content):
+            values = [content]
+        elif isinstance(content, list):
+            values = content
+        else:
+            values = []
+        attachments: list[Attachment] = []
+        for value in values:
+            if cls._is_file_reference(value):
+                attachments.append(cls._attachment(cls._file_reference(value)))
+        return attachments
 
     @classmethod
     def _prepare_content(cls, content: Any) -> tuple[Any, Any, Any] | None:
@@ -610,8 +802,18 @@ class LLMCaller:
             path=path,
             mime=mime,
             digest=digest,
+            size_bytes=path.stat().st_size,
             detail=value.get("detail"),
             has_detail="detail" in value,
+        )
+
+    @staticmethod
+    def _attachment(reference: _FileReference) -> Attachment:
+        return Attachment(
+            path=str(reference.path),
+            content_hash=reference.digest,
+            mime_type=reference.mime,
+            size_bytes=reference.size_bytes,
         )
 
     @staticmethod
