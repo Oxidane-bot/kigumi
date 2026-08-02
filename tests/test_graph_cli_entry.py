@@ -48,14 +48,16 @@ both entry points; see `test_both_entry_points_expose_identical_graph_commands`.
 """
 
 
-@pytest.fixture
-def isolated_synthetic_nodes_modules(monkeypatch):
-    """Always remove imported fixture modules, even when a CLI parser exits with 2."""
-    for name in ("nodes", "nodes.graph"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+@pytest.fixture(autouse=True)
+def isolated_synthetic_nodes_modules():
+    """Always remove synthetic ``nodes`` imports, including after parser exits."""
+    for name in list(sys.modules):
+        if name == "nodes" or name.startswith("nodes."):
+            sys.modules.pop(name, None)
     yield
-    for name in ("nodes.graph", "nodes"):
-        sys.modules.pop(name, None)
+    for name in list(sys.modules):
+        if name == "nodes" or name.startswith("nodes."):
+            sys.modules.pop(name, None)
 
 
 EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
@@ -144,6 +146,35 @@ def test_recover_parser_accepts_repeated_evidence_and_graph_args() -> None:
         "retry_after_external_check",
         "fail",
     )
+
+
+def test_recover_and_resume_parse_option_like_ids_after_separator() -> None:
+    """Historical run and target names may begin with dashes and remain valid IDs."""
+    parser = _graph_commands(_parser())
+    recover_args = parser["recover"].parse_args(
+        [
+            "--graph-arg",
+            "episode=E2S4",
+            "--attempt",
+            "3",
+            "--decision",
+            "retry_after_external_check",
+            "--reason",
+            "validated provider logs",
+            "--",
+            "--historical-run",
+            "--work",
+        ]
+    )
+    resume_args = parser["resume"].parse_args(
+        ["--graph-arg", "episode=E2S4", "--workers", "2", "--", "--historical-run"]
+    )
+
+    assert recover_args.run_id == "--historical-run"
+    assert recover_args.target == "--work"
+    assert recover_args.graph_arg == ["episode=E2S4"]
+    assert resume_args.run_id == "--historical-run"
+    assert resume_args.graph_arg == ["episode=E2S4"]
 
 
 def test_both_entry_points_expose_identical_graph_commands() -> None:
@@ -374,6 +405,12 @@ def test_broken_dag_entry_reports_which_part_is_wrong(
 
     assert main(["describe"]) == 2
     assert expected in capsys.readouterr().err
+
+
+def test_configured_entry_errors_leave_no_synthetic_nodes_modules() -> None:
+    """Configured-entry failures must not leak imports into following tests."""
+    assert "nodes.graph" not in sys.modules
+    assert "nodes" not in sys.modules
 
 
 def test_malformed_dag_entry_is_rejected_by_config(tmp_path: Path, monkeypatch, capsys) -> None:

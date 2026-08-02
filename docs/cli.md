@@ -113,8 +113,10 @@ source of truth，wheel 通过 hatch `force-include` 映射而非复制，因此
 
 run id 不安全、run 不存在或画像 receipt 校验失败时为 1；成功为 0。非 JSON 输出在终态
 `failed` run 上会附带可复制的 recovery 建议。该建议从落盘状态无法得知构图工厂参数；
-执行命令前，必须追加构造该 run 时使用的同一组、可重复的
-`--graph-arg KEY=VALUE` 参数，不要用占位值代替。
+`recover` 与随后显式执行的 `resume` 都必须使用构造该 run 时的同一组、可重复的实际
+`--graph-arg KEY=VALUE` 参数。把这些选项放在建议命令的 `--` 分隔符之前，再把
+`RUN_ID`（以及 recovery 的 `TARGET`）放在分隔符之后；不要用占位值代替，也不要假设
+run state 会重建这些值。
 
 ### `kigumi approve RUN_ID NAME`
 

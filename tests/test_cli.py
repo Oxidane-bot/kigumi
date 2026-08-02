@@ -10,7 +10,7 @@ import pytest
 
 from kigumi import PromptRef, PromptSpec
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
-from kigumi.cli import _recovery_advice, main
+from kigumi.cli import _parser, _recovery_advice, main
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
 
@@ -68,16 +68,24 @@ def test_recovery_advice_shell_quotes_dynamic_arguments(run_id: str, target: str
     assert shlex.split(recovery_line) == [
         "kigumi",
         "recover",
-        run_id,
-        target,
         "--attempt",
         "7",
         "--decision",
         "retry_after_external_check",
         "--reason",
         "<explanation>",
+        "--",
+        run_id,
+        target,
     ]
-    assert shlex.split(resume_line) == ["kigumi", "resume", run_id]
+    assert shlex.split(resume_line) == ["kigumi", "resume", "--", run_id]
+
+    parser = _parser()
+    recovery_args = parser.parse_args(shlex.split(recovery_line)[1:])
+    resume_args = parser.parse_args(shlex.split(resume_line)[1:])
+    assert recovery_args.run_id == run_id
+    assert recovery_args.target == target
+    assert resume_args.run_id == run_id
 
 
 def test_recovery_advice_warns_to_reuse_graph_args() -> None:
@@ -87,9 +95,54 @@ def test_recovery_advice_warns_to_reuse_graph_args() -> None:
         index for index, line in enumerate(lines) if line.strip().startswith("kigumi recover ")
     )
 
+    assert "--" in lines[command_index]
+    assert "--" in lines[command_index + 2]
     assert lines[command_index + 1] == (
-        "Append the same repeated --graph-arg KEY=VALUE arguments used to construct this run."
+        "Before the `--` separator on both commands, add the same actual repeated "
+        "--graph-arg KEY=VALUE options used to construct this run; run state cannot "
+        "reconstruct them, and placeholder values are invalid."
     )
+
+
+def test_recovery_advice_graph_args_can_be_added_before_separator() -> None:
+    """The documented graph-argument insertion point must remain parser-valid."""
+    advice = _recovery_advice("--historical-run", "--work", 3)
+    lines = advice.splitlines()
+    recovery_line = next(
+        line.strip() for line in lines if line.strip().startswith("kigumi recover ")
+    )
+    resume_line = next(
+        line.strip().removeprefix("Then explicitly run: ")
+        for line in lines
+        if line.strip().startswith("Then explicitly run: kigumi resume ")
+    )
+    parser = _parser()
+
+    recovery_argv = shlex.split(recovery_line)
+    recovery_separator = recovery_argv.index("--")
+    recovery_argv[recovery_separator:recovery_separator] = [
+        "--graph-arg",
+        "episode=E2S4",
+        "--graph-arg",
+        "profile=production",
+    ]
+    recovery_args = parser.parse_args(recovery_argv[1:])
+
+    resume_argv = shlex.split(resume_line)
+    resume_separator = resume_argv.index("--")
+    resume_argv[resume_separator:resume_separator] = [
+        "--graph-arg",
+        "episode=E2S4",
+        "--graph-arg",
+        "profile=production",
+    ]
+    resume_args = parser.parse_args(resume_argv[1:])
+
+    assert recovery_args.graph_arg == ["episode=E2S4", "profile=production"]
+    assert resume_args.graph_arg == recovery_args.graph_arg
+    assert recovery_args.run_id == "--historical-run"
+    assert recovery_args.target == "--work"
+    assert resume_args.run_id == "--historical-run"
 
 
 def test_init_creates_default_layout_and_refuses_repeat(

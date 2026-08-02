@@ -803,20 +803,23 @@ def _recovery_advice(run_id: str, target: str, attempt: int | str) -> str:
     recovery_argv = [
         "kigumi",
         "recover",
-        run_id,
-        target,
         "--attempt",
         str(attempt),
         "--decision",
         "retry_after_external_check",
         "--reason",
         "<explanation>",
+        "--",
+        run_id,
+        target,
     ]
-    resume_argv = ["kigumi", "resume", run_id]
+    resume_argv = ["kigumi", "resume", "--", run_id]
     return (
         "To retry with explicit decision:\n"
         f"  {shlex.join(recovery_argv)}\n"
-        "Append the same repeated --graph-arg KEY=VALUE arguments used to construct this run.\n"
+        "Before the `--` separator on both commands, add the same actual repeated "
+        "--graph-arg KEY=VALUE options used to construct this run; run state cannot "
+        "reconstruct them, and placeholder values are invalid.\n"
         f"Then explicitly run: {shlex.join(resume_argv)}\n"
         "Recovery does not resume automatically; see docs/cli.md and docs/recovery.md"
     )

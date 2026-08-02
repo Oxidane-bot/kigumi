@@ -16,6 +16,16 @@ receipt = dag.recover(
 dag.resume("run-0042")
 ```
 
+When copying the commands from `kigumi runs show`, a `dag_entry` factory that
+needs arguments requires both `recover` and the subsequent explicit `resume` to
+receive the same actual, repeated `--graph-arg KEY=VALUE` options used for the
+run. Put those options before `--` in both commands, followed by the run ID (and
+the target for recovery); for example, insert the real
+`--graph-arg episode=E2S4` before the `--` in both commands. Run state cannot
+reconstruct historical factory arguments, so do not fill in placeholder values.
+The `--` also makes valid IDs such as `--historical-run` and `--work` positional
+arguments rather than options.
+
 The two retry decisions both queue one new attempt. `retry_not_started` records
 that the failed operation did not cross its external side-effect boundary;
 `retry_after_external_check` records that an operator verified an external fix.
