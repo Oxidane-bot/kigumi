@@ -20,7 +20,7 @@ Status: Active (0.5.0)
 
 ## Invariants
 
-1. 注册环只查节点函数体，是精确且权威的边界；外环（`dag check`、pytest 守卫、`kigumi guard`）对 raw-I/O 用装饰器启发式（`.node`/`.map`/`.scan`/`.foreach`），可能漏报、注册环兜底。
+1. 注册环只查节点函数体，是精确且权威的边界；外环（`dag check`、pytest 守卫、`kigumi guard`）对 raw-I/O 用装饰器启发式（`.node`/`.map`/`.scan`/`.foreach`/`.agent`），可能漏报、注册环兜底。
 2. 两类豁免（`raw-llm-ok`/`raw-io-ok`）必须带理由；各自独立留痕，比对互不吞并。
 3. `guard --changed` 按理由文本（非行号）比对 `HEAD`，新增豁免必须上报。
 

@@ -321,3 +321,26 @@
 
 - `observe() -> Iterator[list[dict[str, Any]]]`：上下文管理器，收集当前 context 内每次
   `LLMCaller` 调用事实；并行 context 之间不串线。
+
+### 静态守卫（`kigumi.enforce`）
+
+这些符号是模块级 AST 工具，不从 `kigumi` 顶层导出，也不执行项目代码；它们返回 finding
+列表，不定义 CLI 或 pytest 的退出语义。项目接入时的选择、wrapper 和失败码见
+[守卫四环](adoption.md#守卫四环)。
+
+- `Finding(path: Path, lineno: int, snippet: str, waived: bool, waiver_reason: str | None) -> None`：
+  循环裸 LLM finding；`waived` 只有在行尾 `raw-llm-ok` 后确实有非空理由时为真。
+- `RawIOFinding(path: Path, lineno: int, snippet: str, waived: bool, waiver_reason: str | None) -> None`：
+  节点直接文件读取 finding；其 `raw-io-ok` 豁免与 `Finding` 的豁免独立。
+- `waiver_reasons(text: str) -> list[str]`：按源码行序提取所有 `raw-llm-ok` 理由，保留重复项。
+- `raw_io_waiver_reasons(text: str) -> list[str]`：只提取 `raw-io-ok` 理由，不与另一类混合。
+- `check_source(text: str, path: Path) -> list[Finding]`：检查一段源码中循环/推导式下的
+  `.call()` 与 `.llm()`。
+- `check_paths(source_dirs: list[Path]) -> list[Finding]`：递归检查目录中的 Python 文件的
+  循环裸 LLM 调用；不存在的目录跳过。
+- `check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]`：检查一个模块中
+  顶层 `node`/`map`/`scan`/`foreach`/`agent` 装饰器函数的最外层函数体。
+- `check_raw_io_node_paths(source_dirs: list[Path]) -> list[RawIOFinding]`：对目录递归执行
+  上一项节点装饰器过滤后的 raw-I/O 检查。
+- `check_raw_io_source(text: str, path: Path, *, context_name: str = "ctx") -> list[RawIOFinding]`：
+  检查已知单个节点函数体；只把指定上下文对象的 `read_text`/`read_bytes` 视为受控读取。

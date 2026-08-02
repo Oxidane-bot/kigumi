@@ -24,7 +24,8 @@ Status: Active (0.8.0)
 1. `canonical_json(sort_keys/indent=2/ensure_ascii=False)` 是唯一 JSON 序列化；`artifacts.sha` 是唯一哈希入口。
 2. miss 路径产物经 canonical 化后喂下游，与命中路径逐字节一致，含 map 聚合。
 3. wording 常量由 golden snapshot 锁字节；改动等于换族，记入 `CHANGELOG.md`。
-4. 空响应双闸：传输层重试后仍空则抛错；缓存层拒写空、读到空缓存按 miss。
+4. 空响应双闸：传输层重试后仍空则抛错；缓存层拒写空，已经存在的空缓存按
+   [缓存键契约](cache-key.md) 的 `CORRUPT` 规则 fail closed，不按 miss 重算。
 5. 截断处理：`finish_reason=length` 时只有调用方设了 `max_tokens` 才加倍重试，至多 2 次；否则直接抛 `TruncatedResponseError`；截断永不静默。
 6. 同一 Prompt snapshot、spec、projected inputs、params、item 与 carry 必须得到逐字节相同
    `ResolvedPrompt` 和 resolution digest。base 控制插入顺序，fragment 原文逐字插入，
@@ -61,7 +62,7 @@ Status: Active (0.8.0)
 `tests/test_prompt.py::test_prompt_component_golden_snapshot`、
 `tests/test_prompt.py::test_schema_format_golden_snapshot`、
 `tests/test_dag.py::test_miss_and_hit_paths_feed_downstream_identical_shape`、
-`tests/test_calling.py::test_poisoned_empty_cache_treated_as_miss`、
+`tests/test_calling.py::test_poisoned_empty_cache_raises_integrity_error`、
 `tests/test_calling.py::test_empty_transport_response_is_rejected_without_cache`、
 `tests/test_transport.py::test_length_finish_doubles_max_tokens`、
 `tests/test_transport.py::test_length_without_max_tokens_returns_as_is`、
@@ -69,7 +70,7 @@ Status: Active (0.8.0)
 `tests/test_transport.py::test_empty_response_exhaustion_raises_with_backoff`。
 
 ```bash
-uv run pytest -q tests/test_artifacts.py::test_canonical_json_byte_stable tests/test_prompt.py::test_prompt_component_golden_snapshot tests/test_prompt.py::test_schema_format_golden_snapshot tests/test_dag.py::test_miss_and_hit_paths_feed_downstream_identical_shape tests/test_calling.py::test_poisoned_empty_cache_treated_as_miss tests/test_calling.py::test_empty_transport_response_is_rejected_without_cache tests/test_transport.py::test_length_finish_doubles_max_tokens tests/test_transport.py::test_length_without_max_tokens_returns_as_is tests/test_transport.py::test_length_retry_exhaustion_raises tests/test_transport.py::test_empty_response_exhaustion_raises_with_backoff
+uv run pytest -q tests/test_artifacts.py::test_canonical_json_byte_stable tests/test_prompt.py::test_prompt_component_golden_snapshot tests/test_prompt.py::test_schema_format_golden_snapshot tests/test_dag.py::test_miss_and_hit_paths_feed_downstream_identical_shape tests/test_calling.py::test_poisoned_empty_cache_raises_integrity_error tests/test_calling.py::test_empty_transport_response_is_rejected_without_cache tests/test_transport.py::test_length_finish_doubles_max_tokens tests/test_transport.py::test_length_without_max_tokens_returns_as_is tests/test_transport.py::test_length_retry_exhaustion_raises tests/test_transport.py::test_empty_response_exhaustion_raises_with_backoff
 ```
 
 ## Change policy

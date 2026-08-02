@@ -44,6 +44,10 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
    manifest 记录 `resume_count` 与 `last_resumed_at`，但它们不改变 immutable run identity。
 10. terminal `failed` recovery 只能匹配当前失败 attempt；retry decision 追加新 attempt 并
     记录继承的成功节点，旧 attempt receipt 与 recovery receipt 保留不删不覆写。
+11. 已存在但 JSON、schema 或 digest 不可信的 durable manifest、attempt receipt、candidate、
+    artifact 或 Prompt lineage 是完整性错误，不是缺失状态；`StateIntegrityError` 或
+    `RunManifestError` 必须 fail closed，不能把它当成未开始 attempt 创建新执行。只有真正缺失
+    的 receipt 才能按未开始处理。
 
 ## Exactly-once boundary
 
@@ -53,4 +57,4 @@ Kigumi 记录可观察的 CALL/Agent attempt 边界，但不承诺外部 effect 
 ## Verification
 
 见 `tests/test_retry.py`、`tests/test_dag_retry_resume.py`、`tests/test_dag_checkpoints.py`、
-`tests/test_cli.py`。
+`tests/test_runstate_integrity.py`、`tests/test_cli.py`。

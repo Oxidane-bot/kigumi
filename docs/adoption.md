@@ -1139,9 +1139,73 @@ git hook 会把新增豁免摆到评审面前。
 
 节点体内的直接文件读取(`open()`、`path.open()`、`.read_text()`、`.read_bytes()`)
 同样在注册期被拒绝,必须改走 `ctx.read_text`/`ctx.read_bytes` 使读取过声明校验;
-豁免写 `# kigumi: raw-io-ok <理由>`,理由必填。两类豁免互不吞并。守卫只扫节点
-函数体,不递归 helper 与 lambda——helper 合法读文件的场景很多,扫了全是误报;
-代价是经 helper 的未声明读取只能靠 `ctx.read_text` 的运行期校验和 review 兜底。
+豁免写 `# kigumi: raw-io-ok <理由>`,理由必填。两类豁免互不吞并。项目级 raw-I/O
+外环只扫装饰节点函数体的最外层,不递归 helper 与 lambda——helper 合法读文件的场景很多,
+扫了全是误报;代价是经 helper 的未声明读取只能靠 `ctx.read_text` 的运行期校验和 review
+兜底。raw-LLM 的 `check_source`/`check_paths` 则会递归扫描源码里的 helper 循环。
+
+#### 直接调用 `kigumi.enforce` 时选哪个 helper
+
+`kigumi.enforce` 是不导入项目模块、也不执行节点的纯 AST 检查层；它返回 findings，
+本身没有退出码。按输入边界选择入口：
+
+| 需要检查 | 使用 | 检查范围 |
+| --- | --- | --- |
+| 一段源码中的循环裸 LLM 调用 | `check_source(text, path)` | `for`/`while`/`async for` 与四种推导式下的 `.call()`/`.llm()` |
+| 配置的整个源码目录中的循环裸 LLM 调用 | `check_paths(source_dirs)` | 递归 `*.py`；不存在的目录跳过 |
+| 一个模块中带装饰器的节点直接读文件 | `check_raw_io_node_source(text, path)` | 顶层 `node`/`map`/`scan`/`foreach`/`agent` 函数的最外层函数体 |
+| 配置的整个源码目录中的节点直接读文件 | `check_raw_io_node_paths(source_dirs)` | 上一行的项目级版本 |
+| 注册环已经拿到的单个节点函数体 | `check_raw_io_source(text, path, context_name="ctx")` | 只查这个节点体；`context_name` 是实际上下文参数名 |
+
+`check_paths()` 只做 raw-LLM 扫描，不能替代 raw-I/O 检查；反过来也一样。所有结果的
+`path`、`lineno`、`snippet`、`waived` 和 `waiver_reason` 都可用于自定义报告；
+`waiver_reasons()` 与 `raw_io_waiver_reasons()` 只是分别读取两类豁免理由（包括重复项），
+不负责判断违规。空理由的注释仍是违规，`raw-llm-ok` 也不能替代 `raw-io-ok`。
+
+例如，直接嵌入测试或自定义检查时可以只消费结构化结果：
+
+```python
+from pathlib import Path
+
+from kigumi.enforce import check_raw_io_source, check_source
+
+llm = check_source("for item in items:\n    client.call(item)\n", Path("nodes/batch.py"))
+io = check_raw_io_source(
+    "def node(inputs, ctx):\n    return open('input.txt').read()\n",
+    Path("nodes/node.py"),
+)
+print([(finding.lineno, finding.waived) for finding in llm])
+print([(finding.lineno, finding.waived) for finding in io])
+```
+
+输出：
+
+```text
+[(2, False)]
+[(2, False)]
+```
+
+项目的 CI 和提交环应使用 wrapper，而不是自行把 findings 猜成状态：
+
+```bash
+# CI：扫描配置的全部 source_dirs
+uv run kigumi guard
+
+# 新项目一次性安装由 Kigumi 生成的 pre-commit
+uv run kigumi init --hooks
+# 完成首个 Git commit 后，pre-commit 会执行这条 changed 检查
+uv run kigumi guard --changed
+```
+
+`kigumi guard` 无未豁免 finding 时退出 `0`，有违规时退出 `1`；未配置项目、
+`--changed` 不在有 `HEAD` 的 Git 仓库中等使用错误退出 `2`。`--changed` 还会把相对 `HEAD` 新增的
+豁免理由打印为 `new waiver`，但新增理由本身不是失败条件；有理由的豁免始终打印清单。
+pytest 插件激活后会追加 `kigumi_guard`：未豁免 finding 使该测试失败，有理由的豁免发
+`PytestWarning`；它不会做 `HEAD` 比较，所以提交审查仍用 `guard --changed`。
+
+不要把项目级 raw-I/O 扫描当成运行时沙箱：它有意不递归 helper，注册环才是已注册节点的
+精确边界；helper 内仍应通过 `ctx.read_text`/`ctx.read_bytes` 和 `files=` 声明输入。
+也不要在只需要统一 `workers` 上限时额外手写守卫调用，或把两类豁免混用。
 
 ### 人工检查点
 

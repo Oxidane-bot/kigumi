@@ -142,7 +142,8 @@ agent_slot_timeout_seconds = 300
 - `LLMCaller(transport, cache_dir, seed, budget, dry)`,依赖注入,测试可替换。
 - 内容寻址缓存:键 = messages + **resolved model**(经 transport.resolve,
   换 .env 模型 = 换缓存键,防跨模型回放旧答案)+ params + seed;
-  撕裂缓存按 miss;**空响应拒入缓存**(transport 违约时的第二道闸)。
+  缺失缓存才是 miss；已存在的撕裂/空/摘要不匹配缓存 fail closed；**空响应拒入缓存**
+  (transport 违约时的第二道闸)。
 - 溯源 meta 同记 model_alias 与 resolved model;**先记 calls 再 permit.commit**,
   以便实际用量超预算时仍保留最贵调用的溯源;`Budget.record` 保留为无预留的兼容入口
   （超限异常不得吞掉最贵那次调用的溯源）。
@@ -298,7 +299,7 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
    guard 输出含 waiver 清单。
 
 source_dirs 级扫描只属于 dag check、测试环与提交环。raw-io 在这些环节用
-`@*.node/map/scan/foreach(...)` 装饰器作启发式过滤，只扫匹配函数的最外层函数体：
+`@*.node/map/scan/foreach/agent(...)` 装饰器作启发式过滤，只扫匹配函数的最外层函数体：
 这避免 helper 合法读文件的误报，但可能漏报；注册环仍是兜底。
 
 ### testing(pytest 插件,面向用户项目)

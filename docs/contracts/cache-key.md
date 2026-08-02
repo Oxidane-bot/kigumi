@@ -71,15 +71,17 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 10. node cache envelope schema 3 固定保存 canonical artifact、artifact SHA-256、首次执行的
     immutable origin provenance 与 origin digest。warm hit 不得以 replay metadata 覆盖 origin。
 11. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy
-    digest 与 Agent slots/lock/timeout 也不属于内容键。
+    digest、Agent slots/lock/timeout、`ResourceRequest` 与 `resource_limits` 也不属于内容键。
 
 ## Failure behavior
 
-键成分不同会得到不同摘要并按缓存未命中处理；空、撕裂或无效缓存按 miss 重算。`libs`
-静态分析遇到上述无法证明的情况时必须使用当前全文件 digest，不得猜测较小闭包；全文件
-digest 仍沿用 `_module_code_text`，语法残破文件使用原文。未在 `CHANGELOG.md` 记录的键
-成分演进不得进入发布件。非法 cache 值或不可 canonical JSON 序列化的 external fingerprint
-在注册期抛 `ValueError`。
+键成分不同会得到不同摘要并按缓存未命中处理；不存在的缓存才是普通 miss。已经存在但为空、
+撕裂、摘要不匹配或 schema/provenance 无效的缓存属于 `CORRUPT`，必须 fail closed，不能按
+miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`CORRUPT` 三态。未在
+`CHANGELOG.md` 记录的键成分演进不得进入发布件。非法 cache 值或不可 canonical JSON
+序列化的 external fingerprint 在注册期抛 `ValueError`。`libs` 静态分析遇到上述无法证明的
+情况时必须使用当前全文件 digest，不得猜测较小闭包；全文件 digest 仍沿用
+`_module_code_text`，语法残破文件使用原文。
 
 ## Affected surfaces
 
