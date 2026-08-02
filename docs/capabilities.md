@@ -35,10 +35,12 @@ adoption.md 的"设计边界"一节。
 | 结构化输出 + 有界修复环 | `call_validated` / `ctx.call_validated` |
 | 自定义校验的修复环 | `repair_loop` / `ctx.repair` |
 | token 预算上限 | `Budget` |
+| 预算调用前预留、成功提交、失败退款 | `BudgetPermit` / `Budget` |
 | 排练全流程不发真实请求 | `LLMCaller(dry=True)`(miss 抛 `DryRunError`) |
 | 换 provider / 自实现传输层 | `Transport` 协议 / `LiteLLMTransport` / `StdlibTransport` |
 | 429 自适应并发 | `AdaptiveCapacity` / `FileSlots` |
 | 抓取每次调用的结构化事件 | `observe` |
+| 区分缓存缺失与损坏并阻止静默重算 | `CacheLookup` / `CacheIntegrityError` |
 | 在 cache/provider 前检查请求大小 | `preflight` / `PreflightPolicy` / `RequestTooLarge` |
 
 ## DAG 编排
@@ -59,6 +61,7 @@ adoption.md 的"设计边界"一节。
 | 人工审批卡点 | `ctx.checkpoint` / `dag.approve` |
 | 声明式重试(不在进程内 sleep) | `RetryPolicy` + `dag.resume()` |
 | 从 terminal failed run 做带理由的 append-only recovery | `dag.recover()` / `RecoveryReceipt` |
+| durable 状态损坏时 fail closed | `StateIntegrityError` |
 | 声明外部不确定输入 | `external_fingerprint=` |
 | 图形状整体过目 | `dag.render_mermaid` / `dag.describe` / `dag.profile` |
 

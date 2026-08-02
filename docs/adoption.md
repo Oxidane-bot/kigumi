@@ -150,6 +150,41 @@ caller = LLMCaller(  # L1:缓存/预算/dry-run/溯源
 - **多阶段流水线**:再上 `Dag`(L3),换取节点级缓存、断点续跑、
   人工检查点、run diff。
 
+### 预算准入：先预留，再计费
+
+如果一个 map 会展开成很多付费调用，问题不是“调用完成后再统计”，而是多个并发
+miss 可能在额度被观察到以前一起发出。`Budget` 的上限按 token 计：先用
+`Budget.reserve()` 拿到 `BudgetPermit`，成功用 provider 返回的 `total_tokens`
+提交，失败或取消释放预留。
+
+```python
+from kigumi import Budget, BudgetPermit
+
+budget = Budget(max_tokens=10)
+permit: BudgetPermit = budget.reserve(6)
+permit.commit({"total_tokens": 4})
+
+refunded = budget.reserve(6)
+refunded.cancel()
+print(budget.spent)
+```
+
+输出：
+
+```text
+4
+```
+
+实际使用 `LLMCaller` 时只需把同一个 `budget` 传给
+`LLMCaller(..., budget=budget)`：L1 miss 会在 provider 请求前自动 `reserve`，
+cache hit 不预留，provider/transport 失败会 `cancel`，成功响应按实际用量 `commit`。
+预估值是 prompt 长度加显式 `max_tokens` 的 best effort；provider 实际用量可能更高，
+所以 `commit` 仍可能在请求完成后抛 `BudgetExceeded`，但响应已经写入缓存。
+
+不要把它当作跨进程或跨主机的总账：预留和同 key single-flight 只在当前进程内协调。
+已经有 file lock、分布式 quota 服务，或调用根本不产生 provider 费用时，不要再叠一层
+`BudgetPermit`；跨进程限流应使用应用自己的协调器。
+
 ### 3. 声明节点(DAG 项目)
 
 ```python
@@ -203,6 +238,54 @@ result = dag.run(workers=4)
 结果中的缓存命中、检查点和跳过节点仍按本次拓扑序排列；并发节点同时失败时，
 对外仍抛拓扑序最靠前的异常，其余失败会作为异常附注一并保留。检查点或跳过只阻断
 其下游，不阻断无关旁支。
+
+### 节点级资源准入：GPU、供应商配额与 CPU 槽位
+
+当“这个节点需要一张 GPU，而且两个同类节点不能同时运行”时，单独调小全局
+`workers` 会连不需要 GPU 的节点一起限住。把需求声明在节点上，再在本次 run
+给出容量上限：
+
+```python
+from kigumi import ResourceRequest
+
+
+@dag.node("render_a", resources=(ResourceRequest("gpu"),))
+def render_a(inputs, ctx):
+    del inputs, ctx
+    return {"done": True}
+
+
+@dag.node("render_b", resources=(ResourceRequest("gpu"),))
+def render_b(inputs, ctx):
+    del inputs, ctx
+    return {"done": True}
+
+
+result = dag.run(workers=4, resource_limits={"gpu": 1})
+print(sorted(result.artifacts))
+```
+
+输出：
+
+```text
+['render_a', 'render_b']
+```
+
+同名 `ResourceRequest` 共享一个 run 内资源池；`units` 是一次执行占用的单位数。
+没有 `resources=` 的节点使用 `None` 默认池，可以用
+`resource_limits={None: 2}` 显式限制它们；未在 `resource_limits` 中出现的资源名
+默认使用 `workers` 作为上限。资源声明只影响调度，不进入缓存键。需要同时占用多种
+资源时，框架按名称固定获取顺序；请求单位数超过上限会在 run 开始时拒绝。
+
+一个重要的迁移点：map item 与普通父节点现在共用同一个 run-wide concurrency plane，
+不再由 map 节点在某个 scheduler worker 内另开一个 `workers` 大小的嵌套池。于是旧图里
+调过 `workers` 的有效并发不再是“父池乘以 map 子池”；没有 `resource_limits` 时，
+map item 和就绪普通节点共同竞争这组 `workers`，有命名资源时再由各资源池分别限额。
+如果真正要限制的是跨进程、跨主机的供应商配额，`resource_limits` 不够，它是进程内
+调度边界；请用 `FileSlots`、`AdaptiveCapacity` 或外部 quota 协调。
+
+如果所有节点都只需要同一个均匀的并发上限，`workers` 已经能表达需求，就不必为每个
+节点添加 `ResourceRequest`。
 
 ### 分层 Prompt：有限选择、统一材料与 selected-only cache
 
@@ -278,9 +361,126 @@ spawn 前失败。
 对象变回普通字符串，receipt 如实标记 unmanaged。Agent builder 也可把同一对象直接作为
 `AgentTask.instruction`。解析但未实际调用的 spec 只作为节点输入，不会伪造 CALL 记录。
 
+### 托管请求清单：附件、响应 schema 与 preflight
+
+当一次请求同时带文件和结构化输出要求时，只有渲染后的 prompt 字符串是不完整的：
+换了附件内容或响应 schema，旧响应都不应该被复用。`PromptResolution` 的 managed
+manifest 用 `Message` 保存消息顺序，用 `Attachment` 保存文件路径、内容摘要、MIME
+和字节数，用 `ResponseSpec` 保存响应格式与 schema identity；附件原文不会被塞进
+provenance。
+
+在低层直接构造 manifest 时，先用 `preflight()` 检查，再决定是否继续：
+
+```python
+from kigumi import (
+    Attachment,
+    Message,
+    PreflightPolicy,
+    PromptResolution,
+    RequestTooLarge,
+    ResponseSpec,
+    preflight,
+)
+
+resolution = PromptResolution(
+    spec_name="summarize",
+    structure_digest="declared",
+    base={},
+    layers=(),
+    axes=(),
+    materials=(),
+    rendered_sha256="rendered",
+    rendered_bytes=15,
+    messages=[Message(role="user", parts=["请总结附件"])],
+    attachments=[Attachment("report.txt", "a" * 64, "text/plain", 4)],
+    response_spec=ResponseSpec("b" * 64, "structured"),
+)
+report = preflight(
+    resolution,
+    PreflightPolicy(max_tokens=100, max_attachments=1, max_attachment_bytes=1024),
+)
+if not report.is_valid():
+    raise RequestTooLarge(report)
+print(report.is_valid(), report.total_bytes)
+```
+
+输出：
+
+```text
+True 4
+```
+
+节点路径通常不需要手写 `Attachment`：已声明的 `FileRef` 会在 `ctx.resolve_prompt()`
+时读取框架注入的字节并生成 attachment manifest。例如，`prompts/summarize.md` 含有
+`{{document}}` 时：
+
+```python
+FILE_REQUEST = PromptSpec(
+    name="summarize_file",
+    base=PromptRef("summarize"),
+    materials=(
+        PromptMaterial(
+            slot="document",
+            source=FileRef(ParamRef("path")),
+            title="文档",
+        ),
+    ),
+)
+
+
+@dag.node(
+    "summarize_file",
+    prompt_specs=(FILE_REQUEST,),
+    params={"path": "fixtures/report.txt"},
+    files=("fixtures/report.txt",),
+)
+def summarize_file(inputs, ctx):
+    del inputs
+    return {"response": ctx.call(ctx.resolve_prompt("summarize_file"))}
+
+
+result = dag.run()
+print(result.artifacts["summarize_file"])
+```
+
+`FileRef` 的路径必须同时属于 `files=` 或 `files_fn=` 声明；内容摘要进入 prompt digest，
+所以换文件内容会失效而只换路径不会伪造一次新的内容身份。`ctx.call_validated()` 会把
+Pydantic schema identity 绑定到 `ResponseSpec`；换 schema 也会换 prompt/cache identity。
+`LLMCaller` 会在 cache lookup 和 provider 请求之前自动调用 `preflight()`，超限抛
+`RequestTooLarge`，可从异常的 `.report` 读取每项 `PreflightViolation`。不要把这个估算
+当作精确计费、访问控制或截断器；如果已经通过 `LLMCaller` 发 managed request，也不要
+再手工绕一层同样的预检。
+
+如果输入只是少量普通文本、没有附件或 schema，直接使用现有 `PromptSpec` 和
+`ctx.resolve_prompt()` 即可；不要为了让每段文本都显式包一层 `Attachment`。
+
 ### Durable retry 与 resume
 
-默认没有 DAG 自动重试；只有节点显式声明 `RetryPolicy` 才创建 durable attempt：
+默认没有 DAG 自动重试；显式 `RetryPolicy` 决定哪些失败可以自动进入 durable retry，
+但它不是 side-effect boundary 的开关。普通 provider 节点以及 map/scan item 在 cache
+miss、准备执行时都会有 durable attempt；对非 `pure`/`agent` executor，框架在 provider 请求前
+持久化 side-effect boundary。这样一个没有声明 `retry` 的节点若在付费调用后崩溃，
+恢复时也不会被当成“从未开始”。
+
+```python
+from kigumi import AmbiguousAttemptError
+
+
+@dag.node("paid_call")
+def paid_call(inputs, ctx):
+    del inputs
+    return {"answer": ctx.call("charge")}
+
+
+# 没有 retry=... 仍会记录 provider side-effect boundary。
+try:
+    dag.resume("run-0042")
+except AmbiguousAttemptError:
+    print("先核对 provider 证据，再决定 retry 或 fail")
+```
+
+这里的异常表示进程在 provider 请求边界之后没有留下可信成功 candidate；先核对 provider
+证据，再用 `retry-resolve` 或 [终态失败 recovery](recovery.md) 作出带理由的决定。
 
 ```python
 from kigumi import RetryPolicy
@@ -317,6 +517,87 @@ kigumi resume run-0042
 `retry|fail` 都要求 reason 并进入 trace。Kigumi 不承诺外部 effect exactly-once；它保证的是
 attempt 边界可见、不能把不确定执行静默当成可安全重试。map 按 item 独立恢复；scan 复用已
 验证前缀，只重试失败 item。
+
+### 缓存与 durable state 的完整性边界
+
+缓存读取有三个事实状态：`CacheLookup.state` 为 `MISSING`、`VALID` 或 `CORRUPT`。
+缺失才是普通 miss；JSON 撕裂、响应为空、摘要不匹配或 provenance/schema 损坏都属于
+`CORRUPT`。DAG 的节点缓存和 `LLMCaller` 的调用缓存遇到损坏会抛
+`CacheIntegrityError`，不把它降级成 miss，也不会静默重新计费。若直接使用存储层，
+保留三态而不是用 `None` 抹平差异：
+
+```python
+from pathlib import Path
+
+from kigumi import CacheIntegrityError, StateIntegrityError
+from kigumi.store import node_cache_path, read_node_cache
+
+
+def read_without_rebilling(artifacts: Path, cache_key: str):
+    lookup = read_node_cache(artifacts, cache_key)
+    if lookup.state == "MISSING":
+        print("cache not generated")
+        return None
+    if lookup.state == "CORRUPT":
+        raise CacheIntegrityError(node_cache_path(artifacts, cache_key), lookup)
+    return lookup.data
+
+
+def resume_without_guessing(dag, run_id: str):
+    try:
+        return dag.resume(run_id)
+    except StateIntegrityError as error:
+        print(f"inspect durable state: {error.path}")
+        raise
+
+
+read_without_rebilling(Path("artifacts"), "known-cache-key")
+```
+
+输出（该 key 尚不存在时）：
+
+```text
+cache not generated
+```
+
+`StateIntegrityError` 表示 durable manifest、attempt receipt 或相关 JSON 已经存在但
+不可信；与“receipt 缺失、尚未开始”严格区分。看到任一完整性异常时先保留现场并核对
+文件、摘要和 provider 证据，再决定修复或新建 run；不要捕获后删除文件然后重跑。
+
+### 终态失败 run：append-only recovery
+
+如果 run 已经是 terminal `failed`，而且你已经知道该失败可以安全再试或完成了外部
+修复，问题是“如何保留失败证据并只重跑失败分支”，不是“删掉 attempt 目录”。
+用 `Dag.recover()` 写入显式 decision、reason 和 evidence，再用同一个 run 的
+`Dag.resume()`：
+
+```python
+receipt = dag.recover(
+    run_id="run-0042",
+    target="transcode",
+    from_attempt=3,
+    decision="retry_after_external_check",
+    reason="已验证替换后的 ffmpeg 能处理失败场景",
+    evidence=["validation-report.md"],
+)
+print(receipt.from_attempt, receipt.to_attempt)
+dag.resume("run-0042")
+```
+
+输出：
+
+```text
+3 4
+```
+
+可用 decision 只有 `retry_not_started`、`retry_after_external_check` 和 `fail`。
+前者要求你确认失败操作没有越过外部 side-effect boundary，后者记录你完成的外部
+核验；`fail` 只记录最终裁决，不排队新 attempt。旧 attempt、`RecoveryReceipt`、
+成功节点和 run 目录都保留，`resume()` 会重新验证继承的成功节点，只运行失败节点及
+其下游。`recover()` 只能接受 terminal failed run 的当前失败 attempt；pending retry、
+approval 或 ambiguous 状态应分别使用 `resume()` 或 `retry-resolve`。完整字段、文件
+命名、`recovered_by` 的非认证语义以及并发 recovery 的无锁限制见
+[终态失败恢复说明](recovery.md)。
 
 ### 只消费上游局部：`consumes`
 
@@ -453,8 +734,10 @@ libs 哈希、共享 deps、item 内容、共享 prompts/files/params 和 `files
 item，重排不重跑 mapper；改 `key_fn` 只改寻址名称，不会重算内容相同的 item。
 
 map 对下游产出 `{"items": {...}, "order": [...], "count": N}`，所以清单的增删和
-重排仍会让依赖该聚合物的下游正确失效。任一 item 失败时其余 item 继续并写缓存，
-全部结束后 map 以带 item ID 的 `RuntimeError` 失败；重跑只会补失败项。普通 map/scan item
+重排仍会让依赖该聚合物的下游正确失效。普通 item 失败时其余 item 继续并写缓存，
+全部结束后 map 以带 item ID 的 `RuntimeError` 失败；重跑只会补失败项。预算准入失败
+是例外：`BudgetExceeded` 会停止后续尚未 admission 的 item，它们不会创建 attempt 或
+伪装成普通 item failure；先调整预算，再重跑即可。普通 map/scan item
 内的 `ctx.checkpoint("review", payload)` 自动命名为 `review@<item_id>`，批准仍用
 `dag.approve(run_id, "review@<item_id>", data)`；其余 item 不会被挂起项拖停。用
 `force=["process"]` 重算全体，`force=["process@id"]` 只重算该项。聚合 sidecar 引用
@@ -1260,9 +1543,10 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
   调用已经完成并进入缓存。缓存命中不做预留。预留与同 key single-flight 都只在当前进程
   内协调；多个进程可能同时为同一个 key 预留并请求 provider,需要 file lock 或分布式协调
   时由应用层另行提供。
-- **缓存/磁带损坏可按 miss 或拒绝重放，但 durable run state 不可猜**：
-  `_run.json`、attempt state、candidate 或已完成 artifact 摘要不一致时 fail closed；
-  不能把可能已经产生外部 side effect 的损坏状态当成“从头开始”。
+- **缓存损坏不是普通 miss**：`CacheIntegrityError` 会阻止节点或 L1 调用缓存静默
+  重放/重新计费；`CacheLookup` 的 `CORRUPT` 必须先核对现场。`_run.json`、attempt state、
+  candidate 或已完成 artifact 摘要不一致时同样 fail closed，不能把可能已经产生外部
+  side effect 的损坏状态当成“从头开始”。
 
 ## 六、排障:按症状查
 
