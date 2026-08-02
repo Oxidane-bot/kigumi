@@ -56,6 +56,7 @@ adoption.md 的"设计边界"一节。
 | 比较两次 run | `dag.diff()` / `diff_runs` |
 | 人工审批卡点 | `ctx.checkpoint` / `dag.approve` |
 | 声明式重试(不在进程内 sleep) | `RetryPolicy` + `dag.resume()` |
+| 从 terminal failed run 做带理由的 append-only recovery | `dag.recover()` / `RecoveryReceipt` |
 | 声明外部不确定输入 | `external_fingerprint=` |
 | 图形状整体过目 | `dag.render_mermaid` / `dag.describe` / `dag.profile` |
 

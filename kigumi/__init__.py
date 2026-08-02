@@ -80,6 +80,7 @@ from .dag import (
     ExplainResult,
     NodeContext,
     PlanResult,
+    RecoveryReceipt,
     RunResult,
     UndeclaredInputError,
 )
@@ -206,6 +207,7 @@ __all__ = [
     "PromptResolution",
     "PromptResolutionError",
     "PromptSpec",
+    "RecoveryReceipt",
     "RepairExhausted",
     "RetryExhausted",
     "RetryPolicy",

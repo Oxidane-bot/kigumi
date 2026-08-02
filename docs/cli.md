@@ -59,7 +59,7 @@ source of truth，wheel 通过 hatch `force-include` 映射而非复制，因此
 
 | 参数 | 必需 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `name` | 否 | 无 | 页名；缺省时打印清单。取值：`brief`、`capabilities`、`adoption`、`api`、`cli`、`contracts`、`design`、`changelog`。 |
+| `name` | 否 | 无 | 页名；缺省时打印清单。取值：`brief`、`capabilities`、`adoption`、`api`、`cli`、`recovery`、`contracts`、`design`、`changelog`。 |
 
 成功为 0；安装缺失该页时为 1；页名不在上表时由 argparse 判 2。
 

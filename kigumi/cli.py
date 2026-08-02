@@ -744,6 +744,29 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             if isinstance(failure, dict):
                 details.append(f"failure={canonical_json(failure)}")
             print(f"attempt: {attempt.get('target')} {' '.join(details)}")
+        if durable.get("run_status") == "failed":
+            failed_attempts = [
+                attempt
+                for attempt in durable.get("attempts", [])
+                if attempt.get("status") == "failed"
+            ]
+            latest = (
+                max(
+                    failed_attempts,
+                    key=lambda attempt: (
+                        attempt.get("attempt") if isinstance(attempt.get("attempt"), int) else -1
+                    ),
+                )
+                if failed_attempts
+                else {}
+            )
+            print(
+                _recovery_advice(
+                    run_id,
+                    str(latest.get("target", "<target>")),
+                    latest.get("attempt", "<N>"),
+                )
+            )
         evidence = durable.get("evidence_policy_digests", {})
         if evidence:
             print(f"evidence policies: {canonical_json(evidence)}")
@@ -771,6 +794,16 @@ def _pending_names(run_path: Path) -> list[str]:
         return []
     return sorted(
         path.name.removesuffix(".pending.json") for path in approvals.glob("*.pending.json")
+    )
+
+
+def _recovery_advice(run_id: str, target: str, attempt: int | str) -> str:
+    """Explain the non-destructive terminal-failure recovery path."""
+    return (
+        "To retry with explicit decision:\n"
+        f"  dag.recover(run_id='{run_id}', target='{target}', from_attempt={attempt}, "
+        "decision='retry_after_external_check', reason='<explanation>')\n"
+        "Or programmatically via Dag.recover() - see docs/recovery.md"
     )
 
 

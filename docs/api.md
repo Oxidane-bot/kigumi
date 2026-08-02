@@ -190,6 +190,9 @@
   风险。见 [请求前成本预览](adoption.md#请求前成本预览plan)。
 - `RunResult(artifacts: dict[str, dict[str, Any]], cache_hits: list[str], pending_checkpoints: list[str], run_id: str, skipped: list[str], map_items: dict[str, dict[str, str]], pending_retries: list[str], ambiguous_attempts: list[str], run_status: str) -> None`：
   一次 run 的产物、命中、挂起、跳过与 durable 状态总览。
+- `RecoveryReceipt(recovery_time: str, from_attempt: int, to_attempt: int, decision: Literal[...], reason: str, evidence_refs: list[str], recovered_by: str) -> None`：
+  `Dag.recover()` 的 append-only 决策记录；终态失败恢复后调用同一 run 的 `Dag.resume()`。
+  见 [恢复终态失败 run](recovery.md)。
 
 ### Agent
 

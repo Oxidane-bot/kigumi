@@ -8,8 +8,10 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import getpass
 import inspect
 import json
+import os
 import sys
 import textwrap
 import threading
@@ -18,9 +20,10 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pydantic
 
@@ -229,6 +232,19 @@ class RunResult:
     pending_retries: list[str]
     ambiguous_attempts: list[str]
     run_status: str
+
+
+@dataclass(frozen=True)
+class RecoveryReceipt:
+    """Record of an explicit recovery decision and its supporting rationale."""
+
+    recovery_time: str
+    from_attempt: int
+    to_attempt: int
+    decision: Literal["retry_not_started", "retry_after_external_check", "fail"]
+    reason: str
+    evidence_refs: list[str]
+    recovered_by: str
 
 
 @dataclass(frozen=True)
@@ -1874,7 +1890,188 @@ class Dag:
             run_id=run_id,
             force=force,
             workers=workers,
+            resource_limits=resource_limits,
         )
+
+    def recover(
+        self,
+        run_id: str,
+        target: str,
+        from_attempt: int,
+        decision: Literal["retry_not_started", "retry_after_external_check", "fail"],
+        reason: str,
+        evidence: list[str] = [],  # noqa: B006 - copied before persistence
+    ) -> RecoveryReceipt:
+        """Recover a terminal failure with an explicit, append-only decision.
+
+        A retry decision queues exactly one new attempt for ``target``.  Existing
+        completed run artifacts remain bound to the run and are revalidated and
+        inherited by :meth:`resume`; the failed attempt receipt is never rewritten.
+        ``decision="fail"`` records the operator's final verdict without queuing work.
+        """
+        valid_decisions = {
+            "retry_not_started",
+            "retry_after_external_check",
+            "fail",
+        }
+        if not isinstance(decision, str) or decision not in valid_decisions:
+            raise ValueError(f"Unknown recovery decision: {decision!r}")
+        if isinstance(from_attempt, bool) or not isinstance(from_attempt, int) or from_attempt < 1:
+            raise ValueError("from_attempt must be a positive integer")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("Recovery target must be a non-empty node name")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Recovery reason must be non-empty")
+        if not isinstance(evidence, list) or not all(
+            isinstance(reference, str) for reference in evidence
+        ):
+            raise ValueError("Recovery evidence must be a list of strings")
+
+        run_dir = store.run_directory(self.config.artifacts_path, run_id)
+        manifest_path = run_dir / "_run.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Run {run_id!r} was not found or has no valid manifest") from error
+        if not isinstance(manifest, dict):
+            raise ValueError(f"Run {run_id!r} has an invalid manifest")
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
+        if manifest.get("status") != "failed":
+            raise ValueError(f"Run {run_id!r} is not in terminal failed state")
+
+        targets = manifest.get("targets")
+        force = manifest.get("force")
+        if not isinstance(targets, list) or not all(isinstance(name, str) for name in targets):
+            raise ValueError(f"Run {run_id!r} has invalid target bindings")
+        if not isinstance(force, list) or not all(isinstance(name, str) for name in force):
+            raise ValueError(f"Run {run_id!r} has invalid force bindings")
+        target_root = target.split("@", 1)[0]
+        if target_root not in self._nodes:
+            raise ValueError(f"Recovery target {target!r} is not registered in this graph")
+
+        # Validate the immutable run identity before changing any mutable state.  A
+        # recovery must use the same graph declaration as resume; otherwise it could
+        # create a new attempt that the next resume correctly refuses to execute.
+        try:
+            order = self._topological_order(tuple(targets))
+            libs_hash = self._libs_hash()
+            prompt_snapshot = self._prompt_snapshot()
+            attempts = AttemptStore(
+                run_dir,
+                self._run_manifest_identity(
+                    run_id,
+                    tuple(targets),
+                    tuple(force),
+                    order,
+                    libs_hash,
+                    prompt_snapshot,
+                ),
+            )
+            attempts.initialize()
+        except (OSError, RunManifestError, ValueError) as error:
+            raise ValueError(f"Run {run_id!r} declaration cannot be recovered: {error}") from error
+
+        state = attempts.state_for(target)
+        if state is None:
+            raise ValueError(f"Recovery target {target!r} has no durable attempt state")
+        if state.get("status") != "failed":
+            raise ValueError(f"Recovery target {target!r} is not terminally failed")
+        if state.get("attempt") != from_attempt:
+            raise ValueError(
+                f"Recovery target {target!r} is at attempt {state.get('attempt')}, "
+                f"not {from_attempt}"
+            )
+
+        recovery_time = _recovery_time()
+        recovered_by = _recovered_by()
+        evidence_refs = list(evidence)
+        normalized_reason = reason.strip()
+        to_attempt = from_attempt if decision == "fail" else from_attempt + 1
+        receipt = RecoveryReceipt(
+            recovery_time=recovery_time,
+            from_attempt=from_attempt,
+            to_attempt=to_attempt,
+            decision=decision,
+            reason=normalized_reason,
+            evidence_refs=evidence_refs,
+            recovered_by=recovered_by,
+        )
+        receipt_payload = _recovery_payload(receipt)
+        if decision == "fail":
+            _write_recovery_receipt(run_dir, receipt_payload)
+            return receipt
+
+        inherited_nodes = self._recovery_inherited_nodes(
+            run_dir,
+            target_root,
+            order,
+        )
+        _write_recovery_receipt(run_dir, receipt_payload)
+        attempts.schedule_recovery(
+            target,
+            from_attempt=from_attempt,
+            to_attempt=to_attempt,
+            recovery=receipt_payload,
+            inherited_nodes=inherited_nodes,
+        )
+        attempts.update_manifest(
+            "pending_retry",
+            pending_retries=attempts.pending_retries(),
+            ambiguous_attempts=attempts.ambiguous_attempts(),
+        )
+        return receipt
+
+    def _recovery_inherited_nodes(
+        self,
+        run_dir: Path,
+        target: str,
+        order: list[str],
+    ) -> dict[str, Any]:
+        """Describe successful run-local artifacts that the retry will inherit."""
+        downstream = _downstream_nodes(self._nodes, {target})
+        attempts = AttemptStore(run_dir, {})
+        inherited: dict[str, Any] = {}
+        for name in order:
+            if name == target or name in downstream:
+                continue
+            artifact_path = run_dir / f"{name}.json"
+            sidecar_path = Path(f"{artifact_path}.meta.json")
+            if not artifact_path.is_file() or not sidecar_path.is_file():
+                continue
+            try:
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"Inherited node {name!r} has invalid persisted artifacts"
+                ) from error
+            if not isinstance(artifact, dict) or not isinstance(metadata, dict):
+                raise ValueError(f"Inherited node {name!r} has invalid persisted artifacts")
+            artifact_digest = sha(artifact)
+            origin = metadata.get("origin_provenance")
+            if (
+                metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
+                or metadata.get("artifact_sha256") != artifact_digest
+                or not isinstance(origin, dict)
+                or origin.get("artifact_sha256") != artifact_digest
+                or metadata.get("origin_provenance_digest") != sha(origin)
+            ):
+                raise ValueError(f"Inherited node {name!r} failed artifact validation")
+            state = attempts.state_for(name)
+            if state is not None and state.get("status") != "completed":
+                continue
+            inherited[name] = {
+                "status": "inherited",
+                "source": f"{name}.json",
+                "source_attempt": (
+                    int(state["attempt"])
+                    if state is not None and isinstance(state.get("attempt"), int)
+                    else None
+                ),
+                "artifact_sha256": artifact_digest,
+            }
+        return inherited
 
     def retry_resolve(
         self,
@@ -4310,6 +4507,48 @@ def _downstream_nodes(nodes: Mapping[str, _Node], roots: set[str]) -> set[str]:
         }
         skipped.update(frontier)
     return skipped
+
+
+def _recovery_time() -> str:
+    """Return a sortable UTC recovery timestamp in the public receipt shape."""
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _recovered_by() -> str:
+    """Return an operator identity without adding it to run or cache identity."""
+    for name in ("KIGUMI_RECOVERED_BY", "USER"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    try:
+        return getpass.getuser()
+    except OSError:
+        return "unknown"
+
+
+def _recovery_payload(receipt: RecoveryReceipt) -> dict[str, Any]:
+    """Project a recovery dataclass to its canonical persisted JSON shape."""
+    return {
+        "recovery_time": receipt.recovery_time,
+        "from_attempt": receipt.from_attempt,
+        "to_attempt": receipt.to_attempt,
+        "decision": receipt.decision,
+        "reason": receipt.reason,
+        "evidence_refs": list(receipt.evidence_refs),
+        "recovered_by": receipt.recovered_by,
+    }
+
+
+def _write_recovery_receipt(run_dir: Path, payload: dict[str, Any]) -> Path:
+    """Persist one recovery record without replacing an earlier record."""
+    stem = f"recovery-{payload['recovery_time']}"
+    path = run_dir / f"{stem}.json"
+    suffix = 1
+    while path.exists():
+        path = run_dir / f"{stem}-{suffix}.json"
+        suffix += 1
+    atomic_write_json(path, payload)
+    return path
 
 
 class _DocstringStripper(ast.NodeTransformer):

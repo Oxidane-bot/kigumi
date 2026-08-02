@@ -57,6 +57,7 @@ packages = ["kigumi"]
 "docs/adoption.md" = "kigumi/docs/adoption.md"
 "docs/api.md" = "kigumi/docs/api.md"
 "docs/cli.md" = "kigumi/docs/cli.md"
+"docs/recovery.md" = "kigumi/docs/recovery.md"
 "docs/contracts" = "kigumi/docs/contracts"
 "DESIGN.md" = "kigumi/DESIGN.md"
 "CHANGELOG.md" = "kigumi/CHANGELOG.md"

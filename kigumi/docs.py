@@ -64,6 +64,12 @@ SHIPPED_DOCS: tuple[ShippedDoc, ...] = (
         "unified kigumi CLI; optional standalone dag script",
     ),
     ShippedDoc(
+        "recovery",
+        "docs/recovery.md",
+        "docs/recovery.md",
+        "append-only recovery from terminal failed runs",
+    ),
+    ShippedDoc(
         "contracts",
         "docs/contracts/README.md",
         "docs/contracts/README.md",

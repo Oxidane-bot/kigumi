@@ -15,6 +15,10 @@
   运行时分别限流;未声明的节点走 `None` 默认池。多资源按名字确定序获取,不会互等。
 - `BudgetPermit` 与 `Budget.reserve()` / `commit()` / `cancel()` 预算 admission API:
   付费调用前先预留额度,缓存命中不占额度,失败与空响应会退还预留。
+- 为 terminal `failed` run 增加 `Dag.recover()` 与 `RecoveryReceipt`:恢复决定、理由和证据
+  以 append-only receipt 落盘,成功节点继承,旧 attempt 不再需要删除即可安全重试。
+  新增 `docs/recovery.md`,`kigumi docs recovery` 可读。
+- `kigumi runs show` 在 run 处于终态 `failed` 时打印非破坏性恢复路径。
 
 ### 修复
 
