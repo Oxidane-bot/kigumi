@@ -313,9 +313,11 @@ def bench(
     example_ids = [artifacts.sha(example) for example in example_items]
     if len(set(example_ids)) != len(example_ids):
         raise ValueError("bench examples must not contain duplicate example contents")
+    trial_count = len(example_items) * len(seed_items)
 
     trials: list[dict[str, Any]] = []
     scores_by_variant: list[list[float]] = [[] for _ in variant_items]
+    errors_by_variant: list[list[dict[str, str] | None]] = [[] for _ in variant_items]
     by_example: list[dict[str, list[float]]] = [
         {example_id: [] for example_id in example_ids} for _ in variant_items
     ]
@@ -379,6 +381,7 @@ def bench(
                     if observation.duration_seconds is not None
                     else time.monotonic() - started
                 )
+                errors_by_variant[variant_index].append(error)
                 scores_by_variant[variant_index].append(judgment.score)
                 by_example[variant_index][example_id].append(judgment.score)
                 trials.append(
@@ -409,6 +412,10 @@ def bench(
             "hypothesis": variant.hypothesis,
             "incumbent": variant.incumbent,
             "subject_identity": identities[index],
+            "outcome_summary": _outcome_summary(
+                errors_by_variant[index],
+                trial_count=trial_count,
+            ),
             "mean": statistics.mean(scores),
             "stdev": statistics.pstdev(scores),
             "by_example": by_example[index],
@@ -417,7 +424,7 @@ def bench(
             item["pass_rate"] = sum(score >= pass_threshold for score in scores) / len(scores)
         reports.append(item)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "experiment_dir": str(root),
         "examples": example_ids,
         "seeds": seed_items,
@@ -428,6 +435,49 @@ def bench(
     if report_path is not None:
         artifacts.atomic_write_json(report_path, report)
     return report
+
+
+def _outcome_summary(
+    errors: Iterable[Mapping[str, Any] | None], *, trial_count: int
+) -> dict[str, int | float]:
+    if trial_count <= 0:
+        raise ValueError("Benchmark outcome summary requires a positive trial_count")
+    error_items = list(errors)
+    if len(error_items) != trial_count:
+        raise ValueError("Benchmark outcome summary error count must equal trial_count")
+
+    subject_successes = 0
+    metric_successes = 0
+    subject_failures = 0
+    metric_failures = 0
+    for error in error_items:
+        if error is None:
+            subject_successes += 1
+            metric_successes += 1
+            continue
+        if not isinstance(error, Mapping):
+            raise ValueError("Benchmark outcome error must be a mapping or None")
+        stage = error.get("stage")
+        if stage == "subject":
+            subject_failures += 1
+        elif stage == "metric":
+            subject_successes += 1
+            metric_failures += 1
+        else:
+            raise ValueError(f"Unknown benchmark error stage: {stage!r}")
+
+    subject_failure_rate = subject_failures / trial_count
+    metric_failure_rate = metric_failures / trial_count
+    return {
+        "trial_count": trial_count,
+        "subject_successes": subject_successes,
+        "metric_successes": metric_successes,
+        "subject_failures": subject_failures,
+        "metric_failures": metric_failures,
+        "subject_failure_rate": subject_failure_rate,
+        "metric_failure_rate": metric_failure_rate,
+        "any_failure_rate": (subject_failures + metric_failures) / trial_count,
+    }
 
 
 def _validate_inputs(

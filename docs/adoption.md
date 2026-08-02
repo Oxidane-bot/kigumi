@@ -1338,6 +1338,27 @@ report = bench(
 )
 ```
 
+报告 schema 3 把两个问题分开读：`mean`、`stdev`、`pass_rate` 与 `by_example` 是质量轴，
+`outcome_summary` 是计划网格上的运行结果/评估覆盖轴。不要把 score 为 `0.0` 的合法输出
+当成 subject 不可用，也不要从质量均分反推 metric 是否实际跑过：
+
+```python
+variant_report = report["variants"][0]
+quality = {
+    "mean": variant_report["mean"],
+    "stdev": variant_report["stdev"],
+    "pass_rate": variant_report.get("pass_rate"),
+    "by_example": variant_report["by_example"],
+}
+operational = variant_report["outcome_summary"]
+assert operational["trial_count"] == len(report["examples"]) * len(report["seeds"])
+```
+
+`outcome_summary` 的所有 rate 都以 `trial_count`（包含失败格的计划格数）为分母。无 error
+同时计 subject/metric success；`error.stage == "subject"` 只计 subject failure，metric 未运行；
+`error.stage == "metric"` 计 subject success 与 metric failure。完整错误消息、tags 和 evidence
+仍只在 raw trial 中保留，不进入汇总。
+
 `CallerSubject` 自己构造 Caller 并提取 usage；`DagSubject` factory 必须使用传入
 `TrialContext.project_root` 和 `evidence_root`。multi-seed Dag 实验的 target 必须显式
 `cache="refresh"` 或 `cache="off"`，v1 不接受 `auto`。`AgentSubject` 则自动为每格创建隔离

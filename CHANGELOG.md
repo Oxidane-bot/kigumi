@@ -6,6 +6,8 @@
 
 ### 重大变更
 
+- `bench` 报告 schema 升至 3：每个 variant 新增 stage-aware `outcome_summary`，把质量聚合与
+  subject/metric 运行结果覆盖分开；这是报告格式变化，不轮换缓存族，`CACHE_SCHEMA` 不变。
 - **缓存族轮换**:`CACHE_SCHEMA` 升至 7。提示摘要现纳入附件内容哈希与响应 schema 标识,
   L1 调用缓存条目也开始写 `response_sha256`,因此旧缓存整体失效,首次运行会重新计费。
   本次 `libs` 改为按节点静态 import 闭包取值，沿用这次尚未发布的 7 轮换，不再新增

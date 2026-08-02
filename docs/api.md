@@ -219,6 +219,13 @@
 - `TrialObservation(output: Any, usage: Mapping[str, Any] | None = None, evidence: Mapping[str, Any] = field(default_factory=dict), seed_applied: bool = False, duration_seconds: float | None = None) -> None`：
   subject 返回的输出、usage、证据和 seed/duration 事实。见
   [统一实验主体](adoption.md#统一实验主体workflow-与-agent-使用同一证据网格)。
+- `Metric = Callable[[dict[str, Any], Any], Judgment]`：只依据 example 与 subject output 返回
+  `Judgment`；它定义质量轴，不接收 trial、seed 或运行时失败上下文。
+- `bench(variants, examples, metric, *, seeds=range(5), pass_threshold=None, experiment_dir=None, report_path=None) -> dict[str, Any]`：
+  返回 report schema 3。variant 保留 `mean`、`stdev`、`by_example` 与可选 `pass_rate` 质量聚合，
+  另有 `outcome_summary` 运行结果轴：`trial_count`、`subject_successes`、`metric_successes`、
+  `subject_failures`、`metric_failures` 及三个以计划格数为分母的 rate。合法的零分 Judgment
+  仍是质量结果，不等同于 subject failure；stage 细节仍在 raw trial 的 `error`。
 
 ### Prompt
 

@@ -85,6 +85,41 @@ def test_function_and_refresh_dag_share_isolated_grid(tmp_path: Path) -> None:
     assert "winner" not in report
 
 
+def test_dag_subject_failure_is_a_subject_outcome(tmp_path: Path) -> None:
+    def factory(context: Any) -> Dag:
+        config = KigumiConfig(
+            project_root=context.project_root,
+            artifacts_dir=str(context.evidence_root),
+            source_dirs=[],
+        )
+        dag = _make_dag(context.project_root)
+        dag.config = config
+
+        @dag.node("target", cache="off")
+        def target(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs, ctx
+            raise RuntimeError("target failed")
+
+        return dag
+
+    subject = DagSubject(factory, "target", {"kind": "failing-dag"})
+    report = bench(
+        [Variant("dag", "record DAG failure", subject, True)],
+        [{"id": 1}],
+        lambda example, output: Judgment(1.0, "should not run"),
+        seeds=(0,),
+        experiment_dir=tmp_path / "experiment",
+    )
+
+    trial = report["trials"][0]
+    assert report["variants"][0]["outcome_summary"]["subject_failures"] == 1
+    assert report["variants"][0]["outcome_summary"]["metric_failures"] == 0
+    assert trial["error"]["stage"] == "subject"
+    assert trial["error"]["type"] == "RuntimeError"
+    assert trial["error"]["message"] == "target failed"
+    assert trial["judgment"]["tags"] == ["task_error"]
+
+
 def test_agent_subject_trials_are_isolated_and_aggregate_usage_evidence(tmp_path: Path) -> None:
     class Adapter:
         def __init__(self) -> None:
@@ -162,4 +197,5 @@ def test_agent_subject_failure_keeps_run_evidence_and_scores_zero(tmp_path: Path
     trial = report["trials"][0]
     assert trial["judgment"]["score"] == 0
     assert trial["judgment"]["tags"] == ["task_error"]
+    assert report["variants"][0]["outcome_summary"]["subject_failures"] == 1
     assert trial["evidence"]["failure"]["evidence"][0]["workspace_path"].endswith("rpc.jsonl")
