@@ -48,6 +48,16 @@ both entry points; see `test_both_entry_points_expose_identical_graph_commands`.
 """
 
 
+@pytest.fixture
+def isolated_synthetic_nodes_modules(monkeypatch):
+    """Always remove imported fixture modules, even when a CLI parser exits with 2."""
+    for name in ("nodes", "nodes.graph"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    yield
+    for name in ("nodes.graph", "nodes"):
+        sys.modules.pop(name, None)
+
+
 EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
     "check": ([], set()),
     "plan": ([], {"--targets"}),
@@ -251,7 +261,7 @@ def test_graph_command_without_dag_entry_names_the_fix(tmp_path: Path, monkeypat
 
 
 def test_top_level_recover_routes_through_configured_dag_entry(
-    tmp_path: Path, monkeypatch, capsys
+    tmp_path: Path, monkeypatch, capsys, isolated_synthetic_nodes_modules
 ) -> None:
     """The configured factory must reach the shared recovery handler."""
     (tmp_path / "pyproject.toml").write_text(
@@ -282,8 +292,6 @@ def test_top_level_recover_routes_through_configured_dag_entry(
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
-    for name in ("nodes", "nodes.graph"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
 
     dag = importlib.import_module("nodes.graph").build_dag(marker="for-run")
 
@@ -311,8 +319,30 @@ def test_top_level_recover_routes_through_configured_dag_entry(
     output = capsys.readouterr().out
     assert "run=top-level-recovery target=work" in output
     assert "decision=fail" in output
-    sys.modules.pop("nodes.graph", None)
-    sys.modules.pop("nodes", None)
+
+
+def test_parent_style_cli_failure_does_not_leak_synthetic_modules(
+    tmp_path: Path, monkeypatch, isolated_synthetic_nodes_modules
+) -> None:
+    """A caught argparse SystemExit still lets the fixture clean imported modules."""
+    package = tmp_path / "nodes"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "graph.py").write_text("def build_dag():\n    return None\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.import_module("nodes.graph")
+
+    with pytest.raises(SystemExit) as exited:
+        main(["recover", "top-level-recovery", "work"])
+
+    assert exited.value.code == 2
+
+
+def test_following_test_starts_without_synthetic_nodes_modules() -> None:
+    """The parent-style failure above must not affect the next test process state."""
+    assert "nodes.graph" not in sys.modules
+    assert "nodes" not in sys.modules
 
 
 @pytest.mark.parametrize(

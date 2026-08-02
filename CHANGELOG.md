@@ -57,6 +57,8 @@
   保守的额外失效是有意的，避免动态 helper 编辑复用陈旧节点产物。这是
   `CACHE_SCHEMA=7` 尚未发布期间的正确性修复，不新增缓存族轮换；该边界是源码 AST 分析，
   不宣称覆盖任意外部/native 运行时代码。
+- 修复 `kigumi runs show` 的 recovery 建议：参数改为 shell-safe 命令渲染，并明确要求补回构造该
+  run 时使用的重复 `--graph-arg KEY=VALUE`；不涉及 `CACHE_SCHEMA`。
 - `BudgetExceeded` 现从 map、scan 和 foreach 保持原类型传播;预算超限会中止后续 fan-out
   item,已在途 item 完成后再统一收尾,而不是把超限埋进聚合失败里。
 - `Budget` 预留估算现同时计入 prompt 与 `max_tokens`;此前声明 `max_tokens` 会让预留

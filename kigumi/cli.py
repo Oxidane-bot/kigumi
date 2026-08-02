@@ -6,6 +6,7 @@ import argparse
 import importlib
 import inspect
 import json
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -799,11 +800,24 @@ def _pending_names(run_path: Path) -> list[str]:
 
 def _recovery_advice(run_id: str, target: str, attempt: int | str) -> str:
     """Explain the non-destructive terminal-failure recovery path."""
+    recovery_argv = [
+        "kigumi",
+        "recover",
+        run_id,
+        target,
+        "--attempt",
+        str(attempt),
+        "--decision",
+        "retry_after_external_check",
+        "--reason",
+        "<explanation>",
+    ]
+    resume_argv = ["kigumi", "resume", run_id]
     return (
         "To retry with explicit decision:\n"
-        f"  kigumi recover {run_id} {target} --attempt {attempt} "
-        "--decision retry_after_external_check --reason '<explanation>'\n"
-        f"Then explicitly run: kigumi resume {run_id}\n"
+        f"  {shlex.join(recovery_argv)}\n"
+        "Append the same repeated --graph-arg KEY=VALUE arguments used to construct this run.\n"
+        f"Then explicitly run: {shlex.join(resume_argv)}\n"
         "Recovery does not resume automatically; see docs/cli.md and docs/recovery.md"
     )
 

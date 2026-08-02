@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ import pytest
 
 from kigumi import PromptRef, PromptSpec
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
-from kigumi.cli import main
+from kigumi.cli import _recovery_advice, main
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
 
@@ -42,6 +43,53 @@ def _run_dag_cli(dag: Dag, argv: list[str]) -> int:
     with pytest.raises(SystemExit) as exited:
         dag.cli(argv)
     return int(exited.value.code)
+
+
+@pytest.mark.parametrize(
+    ("run_id", "target"),
+    [
+        ("run with spaces", "target with spaces"),
+        ("run 'with' \"quotes\"", "target 'with' \"quotes\""),
+        ("run;$(touch should-not-run)", "target && echo unsafe"),
+    ],
+)
+def test_recovery_advice_shell_quotes_dynamic_arguments(run_id: str, target: str) -> None:
+    """The copy/paste recovery and resume commands preserve argv boundaries."""
+    advice = _recovery_advice(run_id, target, 7)
+    recovery_line = next(
+        line.strip() for line in advice.splitlines() if line.strip().startswith("kigumi recover ")
+    )
+    resume_line = next(
+        line.strip().removeprefix("Then explicitly run: ")
+        for line in advice.splitlines()
+        if line.strip().startswith("Then explicitly run: kigumi resume ")
+    )
+
+    assert shlex.split(recovery_line) == [
+        "kigumi",
+        "recover",
+        run_id,
+        target,
+        "--attempt",
+        "7",
+        "--decision",
+        "retry_after_external_check",
+        "--reason",
+        "<explanation>",
+    ]
+    assert shlex.split(resume_line) == ["kigumi", "resume", run_id]
+
+
+def test_recovery_advice_warns_to_reuse_graph_args() -> None:
+    """Advice must not pretend it can reconstruct graph factory arguments."""
+    lines = _recovery_advice("run-0042", "transcode", 3).splitlines()
+    command_index = next(
+        index for index, line in enumerate(lines) if line.strip().startswith("kigumi recover ")
+    )
+
+    assert lines[command_index + 1] == (
+        "Append the same repeated --graph-arg KEY=VALUE arguments used to construct this run."
+    )
 
 
 def test_init_creates_default_layout_and_refuses_repeat(
