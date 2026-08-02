@@ -63,9 +63,12 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 `Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入继续保留；但它们只组成一条
 实验性、content-only 的普通提示词文本进化 recipe。它不是 DAG/Agent 优化器、durable run
 recovery 或无偏的泛化估计器，也不会自动晋升候选。需要函数、Caller、DAG 或 Agent 的证据时，
-应使用 `bench` 加 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；需要晋升时，
-用 `PromptSpec` 等 Prompt 声明并经过明确人工审阅。它仍提供验证反馈隔离、有界指标评估、手工晋升
-与可续跑的本地 JSON 状态；后者只是本地算法检查点，不是带副作用感知的 durable run receipt。
+应使用 `bench` 加 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。采用候选由调用方
+负责，流程是：(1) 调用方/人工审阅 `result.best`；(2) 调用方手动把批准文本写入 `prompts/*.md`；
+(3) 项目通过 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它，而 `PromptSpec` 只声明组合。
+没有晋升 API，也不会自动写盘。验证反馈隔离只有在 train 与 validation 两组内容互斥时才成立；
+调用前请自行验证不重叠，框架不会在运行时执行 disjointness 检查。它仍提供有界指标评估与可续跑的
+本地 JSON 状态；后者只是本地算法检查点，不是带副作用感知的 durable run receipt。
 
 内置 judge、pairwise 与 reflection prompt 默认使用中文文本，三者都可覆盖；参数与槽位契约见
 [实验性评估与提示词进化 recipe](docs/adoption.md#四评估与提示词进化evals--optimize)。

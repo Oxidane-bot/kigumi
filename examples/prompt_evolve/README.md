@@ -17,8 +17,11 @@ uv run python examples/prompt_evolve/demo.py
 
 需要函数、Caller、DAG 或 Agent 的证据时，应改用 `bench` 加
 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；需要把候选用于实际运行时，
-应先用 Prompt 声明记录选择，再经过明确人工审阅。这里的 state 是本地 JSON 算法检查点，
-不是带副作用感知的 durable run receipt。
+应由调用方/人工按以下顺序处理：先审阅 `result.best`，再手动把批准文本写入 `prompts/*.md`，
+最后由项目通过 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它；`PromptSpec` 只声明组合。
+没有晋升 API，也不会自动写盘。验证反馈隔离以 train 与 validation 内容互斥为前提；运行前请自行
+验证两组内容不重叠，框架不做运行时检查。这里的 state 是本地 JSON 算法检查点，不是带副作用感知的
+durable run receipt。
 
 ## 框架摩擦与缺口
 

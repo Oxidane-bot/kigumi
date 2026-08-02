@@ -8,7 +8,8 @@
 
 想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](https://github.com/Oxidane-bot/kigumi/blob/master/examples/ticket_extract/README.md)
 或[实验性内容级提示词进化 recipe](https://github.com/Oxidane-bot/kigumi/blob/master/examples/prompt_evolve/README.md)（示例只在仓库里，不随 wheel 交付）。前者用 150 张固定 seed 合成工单测量
-map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
+map/cache/GC，后者验收在 train/validation 内容由调用方预先确认不重叠时的验证反馈隔离、拒收与
+state 续跑；两者都保留已知框架摩擦。
 
 ## 进场协议（改节点前先做这三步）
 
@@ -1289,9 +1290,13 @@ prompt 字符串和调用方提供的 `task`、`metric`、`caller`，演化字�
 `Candidate`、`EvolveResult` 与 `evolve_prompt` 导入继续保留。
 
 需要函数、Caller、DAG 或 Agent 的可比较证据时，用 `bench` 加
-`FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。需要把候选用于实际运行时，先用
-`PromptSpec` 等 Prompt 声明记录选择，再经过明确人工审阅；不要把这条 recipe 当作框架级的
-Prompt、DAG 或 Agent 选型器。
+`FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。采用候选由调用方/人工负责，流程是：
+
+1. 审阅 `result.best`。
+2. 手动把批准文本写入 `prompts/*.md`。
+3. 项目通过 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它；`PromptSpec` 只声明组合。
+
+没有晋升 API，也不会自动写盘；不要把这条 recipe 当作框架级的 Prompt、DAG 或 Agent 选型器。
 
 ### 指标怎么写
 
@@ -1365,7 +1370,7 @@ from kigumi import evolve_prompt
 
 result = evolve_prompt(
     template=seed_text,
-    train_examples=train,  # 反思材料只来自这里
+    train_examples=train,  # train/val 内容须不重叠；满足前提时反思材料只来自这里
     val_examples=val,  # 去留、前沿、胜出只看这里
     task=lambda text, ex: run_pipeline(text, ex),
     metric=metric,
@@ -1375,13 +1380,15 @@ result = evolve_prompt(
 print(result.generalization_gap)  # 当前已记录分数的 train - val 均值差,不是无偏泛化估计
 ```
 
-必须知道的机制(这些是代码闸门,不是建议):
+必须知道的机制与前提（其中代码闸门不是建议，内容互斥需由调用方负责）:
 
-1. **train/val 由你切**,库不猜。两侧都不许为空。经验起点:小测评集
-   对半切;样例总数 < 6 时先扩测评集再谈优化。这个验证均值闸门不构成无偏的
-   泛化估计;没有 untouched test set、统计比较或多 seed 证据时,不要把
-   `generalization_gap` 当成通用泛化结论。
-2. **val 的内容与评语永远不会进反思 prompt**;候选 val 均分低于父本直接
+1. **train/val 由你切且内容必须不重叠**,库不猜,也不在运行时检查。运行前请自行验证两组样例
+   的内容不重叠；这是验证反馈隔离的前提。判分按 `(candidate_sha, example-content hash)` 缓存
+   且先评 val，若内容重叠，val judgment 可能复用于 train 并进入反思。两侧都不许为空。经验
+   起点:小测评集对半切;样例总数 < 6 时先扩测评集再谈优化。这个验证均值闸门不构成无偏的
+   泛化估计;没有 untouched test set、统计比较或多 seed 证据时,不要把 `generalization_gap`
+   当成通用泛化结论。
+2. **在上述内容互斥前提下的验证反馈隔离**:val 的内容与评语不会进反思 prompt;候选 val 均分低于父本直接
    拒收;候选新增文本含 ≥ `leak_run_chars`(默认 12)字的样例原文直接拒收。
    这三道闸不可配置关闭。`leak_run_chars` 是可调的防泄漏闸，窗口按字符计：
    中文 12 字符就是 12 个汉字；英文约两个词，常见套话可能误伤合法候选，可按
@@ -1389,9 +1396,10 @@ print(result.generalization_gap)  # 当前已记录分数的 train - val 均值�
 3. **同分更短者胜**:简洁性是 Pareto 前沿的一个维度。种子模板本身也可能
    被更短的同分候选剪掉。
 4. `max_chars` 默认是种子长度的 2 倍——想要更紧的指令就调小它。
-5. **胜出文本不落盘**:`result.best` 由你人工审阅后决定是否通过
-   `PromptSpec` 等 Prompt 声明写入项目并提交 git。优化器改提示词是项目变更,
-   必须过人手,不会自动晋升。
+5. **胜出文本不落盘**:`result.best` 只返回给调用方。采用流程是：调用方/人工先审阅
+   `result.best`，再由调用方手动把批准文本写入 `prompts/*.md`，最后项目通过 `PromptRef`
+   引用该既有文件，或用 `PromptSpec` 组合它；`PromptSpec` 只声明组合。没有晋升 API，也不会
+   自动写盘。优化器改提示词是项目变更,必须过人手,并提交 git。
 6. 反思模板与评委措辞都是参数(`reflection_template` / `wording`),
    默认常量只是合理起点;自定义反思模板槽位必须恰好是
    `current_template` / `merged_feedback` / `max_chars`。

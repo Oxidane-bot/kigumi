@@ -223,9 +223,12 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   也不自动晋升候选。
 - optimize 的 `(候选, 样例)` 判分状态文件只服务本地算法检查点与续跑；它不产生
   DAG/Agent 的 provenance、attempt receipt 或 side-effect-aware durable recovery。
-  胜出文本不自动落盘，须经人工审阅并通过 Prompt 声明后才进入项目。
-- 这条 recipe 仍提供验证反馈隔离、有界指标评估、手工晋升与本地 JSON 续跑；需要函数、
-  Caller、DAG 或 Agent 的可比较证据时，应使用 `bench` 加
+  胜出文本不自动落盘。采用候选由调用方/人工负责：先审阅 `result.best`，再手动把批准文本
+  写入 `prompts/*.md`，最后由项目用 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它；
+  `PromptSpec` 只声明组合，没有晋升 API，也不会自动写入。
+- 这条 recipe 的验证反馈隔离以 train 与 validation 两组内容互斥为前提；调用方应在运行前自行
+  验证不重叠，框架不做运行时 disjointness 检查。满足此前提时，它还提供有界指标评估与本地
+  JSON 续跑；需要函数、Caller、DAG 或 Agent 的可比较证据时，应使用 `bench` 加
   `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。
 - `bench.py` 为同一流水线的结构切法生产变体×样例×种子的可归档证据，不裁决胜负，
   不自动接线；每个变体独立持有 caller，固定种子仍可复用 L1。

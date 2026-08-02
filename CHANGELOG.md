@@ -9,10 +9,13 @@
 - 将 `optimize.py` / `evolve_prompt` 定位为实验性、内容级提示词 recipe：保留
   `Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入兼容性，不再将其描述为
   DAG/Agent 优化器、durable run recovery 或无偏的泛化估计器，也不提供自动晋升。证据建议
-  使用 `bench` 加 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；晋升使用
-  Prompt 声明并经过明确人工审阅。保留验证反馈隔离、有界指标评估、手工晋升与可续跑本地
-  JSON 算法检查点的说明，并明确它不是带副作用感知的 durable run receipt。本次仅变更定位，
-  不修改运行时、state schema 或算法，也不改变任何缓存族。
+  使用 `bench` 加 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。采用候选由
+  调用方/人工负责：先审阅 `result.best`，再手动把批准文本写入 `prompts/*.md`，最后由项目
+  通过 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它；`PromptSpec` 只声明组合。
+  没有晋升 API，也不会自动写入。验证反馈隔离仅在 train 与 validation 内容由调用方预先验证为
+  互斥时成立；框架不做运行时检查。保留有界指标评估与可续跑本地 JSON 算法检查点的说明，并
+  明确它不是带副作用感知的 durable run receipt。本次仅变更定位，不修改运行时、state schema
+  或算法，也不改变任何缓存族。
 
 ### 重大变更
 

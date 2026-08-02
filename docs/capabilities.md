@@ -100,9 +100,12 @@ adoption.md 的"设计边界"一节。
 
 `evolve_prompt` 只演化普通提示词字符串，保留 `Candidate`、`EvolveResult` 与
 `evolve_prompt` 的导入兼容性；它不是 DAG/Agent 优化器、durable run recovery 或无偏的泛化
-估计器，也不自动晋升候选。它仍提供验证反馈隔离、有界指标评估、手工晋升与可续跑的本地 JSON
-状态，但 state 只是本地算法检查点，不是带副作用感知的 durable run receipt。需要证据时使用
-`bench` 与上面的四类实验主体；需要晋升时用 Prompt 声明并进行明确人工审阅。
+估计器，也不自动晋升候选。验证反馈隔离只有在 train 与 validation 内容互斥时才成立；调用方
+应在运行前自行验证不重叠，框架不做运行时检查。采用候选由调用方/人工负责：先审阅 result.best，
+再手动把批准文本写入 `prompts/*.md`，最后用 `PromptRef` 引用该既有文件，或用 `PromptSpec`
+组合它；`PromptSpec` 只声明组合。没有晋升 API，也不会自动写盘。它仍提供有界指标评估与可续跑的
+本地 JSON 状态，但 state 只是本地算法检查点，不是带副作用感知的 durable run receipt。需要证据时
+使用 `bench` 与上面的四类实验主体。
 
 ## 测试与守卫
 

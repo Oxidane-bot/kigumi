@@ -177,8 +177,11 @@
 `evolve_prompt` 是实验性、内容级 recipe，只对普通提示词字符串做候选演化。它不是
 DAG/Agent 优化器、durable run recovery 或无偏的泛化估计器，也不自动晋升候选；其
 `Candidate`、`EvolveResult` 与 `evolve_prompt` 导入继续保持兼容。需要可比较证据时见
-`bench` 与 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；需要晋升时使用
-Prompt 声明并进行明确人工审阅。
+`bench` 与 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。验证反馈隔离只有在
+train 与 validation 内容互斥时才成立；调用方应在运行前自行验证不重叠，框架不做运行时检查。
+采用候选由调用方/人工负责：先审阅 `result.best`，再手动把批准文本写入 `prompts/*.md`，最后
+项目用 `PromptRef` 引用该既有文件，或用 `PromptSpec` 组合它；`PromptSpec` 只声明组合。没有
+晋升 API，也不会自动写入。
 
 - `Judgment(score: float, feedback: str, tags: tuple[str, ...] = (), subscores: dict[str, float] | None = None) -> None`：
   单样例的 `[0, 1]` 主分、反思评语、错误标签与可选子分。见
@@ -186,8 +189,8 @@ Prompt 声明并进行明确人工审阅。
 - `Candidate(text: str, parent: int | None, train_scores: dict[str, float], val_scores: dict[str, float], round: int) -> None`：
   一个已接受候选及其父本、train/val 分数和轮次；不是每轮拒绝原因的完整事件记录。
 - `EvolveResult(best: str, candidates: list[Candidate], metric_calls: int, rounds_run: int, generalization_gap: float) -> None`：
-  `evolve_prompt` 的返回结果；不自动写回 Prompt。`generalization_gap` 只是当前已记录
-  train/val 分数的均值差，不能作为无偏的通用泛化估计。见
+  `evolve_prompt` 的返回结果；`best` 只返回给调用方，不自动写入 `prompts/`。`generalization_gap`
+  只是当前已记录 train/val 分数的均值差，不能作为无偏的通用泛化估计。见
   [进化怎么跑](adoption.md#进化怎么跑)。
 
 传入 `state_path` 时，续跑依赖本地 JSON 算法检查点；它不是带副作用感知的 durable run

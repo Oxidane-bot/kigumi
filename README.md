@@ -81,11 +81,16 @@ experimental, content-only recipe for evolving plain prompt strings. It is not a
 DAG/Agent optimizer, durable run recovery, or an unbiased generalization estimator,
 and it never promotes a candidate automatically. For evidence about functions,
 callers, DAGs, or Agents, use `bench` with `FunctionSubject`, `CallerSubject`,
-`DagSubject`, or `AgentSubject`; promote through Prompt declarations such as
-`PromptSpec` and explicit human review. The recipe still provides validation-
-feedback isolation, bounded metric evaluation, manual promotion, and resumable
-local JSON state; that state is a local algorithm checkpoint, not a durable
-side-effect-aware run receipt.
+`DagSubject`, or `AgentSubject`. Adopting a candidate is caller-owned: (1) the
+caller/human reviews `result.best`; (2) the caller manually writes the approved
+text to `prompts/*.md`; and (3) the project references that existing file with
+`PromptRef` or composes it with `PromptSpec`, which only declares composition.
+There is no promotion API and no automatic write. Validation-feedback isolation
+applies only when the train and validation sets are content-disjoint; callers
+should validate that before running because the framework does not enforce
+disjointness at runtime. The recipe still provides bounded metric evaluation and
+resumable local JSON state; that state is a local algorithm checkpoint, not a
+durable side-effect-aware run receipt.
 
 The built-in judge, pairwise, and reflection prompts default to Chinese text;
 all three are overridable. See the
