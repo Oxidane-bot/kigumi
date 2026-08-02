@@ -107,6 +107,7 @@ If a project has both, they inspect the same graph.
 | Show me the shape | `kigumi graph` (`--prompts` for Mermaid, `--html PATH`) |
 | Give me the canonical IR | `kigumi profile [--run-id ID] [--format json]` |
 | Continue a run that stopped for retry or approval | `kigumi resume RUN_ID` |
+| Record an explicit decision for a terminal failed run | `kigumi recover RUN_ID TARGET --attempt N --decision ... --reason TEXT` |
 | Rule on an ambiguous attempt | `kigumi retry-resolve RUN_ID TARGET --attempt N --action retry\|fail --reason TEXT` |
 | Which run IDs exist, what happened in one | `kigumi runs list` / `kigumi runs show ID` |
 | The payload of one LLM call | `kigumi call <key_prefix> --field messages\|response` |

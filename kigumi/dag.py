@@ -3011,6 +3011,7 @@ class Dag:
             "describe": self._cli_describe,
             "resume": self._cli_resume,
             "retry-resolve": self._cli_retry_resolve,
+            "recover": self._cli_recover,
         }
         return handlers[args.command](args)
 
@@ -3154,6 +3155,27 @@ class Dag:
             return 1
         print(
             f"resolved {args.target} attempt={args.attempt} action={args.action} run={args.run_id}"
+        )
+        return 0
+
+    def _cli_recover(self, args: argparse.Namespace) -> int:
+        """Persist an explicit decision for a terminal failed run."""
+        try:
+            receipt = self.recover(
+                args.run_id,
+                args.target,
+                from_attempt=args.attempt,
+                decision=args.decision,
+                reason=args.reason,
+                evidence=args.evidence,
+            )
+        except Exception as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(
+            f"run={args.run_id} target={args.target} "
+            f"from_attempt={receipt.from_attempt} to_attempt={receipt.to_attempt} "
+            f"decision={receipt.decision} evidence_count={len(receipt.evidence_refs)}"
         )
         return 0
 
@@ -4303,6 +4325,7 @@ GRAPH_COMMAND_HELP: dict[str, str] = {
     "profile": "emit the canonical workflow IR for the graph or a past run",
     "resume": "continue a run that stopped for retry or approval",
     "retry-resolve": "rule on an ambiguous retry attempt",
+    "recover": "record an explicit decision for a terminal failed run",
 }
 """One line per graph command, shared by both entry points' help output."""
 
@@ -4382,6 +4405,18 @@ def register_graph_commands(
     resolve.add_argument("--attempt", type=int, required=True)
     resolve.add_argument("--action", choices=("retry", "fail"), required=True)
     resolve.add_argument("--reason", required=True)
+
+    recover = add("recover")
+    recover.add_argument("run_id")
+    recover.add_argument("target")
+    recover.add_argument("--attempt", type=int, required=True)
+    recover.add_argument(
+        "--decision",
+        choices=("retry_not_started", "retry_after_external_check", "fail"),
+        required=True,
+    )
+    recover.add_argument("--reason", required=True)
+    recover.add_argument("--evidence", action="append", default=[], metavar="REF")
 
 
 def _cli_display_path(root: Path, path: Path) -> str:

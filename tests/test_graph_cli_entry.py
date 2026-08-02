@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,10 @@ EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
     "describe": ([], {"--format"}),
     "resume": (["run_id"], {"--workers"}),
     "retry-resolve": (["run_id", "target"], {"--attempt", "--action", "--reason"}),
+    "recover": (
+        ["run_id", "target"],
+        {"--attempt", "--decision", "--reason", "--evidence"},
+    ),
 }
 """The documented surface of each graph command, spelled out independently.
 
@@ -73,6 +79,61 @@ def test_graph_commands_keep_their_documented_arguments() -> None:
         assert _option_strings(commands[name]) - {"-h", "--help"} == options, (
             f"{name} options changed"
         )
+
+
+def test_recover_parser_accepts_repeated_evidence_and_graph_args() -> None:
+    """Recovery exposes its complete operator input on both graph parser paths."""
+    base = [
+        "run-0042",
+        "outline",
+        "--attempt",
+        "3",
+        "--decision",
+        "retry_after_external_check",
+        "--reason",
+        "validated provider logs",
+        "--evidence",
+        "validation-report.md",
+        "--evidence",
+        "ticket:PROJ-123",
+    ]
+    dag_parser = _graph_commands(_build_cli_parser())["recover"]
+    dag_args = dag_parser.parse_args(base)
+    assert dag_args.run_id == "run-0042"
+    assert dag_args.target == "outline"
+    assert dag_args.attempt == 3
+    assert dag_args.decision == "retry_after_external_check"
+    assert dag_args.reason == "validated provider logs"
+    assert dag_args.evidence == ["validation-report.md", "ticket:PROJ-123"]
+
+    default_args = dag_parser.parse_args(
+        [
+            "run-0042",
+            "outline",
+            "--attempt",
+            "1",
+            "--decision",
+            "fail",
+            "--reason",
+            "final verdict",
+        ]
+    )
+    assert default_args.evidence == []
+
+    kigumi_parser = _graph_commands(_parser())["recover"]
+    kigumi_args = kigumi_parser.parse_args([*base, "--graph-arg", "episode=E2S4"])
+    assert kigumi_args.graph_arg == ["episode=E2S4"]
+
+    decision_action = next(
+        action
+        for action in dag_parser._actions
+        if action.dest == "decision"  # noqa: SLF001
+    )
+    assert tuple(decision_action.choices) == (
+        "retry_not_started",
+        "retry_after_external_check",
+        "fail",
+    )
 
 
 def test_both_entry_points_expose_identical_graph_commands() -> None:
@@ -187,6 +248,71 @@ def test_graph_command_without_dag_entry_names_the_fix(tmp_path: Path, monkeypat
     message = capsys.readouterr().err
     assert "dag_entry" in message
     assert "module:callable" in message
+
+
+def test_top_level_recover_routes_through_configured_dag_entry(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The configured factory must reach the shared recovery handler."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'sample'\n\n"
+        "[tool.kigumi]\nsource_dirs = []\ndag_entry = 'nodes.graph:build_dag'\n",
+        encoding="utf-8",
+    )
+    package = tmp_path / "nodes"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "graph.py").write_text(
+        "from pathlib import Path\n"
+        "from typing import Any\n\n"
+        "from kigumi import Dag, KigumiConfig\n\n"
+        "def build_dag(marker='default'):\n"
+        "    del marker\n"
+        "    dag = Dag(\n"
+        "        KigumiConfig(project_root=Path(__file__).parents[1], source_dirs=[]), object()\n"
+        "    )\n"
+        "\n"
+        "    @dag.node('work', cache='off')\n"
+        "    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:\n"
+        "        del inputs, ctx\n"
+        "        raise RuntimeError('terminal failure')\n"
+        "\n"
+        "    return dag\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("nodes", "nodes.graph"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    dag = importlib.import_module("nodes.graph").build_dag(marker="for-run")
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        dag.run(run_id="top-level-recovery")
+
+    assert (
+        main(
+            [
+                "recover",
+                "top-level-recovery",
+                "work",
+                "--attempt",
+                "1",
+                "--decision",
+                "fail",
+                "--reason",
+                "operator made the final decision",
+                "--graph-arg",
+                "marker=from-cli",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "run=top-level-recovery target=work" in output
+    assert "decision=fail" in output
+    sys.modules.pop("nodes.graph", None)
+    sys.modules.pop("nodes", None)
 
 
 @pytest.mark.parametrize(

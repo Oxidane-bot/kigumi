@@ -183,7 +183,7 @@ run/节点/载荷不存在或输入无效时为 1；成功为 0。
 
 ### `--graph-arg KEY=VALUE`
 
-全部 8 条图命令都接受，可重复。把一个 `key=value` 按名传给 `dag_entry` 工厂，
+全部 9 条图命令都接受，可重复。把一个 `key=value` 按名传给 `dag_entry` 工厂，
 供图形状或 `params` 依赖运行时输入的项目使用（按 episode 展开 `foreach`、按输入文件
 声明 `files` 等）。只在 `kigumi <命令>` 上提供：它才负责构图，而 `Dag.cli()` 拿到的是
 已经构好的图，这个旗标在那一侧不可能起作用。
@@ -280,6 +280,59 @@ kigumi explain scene_E2S4 --graph-arg episode=E2S4
 | `--workers N` | 否 | `1` | DAG worker 数。 |
 
 恢复成功（包括返回 pending 状态）为 0；恢复抛错时捕获并以 1 退出。
+
+### `kigumi recover RUN_ID TARGET`
+
+为 terminal `failed` run 写入一次 append-only recovery receipt，并按显式 decision
+决定是否排队一个新的 attempt。完整语法如下；`--graph-arg` 只适用于 `kigumi` 入口，
+独立 `dag recover` 使用同样的其余参数：
+
+```bash
+kigumi recover RUN_ID TARGET \
+  --attempt N \
+  --decision {retry_not_started,retry_after_external_check,fail} \
+  --reason TEXT \
+  [--evidence REF ...] \
+  [--graph-arg KEY=VALUE ...]
+```
+
+| 参数 | 必需 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `RUN_ID` | 是 | 无 | 要恢复的 schema-2 terminal `failed` run。 |
+| `TARGET` | 是 | 无 | 失败节点或 map/scan item，例如 `outline` 或 `outline@item-7`。 |
+| `--attempt N` | 是 | 无 | 当前失败 attempt 序号；正整数校验由 `Dag.recover()` 执行。 |
+| `--decision {retry_not_started,retry_after_external_check,fail}` | 是 | 无 | 明确失败操作尚未开始、已完成外部核验后重试，或作最终失败裁决。 |
+| `--reason TEXT` | 是 | 无 | 必填并持久化的操作员理由。 |
+| `--evidence REF` | 否 | `[]` | 一个证据引用；可重复，每次传一个引用。 |
+| `--graph-arg KEY=VALUE` | 否 | `[]` | 传给 `dag_entry` 工厂的参数；可重复，仅 `kigumi` 入口提供。 |
+
+retry decision 会由 API 排队恰好一个新的 attempt；`fail` 的 `to_attempt` 等于
+`from_attempt`，不会排队 retry。成功输出一行包含 run、target、两个 attempt、decision
+和 evidence 数量，并以 0 退出。API 抛错时 stderr 输出 `error: <message>` 并以 1 退出；
+参数缺失或 choice 无效仍是 argparse 的 2。recover **不会自动 resume**；需要执行排队的
+retry 时，操作员必须另行明确运行 `kigumi resume RUN_ID`。
+
+重试示例：
+
+```bash
+kigumi recover run-0042 transcode \
+  --attempt 3 \
+  --decision retry_after_external_check \
+  --reason "已验证替换后的 ffmpeg 能处理失败场景" \
+  --evidence validation-report.md
+# 之后如果要执行排队的 attempt，再明确运行：
+kigumi resume run-0042
+```
+
+最终失败示例：
+
+```bash
+kigumi recover run-0042 transcode \
+  --attempt 3 \
+  --decision fail \
+  --reason "外部核验确认该场景不可恢复" \
+  --evidence incident-2026-08-02.md
+```
 
 ### `kigumi retry-resolve RUN_ID TARGET`
 

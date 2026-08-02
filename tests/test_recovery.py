@@ -54,6 +54,142 @@ def _attempt_path(tmp_path: Path, run_id: str, target: str, attempt: int) -> Pat
     return target_root / f"attempt-{attempt:04d}.json"
 
 
+def _run_dag_cli(dag: Dag, argv: list[str]) -> int:
+    with pytest.raises(SystemExit) as exited:
+        dag.cli(argv)
+    return int(exited.value.code)
+
+
+def _terminal_failed_dag(tmp_path: Path, run_id: str = "cli-recovery") -> Dag:
+    dag = _dag(tmp_path)
+
+    @dag.node("work", cache="off")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        raise RuntimeError("terminal failure")
+
+    with pytest.raises(RuntimeError, match="terminal failure"):
+        dag.run(run_id=run_id)
+    return dag
+
+
+def test_dag_cli_recover_retry_writes_one_receipt_and_queues_one_retry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dag = _terminal_failed_dag(tmp_path)
+
+    assert (
+        _run_dag_cli(
+            dag,
+            [
+                "recover",
+                "cli-recovery",
+                "work",
+                "--attempt",
+                "1",
+                "--decision",
+                "retry_not_started",
+                "--reason",
+                "the external side effect never started",
+                "--evidence",
+                "provider-log.txt",
+                "--evidence",
+                "ticket:PROJ-123",
+            ],
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+
+    receipts = sorted((tmp_path / "artifacts" / "runs" / "cli-recovery").glob("recovery-*.json"))
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].read_text())
+    assert payload["from_attempt"] == 1
+    assert payload["to_attempt"] == 2
+    assert payload["decision"] == "retry_not_started"
+    assert payload["evidence_refs"] == ["provider-log.txt", "ticket:PROJ-123"]
+    assert (
+        f"run=cli-recovery target=work from_attempt={payload['from_attempt']} "
+        f"to_attempt={payload['to_attempt']} decision={payload['decision']} "
+        f"evidence_count={len(payload['evidence_refs'])}"
+    ) in output
+    assert (
+        json.loads(_attempt_path(tmp_path, "cli-recovery", "work", 2).read_text())["status"]
+        == "retry_scheduled"
+    )
+    manifest = json.loads(
+        (tmp_path / "artifacts" / "runs" / "cli-recovery" / "_run.json").read_text()
+    )
+    assert len(manifest["pending_retries"]) == 1
+    assert manifest["pending_retries"][0]["target"] == "work"
+
+
+def test_dag_cli_recover_fail_keeps_attempt_and_does_not_queue_retry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dag = _terminal_failed_dag(tmp_path, run_id="cli-fail")
+
+    assert (
+        _run_dag_cli(
+            dag,
+            [
+                "recover",
+                "cli-fail",
+                "work",
+                "--attempt",
+                "1",
+                "--decision",
+                "fail",
+                "--reason",
+                "the final operator verdict",
+            ],
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    receipts = sorted((tmp_path / "artifacts" / "runs" / "cli-fail").glob("recovery-*.json"))
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].read_text())
+    assert payload["from_attempt"] == 1
+    assert payload["to_attempt"] == payload["from_attempt"]
+    assert payload["decision"] == "fail"
+    assert "run=cli-fail target=work from_attempt=1 to_attempt=1" in output
+    assert "decision=fail evidence_count=0" in output
+    assert not _attempt_path(tmp_path, "cli-fail", "work", 2).exists()
+    manifest = json.loads((tmp_path / "artifacts" / "runs" / "cli-fail" / "_run.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest.get("pending_retries", []) == []
+
+
+def test_dag_cli_recover_api_failure_is_an_error_without_success_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dag = _terminal_failed_dag(tmp_path, run_id="cli-error")
+
+    assert (
+        _run_dag_cli(
+            dag,
+            [
+                "recover",
+                "cli-error",
+                "work",
+                "--attempt",
+                "2",
+                "--decision",
+                "retry_not_started",
+                "--reason",
+                "wrong attempt should fail closed",
+            ],
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "not 2" in captured.err
+    assert not list((tmp_path / "artifacts" / "runs" / "cli-error").glob("recovery-*.json"))
+
+
 def test_failed_run_can_be_recovered_and_creates_new_attempt(tmp_path: Path) -> None:
     dag = _dag(tmp_path)
     should_fail = True

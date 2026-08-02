@@ -42,6 +42,9 @@
   以 append-only receipt 落盘,成功节点继承,旧 attempt 不再需要删除即可安全重试。
   新增 `docs/recovery.md`,`kigumi docs recovery` 可读。
 - `kigumi runs show` 在 run 处于终态 `failed` 时打印非破坏性恢复路径。
+- 新增图命令 `kigumi recover RUN_ID TARGET`（`dag recover` 共享同一 parser/dispatch）：
+  可用显式 decision、reason 和可重复 evidence 对 terminal `failed` run 做 append-only recovery，
+  并报告返回的 `RecoveryReceipt`；命令不会自动 resume。
 
 ### 修复
 

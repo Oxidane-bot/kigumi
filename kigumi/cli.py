@@ -801,9 +801,10 @@ def _recovery_advice(run_id: str, target: str, attempt: int | str) -> str:
     """Explain the non-destructive terminal-failure recovery path."""
     return (
         "To retry with explicit decision:\n"
-        f"  dag.recover(run_id='{run_id}', target='{target}', from_attempt={attempt}, "
-        "decision='retry_after_external_check', reason='<explanation>')\n"
-        "Or programmatically via Dag.recover() - see docs/recovery.md"
+        f"  kigumi recover {run_id} {target} --attempt {attempt} "
+        "--decision retry_after_external_check --reason '<explanation>'\n"
+        f"Then explicitly run: kigumi resume {run_id}\n"
+        "Recovery does not resume automatically; see docs/cli.md and docs/recovery.md"
     )
 
 

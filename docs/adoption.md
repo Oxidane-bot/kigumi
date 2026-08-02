@@ -65,7 +65,7 @@ dag_entry = "nodes.graph:build_dag"  # 图命令的入口；不声明则只有�
 ```
 
 `dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
-`check` / `graph` / `profile` / `resume` / `retry-resolve` 要读内存里的图，而节点是靠
+`check` / `graph` / `profile` / `resume` / `retry-resolve` / `recover` 要读内存里的图，而节点是靠
 装饰器在 import 时注册的，所以这些命令必须 import 一个返回 `Dag` 的工厂函数。指向它，
 这组命令就能在项目里直接敲；不指向，其余命令照常工作。`kigumi init` 会生成
 `nodes/graph.py` 骨架并写好这个键。
@@ -568,7 +568,21 @@ cache not generated
 
 如果 run 已经是 terminal `failed`，而且你已经知道该失败可以安全再试或完成了外部
 修复，问题是“如何保留失败证据并只重跑失败分支”，不是“删掉 attempt 目录”。
-用 `Dag.recover()` 写入显式 decision、reason 和 evidence，再用同一个 run 的
+现在可以直接用图 CLI 写入显式 decision、reason 和 evidence；完整参数、退出码和两个
+decision 示例见 [CLI 参考中的 `recover`](cli.md)。CLI 只做 recovery，不会自动 resume：
+
+```bash
+kigumi recover run-0042 transcode \
+  --attempt 3 \
+  --decision retry_after_external_check \
+  --reason "已验证替换后的 ffmpeg 能处理失败场景" \
+  --evidence validation-report.md
+
+# 这是第二个、仍需操作员明确发起的动作：
+kigumi resume run-0042
+```
+
+在 Python 中也可以用同一个 `Dag.recover()` API 写入 receipt，再用同一个 run 的
 `Dag.resume()`：
 
 ```python
