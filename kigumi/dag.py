@@ -4654,6 +4654,7 @@ class _ImportResolution:
 
     paths: tuple[Path, ...] = ()
     ambiguous: bool = False
+    candidate: Path | None = None
 
 
 def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSnapshot:
@@ -4804,6 +4805,8 @@ class _StaticLibsAnalyzer:
                 resolution = self._resolve_absolute(tuple(alias.name.split(".")))
                 if resolution.ambiguous:
                     return resolution
+                if self._loaded_module_mismatch((alias.name,), resolution):
+                    return _ImportResolution(ambiguous=True)
                 if not resolution.paths and not self._known_external(alias.name.split(".")[0]):
                     return _ImportResolution(ambiguous=True)
                 paths.update(resolution.paths)
@@ -4833,15 +4836,52 @@ class _StaticLibsAnalyzer:
         base_resolution = self._resolve_absolute(module_parts)
         if base_resolution.ambiguous:
             return base_resolution
+        runtime_names = [statement.module] if statement.module else []
+        if self._loaded_module_mismatch(runtime_names, base_resolution):
+            return _ImportResolution(ambiguous=True)
         paths = set(base_resolution.paths)
         for alias in statement.names:
             child_resolution = self._resolve_absolute((*module_parts, alias.name))
             if child_resolution.ambiguous:
                 return child_resolution
+            if module_parts and self._loaded_module_mismatch(
+                (".".join((*module_parts, alias.name)),), child_resolution
+            ):
+                return _ImportResolution(ambiguous=True)
             paths.update(child_resolution.paths)
         if not paths and module_parts and not self._known_external(module_parts[0]):
             return _ImportResolution(ambiguous=True)
         return _ImportResolution(tuple(sorted(paths)))
+
+    def _loaded_module_mismatch(
+        self,
+        module_names: Iterable[str],
+        resolution: _ImportResolution,
+    ) -> bool:
+        """Reject a loaded configured module whose file differs from static resolution."""
+        static_paths = set(resolution.paths)
+        for module_name in module_names:
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            module_file = getattr(module, "__file__", None)
+            if not isinstance(module_file, str) or not module_file:
+                continue
+            try:
+                runtime_path = Path(module_file).resolve()
+            except (OSError, RuntimeError):
+                return True
+            if runtime_path in static_paths:
+                continue
+            if self._is_source_universe_path(runtime_path):
+                return True
+        return False
+
+    def _is_source_universe_path(self, path: Path) -> bool:
+        """Return whether a runtime module belongs to project or configured sources."""
+        return _path_is_within(path, self.project_root) or any(
+            _path_is_within(path, source_dir) for source_dir in self.source_dirs
+        )
 
     def _known_external(self, top_level: str) -> bool:
         """Accept only imports proven outside the configured project source universe."""
@@ -4853,17 +4893,22 @@ class _StaticLibsAnalyzer:
         module_file = getattr(module, "__file__", None)
         if not isinstance(module_file, str) or not module_file:
             return False
-        return not _path_is_within(Path(module_file), self.project_root)
+        return not self._is_source_universe_path(Path(module_file))
 
     def _resolve_absolute(self, parts: tuple[str, ...]) -> _ImportResolution:
         if not parts:
             return _ImportResolution()
         paths: set[Path] = set()
+        candidates: set[Path] = set()
         roots = (self.project_root, *self.source_dirs)
         for root in dict.fromkeys(roots):
             resolution = self._resolve_path(root.joinpath(*parts).resolve(), root)
             if resolution.ambiguous:
                 return resolution
+            if resolution.candidate is not None:
+                candidates.add(resolution.candidate)
+                if len(candidates) > 1:
+                    return _ImportResolution(ambiguous=True)
             paths.update(resolution.paths)
         return _ImportResolution(tuple(sorted(paths)))
 
@@ -4883,16 +4928,55 @@ class _StaticLibsAnalyzer:
             if init in self.source_files:
                 paths.add(init)
             parent = parent.parent
-        return _ImportResolution(tuple(sorted(paths)))
+        return _ImportResolution(tuple(sorted(paths)), candidate=matches[0])
+
+
+_REFLECTION_NAMES = frozenset(
+    {
+        "getattr",
+        "globals",
+        "locals",
+        "vars",
+        "__dict__",
+        "__getattribute__",
+        "__builtins__",
+    }
+)
+_REFLECTION_ATTRIBUTES = _REFLECTION_NAMES | {"modules"}
+
+
+def _module_uses_ambiguous_reflection(tree: ast.Module) -> bool:
+    """Reject common reflection because syntax-only analysis cannot prove its target."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _REFLECTION_NAMES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in _REFLECTION_ATTRIBUTES:
+            return True
+        if isinstance(node, ast.Import):
+            if any(
+                alias.name == "builtins" or alias.name.startswith("builtins.")
+                for alias in node.names
+            ):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "builtins":
+                return True
+            if node.module == "sys" and any(alias.name == "modules" for alias in node.names):
+                return True
+    # False positives only widen the cache input; a false negative can replay stale output.
+    return False
 
 
 def _module_imports_are_ambiguous(tree: ast.Module) -> bool:
     """Reject every import shape whose runtime reachability is not statically certain."""
+    if _module_uses_ambiguous_reflection(tree):
+        return True
     top_level_imports = {
         id(statement)
         for statement in tree.body
         if isinstance(statement, (ast.Import, ast.ImportFrom))
     }
+    dynamic_calls = set(_StaticLibsAnalyzer._DYNAMIC_CALLS)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             if id(node) not in top_level_imports:
@@ -4903,19 +4987,25 @@ def _module_imports_are_ambiguous(tree: ast.Module) -> bool:
                     for alias in node.names
                 ):
                     return True
-            elif node.module is not None and node.module == "importlib":
+            elif node.module is not None and (
+                node.module == "importlib" or node.module.startswith("importlib.")
+            ):
+                dynamic_calls.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
+                )
                 return True
+            elif node.module == "builtins":
+                dynamic_calls.update(
+                    alias.asname or alias.name for alias in node.names if alias.name == "__import__"
+                )
             if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
                 return True
-        if isinstance(node, ast.Call):
-            function = node.func
-            if isinstance(function, ast.Name) and function.id in _StaticLibsAnalyzer._DYNAMIC_CALLS:
-                return True
-            if (
-                isinstance(function, ast.Attribute)
-                and function.attr in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
-            ):
-                return True
+
+    for node in ast.walk(tree):
+        if _is_dynamic_callable_reference(node, dynamic_calls):
+            return True
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__getattr__":
@@ -4929,6 +5019,35 @@ def _module_imports_are_ambiguous(tree: ast.Module) -> bool:
             ):
                 return True
     return False
+
+
+def _is_dynamic_callable_reference(node: ast.AST, dynamic_calls: set[str]) -> bool:
+    """Recognize dynamic-callable references at any AST position."""
+    if isinstance(node, ast.Name):
+        return node.id in dynamic_calls
+    if isinstance(node, ast.Attribute):
+        return node.attr in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
+    if isinstance(node, ast.Call):
+        return (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and _static_string(node.args[1]) in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
+        )
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Attribute)
+            and node.value.attr == "__dict__"
+            and _static_string(node.slice) in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
+        )
+    return False
+
+
+def _static_string(node: ast.AST) -> str | None:
+    """Return a literal string value, keeping reflective lookup recognition syntax-only."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
 
 
 def _function_module_path(function: Callable[..., Any]) -> Path | None:

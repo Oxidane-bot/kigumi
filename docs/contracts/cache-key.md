@@ -38,10 +38,18 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 只纳入从节点函数所属
    模块出发、在 `config.source_paths` 内由静态 import 图可达的文件，并按传递闭包计算。
    静态分析只接受模块顶层、无歧义的 import；配置源码快照中任一文件语法残破、节点模块
-   无法定位或读取、可达模块无法解析，或发现条件/嵌套 import、`importlib`/动态导入调用、
-   star-import、模块级 `__getattr__`、相对导入无法解析、同一导入对应多个配置源码文件等
-   不确定情形时，该节点退回当前全文件 digest。无配置源码候选且已能证明属于标准库、内置
-   模块或项目外已加载模块的绝对 import 不纳入 `libs`。
+   无法定位或读取、可达模块无法解析，或发现条件/嵌套 import、`importlib` 及其子模块/动态导入调用、
+   已识别的动态可调用引用（无论是否调用，也不论赋值目标是简单名、walrus、属性、下标/容器、
+   解构或链式赋值）、动态导入别名、star-import、模块级 `__getattr__`、相对导入无法解析、同一导入对应多个
+   配置源码候选，或已加载模块的 `__file__` 偏离静态候选且仍落在项目/配置源码范围内等
+   不确定情形时，该节点退回当前全文件 digest。模块 AST 中出现常见反射原语
+   （`getattr`、`globals`、`locals`、`vars`、`__dict__`、`__getattribute__`、
+   `__builtins__`、显式 `builtins` 导入或模块注册表属性如 `sys.modules`）也一律回退，
+   即使反射与导入无关，或被查找的名称/键是计算出来的；不做常量传播。无配置源码候选且
+   已能证明属于标准库、内置模块或项目外已加载模块的绝对 import 不纳入 `libs`。
+   这种保守 false positive 是有意的：扩大输入可以多失效，但不能用未覆盖的反射路径复用
+   陈旧产物。该规则是源码 AST 分析边界，不宣称覆盖整个 Python 运行时或任意外部/native
+   代码。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
 6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=7, pydantic})`；其中
@@ -98,28 +106,34 @@ miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`C
 锁定测试：`tests/test_calling.py::test_cache_key_ignores_param_order`、
 `tests/test_calling.py::test_resolved_model_changes_cache_key_and_provenance`、
 `tests/test_calling.py::test_seed_changes_cache_key`、
-`tests/test_dag.py::test_docstring_does_not_change_cache_but_code_does`、
-`tests/test_dag.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema`、
-`tests/test_dag.py::test_key_components_lock_exact_label_set`、
+`tests/test_dag_cache_keys.py::test_docstring_does_not_change_cache_but_code_does`、
+`tests/test_dag_cache_keys.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema`、
+`tests/test_dag_cache_keys.py::test_key_components_lock_exact_label_set`、
 `tests/test_cache_policy.py::test_key_component_labels_add_only_external_when_supplied`、
 `tests/test_cache_policy.py::test_external_fingerprint_changes_owner_then_downstream_and_uses_exact_digest`、
 `tests/test_cache_policy.py::test_cache_policy_repeated_runs_and_plan`、
 `tests/test_cache_policy.py::test_map_item_cache_policy_executes_every_item_and_plan_reports_miss`、
 `tests/test_cache_policy.py::test_scan_explain_without_initial_carry_uses_run_key_components`、
-`tests/test_dag.py::test_kigumi_component_tracks_prompt_bytes_and_pydantic_version`、
-`tests/test_dag.py::test_explain_records_key_components_and_reports_one_changed_input`、
-`tests/test_dag.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal`、
-`tests/test_dag.py::test_scan_carry_from_content_invalidates_the_whole_chain`、
-`tests/test_dag.py::test_libs_hash_ignores_comment_and_docstring_edits`、
-`tests/test_dag.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text`、
+`tests/test_dag_cache_keys.py::test_kigumi_component_tracks_prompt_bytes_and_pydantic_version`、
+`tests/test_dag_plan_explain.py::test_explain_records_key_components_and_reports_one_changed_input`、
+`tests/test_dag_scan.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal`、
+`tests/test_dag_scan.py::test_scan_carry_from_content_invalidates_the_whole_chain`、
+`tests/test_dag_cache_keys.py::test_libs_hash_ignores_comment_and_docstring_edits`、
+`tests/test_dag_cache_keys.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text`、
 `tests/test_dag_cache_keys.py::test_libs_hash_follows_transitive_imports_per_node`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_ambiguous_imports`、
-`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_when_node_module_is_unknown`，以及
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_when_node_module_is_unknown`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_multiple_configured_candidates`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_loaded_runtime_module_mismatch`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_aliased_dynamic_imports`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_importlib_submodule_alias`、
+`tests/test_dag_cache_keys.py::test_libs_hash_tracks_ancestor_package_init`、
+`tests/test_dag_cache_keys.py::test_libs_hash_tracks_unresolved_import_inside_source_tree`，以及
 `tests/test_consumes.py` 中对投影键、输入隔离、plan/run/explain、动态节点、Subgraph、
 注册校验、错误上下文、标签集与 schema 的锁定测试。
 
 ```bash
-uv run pytest -q tests/test_consumes.py tests/test_calling.py::test_cache_key_ignores_param_order tests/test_calling.py::test_resolved_model_changes_cache_key_and_provenance tests/test_calling.py::test_seed_changes_cache_key tests/test_dag.py::test_docstring_does_not_change_cache_but_code_does tests/test_dag.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema tests/test_dag.py::test_key_components_lock_exact_label_set tests/test_cache_policy.py::test_key_component_labels_add_only_external_when_supplied tests/test_cache_policy.py::test_external_fingerprint_changes_owner_then_downstream_and_uses_exact_digest tests/test_cache_policy.py::test_cache_policy_repeated_runs_and_plan tests/test_cache_policy.py::test_map_item_cache_policy_executes_every_item_and_plan_reports_miss tests/test_cache_policy.py::test_scan_explain_without_initial_carry_uses_run_key_components tests/test_dag.py::test_kigumi_component_tracks_prompt_bytes_and_pydantic_version tests/test_dag.py::test_explain_records_key_components_and_reports_one_changed_input tests/test_dag.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal tests/test_dag.py::test_scan_carry_from_content_invalidates_the_whole_chain tests/test_dag.py::test_libs_hash_ignores_comment_and_docstring_edits tests/test_dag.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text
+uv run pytest -q tests/test_consumes.py tests/test_calling.py::test_cache_key_ignores_param_order tests/test_calling.py::test_resolved_model_changes_cache_key_and_provenance tests/test_calling.py::test_seed_changes_cache_key tests/test_dag_cache_keys.py::test_docstring_does_not_change_cache_but_code_does tests/test_dag_cache_keys.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema tests/test_dag_cache_keys.py::test_key_components_lock_exact_label_set tests/test_cache_policy.py::test_key_component_labels_add_only_external_when_supplied tests/test_cache_policy.py::test_external_fingerprint_changes_owner_then_downstream_and_uses_exact_digest tests/test_cache_policy.py::test_cache_policy_repeated_runs_and_plan tests/test_cache_policy.py::test_map_item_cache_policy_executes_every_item_and_plan_reports_miss tests/test_cache_policy.py::test_scan_explain_without_initial_carry_uses_run_key_components tests/test_dag_cache_keys.py::test_kigumi_component_tracks_prompt_bytes_and_pydantic_version tests/test_dag_plan_explain.py::test_explain_records_key_components_and_reports_one_changed_input tests/test_dag_scan.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal tests/test_dag_scan.py::test_scan_carry_from_content_invalidates_the_whole_chain tests/test_dag_cache_keys.py::test_libs_hash_ignores_comment_and_docstring_edits tests/test_dag_cache_keys.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_multiple_configured_candidates tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_loaded_runtime_module_mismatch tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_aliased_dynamic_imports tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_importlib_submodule_alias tests/test_dag_cache_keys.py::test_libs_hash_tracks_ancestor_package_init tests/test_dag_cache_keys.py::test_libs_hash_tracks_unresolved_import_inside_source_tree
 ```
 
 ## Change policy

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
 from dataclasses import replace
@@ -398,6 +399,352 @@ def test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text(tmp_path: Path) -
     assert dag.plan().nodes["work"] == "hit"
 
 
+def test_libs_hash_falls_back_for_multiple_configured_candidates(
+    tmp_path: Path,
+) -> None:
+    """教训 libs_multiple_candidates: 运行时选择不同源码时不得复用旧产物。"""
+    source_a = tmp_path / "src_a"
+    source_b = tmp_path / "src_b"
+    source_a.mkdir()
+    source_b.mkdir()
+    module_name = "libs_multiple_candidates_case"
+    node_name = "libs_multiple_candidates_node"
+    helper_a = source_a / f"{module_name}.py"
+    helper_b = source_b / f"{module_name}.py"
+    helper_a.write_text("VALUE = 'A'\n", encoding="utf-8")
+    helper_b.write_text("VALUE = 'B'\n", encoding="utf-8")
+    node_path = tmp_path / f"{node_name}.py"
+    node_path.write_text(
+        f"import {module_name} as helper\n\n"
+        "def run(inputs, ctx):\n"
+        "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+
+    original_sys_path = list(sys.path)
+    runtime_paths = {str(source_a), str(source_b)}
+
+    def load_node(runtime_first: Path, runtime_second: Path) -> Any:
+        sys.path[:] = [
+            str(runtime_first),
+            str(runtime_second),
+            *(entry for entry in original_sys_path if entry not in runtime_paths),
+        ]
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(node_name, None)
+        spec = importlib.util.spec_from_file_location(node_name, node_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[node_name] = module
+        spec.loader.exec_module(module)
+        assert Path(module.helper.__file__).resolve() == (runtime_first / f"{module_name}.py")
+        return module.run
+
+    try:
+        first_config = KigumiConfig(
+            project_root=tmp_path,
+            source_dirs=["src_a", "src_b"],
+        )
+        first_dag = Dag(first_config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        first_dag.node("work")(load_node(source_a, source_b))
+        first = first_dag.run()
+        assert first.cache_hits == []
+        assert first.artifacts["work"] == {"value": "A"}
+
+        second_config = KigumiConfig(
+            project_root=tmp_path,
+            source_dirs=["src_b", "src_a"],
+        )
+        second_dag = Dag(second_config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        second_dag.node("work")(load_node(source_b, source_a))
+        second = second_dag.run()
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"value": "B"}
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(node_name, None)
+
+
+def test_libs_hash_falls_back_for_loaded_runtime_module_mismatch(
+    tmp_path: Path,
+) -> None:
+    """教训 libs_loaded_runtime: 已加载模块路径偏离静态候选时不得漏算。"""
+    source = tmp_path / "src"
+    deep = source / "deep"
+    deep.mkdir(parents=True)
+    module_name = "libs_loaded_runtime_case"
+    node_name = "libs_loaded_runtime_node"
+    static_helper = source / f"{module_name}.py"
+    runtime_helper = deep / f"{module_name}.py"
+    static_helper.write_text("VALUE = 'static'\n", encoding="utf-8")
+    runtime_helper.write_text("VALUE = 'deep-runtime-v1'\n", encoding="utf-8")
+    node_path = source / f"{node_name}.py"
+    node_path.write_text(
+        f"import {module_name} as helper\n\n"
+        "def run(inputs, ctx):\n"
+        "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+
+    original_sys_path = list(sys.path)
+    try:
+        sys.path[:] = [
+            str(deep),
+            str(source),
+            *(entry for entry in original_sys_path if entry not in {str(deep), str(source)}),
+        ]
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(node_name, None)
+        module = importlib.import_module(node_name)
+        assert Path(module.helper.__file__).resolve() == runtime_helper.resolve()
+
+        config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+
+        first = dag.run()
+        assert first.cache_hits == []
+        assert first.artifacts["work"] == {"value": "deep-runtime-v1"}
+
+        runtime_helper.write_text("VALUE = 'deep-runtime-version-two'\n", encoding="utf-8")
+        sys.modules.pop(module_name, None)
+        reloaded = importlib.import_module(module_name)
+        assert Path(reloaded.__file__).resolve() == runtime_helper.resolve()
+        assert reloaded.VALUE == "deep-runtime-version-two"
+        module.helper = reloaded
+
+        second = dag.run()
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"value": "deep-runtime-version-two"}
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(node_name, None)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "dynamic_import", "dynamic_call"),
+    [
+        (
+            "builtins_alias",
+            "from builtins import __import__ as load\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "importlib_function_alias",
+            "from importlib import import_module as load\n",
+            "    helper = load('{package_name}.helper')\n",
+        ),
+        (
+            "importlib_module_alias",
+            "import importlib as il\n",
+            "    helper = il.import_module('{package_name}.helper')\n",
+        ),
+        (
+            "builtins_assignment_alias",
+            "load = __import__\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_module_assignment_alias",
+            "import builtins\nload = builtins.__import__\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_getattr_assignment_alias",
+            'import builtins\nload = getattr(builtins, "__import__")\n',
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_dict_assignment_alias",
+            'import builtins\nload = builtins.__dict__["__import__"]\n',
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_getattr_direct",
+            "import builtins\n",
+            "    helper = getattr(builtins, '__import__')('"
+            "{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_dict_direct",
+            "import builtins\n",
+            "    helper = builtins.__dict__['__import__']('"
+            "{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_getattr_computed_assignment_alias",
+            'import builtins\nname = "__" + "import__"\nload = getattr(builtins, name)\n',
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_dict_computed_assignment_alias",
+            'import builtins\nname = "__" + "import__"\nload = builtins.__dict__[name]\n',
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "globals_builtins_mapping_computed_assignment_alias",
+            'name = "__" + "import__"\n'
+            'builtins_map = globals()["__builtins__"]\n'
+            "load = builtins_map[name]\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "locals_builtins_mapping_computed_assignment_alias",
+            'name = "__" + "import__"\n'
+            'builtins_map = locals()["__builtins__"]\n'
+            "load = builtins_map[name]\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "vars_builtins_mapping_computed_assignment_alias",
+            'name = "__" + "import__"\n'
+            'builtins_map = vars()["__builtins__"]\n'
+            "load = builtins_map[name]\n",
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_getattr_computed_direct",
+            'import builtins\nname = "__" + "import__"\n',
+            "    helper = getattr(builtins, name)('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "builtins_getattribute_computed_direct",
+            'import builtins\nname = "__" + "import__"\n',
+            "    helper = builtins.__getattribute__(name)('"
+            "{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "sys_modules_builtins_dict_computed_alias",
+            'import sys\nname = "__" + "import__"\nload = sys.modules["builtins"].__dict__[name]\n',
+            "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
+        ),
+        (
+            "walrus_target",
+            "",
+            '    helper = (load := __import__)("{package_name}.helper", fromlist=["VALUE"])\n',
+        ),
+        (
+            "attribute_target",
+            "class Box:\n    pass\n\nbox = Box()\n",
+            "    box.load = __import__\n"
+            '    helper = box.load("{package_name}.helper", fromlist=["VALUE"])\n',
+        ),
+        (
+            "container_target",
+            "loaders = {}\n",
+            '    loaders["x"] = __import__\n'
+            '    helper = loaders["x"]("{package_name}.helper", fromlist=["VALUE"])\n',
+        ),
+    ],
+)
+def test_libs_hash_falls_back_for_aliased_dynamic_imports(
+    tmp_path: Path,
+    case_name: str,
+    dynamic_import: str,
+    dynamic_call: str,
+) -> None:
+    """教训 libs_dynamic_alias: 无法静态证明动态导入引用时必须退回全量源码。"""
+    package_name = f"libs_dynamic_alias_{case_name}"
+    source = tmp_path / "src" / package_name
+    source.mkdir(parents=True)
+    package_init = source / "__init__.py"
+    helper = source / "helper.py"
+    node_path = source / "node.py"
+    package_init.write_text("", encoding="utf-8")
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+    node_path.write_text(
+        dynamic_import
+        + "\n"
+        + "def run(inputs, ctx):\n"
+        + dynamic_call.format(package_name=package_name)
+        + "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+
+    original_sys_path = list(sys.path)
+    module_names = (package_name, f"{package_name}.node", f"{package_name}.helper")
+    try:
+        sys.path[:] = [
+            str(tmp_path / "src"),
+            *(entry for entry in original_sys_path if entry != str(tmp_path / "src")),
+        ]
+        for name in module_names:
+            sys.modules.pop(name, None)
+        module = importlib.import_module(f"{package_name}.node")
+
+        config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+
+        first = dag.run()
+        assert first.cache_hits == []
+        assert first.artifacts["work"] == {"value": 1}
+        loaded_helper = sys.modules[f"{package_name}.helper"]
+        assert Path(loaded_helper.__file__).resolve() == helper.resolve()
+
+        helper.write_text("VALUE = 222\n", encoding="utf-8")
+        sys.modules.pop(f"{package_name}.helper", None)
+        second = dag.run()
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"value": 222}
+    finally:
+        sys.path[:] = original_sys_path
+        for name in module_names:
+            sys.modules.pop(name, None)
+
+
+def test_libs_hash_falls_back_for_importlib_submodule_alias(tmp_path: Path) -> None:
+    """教训 libs_importlib_submodule: importlib 子模块别名也必须退回全量源码。"""
+    package_name = "libs_importlib_submodule_case"
+    source = tmp_path / "src" / package_name
+    source.mkdir(parents=True)
+    helper = source / "helper.py"
+    node_path = source / "node.py"
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+    node_path.write_text(
+        "import types\n"
+        "from importlib.util import find_spec as load\n\n"
+        "def run(inputs, ctx):\n"
+        f"    spec = load({f'{package_name}.helper'!r})\n"
+        "    helper = types.ModuleType(spec.name)\n"
+        "    spec.loader.exec_module(helper)\n"
+        "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+
+    original_sys_path = list(sys.path)
+    module_names = (package_name, f"{package_name}.node")
+    try:
+        sys.path[:] = [
+            str(tmp_path / "src"),
+            *(entry for entry in original_sys_path if entry != str(tmp_path / "src")),
+        ]
+        for name in module_names:
+            sys.modules.pop(name, None)
+        module = importlib.import_module(f"{package_name}.node")
+
+        config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+
+        first = dag.run()
+        assert first.cache_hits == []
+        assert first.artifacts["work"] == {"value": 1}
+
+        helper.write_text("VALUE = 222\n", encoding="utf-8")
+        second = dag.run()
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"value": 222}
+    finally:
+        sys.path[:] = original_sys_path
+        for name in (*module_names, f"{package_name}.helper"):
+            sys.modules.pop(name, None)
+
+
 def test_libs_hash_tracks_ancestor_package_init(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -581,6 +928,43 @@ def test_libs_hash_falls_back_for_ambiguous_imports(tmp_path: Path, ambiguous_so
         for name in list(sys.modules):
             if name == package or name.startswith(f"{package}."):
                 sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    "reflection_source",
+    [
+        "def run(inputs, ctx):\n    return getattr(inputs, 'value', None)\n",
+        "def run(inputs, ctx):\n    return globals()\n",
+        "def run(inputs, ctx):\n    return locals()\n",
+        "def run(inputs, ctx):\n    return vars(inputs)\n",
+        "def run(inputs, ctx):\n    return inputs.__dict__\n",
+        "def run(inputs, ctx):\n    return inputs.__getattribute__('value')\n",
+        "def run(inputs, ctx):\n    return __builtins__\n",
+        "import builtins\n\ndef run(inputs, ctx):\n    return builtins\n",
+        "from builtins import object\n\ndef run(inputs, ctx):\n    return object\n",
+        "import sys\n\ndef run(inputs, ctx):\n    return sys.modules\n",
+    ],
+    ids=[
+        "getattr",
+        "globals",
+        "locals",
+        "vars",
+        "dict",
+        "getattribute",
+        "builtins-name",
+        "builtins-import",
+        "builtins-from-import",
+        "sys-modules",
+    ],
+)
+def test_common_reflection_is_conservatively_ambiguous(reflection_source: str) -> None:
+    """教训 libs_reflection_boundary: 普通反射也必须宁可多失效而不漏算。"""
+    assert dag_module._module_imports_are_ambiguous(ast.parse(reflection_source))
+
+
+def test_dynamic_callable_reference_without_call_is_ambiguous() -> None:
+    """教训 libs_dynamic_reference: 引用动态原语本身就必须退回全量源码。"""
+    assert dag_module._module_imports_are_ambiguous(ast.parse("load = __import__\n"))
 
 
 def test_libs_hash_falls_back_when_node_module_is_unknown(

@@ -48,6 +48,15 @@
 
 ### 修复
 
+- `libs` 静态闭包遇到多个配置源码候选、已加载模块路径偏离静态候选、已识别的动态可调用引用
+  （`__import__`、`import_module`、`find_spec`、`eval`、`exec`、`compile`，无论是否实际调用、
+  也不论赋值目标是简单名、walrus、属性、下标/容器、解构或链式赋值），或模块 AST 中出现
+  常见反射原语（`getattr`、`globals`、`locals`、`vars`、`__dict__`、
+  `__getattribute__`、`__builtins__`、显式 `builtins` 导入、`importlib` 子模块导入及模块注册表访问如
+  `sys.modules`）时，现在统一退回精确全文件摘要，即使名称/键是计算出来的也不尝试常量传播；
+  保守的额外失效是有意的，避免动态 helper 编辑复用陈旧节点产物。这是
+  `CACHE_SCHEMA=7` 尚未发布期间的正确性修复，不新增缓存族轮换；该边界是源码 AST 分析，
+  不宣称覆盖任意外部/native 运行时代码。
 - `BudgetExceeded` 现从 map、scan 和 foreach 保持原类型传播;预算超限会中止后续 fan-out
   item,已在途 item 完成后再统一收尾,而不是把超限埋进聚合失败里。
 - `Budget` 预留估算现同时计入 prompt 与 `max_tokens`;此前声明 `max_tokens` 会让预留

@@ -257,9 +257,15 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   `consumes` 时，`upstream:<dep>` 改为投影视图摘要，节点也只收到该 canonical 视图；未声明边
   仍按完整上游产物入键和传值。
 - `libs` 从节点函数所属模块出发沿静态 import 图计算传递闭包；只有模块顶层且无歧义的
-  import 才缩小文件集合。语法残破、节点模块无法定位、条件/嵌套或动态 import、
-  `importlib`、star-import、模块级 `__getattr__`、相对导入无法解析或导入解析有多个
-  配置候选时，节点退回旧的全文件 digest，宁可多失效也不漏掉真实依赖。
+  import 才缩小文件集合。语法残破、节点模块无法定位、条件/嵌套或动态 import、动态
+  导入别名、已识别的动态可调用引用（无论是否调用，也不论赋值目标是简单名、walrus、属性、
+  下标/容器、解构或链式赋值）、`importlib` 及其子模块、star-import、模块级 `__getattr__`、相对导入无法解析、导入解析
+  有多个配置候选，或已加载模块的 `__file__` 偏离静态候选且仍在项目/配置源码范围内时，
+  节点退回旧的全文件 digest。模块 AST 中只要出现常见反射原语（`getattr`、`globals`、
+  `locals`、`vars`、`__dict__`、`__getattribute__`、`__builtins__`、显式
+  `builtins` 导入或模块注册表属性如 `sys.modules`），即使与导入无关或名称/键是计算出来的，
+  也退回精确全文件 digest；不做脆弱的常量传播。这里宁可多失效也不漏失效是刻意的安全边界，
+  但它仍只是源码 AST 分析，不是对整个 Python 运行时或任意外部/native 代码的证明。
 - `PromptSpec` 使用 selected-only L3 成分：base、固定 layer、selector/binding、实际 variant、
   material 与 rendered digest 入键，未选中 variant 内容不入该节点 key；完整候选 universe
   仍进入 run identity，因此可以安全复用同 selection 的 cache，却不能用漂移声明 resume。
