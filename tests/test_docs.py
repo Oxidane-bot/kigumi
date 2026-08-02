@@ -7,7 +7,8 @@ from urllib.parse import unquote, urlsplit
 import kigumi
 
 ROOT = Path(__file__).resolve().parents[1]
-STATUS_PATTERN = re.compile(r"^Status: Active \((\d+\.\d+\.\d+)\)$", re.MULTILINE)
+STATUS_LINE_PATTERN = r"Status: (?:Active \(\d+\.\d+\.\d+\)|Draft \(Unreleased\))"
+STATUS_PATTERN = re.compile(rf"^{STATUS_LINE_PATTERN}$", re.MULTILINE)
 MARKDOWN_LINK_PATTERN = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 
 # Keep exclusions explicit and justified. There are currently none: every public export is
@@ -33,8 +34,8 @@ def test_readme_status_versions_match_package_version() -> None:
         assert status_match.group(1) == kigumi.__version__
 
 
-def test_every_contract_has_a_versioned_status_and_index_entry() -> None:
-    """教训 contract_index:新增契约不能缺状态，也不能成为索引外的孤岛。"""
+def test_every_contract_has_a_recognized_status_and_index_entry() -> None:
+    """教训 contract_index:契约状态必须严格可识别，也不能成为索引外的孤岛。"""
     contracts_root = ROOT / "docs" / "contracts"
     index = (contracts_root / "README.md").read_text(encoding="utf-8")
     contract_files = sorted(
@@ -45,10 +46,12 @@ def test_every_contract_has_a_versioned_status_and_index_entry() -> None:
     for path in contract_files:
         text = path.read_text(encoding="utf-8")
         assert re.match(
-            r"^# .+\n\nStatus: Active \(\d+\.\d+\.\d+\)\n",
+            rf"^# .+\n\n{STATUS_LINE_PATTERN}\n",
             text,
-        ), f"{path.relative_to(ROOT)} must put a versioned Status directly below its H1"
-        assert STATUS_PATTERN.search(text) is not None
+        ), f"{path.relative_to(ROOT)} must put one recognized Status directly below its H1"
+        assert len(STATUS_PATTERN.findall(text)) == 1, (
+            f"{path.relative_to(ROOT)} must have exactly one recognized Status"
+        )
         assert f"]({path.name})" in index, f"{path.name} is missing from the contracts index"
 
 
