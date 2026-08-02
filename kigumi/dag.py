@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -29,6 +29,7 @@ from . import prompt, repair, store, views
 from ._declarations import (
     CachePolicy,
     ConsumeFunction,
+    ResourceRequest,
     external_fingerprint_digest,
     validate_cache_policy,
     validate_consumes,
@@ -93,6 +94,77 @@ _NO_ITEM = object()
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
 CACHE_SCHEMA = 6
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
+
+
+class _ResourcePool:
+    """Serialize multi-unit acquisition for one in-process semaphore."""
+
+    def __init__(self, name: str | None, limit: int) -> None:
+        self.name = name
+        self.semaphore = threading.Semaphore(limit)
+        self._acquire_lock = threading.Lock()
+
+    def acquire(self, units: int, deadline: float | None) -> None:
+        acquired = 0
+        # Holding this lock while acquiring all units prevents two callers from
+        # each taking part of a multi-unit request and waiting on one another.
+        with self._acquire_lock:
+            try:
+                while acquired < units:
+                    if deadline is None:
+                        available = self.semaphore.acquire()
+                    else:
+                        available = self.semaphore.acquire(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                    if not available:
+                        raise TimeoutError(f"Timed out waiting for resource {self.name!r}")
+                    acquired += 1
+            except BaseException:
+                for _ in range(acquired):
+                    self.semaphore.release()
+                raise
+
+    def release(self, units: int) -> None:
+        for _ in range(units):
+            self.semaphore.release()
+
+
+class _PermitPlane:
+    """One in-process permit plane shared by regular nodes and dynamic items."""
+
+    def __init__(
+        self,
+        limits: Mapping[str | None, int],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._pools = {name: _ResourcePool(name, limit) for name, limit in limits.items()}
+        self._timeout_seconds = timeout_seconds
+
+    @contextmanager
+    def acquire(self, requests: tuple[ResourceRequest, ...]) -> Any:
+        grouped: dict[str | None, int] = {}
+        effective_requests = requests or (None,)
+        for request in effective_requests:
+            name = request.name if isinstance(request, ResourceRequest) else request
+            units = request.units if isinstance(request, ResourceRequest) else 1
+            grouped[name] = grouped.get(name, 0) + units
+        ordered = sorted(grouped, key=lambda name: "" if name is None else name)
+        acquired: list[tuple[_ResourcePool, int]] = []
+        deadline = (
+            time.monotonic() + self._timeout_seconds if self._timeout_seconds is not None else None
+        )
+        try:
+            for name in ordered:
+                pool = self._pools[name]
+                units = grouped[name]
+                pool.acquire(units, deadline)
+                acquired.append((pool, units))
+            yield
+        finally:
+            for pool, units in reversed(acquired):
+                pool.release(units)
 
 
 def _kigumi_key_inputs() -> dict[str, Any]:
@@ -228,6 +300,7 @@ class _Node:
     files: tuple[Path, ...]
     params: dict[str, Any]
     consumes: dict[str, ConsumeFunction]
+    resources: tuple[ResourceRequest, ...] = ()
     items_from: tuple[str, str] | None = None
     key_fn: Callable[[Any], str] | None = None
     files_fn: Callable[[Any], Iterable[str | Path]] | None = None
@@ -421,6 +494,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[NodeFunction], NodeFunction]:
         """Register a deterministic node without sharing registry state with other DAGs."""
@@ -436,6 +510,7 @@ class Dag:
         node_params = copy.deepcopy(params) if params is not None else {}
         node_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        node_resources = _validate_resources(resources, "Node")
         retry_policy = _validate_retry_policy(retry)
 
         def register(function: NodeFunction) -> NodeFunction:
@@ -447,6 +522,7 @@ class Dag:
                 prompt_specs=node_prompt_specs,
                 files=node_files,
                 params=node_params,
+                resources=node_resources,
                 consumes=consumes,
                 cache=node_cache,
                 external_fingerprint_digest=fingerprint_digest,
@@ -470,6 +546,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[Callable[[dict[str, dict[str, Any]], AgentBuildContext], AgentTask]], Any]:
         """Register an external-agent executor on the ordinary node scheduler."""
@@ -479,6 +556,7 @@ class Dag:
         node_cache = validate_cache_policy(cache)
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
+        node_resources = _validate_resources(resources, "Agent node")
         retry_policy = _validate_retry_policy(retry)
         node_prompt_specs = validate_prompt_specs(
             tuple(prompt_specs),
@@ -507,6 +585,7 @@ class Dag:
                 prompt_specs=node_prompt_specs,
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
+                resources=node_resources,
                 consumes=consumes,
                 cache=node_cache,
                 external_fingerprint_digest=external_fingerprint_digest(identity),
@@ -541,6 +620,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[Any], Any]:
         """Register a serial carry-dependent scan whose items execute through an Agent."""
@@ -552,6 +632,7 @@ class Dag:
             raise ValueError(f"Node {name!r} is already registered")
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
+        node_resources = _validate_resources(resources, "Agent scan")
         node_cache = validate_cache_policy(cache)
         retry_policy = _validate_retry_policy(retry)
         node_prompt_specs = validate_prompt_specs(
@@ -585,6 +666,7 @@ class Dag:
                 prompt_specs=node_prompt_specs,
                 files=tuple(Path(path) for path in files),
                 params=copy.deepcopy(params) if params is not None else {},
+                resources=node_resources,
                 consumes=consumes,
                 items_from=items_from,
                 key_fn=key_fn,
@@ -622,6 +704,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[MapFunction], MapFunction]:
         """Register a runtime-data fan-out node while retaining one static graph vertex.
@@ -641,6 +724,7 @@ class Dag:
         map_params = copy.deepcopy(params) if params is not None else {}
         map_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        map_resources = _validate_resources(resources, "Map node")
         retry_policy = _validate_retry_policy(retry)
 
         def register(function: MapFunction) -> MapFunction:
@@ -652,6 +736,7 @@ class Dag:
                 prompt_specs=map_prompt_specs,
                 files=map_files,
                 params=map_params,
+                resources=map_resources,
                 consumes=consumes,
                 items_from=(source_name, artifact_key),
                 key_fn=key_fn,
@@ -683,6 +768,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[ScanFunction], ScanFunction]:
         """Register a runtime list whose items form one carry-dependent serial chain."""
@@ -704,6 +790,7 @@ class Dag:
         scan_params = copy.deepcopy(params) if params is not None else {}
         scan_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        scan_resources = _validate_resources(resources, "Scan node")
         retry_policy = _validate_retry_policy(retry)
 
         def register(function: ScanFunction) -> ScanFunction:
@@ -715,6 +802,7 @@ class Dag:
                 prompt_specs=scan_prompt_specs,
                 files=scan_files,
                 params=scan_params,
+                resources=scan_resources,
                 consumes=consumes,
                 items_from=(source_name, artifact_key),
                 key_fn=key_fn,
@@ -746,6 +834,7 @@ class Dag:
         consumes: Mapping[str, ConsumeFunction] | None = None,
         cache: CachePolicy = "auto",
         external_fingerprint: Any | None = None,
+        resources: Iterable[ResourceRequest] | None = None,
         retry: RetryPolicy | None = None,
     ) -> Callable[[NodeFunction], NodeFunction]:
         """Register one node per item, fixing names, dependencies, and params immediately."""
@@ -759,6 +848,7 @@ class Dag:
         fixed_params = copy.deepcopy(params) if params is not None else {}
         fixed_cache = validate_cache_policy(cache)
         fingerprint_digest = external_fingerprint_digest(external_fingerprint)
+        fixed_resources = _validate_resources(resources, "Foreach node")
         retry_policy = _validate_retry_policy(retry)
         fixed_items: list[tuple[str, tuple[str, ...], tuple[Path, ...], dict[str, Any]]] = []
         for index, raw_item in enumerate(items):
@@ -790,6 +880,7 @@ class Dag:
                     prompt_specs=fixed_prompt_specs,
                     files=item_files,
                     params=item_params,
+                    resources=fixed_resources,
                     consumes=consumes,
                     cache=fixed_cache,
                     external_fingerprint_digest=fingerprint_digest,
@@ -809,6 +900,7 @@ class Dag:
         prompt_specs: tuple[PromptSpec, ...],
         files: tuple[Path, ...],
         params: dict[str, Any],
+        resources: tuple[ResourceRequest, ...] = (),
         consumes: Mapping[str, ConsumeFunction] | None = None,
         items_from: tuple[str, str] | None = None,
         key_fn: Callable[[Any], str] | None = None,
@@ -861,6 +953,7 @@ class Dag:
             files=files,
             params=params,
             consumes=projections,
+            resources=resources,
             items_from=items_from,
             key_fn=key_fn,
             files_fn=files_fn,
@@ -1019,12 +1112,65 @@ class Dag:
         self._subgraphs[mounted_namespace] = mounted_description
         return output_bindings
 
+    def _build_permit_plane(
+        self,
+        order: Iterable[str],
+        *,
+        workers: int,
+        resource_limits: Mapping[str | None, int] | None,
+    ) -> tuple[_PermitPlane, int]:
+        """Build one run-local plane and enough workers to serve its declared limits."""
+        if resource_limits is not None and not isinstance(resource_limits, Mapping):
+            raise TypeError("resource_limits must be a mapping or None")
+
+        configured: dict[str | None, int] = {}
+        if resource_limits is not None:
+            for name, limit in resource_limits.items():
+                if name is not None and not isinstance(name, str):
+                    raise TypeError("resource_limits keys must be strings or None")
+                if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+                    raise ValueError(f"resource_limits[{name!r}] must be a positive integer")
+                configured[name] = limit
+
+        used_names: set[str | None] = set()
+        node_requests: dict[str, dict[str | None, int]] = {}
+        for name in order:
+            node = self._nodes[name]
+            grouped: dict[str | None, int] = {}
+            if node.resources:
+                for request in node.resources:
+                    grouped[request.name] = grouped.get(request.name, 0) + request.units
+                used_names.update(grouped)
+            else:
+                grouped[None] = 1
+                used_names.add(None)
+            node_requests[name] = grouped
+
+        limits = {name: configured.get(name, workers) for name in used_names}
+        for node_name, grouped in node_requests.items():
+            for name, units in grouped.items():
+                limit = limits[name]
+                if units > limit:
+                    raise ValueError(
+                        f"Node {node_name!r} requests {units} units of resource {name!r}, "
+                        f"but its limit is {limit}"
+                    )
+
+        # With no resource_limits, workers retains its old global ceiling. When
+        # limits are supplied, distinct pools may run in parallel, so the shared
+        # executor needs the sum of their possible slots.
+        execution_workers = (
+            workers if resource_limits is None else max(workers, sum(limits.values(), 0))
+        )
+        return _PermitPlane(limits), execution_workers
+
     def run(
         self,
         targets: Iterable[str] | None = None,
         run_id: str | None = None,
         force: Iterable[str] = (),
         workers: int = 1,
+        resource_limits: Mapping[str | None, int] | None = None,
     ) -> RunResult:
         """Run a topological target closure and persist every completed node artifact."""
         if workers < 1:
@@ -1049,6 +1195,11 @@ class Dag:
         if not requested_force and existing_manifest is not None:
             requested_force = tuple(existing_manifest.get("force", ()))
         order = self._topological_order(selected)
+        permit_plane, execution_workers = self._build_permit_plane(
+            order,
+            workers=workers,
+            resource_limits=resource_limits,
+        )
         current_run_id = (
             run_id if run_id is not None else store.allocate_run_id(self.config.artifacts_path)
         )
@@ -1207,6 +1358,8 @@ class Dag:
                             current_run_id,
                             libs_hash,
                             workers,
+                            permit_plane=permit_plane,
+                            executor=execution_executor,
                             forced_all=node.name in forced_nodes,
                             forced_items=forced_items.get(node.name, set()),
                             envelope=envelope,
@@ -1297,7 +1450,7 @@ class Dag:
                                     if node.executor not in {"pure", "agent"}
                                     else nullcontext()
                                 )
-                                with boundary:
+                                with permit_plane.acquire(node.resources), boundary:
                                     if node.executor == "agent":
                                         build_context = AgentBuildContext(
                                             node.params,
@@ -1544,12 +1697,46 @@ class Dag:
 
         in_flight: dict[Future[tuple[str, str | None]], str] = {}
         ready = classify_ready()
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=execution_workers) as execution_executor:
             while ready or in_flight:
-                while ready and len(in_flight) < workers and not failures:
-                    node_name = ready.pop(0)
-                    states[node_name] = "running"
-                    in_flight[executor.submit(execute, node_name)] = node_name
+                if not failures:
+                    # Dynamic nodes run on the scheduler thread and submit their
+                    # items to this same executor. That leaves every executor
+                    # worker available to service map items, avoiding nested
+                    # pools and the worker-squared thread explosion.
+                    index = 0
+                    while index < len(ready) and len(in_flight) < execution_workers:
+                        node_name = ready[index]
+                        if self._nodes[node_name].items_from is not None:
+                            index += 1
+                            continue
+                        ready.pop(index)
+                        states[node_name] = "running"
+                        in_flight[execution_executor.submit(execute, node_name)] = node_name
+
+                    dynamic_index = next(
+                        (
+                            index
+                            for index, node_name in enumerate(ready)
+                            if self._nodes[node_name].items_from is not None
+                        ),
+                        None,
+                    )
+                    if dynamic_index is not None:
+                        node_name = ready.pop(dynamic_index)
+                        states[node_name] = "running"
+                        try:
+                            _, outcome = execute(node_name)
+                        except BaseException as error:
+                            states[node_name] = "failed"
+                            failures[node_name] = error
+                        else:
+                            assert outcome is not None
+                            states[node_name] = outcome
+                        if not failures:
+                            ready.extend(name for name in classify_ready() if name not in ready)
+                        continue
+
                 if not in_flight:
                     break
                 done, _ = wait(in_flight, return_when="FIRST_COMPLETED")
@@ -1622,7 +1809,13 @@ class Dag:
             run_status,
         )
 
-    def resume(self, run_id: str, *, workers: int = 1) -> RunResult:
+    def resume(
+        self,
+        run_id: str,
+        *,
+        workers: int = 1,
+        resource_limits: Mapping[str | None, int] | None = None,
+    ) -> RunResult:
         """Resume one schema-2 run under its originally bound declaration."""
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
         try:
@@ -2897,6 +3090,8 @@ class Dag:
         libs_hash: str,
         workers: int,
         *,
+        permit_plane: _PermitPlane,
+        executor: ThreadPoolExecutor,
         forced_all: bool,
         forced_items: set[str],
         envelope: ExecutionEnvelope,
@@ -3046,7 +3241,7 @@ class Dag:
                                 else nullcontext()
                             )
                             try:
-                                with boundary:
+                                with permit_plane.acquire(node.resources), boundary:
                                     artifact = node.function(  # type: ignore[call-arg]
                                         item,
                                         copy.deepcopy(shared_inputs),
@@ -3137,11 +3332,10 @@ class Dag:
         if len(entries) <= 1 or workers == 1:
             outcomes = [execute_item(item_id, item) for item_id, item in entries]
         else:
-            with ThreadPoolExecutor(max_workers=min(workers, len(entries))) as executor:
-                futures = [
-                    executor.submit(execute_item, item_id, item) for item_id, item in entries
-                ]
-                outcomes = [future.result() for future in futures]
+            # Items share the run-wide executor rather than opening a nested pool:
+            # the permit plane, not a private worker count, is what bounds them.
+            futures = [executor.submit(execute_item, item_id, item) for item_id, item in entries]
+            outcomes = [future.result() for future in futures]
 
         completed: dict[str, dict[str, Any]] = {}
         cache_keys: list[str] = []
@@ -3231,6 +3425,8 @@ class Dag:
         libs_hash: str,
         workers: int,
         *,
+        permit_plane: _PermitPlane,
+        executor: ThreadPoolExecutor,
         forced_all: bool,
         forced_items: set[str],
         envelope: ExecutionEnvelope,
@@ -3238,7 +3434,7 @@ class Dag:
         prompt_snapshot: PromptCatalogSnapshot,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
-        del workers  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
+        del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
         assert node.items_from is not None
         source_name, _ = node.items_from
         entries = self._map_entries(node, inputs)
@@ -3411,7 +3607,7 @@ class Dag:
                                 else nullcontext()
                             )
                             try:
-                                with boundary:
+                                with permit_plane.acquire(node.resources), boundary:
                                     if node.executor == "agent":
                                         build_context = AgentBuildContext(
                                             node.params,
@@ -4274,3 +4470,19 @@ def _validate_retry_policy(retry: RetryPolicy | None) -> RetryPolicy | None:
     if retry is not None and not isinstance(retry, RetryPolicy):
         raise TypeError("retry must be RetryPolicy or None")
     return retry
+
+
+def _validate_resources(
+    resources: Iterable[ResourceRequest] | None,
+    kind: str,
+) -> tuple[ResourceRequest, ...]:
+    """Freeze and validate the resource declarations attached to one node."""
+    if resources is None:
+        return ()
+    try:
+        frozen = tuple(resources)
+    except TypeError as error:
+        raise TypeError(f"{kind} resources must be an iterable of ResourceRequest") from error
+    if not all(isinstance(resource, ResourceRequest) for resource in frozen):
+        raise TypeError(f"{kind} resources must contain only ResourceRequest values")
+    return frozen

@@ -45,6 +45,10 @@
 
 ### DAG、重试与存储
 
+- `ResourceRequest(name: str, units: int = 1, scope: str = "global") -> None`
+  （`kigumi._declarations`，顶层导出）：声明节点运行时容量需求（GPU、供应商配额、CPU 槽位）。
+  节点用 `resources=(ResourceRequest("gpu"),)` 声明，`dag.run(resource_limits={"gpu": 1})`
+  给出运行期上限；未声明资源的节点走 `None` 默认池。多资源按名字确定序获取，避免互等。
 - `class CacheIntegrityError(RuntimeError)`（`kigumi.errors`，顶层导出）：缓存条目存在但不可
   安全复用（JSON 撕裂、响应为空、`response_sha256` 不匹配）。损坏不再退化成 miss，因此不会
   静默重新计费；先核对该条目再决定是删除重算还是修复。`CacheLookup`（`kigumi.store`）是缓存

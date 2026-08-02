@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
 from .artifacts import canonical_json, sha
 
 CachePolicy: TypeAlias = Literal["auto", "refresh", "off"]
 ConsumeFunction: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ResourceRequest:
+    """One named runtime capacity requested by a node execution."""
+
+    name: str
+    units: int = 1
+    scope: str = "global"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("ResourceRequest.name must be a non-empty string")
+        if isinstance(self.units, bool) or not isinstance(self.units, int) or self.units < 1:
+            raise ValueError("ResourceRequest.units must be a positive integer")
+        if self.scope not in {"host", "account", "global"}:
+            raise ValueError("ResourceRequest.scope must be 'host', 'account', or 'global'")
 
 
 def validate_cache_policy(value: Any) -> CachePolicy:

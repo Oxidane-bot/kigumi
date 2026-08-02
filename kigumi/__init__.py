@@ -25,7 +25,7 @@ brief, capabilities (full "I need X" index), adoption (narrative guide), api
 (signatures and failure handling), cli, contracts (promises), design, changelog.
 """
 
-from ._declarations import CachePolicy
+from ._declarations import CachePolicy, ResourceRequest
 from ._runstate import StateIntegrityError
 from ._version import __version__
 from .agents import (
@@ -202,6 +202,7 @@ __all__ = [
     "RetryPolicy",
     "RetrySchedule",
     "Response",
+    "ResourceRequest",
     "ResolvedPrompt",
     "RunResult",
     "StateIntegrityError",

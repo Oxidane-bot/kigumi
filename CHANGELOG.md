@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### 重大变更
+
+- map 与 parent 节点现共享同一并发平面,嵌套 map 线程池已移除:既有图的实际并发度可能变化。
+  此前每个 map 在调度器 worker 里再开一个 `workers` 大小的池,总线程数是 workers 的平方。
+
+### 新增
+
+- `ResourceRequest` 与 `Dag.run(resource_limits=...)`:按节点声明资源(GPU、供应商配额等),
+  运行时分别限流;未声明的节点走 `None` 默认池。多资源按名字确定序获取,不会互等。
+
 ### 修复
 
 - 副作用边界改按 executor 类型安装,不再要求节点声明 `retry`:此前未声明重试策略的节点

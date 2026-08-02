@@ -47,6 +47,7 @@ adoption.md 的"设计边界"一节。
 | 数据驱动扇出(项独立) | `@dag.map` |
 | 线性扇出带 carry | `@dag.scan` |
 | 注册期固化的清单 | `@dag.foreach` |
+| 按节点限制 GPU、API 或 CPU 并发 | `ResourceRequest` / `dag.run(resource_limits=...)` |
 | 静态可复用子图 | `Subgraph` / `dag.mount` |
 | 只消费上游局部(缩小失效面) | `consumes=` |
 | 强制重算某节点 | `dag.run(force=[...])` |
