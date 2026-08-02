@@ -97,6 +97,20 @@ def node(inputs, ctx):
     assert findings[2].waiver_reason == "fixture fixture"
 
 
+def test_raw_io_context_exempts_only_controlled_read_methods() -> None:
+    """教训 context_method_gap: 上下文不存在的 open 不能成为 raw-I/O 后门。"""
+    source = """
+def node(inputs, context):
+    context.open("secret.txt").read()
+    context.read_text("declared.txt")
+    context.read_bytes("declared.bin")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/sample.py"), context_name="context")
+
+    assert [(finding.lineno, finding.waived) for finding in findings] == [(3, False)]
+
+
 def test_raw_io_path_guard_checks_only_decorated_top_level_node_bodies(tmp_path: Path) -> None:
     """教训 raw_io_scope: 项目级守卫不能把合法 helper 读取误判成节点违规。"""
     source = tmp_path / "nodes"

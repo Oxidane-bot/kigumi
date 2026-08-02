@@ -60,6 +60,8 @@
 - 修复 `kigumi runs show` 的 recovery 建议：参数改为 shell-safe 命令渲染，要求在 `recover` 与
   随后的 `resume` 两条命令中都补回构造该 run 时使用的同一组实际重复
   `--graph-arg KEY=VALUE`（放在 `--` 之前，以支持 option-like ID）；不涉及 `CACHE_SCHEMA`。
+- 收紧节点 raw-I/O 守卫：只有 `ctx.read_text()` / `ctx.read_bytes()` 是受控读取，`ctx.open()`
+  现在会被报告为违规。
 - `BudgetExceeded` 现从 map、scan 和 foreach 保持原类型传播;预算超限会中止后续 fan-out
   item,已在途 item 完成后再统一收尾,而不是把超限埋进聚合失败里。
 - `Budget` 预留估算现同时计入 prompt 与 `max_tokens`;此前声明 `max_tokens` 会让预留

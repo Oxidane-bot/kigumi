@@ -226,12 +226,14 @@ class _RawIOVisitor(ast.NodeVisitor):
             return node.func.id == "open"
         if not isinstance(node.func, ast.Attribute):
             return False
-        # path.open() 与 read_text/read_bytes 是同一类绕过;误报(如库对象的
-        # open 方法)可用 raw-io-ok 豁免。
+        # 只有上下文对象的受控读取方法绕过 raw-I/O finding；其它对象方法，包含
+        # context.open()，都仍是直接读取，误报可用 raw-io-ok 豁免。
         if node.func.attr not in {"open", "read_text", "read_bytes"}:
             return False
         return not (
-            isinstance(node.func.value, ast.Name) and node.func.value.id == self.context_name
+            isinstance(node.func.value, ast.Name)
+            and node.func.value.id == self.context_name
+            and node.func.attr in {"read_text", "read_bytes"}
         )
 
 
