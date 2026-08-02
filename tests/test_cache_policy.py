@@ -240,8 +240,10 @@ def test_key_component_labels_add_only_external_when_supplied(tmp_path: Path) ->
     def external(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
         return {"value": "external"}
 
-    plain_components = dag._key_components(dag._nodes["plain"], {}, dag._libs_hash())
-    external_components = dag._key_components(dag._nodes["external"], {}, dag._libs_hash())
+    plain_node = dag._nodes["plain"]
+    external_node = dag._nodes["external"]
+    plain_components = dag._key_components(plain_node, {}, dag._libs_hash(plain_node))
+    external_components = dag._key_components(external_node, {}, dag._libs_hash(external_node))
 
     assert set(plain_components) == {"source", "libs", "params", "kigumi"}
     assert set(external_components) == {*plain_components, "external"}

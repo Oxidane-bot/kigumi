@@ -6,6 +6,8 @@ Status: Active (0.9.0)
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
 > 硬切，不迁移 0.7.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
+> 本次 `libs` 按节点静态 import 闭包细化，沿用这个尚未发布的 7 轮换，不再把
+> `CACHE_SCHEMA` 递增为 8。
 
 ## Purpose
 
@@ -33,14 +35,22 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 3. `items_from` 与 scan 的 `carry_from` 源不入共享 `upstream`；`item` 按内容入键；`carry` 只按
    本项实收内容入键，`carry_fn` 源码不入键。消费投影的源码同样不入键；节点函数收到 canonical
    JSON round-trip 后的投影视图而非完整上游产物，未声明投影的依赖输入形态不变。
-4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 的语法残破文件退回原文。
+4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 只纳入从节点函数所属
+   模块出发、在 `config.source_paths` 内由静态 import 图可达的文件，并按传递闭包计算。
+   静态分析只接受模块顶层、无歧义的 import；配置源码快照中任一文件语法残破、节点模块
+   无法定位或读取、可达模块无法解析，或发现条件/嵌套 import、`importlib`/动态导入调用、
+   star-import、模块级 `__getattr__`、相对导入无法解析、同一导入对应多个配置源码文件等
+   不确定情形时，该节点退回当前全文件 digest。无配置源码候选且已能证明属于标准库、内置
+   模块或项目外已加载模块的绝对 import 不纳入 `libs`。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
 6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=7, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
-7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时必须递增
+7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时原则上必须递增
    `CACHE_SCHEMA`；生成字节模块集合（当前为 `prompt.py`、`repair.py`）成员变化视同键成分变化。
+   若当前值只是尚未发布的 Unreleased 轮换，变更必须搭载该轮换，不得为同一批未发布缓存
+   再造一次递增。
 8. 键成分任何变化等于全项目缓存换族，必须记入 `CHANGELOG.md`。0.2.0 将
    `CACHE_SCHEMA` 从 1 升至 2，是为可选 external 成分进行的有意完整 L3 换族。
    0.3.0 将 schema 从 2 升至 3，是为普通依赖边的可选消费投影进行的有意完整换族。
@@ -49,7 +59,8 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    envelope 升至 schema 3，以引入声明式 Prompt resolution、selected-only L3 成分和
    hash-bound origin。0.8.0 从 5 升至 6，以引入 `agent_schema=3` 的 session attachment
    与 Agent scan executor 语义。Unreleased 从 6 升至 7，以绑定 managed request 的
-   attachment content hash、typed message digest 和 response schema identity。
+   attachment content hash、typed message digest 和 response schema identity；本次 `libs`
+   细化搭载同一未发布的 7 轮换，不新增第 8 次全项目换族。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash
@@ -64,9 +75,11 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 
 ## Failure behavior
 
-键成分不同会得到不同摘要并按缓存未命中处理；空、撕裂或无效缓存按 miss 重算。未在
-`CHANGELOG.md` 记录的键成分演进不得进入发布件。非法 cache 值或不可 canonical JSON
-序列化的 external fingerprint 在注册期抛 `ValueError`。
+键成分不同会得到不同摘要并按缓存未命中处理；空、撕裂或无效缓存按 miss 重算。`libs`
+静态分析遇到上述无法证明的情况时必须使用当前全文件 digest，不得猜测较小闭包；全文件
+digest 仍沿用 `_module_code_text`，语法残破文件使用原文。未在 `CHANGELOG.md` 记录的键
+成分演进不得进入发布件。非法 cache 值或不可 canonical JSON 序列化的 external fingerprint
+在注册期抛 `ValueError`。
 
 ## Affected surfaces
 
@@ -74,6 +87,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 - `kigumi/_declarations.py:9-27`
 - kigumi/dag.py 的 `CACHE_SCHEMA` 与 `_kigumi_key_inputs`
 - kigumi/dag.py 的 `Dag._key_components` 与 `Dag._libs_hash`
+- kigumi/dag.py 的 per-node 静态 import 闭包与全文件 fallback
 - kigumi/dag.py 的 `_module_code_text`
 - `kigumi/artifacts.py:15-23`
 
@@ -95,7 +109,10 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 `tests/test_dag.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal`、
 `tests/test_dag.py::test_scan_carry_from_content_invalidates_the_whole_chain`、
 `tests/test_dag.py::test_libs_hash_ignores_comment_and_docstring_edits`、
-`tests/test_dag.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text`，以及
+`tests/test_dag.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text`、
+`tests/test_dag_cache_keys.py::test_libs_hash_follows_transitive_imports_per_node`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_ambiguous_imports`、
+`tests/test_dag_cache_keys.py::test_libs_hash_falls_back_when_node_module_is_unknown`，以及
 `tests/test_consumes.py` 中对投影键、输入隔离、plan/run/explain、动态节点、Subgraph、
 注册校验、错误上下文、标签集与 schema 的锁定测试。
 

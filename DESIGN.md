@@ -242,13 +242,17 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   provider/Pi side effect 前写 schema-2 receipt；成功先写 schema-2 candidate，
   因而 crash-after-success 可提交而不重请求。side effect 后无 terminal receipt 时必须人工
   `retry-resolve`，不假装 exactly-once。
-- 缓存键 = 节点源码哈希 + helper/库哈希(source_dirs)+ 上游产物哈希
+- 缓存键 = 节点源码哈希 + 节点静态可达的 helper/库哈希(source_dirs)+ 上游产物哈希
   + prompt 文件哈希 + 参数 + **kigumi prompt 相关模块哈希 + pydantic 版本**
   (库现在拥有 prompt 字节的生成权:inject 围栏/格式段/措辞常量变了,
   节点键必须失效,否则升级库后回放陈旧渲染的产物)。声明外部状态时只把
   `sha(external_fingerprint)` 作为可选 `external` 成分，原值不落 sidecar。普通依赖边声明
   `consumes` 时，`upstream:<dep>` 改为投影视图摘要，节点也只收到该 canonical 视图；未声明边
   仍按完整上游产物入键和传值。
+- `libs` 从节点函数所属模块出发沿静态 import 图计算传递闭包；只有模块顶层且无歧义的
+  import 才缩小文件集合。语法残破、节点模块无法定位、条件/嵌套或动态 import、
+  `importlib`、star-import、模块级 `__getattr__`、相对导入无法解析或导入解析有多个
+  配置候选时，节点退回旧的全文件 digest，宁可多失效也不漏掉真实依赖。
 - `PromptSpec` 使用 selected-only L3 成分：base、固定 layer、selector/binding、实际 variant、
   material 与 rendered digest 入键，未选中 variant 内容不入该节点 key；完整候选 universe
   仍进入 run identity，因此可以安全复用同 selection 的 cache，却不能用漂移声明 resume。

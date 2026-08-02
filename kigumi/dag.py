@@ -1246,7 +1246,7 @@ class Dag:
                 return allocated_archive[0]
 
         # 源码只在 run 开始读一次:中途改文件不得让同一 run 内的缓存键漂移。
-        libs_hash = self._libs_hash()
+        libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
         prompt_snapshot = self._prompt_snapshot()
         attempt_store = AttemptStore(
             run_dir,
@@ -1255,7 +1255,7 @@ class Dag:
                 selected,
                 requested_force,
                 order,
-                libs_hash,
+                libs_hashes,
                 prompt_snapshot,
             ),
         )
@@ -1314,7 +1314,7 @@ class Dag:
                 key_components = self._key_components(
                     node,
                     upstream_shas,
-                    libs_hash,
+                    libs_hashes[node.name],
                     upstream_artifacts=inputs,
                     prompt_snapshot=prompt_snapshot,
                     prompt_resolutions=prompt_resolutions,
@@ -1384,7 +1384,7 @@ class Dag:
                             inputs,
                             upstream_shas,
                             current_run_id,
-                            libs_hash,
+                            libs_hashes[node.name],
                             workers,
                             permit_plane=permit_plane,
                             executor=execution_executor,
@@ -1955,7 +1955,7 @@ class Dag:
         # create a new attempt that the next resume correctly refuses to execute.
         try:
             order = self._topological_order(tuple(targets))
-            libs_hash = self._libs_hash()
+            libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
             prompt_snapshot = self._prompt_snapshot()
             attempts = AttemptStore(
                 run_dir,
@@ -1964,7 +1964,7 @@ class Dag:
                     tuple(targets),
                     tuple(force),
                     order,
-                    libs_hash,
+                    libs_hashes,
                     prompt_snapshot,
                 ),
             )
@@ -2118,7 +2118,7 @@ class Dag:
         targets: tuple[str, ...],
         force: tuple[str, ...],
         order: list[str],
-        libs_hash: str,
+        libs_hashes: Mapping[str, str],
         prompt_snapshot: PromptCatalogSnapshot,
     ) -> dict[str, Any]:
         declarations: dict[str, Any] = {}
@@ -2153,6 +2153,7 @@ class Dag:
             }
         source_digest = sha(declarations)
         static_profile = self._static_workflow_profile(prompt_snapshot)
+        libs_digest = sha(libs_hashes)
         return {
             "run_id": run_id,
             "graph_identity": sha(
@@ -2160,13 +2161,13 @@ class Dag:
                     "declarations": declarations,
                     "targets": list(targets),
                     "force": list(force),
-                    "libs": libs_hash,
+                    "libs": libs_digest,
                 }
             ),
             "targets": list(targets),
             "force": list(force),
             "source_digest": source_digest,
-            "libs_digest": libs_hash,
+            "libs_digest": libs_digest,
             "retry_policy_digests": retry_digests,
             "evidence_policy_digests": evidence_digests,
             "workflow_profile": static_profile,
@@ -2253,7 +2254,7 @@ class Dag:
         selected = tuple(self._nodes) if targets is None else tuple(targets)
         order = self._topological_order(selected)
         forced_nodes, forced_items = self._parse_forced(force)
-        libs_hash = self._libs_hash()
+        libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
         prompt_snapshot = _prompt_snapshot or self._prompt_snapshot(
             self._nodes[name] for name in order
         )
@@ -2288,7 +2289,7 @@ class Dag:
                     self._key_components(
                         node,
                         upstream_shas,
-                        libs_hash,
+                        libs_hashes[node.name],
                         upstream_artifacts=inputs,
                         prompt_snapshot=prompt_snapshot,
                     )
@@ -2356,7 +2357,7 @@ class Dag:
                         self._key_components(
                             node,
                             upstream_shas,
-                            libs_hash,
+                            libs_hashes[node.name],
                             upstream_artifacts=inputs,
                             item=item,
                             item_files=item_files,
@@ -2409,7 +2410,7 @@ class Dag:
                 key_components = self._key_components(
                     node,
                     upstream_shas,
-                    libs_hash,
+                    libs_hashes[node.name],
                     upstream_artifacts=inputs,
                     item=item,
                     item_files=item_files,
@@ -2547,7 +2548,7 @@ class Dag:
         """重建一个 explain 目标的当前键成分，不执行节点函数。"""
         memo: dict[str, dict[str, Any]] = {}
         components: dict[str, dict[str, str]] = {}
-        libs_hash = self._libs_hash()
+        libs_hashes = self._libs_hashes(self._nodes.values())
         prompt_snapshot = prompt_snapshot or self._prompt_snapshot()
 
         def artifact_for(name: str) -> dict[str, Any]:
@@ -2560,7 +2561,7 @@ class Dag:
                 component = self._key_components(
                     node,
                     upstream_shas,
-                    libs_hash,
+                    libs_hashes[node.name],
                     upstream_artifacts=inputs,
                     prompt_snapshot=prompt_snapshot,
                 )
@@ -2594,7 +2595,7 @@ class Dag:
                 component = self._key_components(
                     node,
                     upstream_shas,
-                    libs_hash,
+                    libs_hashes[node.name],
                     upstream_artifacts=inputs,
                     item=item,
                     item_files=item_files,
@@ -2628,7 +2629,7 @@ class Dag:
             return self._key_components(
                 target_node,
                 target_upstream_shas,
-                libs_hash,
+                libs_hashes[target_node.name],
                 upstream_artifacts=target_inputs,
                 prompt_snapshot=prompt_snapshot,
             )
@@ -2656,7 +2657,7 @@ class Dag:
             component = self._key_components(
                 target_node,
                 target_upstream_shas,
-                libs_hash,
+                libs_hashes[target_node.name],
                 upstream_artifacts=target_inputs,
                 item=item,
                 item_files=item_files,
@@ -4268,15 +4269,23 @@ class Dag:
             str(path): self.config.resolve(path).read_bytes() for path in (*node.files, *item_files)
         }
 
-    def _libs_hash(self) -> str:
-        contents: list[str] = []
-        for source_dir in self.config.source_paths:
-            if source_dir.is_dir():
-                contents.extend(
-                    _module_code_text(path.read_text(encoding="utf-8"))
-                    for path in sorted(source_dir.rglob("*.py"))
-                )
-        return sha(contents)
+    def _libs_hash(self, node: _Node) -> str:
+        """Hash the configured library files statically reachable from one node."""
+        return self._libs_hashes((node,))[node.name]
+
+    def _libs_hashes(self, nodes: Iterable[_Node]) -> dict[str, str]:
+        """Compute one immutable per-node library snapshot for a run or read-only query."""
+        selected = tuple(nodes)
+        snapshot = _capture_libs_source_snapshot(self.config.source_paths)
+        all_files_hash = _all_libs_hash(snapshot.entries)
+        if snapshot.has_syntax_error:
+            return {node.name: all_files_hash for node in selected}
+        analyzer = _StaticLibsAnalyzer(
+            self.config.project_root,
+            self.config.source_paths,
+            snapshot,
+        )
+        return {node.name: analyzer.hash_for(node.function, all_files_hash) for node in selected}
 
     def _prompt_path(self, template_name: str) -> Path:
         return self.config.prompts_path / f"{template_name}.md"
@@ -4591,6 +4600,340 @@ def _module_code_text(text: str) -> str:
         return text
     normalized = _DocstringStripper().visit(parsed)
     return ast.dump(normalized, annotate_fields=True, include_attributes=False)
+
+
+@dataclass(frozen=True)
+class _LibsSourceSnapshot:
+    """One read-only view of configured source files for one keying operation."""
+
+    entries: tuple[tuple[Path, str], ...]
+    texts: dict[Path, str]
+    trees: dict[Path, ast.Module | None]
+    source_files: frozenset[Path]
+    has_syntax_error: bool
+
+
+@dataclass(frozen=True)
+class _ImportResolution:
+    """Source files found for one import, or an ambiguity that requires fallback."""
+
+    paths: tuple[Path, ...] = ()
+    ambiguous: bool = False
+
+
+def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSnapshot:
+    """Read configured Python files once, retaining the legacy ordered all-files view."""
+    entries: list[tuple[Path, str]] = []
+    texts: dict[Path, str] = {}
+    for source_dir in source_dirs:
+        if not source_dir.is_dir():
+            continue
+        for raw_path in sorted(source_dir.rglob("*.py")):
+            path = raw_path.resolve()
+            text = texts.get(path)
+            if text is None:
+                text = path.read_text(encoding="utf-8")
+                texts[path] = text
+            entries.append((path, text))
+
+    trees: dict[Path, ast.Module | None] = {}
+    has_syntax_error = False
+    for path, text in texts.items():
+        try:
+            trees[path] = ast.parse(text)
+        except SyntaxError:
+            trees[path] = None
+            has_syntax_error = True
+    return _LibsSourceSnapshot(
+        tuple(entries),
+        texts,
+        trees,
+        frozenset(texts),
+        has_syntax_error,
+    )
+
+
+def _all_libs_hash(entries: Iterable[tuple[Path, str]]) -> str:
+    """Preserve the pre-granularity all-files digest byte-for-byte in its inputs."""
+    return sha([_module_code_text(text) for _, text in entries])
+
+
+class _StaticLibsAnalyzer:
+    """Resolve a conservative, filesystem-only import closure for one node module."""
+
+    _DYNAMIC_CALLS = frozenset(
+        {"__import__", "compile", "eval", "exec", "find_spec", "import_module"}
+    )
+    _IMPORT_LOOKUP_ATTRIBUTES = frozenset({"__import__", "find_spec", "import_module"})
+
+    def __init__(
+        self,
+        project_root: Path,
+        source_dirs: Iterable[Path],
+        snapshot: _LibsSourceSnapshot,
+    ):
+        self.project_root = project_root.resolve()
+        self.source_dirs = tuple(dict.fromkeys(path.resolve() for path in source_dirs))
+        self.source_files = snapshot.source_files
+        self._texts = dict(snapshot.texts)
+        self._trees = dict(snapshot.trees)
+        self._reachable_cache: dict[tuple[Path, str], set[Path] | None] = {}
+
+    def hash_for(self, function: Callable[..., Any], fallback: str) -> str:
+        """Return a selected-files hash, or the exact all-files fallback on uncertainty."""
+        module_path = _function_module_path(function)
+        module_name = _function_module_name(function)
+        if module_path is None or module_name is None:
+            return fallback
+        reachable = self._reachable_paths(module_path, module_name)
+        if reachable is None:
+            return fallback
+        return sha([_module_code_text(self._texts[path]) for path in sorted(reachable)])
+
+    def _reachable_paths(self, root: Path, module_name: str) -> set[Path] | None:
+        cache_key = (root, module_name)
+        if cache_key in self._reachable_cache:
+            cached = self._reachable_cache[cache_key]
+            return None if cached is None else set(cached)
+
+        initial = {root}
+        if root in self.source_files:
+            module_resolution = self._resolve_absolute(tuple(module_name.split(".")))
+            if module_resolution.ambiguous:
+                self._reachable_cache[cache_key] = None
+                return None
+            if root in module_resolution.paths:
+                initial.update(module_resolution.paths)
+            else:
+                initial.update(self._ancestor_package_inits(root))
+        queue = list(initial)
+        seen: set[Path] = set()
+        reachable: set[Path] = set()
+        while queue:
+            path = queue.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            tree = self._tree(path)
+            if tree is None or _module_imports_are_ambiguous(tree):
+                self._reachable_cache[cache_key] = None
+                return None
+            if path in self.source_files:
+                reachable.add(path)
+            for statement in tree.body:
+                if not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    continue
+                resolution = self._resolve_import(path, statement)
+                if resolution.ambiguous:
+                    self._reachable_cache[cache_key] = None
+                    return None
+                queue.extend(resolution.paths)
+
+        self._reachable_cache[cache_key] = set(reachable)
+        return reachable
+
+    def _tree(self, path: Path) -> ast.Module | None:
+        if path in self._trees:
+            return self._trees[path]
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError, UnicodeError):
+            self._trees[path] = None
+            return None
+        self._texts[path] = text
+        self._trees[path] = tree
+        return tree
+
+    def _ancestor_package_inits(self, path: Path) -> set[Path]:
+        """Include package initializers that execute before a source module."""
+        result: set[Path] = set()
+        parent = path.parent
+        while parent != parent.parent:
+            init = (parent / "__init__.py").resolve()
+            if init in self.source_files:
+                result.add(init)
+            if parent == self.project_root:
+                break
+            parent = parent.parent
+        return result
+
+    def _resolve_import(
+        self,
+        importer: Path,
+        statement: ast.Import | ast.ImportFrom,
+    ) -> _ImportResolution:
+        if isinstance(statement, ast.Import):
+            paths: set[Path] = set()
+            for alias in statement.names:
+                resolution = self._resolve_absolute(tuple(alias.name.split(".")))
+                if resolution.ambiguous:
+                    return resolution
+                if not resolution.paths and not self._known_external(alias.name.split(".")[0]):
+                    return _ImportResolution(ambiguous=True)
+                paths.update(resolution.paths)
+            return _ImportResolution(tuple(sorted(paths)))
+
+        if any(alias.name == "*" for alias in statement.names):
+            return _ImportResolution(ambiguous=True)
+        module_parts = tuple(statement.module.split(".")) if statement.module else ()
+        if statement.level:
+            base_dir = importer.parent
+            for _ in range(statement.level - 1):
+                base_dir = base_dir.parent
+            base_path = base_dir.joinpath(*module_parts).resolve()
+            base_resolution = self._resolve_path(base_path, self.project_root)
+            if base_resolution.ambiguous:
+                return base_resolution
+            paths = set(base_resolution.paths)
+            for alias in statement.names:
+                child_resolution = self._resolve_path(
+                    (base_path / alias.name).resolve(), self.project_root
+                )
+                if child_resolution.ambiguous:
+                    return child_resolution
+                paths.update(child_resolution.paths)
+            return _ImportResolution(tuple(sorted(paths)), ambiguous=not paths)
+
+        base_resolution = self._resolve_absolute(module_parts)
+        if base_resolution.ambiguous:
+            return base_resolution
+        paths = set(base_resolution.paths)
+        for alias in statement.names:
+            child_resolution = self._resolve_absolute((*module_parts, alias.name))
+            if child_resolution.ambiguous:
+                return child_resolution
+            paths.update(child_resolution.paths)
+        if not paths and module_parts and not self._known_external(module_parts[0]):
+            return _ImportResolution(ambiguous=True)
+        return _ImportResolution(tuple(sorted(paths)))
+
+    def _known_external(self, top_level: str) -> bool:
+        """Accept only imports proven outside the configured project source universe."""
+        if top_level in sys.builtin_module_names or top_level in sys.stdlib_module_names:
+            return True
+        module = sys.modules.get(top_level)
+        if module is None:
+            return False
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str) or not module_file:
+            return False
+        return not _path_is_within(Path(module_file), self.project_root)
+
+    def _resolve_absolute(self, parts: tuple[str, ...]) -> _ImportResolution:
+        if not parts:
+            return _ImportResolution()
+        paths: set[Path] = set()
+        roots = (self.project_root, *self.source_dirs)
+        for root in dict.fromkeys(roots):
+            resolution = self._resolve_path(root.joinpath(*parts).resolve(), root)
+            if resolution.ambiguous:
+                return resolution
+            paths.update(resolution.paths)
+        return _ImportResolution(tuple(sorted(paths)))
+
+    def _resolve_path(self, base: Path, package_root: Path) -> _ImportResolution:
+        file_path = (base.parent / f"{base.name}.py").resolve()
+        package_path = (base / "__init__.py").resolve()
+        matches = [path for path in (file_path, package_path) if path in self.source_files]
+        if len(matches) > 1:
+            return _ImportResolution(ambiguous=True)
+        if not matches:
+            return _ImportResolution()
+
+        paths = {matches[0]}
+        parent = matches[0].parent
+        while parent != parent.parent and parent != package_root:
+            init = (parent / "__init__.py").resolve()
+            if init in self.source_files:
+                paths.add(init)
+            parent = parent.parent
+        return _ImportResolution(tuple(sorted(paths)))
+
+
+def _module_imports_are_ambiguous(tree: ast.Module) -> bool:
+    """Reject every import shape whose runtime reachability is not statically certain."""
+    top_level_imports = {
+        id(statement)
+        for statement in tree.body
+        if isinstance(statement, (ast.Import, ast.ImportFrom))
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if id(node) not in top_level_imports:
+                return True
+            if isinstance(node, ast.Import):
+                if any(
+                    alias.name == "importlib" or alias.name.startswith("importlib.")
+                    for alias in node.names
+                ):
+                    return True
+            elif node.module is not None and node.module == "importlib":
+                return True
+            if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+                return True
+        if isinstance(node, ast.Call):
+            function = node.func
+            if isinstance(function, ast.Name) and function.id in _StaticLibsAnalyzer._DYNAMIC_CALLS:
+                return True
+            if (
+                isinstance(function, ast.Attribute)
+                and function.attr in _StaticLibsAnalyzer._IMPORT_LOOKUP_ATTRIBUTES
+            ):
+                return True
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__getattr__":
+            return True
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets: Iterable[ast.AST] = (
+                node.targets if isinstance(node, ast.Assign) else (node.target,)
+            )
+            if any(
+                isinstance(target, ast.Name) and target.id == "__getattr__" for target in targets
+            ):
+                return True
+    return False
+
+
+def _function_module_path(function: Callable[..., Any]) -> Path | None:
+    """Return a function's owning Python module path, or None when that fact is unavailable."""
+    try:
+        module = inspect.getmodule(function)
+        source = inspect.getsourcefile(function)
+    except (OSError, TypeError):
+        return None
+    if module is None or source is None:
+        return None
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str) or not module_file:
+        return None
+    source_path = Path(source).resolve()
+    module_path = Path(module_file).resolve()
+    if source_path.suffix != ".py":
+        return None
+    if module_path.suffix == ".py" and module_path != source_path:
+        return None
+    return source_path
+
+
+def _function_module_name(function: Callable[..., Any]) -> str | None:
+    """Return the import name paired with a function's owning module path."""
+    try:
+        module = inspect.getmodule(function)
+    except (OSError, TypeError):
+        return None
+    name = getattr(module, "__name__", None) if module is not None else None
+    return name if isinstance(name, str) and name else None
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    """Return whether a resolved path belongs to a resolved directory."""
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _source_hash(function: NodeFunction) -> str:

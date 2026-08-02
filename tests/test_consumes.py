@@ -249,13 +249,15 @@ def test_consumes_preserves_label_set_and_describe_reports_only_declarations(
         return dict(inputs["source"])
 
     source_artifact = {"used": 1}
+    plain_node = dag._nodes["plain"]
+    projected_node = dag._nodes["projected"]
     plain_components = dag._key_components(
-        dag._nodes["plain"], {"source": sha(source_artifact)}, dag._libs_hash()
+        plain_node, {"source": sha(source_artifact)}, dag._libs_hash(plain_node)
     )
     projected_components = dag._key_components(
-        dag._nodes["projected"],
+        projected_node,
         {"source": sha(source_artifact)},
-        dag._libs_hash(),
+        dag._libs_hash(projected_node),
         upstream_artifacts={"source": source_artifact},
     )
     description = dag.describe()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from dataclasses import replace
 from itertools import repeat
 from pathlib import Path
@@ -62,7 +64,7 @@ def test_kigumi_component_tracks_repair_bytes_and_uses_schema(
         return {"value": "ok"}
 
     node = dag._nodes["work"]
-    baseline = dag._key_components(node, {}, dag._libs_hash())["kigumi"]
+    baseline = dag._key_components(node, {}, dag._libs_hash(node))["kigumi"]
     original_read_bytes = Path.read_bytes
     repair_path = Path(repair_module.__file__).resolve()
 
@@ -73,7 +75,7 @@ def test_kigumi_component_tracks_repair_bytes_and_uses_schema(
         return contents
 
     monkeypatch.setattr(Path, "read_bytes", changed_read_bytes)
-    changed = dag._key_components(node, {}, dag._libs_hash())["kigumi"]
+    changed = dag._key_components(node, {}, dag._libs_hash(node))["kigumi"]
 
     assert changed != baseline
     inputs = dag_module._kigumi_key_inputs()
@@ -92,7 +94,8 @@ def test_key_components_lock_exact_label_set(tmp_path: Path) -> None:
         del inputs, ctx
         return {"value": "ok"}
 
-    components = dag._key_components(dag._nodes["work"], {}, dag._libs_hash())
+    node = dag._nodes["work"]
+    components = dag._key_components(node, {}, dag._libs_hash(node))
 
     assert set(components) == {"source", "libs", "params", "kigumi"}
 
@@ -106,7 +109,8 @@ def test_cache_key_components(tmp_path: Path) -> None:
         del inputs, ctx
         return {"value": "ok"}
 
-    components = dag._key_components(dag._nodes["work"], {}, dag._libs_hash())
+    node = dag._nodes["work"]
+    components = dag._key_components(node, {}, dag._libs_hash(node))
 
     assert set(components) == {"source", "libs", "params", "kigumi"}
 
@@ -121,8 +125,10 @@ def test_resource_declarations_do_not_change_cache_key(tmp_path: Path) -> None:
     second = _make_dag(tmp_path)
     second.node("work", resources=(ResourceRequest("cpu"),))(work)
 
-    first_components = first._key_components(first._nodes["work"], {}, first._libs_hash())
-    second_components = second._key_components(second._nodes["work"], {}, second._libs_hash())
+    first_node = first._nodes["work"]
+    second_node = second._nodes["work"]
+    first_components = first._key_components(first_node, {}, first._libs_hash(first_node))
+    second_components = second._key_components(second_node, {}, second._libs_hash(second_node))
 
     assert first_components == second_components
 
@@ -160,19 +166,19 @@ def test_prompt_key_component_tracks_attachment_hash_and_response_schema(
     first = dag._key_components(
         node,
         {},
-        dag._libs_hash(),
+        dag._libs_hash(node),
         prompt_resolutions={"managed": ResolvedPrompt("same prompt", base)},
     )
     attachment_changed = dag._key_components(
         node,
         {},
-        dag._libs_hash(),
+        dag._libs_hash(node),
         prompt_resolutions={"managed": ResolvedPrompt("same prompt", changed_attachment)},
     )
     schema_changed = dag._key_components(
         node,
         {},
-        dag._libs_hash(),
+        dag._libs_hash(node),
         prompt_resolutions={"managed": ResolvedPrompt("same prompt", changed_schema)},
     )
 
@@ -193,7 +199,7 @@ def test_kigumi_component_tracks_prompt_bytes_and_pydantic_version(
         return {"value": "ok"}
 
     node = dag._nodes["work"]
-    baseline = dag._key_components(node, {}, dag._libs_hash())["kigumi"]
+    baseline = dag._key_components(node, {}, dag._libs_hash(node))["kigumi"]
     original_read_bytes = Path.read_bytes
     prompt_path = Path(prompt_module.__file__).resolve()
 
@@ -204,9 +210,9 @@ def test_kigumi_component_tracks_prompt_bytes_and_pydantic_version(
         return contents
 
     monkeypatch.setattr(Path, "read_bytes", changed_read_bytes)
-    prompt_changed = dag._key_components(node, {}, dag._libs_hash())["kigumi"]
+    prompt_changed = dag._key_components(node, {}, dag._libs_hash(node))["kigumi"]
     monkeypatch.setattr(dag_module.pydantic, "__version__", "cache-key-probe")
-    pydantic_changed = dag._key_components(node, {}, dag._libs_hash())["kigumi"]
+    pydantic_changed = dag._key_components(node, {}, dag._libs_hash(node))["kigumi"]
 
     assert prompt_changed != baseline
     assert pydantic_changed != prompt_changed
@@ -390,3 +396,113 @@ def test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text(tmp_path: Path) -
 
     module.write_text("def helper():\n    return 1\n", encoding="utf-8")
     assert dag.plan().nodes["work"] == "hit"
+
+
+def test_libs_hash_follows_transitive_imports_per_node(tmp_path: Path) -> None:
+    """教训 libs_granularity: 每个节点只因自己可达的库文件失效。"""
+    package = "libs_graph_case"
+    source = tmp_path / package
+    source.mkdir()
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "used.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (source / "transitive.py").write_text(
+        f"from {package}.used import value\n\ndef compute():\n    return value()\n",
+        encoding="utf-8",
+    )
+    unrelated = source / "unrelated.py"
+    unrelated.write_text("VALUE = 1\n", encoding="utf-8")
+    (source / "node_a.py").write_text(
+        f"from {package}.transitive import compute\n\ndef run(inputs, ctx):\n"
+        "    return {'value': compute()}\n",
+        encoding="utf-8",
+    )
+    (source / "node_b.py").write_text(
+        "def run(inputs, ctx):\n    return {'value': 'independent'}\n",
+        encoding="utf-8",
+    )
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        node_a = importlib.import_module(f"{package}.node_a")
+        node_b = importlib.import_module(f"{package}.node_b")
+        config = KigumiConfig(project_root=tmp_path, source_dirs=[package])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("a")(node_a.run)
+        dag.node("b")(node_b.run)
+
+        assert dag.run().cache_hits == []
+        unrelated.write_text("VALUE = 2\n", encoding="utf-8")
+        assert dag.run().cache_hits == ["a", "b"]
+
+        (source / "used.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        assert dag.run().cache_hits == ["b"]
+    finally:
+        sys.path.remove(str(tmp_path))
+        for name in list(sys.modules):
+            if name == package or name.startswith(f"{package}."):
+                sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    "ambiguous_source",
+    [
+        "import importlib\n",
+        "if True:\n    import libs_ambiguous_case.exported\n",
+        "from libs_ambiguous_case.exported import *\n",
+        "def __getattr__(name):\n    raise AttributeError(name)\n",
+    ],
+    ids=["importlib", "conditional-import", "star-import", "module-getattr"],
+)
+def test_libs_hash_falls_back_for_ambiguous_imports(tmp_path: Path, ambiguous_source: str) -> None:
+    """教训 libs_fallback: 不能证明闭包时必须退回全量源码。"""
+    package = "libs_ambiguous_case"
+    source = tmp_path / package
+    source.mkdir()
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "exported.py").write_text("VALUE = 1\n", encoding="utf-8")
+    unrelated = source / "unrelated.py"
+    unrelated.write_text("VALUE = 1\n", encoding="utf-8")
+    (source / "node.py").write_text(
+        f"{ambiguous_source}\ndef run(inputs, ctx):\n    return {{'value': 1}}\n",
+        encoding="utf-8",
+    )
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        module = importlib.import_module(f"{package}.node")
+        config = KigumiConfig(project_root=tmp_path, source_dirs=[package])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+
+        assert dag.run().cache_hits == []
+        unrelated.write_text("VALUE = 2\n", encoding="utf-8")
+        assert dag.run().cache_hits == []
+    finally:
+        sys.path.remove(str(tmp_path))
+        for name in list(sys.modules):
+            if name == package or name.startswith(f"{package}."):
+                sys.modules.pop(name, None)
+
+
+def test_libs_hash_falls_back_when_node_module_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """教训 libs_module_identity: 无法定位节点模块时不得猜测可达文件。"""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    unrelated = lib / "unrelated.py"
+    unrelated.write_text("VALUE = 1\n", encoding="utf-8")
+    config = KigumiConfig(project_root=tmp_path, source_dirs=["lib"])
+    dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        return {"value": 1}
+
+    node = dag._nodes["work"]
+    monkeypatch.setattr(dag_module.inspect, "getmodule", lambda function: None)
+    before = dag._libs_hash(node)
+    unrelated.write_text("VALUE = 2\n", encoding="utf-8")
+    after = dag._libs_hash(node)
+
+    assert after != before

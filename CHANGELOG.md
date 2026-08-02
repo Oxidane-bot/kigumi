@@ -8,6 +8,8 @@
 
 - **缓存族轮换**:`CACHE_SCHEMA` 升至 7。提示摘要现纳入附件内容哈希与响应 schema 标识,
   L1 调用缓存条目也开始写 `response_sha256`,因此旧缓存整体失效,首次运行会重新计费。
+  本次 `libs` 改为按节点静态 import 闭包取值，沿用这次尚未发布的 7 轮换，不再新增
+  `CACHE_SCHEMA=8` 的第二次全项目缓存换族。
 - 附件成为 `PromptResolution` 的一等成员(`Attachment` / `Message` / `ResponseSpec`),
   `FileRef` 端到端可用:换掉一个附件的内容就换缓存键,不再复用按旧文件算出的响应。
 - 新增请求预检:超过 `PreflightPolicy` 上限时抛 `RequestTooLarge`,不静默截断。
