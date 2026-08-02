@@ -26,6 +26,7 @@ brief, capabilities (full "I need X" index), adoption (narrative guide), api
 """
 
 from ._declarations import CachePolicy
+from ._runstate import StateIntegrityError
 from ._version import __version__
 from .agents import (
     AgentAdapter,
@@ -74,7 +75,7 @@ from .dag import (
     RunResult,
     UndeclaredInputError,
 )
-from .errors import OutputOwnershipError
+from .errors import CacheIntegrityError, OutputOwnershipError
 from .evals import Judgment, evaluate, gated_metric, llm_judge, pairwise_judge
 from .evidence import EvidenceMode, EvidencePolicy
 from .failures import (
@@ -116,7 +117,7 @@ from .prompt import (
 from .repair import RepairExhausted, call_validated, repair_loop
 from .retry import AmbiguousAttemptError, RetryExhausted, RetryPolicy, RetrySchedule
 from .slots import AdaptiveCapacity, FileSlots
-from .store import approve_checkpoint, diff_runs, gc_artifacts, gc_cache
+from .store import CacheLookup, approve_checkpoint, diff_runs, gc_artifacts, gc_cache
 from .subgraph import Subgraph
 from .testing import ScriptedTransport
 from .transport import (
@@ -151,6 +152,8 @@ __all__ = [
     "BlobStore",
     "Budget",
     "BudgetExceeded",
+    "CacheIntegrityError",
+    "CacheLookup",
     "Candidate",
     "CachePolicy",
     "Caller",
@@ -201,6 +204,7 @@ __all__ = [
     "Response",
     "ResolvedPrompt",
     "RunResult",
+    "StateIntegrityError",
     "ScriptedTransport",
     "StdlibTransport",
     "Subgraph",

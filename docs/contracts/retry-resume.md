@@ -12,6 +12,9 @@ Status: Active (0.9.0)
 dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 ```
 
+终态 `failed` run 使用 `Dag.recover()` 记录显式 decision、reason 与 evidence，再由
+`Dag.resume()` 执行新 attempt；恢复不删除 run 目录，也不改动缓存键族。
+
 ## Invariants
 
 1. `max_attempts` 包含首次执行。默认只允许 rate limit、server error、timeout、connection；
@@ -39,6 +42,8 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 9. 同 run completed artifact（含 `cache="off"`）恢复时必须重验 Prompt snapshot/selection/
    resolution digest、candidate、artifact、origin、sidecar、输出/blob 字节，并且不重新执行。
    manifest 记录 `resume_count` 与 `last_resumed_at`，但它们不改变 immutable run identity。
+10. terminal `failed` recovery 只能匹配当前失败 attempt；retry decision 追加新 attempt 并
+    记录继承的成功节点，旧 attempt receipt 与 recovery receipt 保留不删不覆写。
 
 ## Exactly-once boundary
 

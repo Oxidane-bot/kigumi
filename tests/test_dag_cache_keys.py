@@ -11,7 +11,7 @@ import kigumi.prompt as prompt_module
 import kigumi.repair as repair_module
 from kigumi import __version__
 from kigumi.artifacts import sha
-from kigumi.calling import LLMCaller
+from kigumi.calling import CacheIntegrityError, LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
 from kigumi.prompt import PromptRef, PromptSpec
@@ -242,10 +242,9 @@ def test_torn_node_cache_is_recomputed(tmp_path: Path) -> None:
     assert len(cache_files) == 1
     cache_files[0].write_text('{"artifact": {"val', encoding="utf-8")
 
-    torn = run_once()
-    assert torn.cache_hits == []
-    assert torn.artifacts["work"] == {"value": "stable"}
-    assert run_once().cache_hits == ["work"]
+    with pytest.raises(CacheIntegrityError):
+        run_once()
+    assert cache_files[0].read_text(encoding="utf-8") == '{"artifact": {"val'
 
 
 def test_libs_hash_ignores_comment_and_docstring_edits(tmp_path: Path) -> None:

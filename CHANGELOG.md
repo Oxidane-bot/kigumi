@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 副作用边界改按 executor 类型安装,不再要求节点声明 `retry`:此前未声明重试策略的节点
+  在付费调用后崩溃不会留下 `side_effect_started`,恢复时会误判为「未产生副作用」。
+- 损坏与缺失现被区分:损坏的 attempt 状态抛 `StateIntegrityError`,损坏的缓存条目按
+  `CORRUPT` 上报而非静默当作 miss 重新调用供应商。新增 `CacheLookup` 三态读取结果与
+  `CacheIntegrityError`。
+
 ## [0.10.1] - 2026-07-30
 
 ### 修复

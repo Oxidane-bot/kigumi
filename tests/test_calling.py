@@ -11,7 +11,7 @@ import pytest
 import kigumi.calling as calling_module
 from kigumi import EvidencePolicy, ProviderFailure, ProviderFailureKind, observe
 from kigumi.artifacts import sha
-from kigumi.calling import Budget, BudgetExceeded, DryRunError, LLMCaller
+from kigumi.calling import Budget, BudgetExceeded, CacheIntegrityError, DryRunError, LLMCaller
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -113,8 +113,8 @@ def test_empty_custom_transport_response_has_typed_failed_call_metadata(
     assert calls[0]["cache"] == "failure"
 
 
-def test_torn_cache_treated_as_miss(tmp_path: Path) -> None:
-    """A torn historical cache is discarded and atomically repaired by the live call."""
+def test_torn_cache_raises_integrity_error(tmp_path: Path) -> None:
+    """A torn historical cache cannot silently trigger a new provider call."""
     transport = FakeTransport()
     caller = LLMCaller(transport, tmp_path)
     key = sha(
@@ -129,13 +129,14 @@ def test_torn_cache_treated_as_miss(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True)
     path.write_text('{"response": ', encoding="utf-8")
 
-    assert caller.call("hello") == "answer"
-    assert len(transport.requests) == 1
-    assert json.loads(path.read_text(encoding="utf-8"))["response"] == "answer"
+    with pytest.raises(CacheIntegrityError):
+        caller.call("hello")
+    assert transport.requests == []
+    assert path.read_text(encoding="utf-8") == '{"response": '
 
 
-def test_poisoned_empty_cache_treated_as_miss(tmp_path: Path) -> None:
-    """A historical cache entry with an empty response is invalid by definition: miss and repair."""
+def test_poisoned_empty_cache_raises_integrity_error(tmp_path: Path) -> None:
+    """An invalid historical response cannot silently trigger a new provider call."""
     transport = FakeTransport()
     caller = LLMCaller(transport, tmp_path)
     key = sha(
@@ -153,9 +154,9 @@ def test_poisoned_empty_cache_treated_as_miss(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    assert caller.call("hello") == "answer"
-    assert len(transport.requests) == 1
-    assert json.loads(path.read_text(encoding="utf-8"))["response"] == "answer"
+    with pytest.raises(CacheIntegrityError):
+        caller.call("hello")
+    assert transport.requests == []
 
 
 def test_dry_run_raises_before_live_call(tmp_path: Path) -> None:

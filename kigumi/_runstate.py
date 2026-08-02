@@ -31,6 +31,24 @@ class RunManifestError(RuntimeError):
     """Raised when an existing run does not match the current declaration."""
 
 
+class StateIntegrityError(RunManifestError):
+    """Raised when durable JSON state exists but cannot be trusted."""
+
+    def __init__(
+        self,
+        path: Path,
+        expected_schema: int,
+        parse_error: BaseException | str,
+    ) -> None:
+        self.path = Path(path)
+        self.expected_schema = expected_schema
+        self.parse_error = parse_error
+        super().__init__(
+            f"Durable state integrity error at {self.path} "
+            f"(expected schema {expected_schema}): {parse_error}"
+        )
+
+
 class AttemptStore:
     """Own one 0.7 run's immutable declaration and mutable attempt receipts."""
 
@@ -42,7 +60,9 @@ class AttemptStore:
     def initialize(self) -> dict[str, Any]:
         """Create a new manifest or fail closed against an existing run."""
         self.run_root.mkdir(parents=True, exist_ok=True)
-        existing = self._read_json(self.manifest_path)
+        existing, corrupted = self._read_json_safe(self.manifest_path)
+        if corrupted:
+            raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
         if existing is None:
             if any(self.run_root.iterdir()):
                 raise RunManifestError(
@@ -131,8 +151,11 @@ class AttemptStore:
         prompt_resolutions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return run, pending, candidate, or completed state for one target."""
+        self._validate_attempt_receipts(target)
         state_path = self._state_path(target)
-        state = self._read_json(state_path)
+        state, corrupted = self._read_json_safe(state_path)
+        if corrupted:
+            raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
         policy_digest = policy.digest if policy is not None else None
         if state is None:
             return self._start_attempt(
@@ -164,6 +187,8 @@ class AttemptStore:
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
                 prompt_resolutions=prompt_resolutions or {},
+                inherited_nodes=state.get("inherited_nodes"),
+                recovery=state.get("recovery"),
             )
         if status == "checkpoint_pending":
             return self._start_attempt(
@@ -183,6 +208,8 @@ class AttemptStore:
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
                 prompt_resolutions=prompt_resolutions or {},
+                inherited_nodes=state.get("inherited_nodes"),
+                recovery=state.get("recovery"),
             )
         if status == "success_candidate":
             candidate = self._required_json(
@@ -206,6 +233,48 @@ class AttemptStore:
         if status == "failed":
             return {"action": "failed", "state": state}
         raise RunManifestError(f"Attempt state for {target!r} has invalid status {status!r}")
+
+    def schedule_recovery(
+        self,
+        target: str,
+        *,
+        from_attempt: int,
+        to_attempt: int,
+        recovery: dict[str, Any],
+        inherited_nodes: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Queue a new manual recovery attempt without touching the failed receipt."""
+        state_path = self._state_path(target)
+        state = self._required_json(state_path)
+        if state.get("status") != "failed" or state.get("attempt") != from_attempt:
+            raise ValueError(
+                f"Target {target!r} attempt {from_attempt} is not the active terminal failure"
+            )
+        if to_attempt != from_attempt + 1:
+            raise ValueError("Recovery attempts must advance by exactly one")
+        next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
+        if next_receipt.exists():
+            raise RunManifestError(
+                f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
+            )
+        canonical_recovery = json.loads(canonical_json(recovery))
+        canonical_inherited = json.loads(canonical_json(inherited_nodes))
+        now = iso_now()
+        state.update(
+            {
+                "attempt": to_attempt,
+                "status": "retry_scheduled",
+                "next_attempt": to_attempt,
+                "delay_seconds": 0.0,
+                "due_at": now,
+                "recovery": canonical_recovery,
+                "inherited_nodes": canonical_inherited,
+                "updated_at": now,
+            }
+        )
+        atomic_write_json(state_path, state)
+        self._write_receipt(target, to_attempt, state)
+        return state
 
     def mark_side_effect(
         self,
@@ -385,7 +454,12 @@ class AttemptStore:
         return state
 
     def state_for(self, target: str) -> dict[str, Any] | None:
-        return self._read_json(self._state_path(target))
+        self._validate_attempt_receipts(target)
+        path = self._state_path(target)
+        state, corrupted = self._read_json_safe(path)
+        if corrupted:
+            raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+        return state
 
     def _start_attempt(
         self,
@@ -395,6 +469,8 @@ class AttemptStore:
         policy_digest: str | None,
         declaration_digest: str,
         prompt_resolutions: dict[str, Any],
+        inherited_nodes: dict[str, Any] | None = None,
+        recovery: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = iso_now()
         state = {
@@ -410,6 +486,10 @@ class AttemptStore:
             "started_at": now,
             "updated_at": now,
         }
+        if inherited_nodes:
+            state["inherited_nodes"] = json.loads(canonical_json(inherited_nodes))
+        if recovery:
+            state["recovery"] = json.loads(canonical_json(recovery))
         target_root = self._target_root(target)
         target_root.mkdir(parents=True, exist_ok=True)
         atomic_write_json(self._state_path(target), state)
@@ -442,7 +522,9 @@ class AttemptStore:
             return []
         found: list[dict[str, Any]] = []
         for path in sorted(attempts_root.glob("*/state.json")):
-            state = self._read_json(path)
+            state, corrupted = self._read_json_safe(path)
+            if corrupted:
+                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
             if state is not None and state.get("status") == status:
                 found.append(state)
         return found
@@ -459,16 +541,45 @@ class AttemptStore:
             state,
         )
 
+    def _validate_attempt_receipts(self, target: str) -> None:
+        """Reject a present torn receipt while allowing an absent receipt."""
+        for path in sorted(self._target_root(target).glob("attempt-*.json")):
+            receipt, corrupted = self._read_json_safe(path)
+            if corrupted:
+                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+            if receipt is not None and receipt.get("attempt_receipt_schema") != (
+                ATTEMPT_RECEIPT_SCHEMA
+            ):
+                raise RunManifestError(f"Attempt receipt {path} has unsupported schema")
+
     @staticmethod
-    def _read_json(path: Path) -> dict[str, Any] | None:
+    def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
+        """Return ``(data, corrupted)`` while keeping missing distinct from torn JSON."""
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
+        except FileNotFoundError:
+            return None, False
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None, True
+        return (value, False) if isinstance(value, dict) else (None, True)
+
+    @staticmethod
+    def _parse_error(path: Path) -> BaseException | str:
+        """Recover a useful parse explanation for a failed safe read."""
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return error
+        return TypeError(f"expected a JSON object, got {type(value).__name__}")
+
+    @classmethod
+    def _integrity_error(cls, path: Path, expected_schema: int) -> StateIntegrityError:
+        return StateIntegrityError(path, expected_schema, cls._parse_error(path))
 
     def _required_json(self, path: Path) -> dict[str, Any]:
-        value = self._read_json(path)
+        value, corrupted = self._read_json_safe(path)
+        if corrupted:
+            raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
         if value is None:
             raise RunManifestError(f"Missing or invalid durable run state: {path}")
         return value

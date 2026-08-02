@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .artifacts import atomic_write_json, sha, sha256_file
+from .errors import CacheIntegrityError
 from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
     ProviderFailure,
@@ -31,6 +32,7 @@ from .failures import (
 )
 from .prompt import PromptResolution, ResolvedPrompt
 from .slots import FileSlots
+from .store import CacheLookup
 from .transport import EmptyResponseError, Transport
 
 _call_observer: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
@@ -136,6 +138,50 @@ class _PreparedMessages:
     key_messages: list[dict[str, Any]]
     cache_messages: list[dict[str, Any]]
     transport_messages: list[dict[str, Any]]
+
+
+def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLookup:
+    """Read one L1 payload while preserving missing and corrupt states."""
+    if cache_key is not None:
+        cache_path = Path(cache_path) / "llm" / f"{cache_key}.json"
+    try:
+        with cache_path.open(encoding="utf-8") as handle:
+            cached = json.load(handle)
+    except FileNotFoundError:
+        return CacheLookup("MISSING", None, None, None, "call cache file is missing")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return CacheLookup("CORRUPT", None, None, None, f"call cache JSON read failed: {error}")
+    if not isinstance(cached, dict):
+        return CacheLookup("CORRUPT", None, None, None, "call cache JSON is not an object")
+
+    response = cached.get("response")
+    actual_sha256 = sha(response) if isinstance(response, str) else None
+    expected_sha256 = cached.get("response_sha256")
+    if expected_sha256 is not None and not isinstance(expected_sha256, str):
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            None,
+            actual_sha256,
+            "call cache response_sha256 is not a string",
+        )
+    if not isinstance(response, str) or not response:
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            expected_sha256,
+            actual_sha256,
+            "call cache response is missing or empty",
+        )
+    if expected_sha256 is not None and expected_sha256 != actual_sha256:
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            expected_sha256,
+            actual_sha256,
+            "call cache response digest validation failed",
+        )
+    return CacheLookup("VALID", cached, expected_sha256, actual_sha256, None)
 
 
 class Budget:
@@ -513,16 +559,10 @@ class LLMCaller:
 
     @staticmethod
     def _read_cached_response(cache_path: Path) -> dict[str, Any] | None:
-        try:
-            with cache_path.open(encoding="utf-8") as handle:
-                cached = json.load(handle)
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        response = cached.get("response") if isinstance(cached, dict) else None
-        if not isinstance(response, str) or not response:
-            # 空响应永远不会被合法写入;读到即按撕裂缓存处理,走 miss。
-            return None
-        return cached
+        lookup = read_call_cache(cache_path)
+        if lookup.state == "CORRUPT":
+            raise CacheIntegrityError(cache_path, lookup)
+        return lookup.data if lookup.state == "VALID" else None
 
     def _record_cache_hit(
         self,

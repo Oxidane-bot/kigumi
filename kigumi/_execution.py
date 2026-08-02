@@ -13,7 +13,7 @@ from . import store
 from ._declarations import CachePolicy
 from ._runstate import RUN_SIDECAR_SCHEMA
 from .artifacts import atomic_write_json, canonical_json, sha
-from .errors import OutputOwnershipError
+from .errors import CacheIntegrityError, OutputOwnershipError
 from .evidence import EvidencePolicy
 
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
@@ -52,7 +52,13 @@ class ExecutionEnvelope:
         """Return a node-cache artifact unless this execution is forced."""
         if forced or cache_policy != "auto":
             return None, False
-        artifact = store.read_node_cache(self.artifacts_path, cache_key)
+        lookup = store.read_node_cache(self.artifacts_path, cache_key)
+        if lookup.state == "CORRUPT":
+            raise CacheIntegrityError(
+                store.node_cache_path(self.artifacts_path, cache_key),
+                lookup,
+            )
+        artifact = lookup.data if lookup.state == "VALID" else None
         if artifact is not None and evidence_policy_digest is not None:
             origin = store.read_node_cache_origin(self.artifacts_path, cache_key)
             if origin is None or origin.get("evidence_policy_digest") != evidence_policy_digest:

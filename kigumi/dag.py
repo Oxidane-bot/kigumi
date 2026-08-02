@@ -1294,7 +1294,7 @@ class Dag:
                                             node.name, effect
                                         )
                                     )
-                                    if node.retry is not None and node.executor != "agent"
+                                    if node.executor not in {"pure", "agent"}
                                     else nullcontext()
                                 )
                                 with boundary:
@@ -1871,10 +1871,13 @@ class Dag:
                         prompt_snapshot=prompt_snapshot,
                     )
                 )
+                cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
                 artifact = (
                     None
                     if node.cache != "auto" or node_name in forced_nodes
-                    else store.read_node_cache(self.config.artifacts_path, cache_key)
+                    else cache_lookup.data
+                    if cache_lookup.state == "VALID"
+                    else None
                 )
                 if artifact is None:
                     nodes[node_name] = "miss"
@@ -1939,12 +1942,15 @@ class Dag:
                             prompt_snapshot=prompt_snapshot,
                         )
                     )
+                    cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
                     artifact = (
                         None
                         if node.cache != "auto"
                         or node_name in forced_nodes
                         or item_id in forced_items.get(node_name, set())
-                        else store.read_node_cache(self.config.artifacts_path, cache_key)
+                        else cache_lookup.data
+                        if cache_lookup.state == "VALID"
+                        else None
                     )
                     if artifact is None:
                         nodes[expanded_name] = "miss"
@@ -1988,12 +1994,15 @@ class Dag:
                     prompt_snapshot=prompt_snapshot,
                 )
                 cache_key = sha(key_components)
+                cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
                 artifact = (
                     None
                     if node.cache != "auto"
                     or node_name in forced_nodes
                     or item_id in forced_items.get(node_name, set())
-                    else store.read_node_cache(self.config.artifacts_path, cache_key)
+                    else cache_lookup.data
+                    if cache_lookup.state == "VALID"
+                    else None
                 )
                 status = "hit" if artifact is not None else "miss"
                 nodes[f"{node_name}@{item_id}"] = status
@@ -2133,7 +2142,8 @@ class Dag:
                     upstream_artifacts=inputs,
                     prompt_snapshot=prompt_snapshot,
                 )
-                artifact = store.read_node_cache(self.config.artifacts_path, sha(component))
+                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
+                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
                 if artifact is None:
                     raise RuntimeError(f"Cannot read current cached artifact for node {name!r}")
                 components[name] = component
@@ -2169,7 +2179,8 @@ class Dag:
                     carry=carry,
                     prompt_snapshot=prompt_snapshot,
                 )
-                artifact = store.read_node_cache(self.config.artifacts_path, sha(component))
+                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
+                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for map item "
@@ -2233,7 +2244,8 @@ class Dag:
             if current_item_id == item_id:
                 return component
             if target_node.scan:
-                artifact = store.read_node_cache(self.config.artifacts_path, sha(component))
+                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
+                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for earlier scan item "
@@ -3030,7 +3042,7 @@ class Dag:
                                         attempt_store.mark_side_effect(attempt_target, effect)
                                     )
                                 )
-                                if node.retry is not None
+                                if node.executor not in {"pure", "agent"}
                                 else nullcontext()
                             )
                             try:
@@ -3395,7 +3407,7 @@ class Dag:
                                         attempt_store.mark_side_effect(attempt_target, effect)
                                     )
                                 )
-                                if node.retry is not None and node.executor != "agent"
+                                if node.executor not in {"pure", "agent"}
                                 else nullcontext()
                             )
                             try:

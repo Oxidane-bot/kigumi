@@ -12,7 +12,7 @@ import shutil
 import tempfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 from .artifacts import atomic_write_json, atomic_write_text, canonical_json, sha, write_artifact
 from .blobs import BlobStore
@@ -21,6 +21,18 @@ from .errors import OutputOwnershipError
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
 _NODE_CACHE_ENVELOPE_SCHEMA = 3
+
+CacheState = Literal["MISSING", "VALID", "CORRUPT"]
+
+
+class CacheLookup(NamedTuple):
+    """A cache read that preserves absence and integrity failure as distinct states."""
+
+    state: CacheState
+    data: Any | None
+    expected_sha256: str | None
+    actual_sha256: str | None
+    reason: str | None
 
 
 def runs_root(artifacts_path: Path) -> Path:
@@ -44,13 +56,30 @@ def node_cache_path(artifacts_path: Path, cache_key: str) -> Path:
     return artifacts_path / "_cache" / "nodes" / f"{cache_key}.json"
 
 
-def read_node_cache(artifacts_path: Path, cache_key: str) -> dict[str, Any] | None:
-    """Read a valid node cache artifact, treating torn or invalid files as misses."""
+def read_node_cache(artifacts_path: Path, cache_key: str) -> CacheLookup:
+    """Read one node cache entry without collapsing corruption into a miss."""
     payload = _read_node_cache_envelope(artifacts_path, cache_key)
-    if payload is None:
-        return None
-    artifact = payload["artifact"]
-    return artifact if isinstance(artifact, dict) else None
+    if payload.state != "VALID":
+        return payload
+    envelope = payload.data
+    if not isinstance(envelope, dict):
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            payload.expected_sha256,
+            payload.actual_sha256,
+            "node cache envelope is not an object",
+        )
+    artifact = envelope.get("artifact")
+    if not isinstance(artifact, dict):
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            payload.expected_sha256,
+            payload.actual_sha256,
+            "node cache artifact is not an object",
+        )
+    return payload._replace(data=artifact)
 
 
 def read_node_cache_origin(
@@ -59,39 +88,63 @@ def read_node_cache_origin(
 ) -> dict[str, Any] | None:
     """Return immutable origin provenance for one valid node-cache entry."""
 
-    payload = _read_node_cache_envelope(artifacts_path, cache_key)
-    if payload is None:
+    lookup = _read_node_cache_envelope(artifacts_path, cache_key)
+    if lookup.state != "VALID" or not isinstance(lookup.data, dict):
         return None
-    origin = payload["origin_provenance"]
+    origin = lookup.data.get("origin_provenance")
     return origin if isinstance(origin, dict) else None
 
 
 def _read_node_cache_envelope(
     artifacts_path: Path,
     cache_key: str,
-) -> dict[str, Any] | None:
+) -> CacheLookup:
+    path = node_cache_path(artifacts_path, cache_key)
     try:
-        with node_cache_path(artifacts_path, cache_key).open(encoding="utf-8") as handle:
+        with path.open(encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("cache_schema") != _NODE_CACHE_ENVELOPE_SCHEMA:
-        return None
+    except FileNotFoundError:
+        return CacheLookup("MISSING", None, None, None, "node cache file is missing")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return CacheLookup("CORRUPT", None, None, None, f"node cache JSON read failed: {error}")
+    if not isinstance(payload, dict):
+        return CacheLookup("CORRUPT", None, None, None, "node cache JSON is not an object")
+    if payload.get("cache_schema") != _NODE_CACHE_ENVELOPE_SCHEMA:
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            None,
+            None,
+            f"node cache schema is not {_NODE_CACHE_ENVELOPE_SCHEMA}",
+        )
     artifact = payload.get("artifact")
     origin = payload.get("origin_provenance")
     artifact_sha256 = payload.get("artifact_sha256")
     origin_sha256 = payload.get("origin_sha256")
+    actual_artifact_sha256 = sha(artifact) if isinstance(artifact, dict) else None
     if (
         not isinstance(artifact, dict)
         or not isinstance(origin, dict)
         or not isinstance(artifact_sha256, str)
-        or artifact_sha256 != sha(artifact)
+        or artifact_sha256 != actual_artifact_sha256
         or origin.get("artifact_sha256") != artifact_sha256
         or not isinstance(origin_sha256, str)
         or origin_sha256 != sha(origin)
     ):
-        return None
-    return payload
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            artifact_sha256 if isinstance(artifact_sha256, str) else None,
+            actual_artifact_sha256,
+            "node cache envelope digest or provenance validation failed",
+        )
+    return CacheLookup(
+        "VALID",
+        payload,
+        artifact_sha256,
+        actual_artifact_sha256,
+        None,
+    )
 
 
 def write_node_cache(

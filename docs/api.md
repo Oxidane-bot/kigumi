@@ -45,6 +45,13 @@
 
 ### DAG、重试与存储
 
+- `class CacheIntegrityError(RuntimeError)`（`kigumi.errors`，顶层导出）：缓存条目存在但不可
+  安全复用（JSON 撕裂、响应为空、`response_sha256` 不匹配）。损坏不再退化成 miss，因此不会
+  静默重新计费；先核对该条目再决定是删除重算还是修复。`CacheLookup`（`kigumi.store`）是缓存
+  读取结果的三态事实：`MISSING` / `VALID` / `CORRUPT`，附带期望与实际摘要。
+- `class StateIntegrityError(RuntimeError)`（`kigumi._runstate`，顶层导出）：durable attempt
+  状态损坏。损坏与缺失不再共用"从未开始"这一条路径，避免把越过 side-effect 边界的 attempt
+  当成没跑过。见 [retry/resume 契约](contracts/retry-resume.md)。
 - `RetryExhausted(target: str, attempts: int, failure: dict[str, object]) -> None`
   （`kigumi.retry`，顶层导出）：durable `RetryPolicy` 已消费最后一次允许的 attempt。通过
   `trace` / `runs show` 检查 canonical failure，修复根因后用新 run 执行；不要继续隐式重试。
