@@ -14,6 +14,7 @@ import inspect
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -50,14 +51,75 @@ both entry points; see `test_both_entry_points_expose_identical_graph_commands`.
 
 @pytest.fixture(autouse=True)
 def isolated_synthetic_nodes_modules():
-    """Always remove synthetic ``nodes`` imports, including after parser exits."""
-    for name in list(sys.modules):
-        if name == "nodes" or name.startswith("nodes."):
-            sys.modules.pop(name, None)
-    yield
-    for name in list(sys.modules):
-        if name == "nodes" or name.startswith("nodes."):
-            sys.modules.pop(name, None)
+    """Isolate synthetic ``nodes`` imports while preserving the prior module state."""
+    preexisting = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "nodes" or name.startswith("nodes.")
+    }
+    for name in preexisting:
+        sys.modules.pop(name, None)
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name == "nodes" or name.startswith("nodes."):
+                sys.modules.pop(name, None)
+        sys.modules.update(preexisting)
+
+
+@pytest.fixture(scope="class")
+def preexisting_nodes_modules():
+    """Install sentinels before function isolation and verify its final state."""
+    before = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "nodes" or name.startswith("nodes.")
+    }
+    for name in before:
+        sys.modules.pop(name, None)
+
+    originals = {
+        "nodes": ModuleType("nodes"),
+        "nodes.graph": ModuleType("nodes.graph"),
+    }
+    sys.modules.update(originals)
+    try:
+        yield originals
+    finally:
+        try:
+            remaining = {
+                name for name in sys.modules if name == "nodes" or name.startswith("nodes.")
+            }
+            assert remaining == set(originals), (
+                f"the isolation boundary leaked or lost matching modules: {sorted(remaining)}"
+            )
+            assert sys.modules["nodes"] is originals["nodes"]
+            assert sys.modules["nodes.graph"] is originals["nodes.graph"]
+        finally:
+            for name in list(sys.modules):
+                if name == "nodes" or name.startswith("nodes."):
+                    sys.modules.pop(name, None)
+            sys.modules.update(before)
+
+
+class TestPreexistingNodesModuleIsolation:
+    def test_restores_preexisting_modules_and_removes_imported_modules(
+        self, tmp_path: Path, monkeypatch, preexisting_nodes_modules
+    ) -> None:
+        """The boundary restores sentinels while removing every imported ``nodes.*``."""
+        package = tmp_path / "nodes"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "graph.py").write_text("", encoding="utf-8")
+        (package / "generated.py").write_text("", encoding="utf-8")
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        graph = importlib.import_module("nodes.graph")
+        generated = importlib.import_module("nodes.generated")
+
+        assert graph is not preexisting_nodes_modules["nodes.graph"]
+        assert generated.__name__ == "nodes.generated"
 
 
 EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
