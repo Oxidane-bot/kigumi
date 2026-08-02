@@ -398,6 +398,105 @@ def test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text(tmp_path: Path) -
     assert dag.plan().nodes["work"] == "hit"
 
 
+def test_libs_hash_tracks_ancestor_package_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """教训 libs_ancestor_init: 节点包初始化器执行后也必须让节点换键。"""
+    source = tmp_path / "src"
+    package_name = "libs_ancestor_case_m4"
+    package = source / package_name
+    package.mkdir(parents=True)
+    package_init = package / "__init__.py"
+    package_init.write_text("SETTING = 1\n", encoding="utf-8")
+    node_path = package / "nodes.py"
+    node_path.write_text(
+        "import sys\n\n"
+        "def run(inputs, ctx):\n"
+        f"    return {{'value': sys.modules[{package_name!r}].SETTING}}\n",
+        encoding="utf-8",
+    )
+    for index in range(3):
+        (source / f"padding_{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+
+    synthetic_name = "graph_mod_m4"
+    monkeypatch.syspath_prepend(str(source))
+    monkeypatch.delitem(sys.modules, package_name, raising=False)
+    monkeypatch.delitem(sys.modules, synthetic_name, raising=False)
+    package_module = importlib.import_module(package_name)
+    assert package_module.SETTING == 1
+
+    spec = importlib.util.spec_from_file_location(synthetic_name, node_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, synthetic_name, module)
+    spec.loader.exec_module(module)
+    assert module.__name__ == synthetic_name
+
+    config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+    dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+    dag.node("work")(module.run)
+
+    ancestor_calls: list[Path] = []
+    original_ancestor_package_inits = dag_module._StaticLibsAnalyzer._ancestor_package_inits
+
+    def record_ancestor_package_inits(
+        analyzer: dag_module._StaticLibsAnalyzer, path: Path
+    ) -> set[Path]:
+        ancestor_calls.append(path)
+        return original_ancestor_package_inits(analyzer, path)
+
+    monkeypatch.setattr(
+        dag_module._StaticLibsAnalyzer,
+        "_ancestor_package_inits",
+        record_ancestor_package_inits,
+    )
+
+    assert dag.run().cache_hits == []
+    assert ancestor_calls == [node_path.resolve()]
+
+    package_init.write_text("SETTING = 2\n", encoding="utf-8")
+    assert dag.run().cache_hits == []
+
+
+def test_libs_hash_tracks_unresolved_import_inside_source_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """教训 libs_unresolved_import: 运行时落入源码树的未解析导入也必须让节点换键。"""
+    source = tmp_path / "src"
+    deep = source / "deep"
+    deep.mkdir(parents=True)
+    inner = deep / "inner.py"
+    inner.write_text("VALUE = 1\n", encoding="utf-8")
+    node_path = source / "nodes_m5.py"
+    node_path.write_text(
+        "import inner\n\ndef run(inputs, ctx):\n    return {'value': inner.VALUE}\n",
+        encoding="utf-8",
+    )
+    for index in range(3):
+        (source / f"padding_{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(source))
+    monkeypatch.syspath_prepend(str(deep))
+    for name in ("nodes_m5", "inner"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    try:
+        module = importlib.import_module("nodes_m5")
+        assert Path(module.inner.__file__).resolve() == inner.resolve()
+
+        config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+
+        assert dag.run().cache_hits == []
+        inner.write_text("VALUE = 2\n", encoding="utf-8")
+        assert dag.run().cache_hits == []
+    finally:
+        sys.modules.pop("nodes_m5", None)
+        sys.modules.pop("inner", None)
+
+
 def test_libs_hash_follows_transitive_imports_per_node(tmp_path: Path) -> None:
     """教训 libs_granularity: 每个节点只因自己可达的库文件失效。"""
     package = "libs_graph_case"
