@@ -184,16 +184,35 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
     return CacheLookup("VALID", cached, expected_sha256, actual_sha256, None)
 
 
-class Budget:
-    """Accumulate usage and fail on the first record after the budget is exceeded.
+class BudgetPermit:
+    """Reservation hold on budget tokens."""
 
-    检查发生在调用完成之后:并发 worker 各自在途的那一批调用仍会花完,
-    超支上限约为 (workers - 1) 倍单次调用用量,这是事后计费的固有限制。
+    def __init__(self, budget: Budget, estimated_tokens: int) -> None:
+        self._budget = budget
+        self._estimated_tokens = estimated_tokens
+        self._active = True
+
+    def commit(self, actual_usage: dict[str, Any]) -> None:
+        """Convert this reservation to actual spend."""
+        self._budget._commit(self, actual_usage)
+
+    def cancel(self) -> None:
+        """Release this reservation without spending it."""
+        self._budget._cancel(self)
+
+
+class Budget:
+    """Reserve estimated tokens before calls and account their actual usage.
+
+    Reservations close the in-process admission race between concurrent calls. The
+    estimate is best effort: a provider response may use more tokens, and commit
+    records that actual usage before enforcing the ceiling.
     """
 
     def __init__(self, max_tokens: int | None) -> None:
         self.max_tokens = max_tokens
         self._spent = 0
+        self._reserved = 0
         self._lock = threading.Lock()
 
     @property
@@ -202,15 +221,63 @@ class Budget:
         with self._lock:
             return self._spent
 
-    def record(self, usage: dict[str, Any]) -> None:
-        """Record a response's total-token usage and enforce the configured cap."""
+    def reserve(self, estimated_tokens: int) -> BudgetPermit:
+        """Reserve tokens before a call, raising when the remaining budget is insufficient."""
+        estimated = self._coerce_tokens(estimated_tokens, name="estimated_tokens")
         with self._lock:
-            total = usage.get("total_tokens", 0)
-            self._spent += int(total) if total is not None else 0
-            if self.max_tokens is not None and self._spent > self.max_tokens:
-                raise BudgetExceeded(
-                    f"Token budget exceeded: spent {self._spent} > {self.max_tokens}"
-                )
+            if self.max_tokens is not None:
+                available = self.max_tokens - self._spent - self._reserved
+                if estimated > available:
+                    raise BudgetExceeded(
+                        "Token budget reservation denied: "
+                        f"requested {estimated}, available {available}, "
+                        f"already spent {self._spent}"
+                    )
+            self._reserved += estimated
+        return BudgetPermit(self, estimated)
+
+    def record(self, usage: dict[str, Any]) -> None:
+        """Record usage without a prior reservation and enforce the configured cap."""
+        total = self._usage_tokens(usage)
+        with self._lock:
+            self._spent += total
+            self._raise_if_exceeded()
+
+    @staticmethod
+    def _coerce_tokens(value: int, *, name: str) -> int:
+        try:
+            tokens = int(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError(f"{name} must be an integer") from error
+        if tokens < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return tokens
+
+    @staticmethod
+    def _usage_tokens(usage: dict[str, Any]) -> int:
+        total = usage.get("total_tokens", 0)
+        return int(total) if total is not None else 0
+
+    def _commit(self, permit: BudgetPermit, usage: dict[str, Any]) -> None:
+        total = self._usage_tokens(usage)
+        with self._lock:
+            if not permit._active:
+                raise RuntimeError("Budget permit is no longer active")
+            permit._active = False
+            self._reserved -= permit._estimated_tokens
+            self._spent += total
+            self._raise_if_exceeded()
+
+    def _cancel(self, permit: BudgetPermit) -> None:
+        with self._lock:
+            if not permit._active:
+                return
+            permit._active = False
+            self._reserved -= permit._estimated_tokens
+
+    def _raise_if_exceeded(self) -> None:
+        if self.max_tokens is not None and self._spent > self.max_tokens:
+            raise BudgetExceeded(f"Token budget exceeded: spent {self._spent} > {self.max_tokens}")
 
 
 class LLMCaller:
@@ -299,15 +366,20 @@ class LLMCaller:
             if self.dry:
                 raise DryRunError(f"Dry run would call model {model!r} for cache key {key}")
 
-            started = time.monotonic()
             transport_messages = (
                 self._expand_transport_messages(prepared.transport_messages)
                 if prepared is not None
                 else normalized_messages
             )
+            permit = (
+                self.budget.reserve(self._estimate_tokens(normalized_messages, params))
+                if self.budget is not None
+                else None
+            )
+            started = time.monotonic()
             # 槽位限的是远程请求本身;base64 展开是本地工作,不许占着槽做。
-            slot_context = self.slots.acquire() if self.slots is not None else nullcontext()
             try:
+                slot_context = self.slots.acquire() if self.slots is not None else nullcontext()
                 with slot_context:
                     durable_callback = _durable_side_effect.get()
                     if durable_callback is not None:
@@ -326,6 +398,8 @@ class LLMCaller:
                         )
                     response = self.transport.complete(transport_messages, model, **params)
             except Exception as error:
+                if permit is not None:
+                    permit.cancel()
                 seconds = time.monotonic() - started
                 failure = (
                     error
@@ -351,8 +425,14 @@ class LLMCaller:
                 )
                 self._append_call(metadata)
                 raise failure from None
+            except BaseException:
+                if permit is not None:
+                    permit.cancel()
+                raise
             seconds = time.monotonic() - started
             if not response.text:
+                if permit is not None:
+                    permit.cancel()
                 empty = EmptyResponseError(
                     f"Transport returned an empty response for model {resolved_model!r}."
                 )
@@ -384,34 +464,44 @@ class LLMCaller:
                     )
                 )
                 raise failure from None
-            payload = {
-                "meta": self._meta(
-                    key=key,
-                    model_alias=model,
-                    model=resolved_model,
-                    params=params,
-                    messages=key_messages,
-                    seconds=seconds,
-                    usage=response.usage,
-                    cache="miss",
-                    provider_response_id=response.provider_response_id,
-                    provider_model=response.model,
-                    provider_model_observed=response.model_observed,
-                    request_value=cache_messages,
-                    response_value={
-                        "text": response.text,
-                        "reasoning": response.reasoning,
-                    },
-                    prompt_lineage=prompt_lineage,
-                ),
-                "response": response.text,
-                "messages": cache_messages,
-                "reasoning": response.reasoning,
-            }
-            atomic_write_json(cache_path, payload)
-            self._append_call(payload["meta"])
-            if self.budget is not None:
-                self.budget.record(response.usage)
+            try:
+                payload = {
+                    "meta": self._meta(
+                        key=key,
+                        model_alias=model,
+                        model=resolved_model,
+                        params=params,
+                        messages=key_messages,
+                        seconds=seconds,
+                        usage=response.usage,
+                        cache="miss",
+                        provider_response_id=response.provider_response_id,
+                        provider_model=response.model,
+                        provider_model_observed=response.model_observed,
+                        request_value=cache_messages,
+                        response_value={
+                            "text": response.text,
+                            "reasoning": response.reasoning,
+                        },
+                        prompt_lineage=prompt_lineage,
+                    ),
+                    "response": response.text,
+                    "messages": cache_messages,
+                    "reasoning": response.reasoning,
+                }
+                atomic_write_json(cache_path, payload)
+                self._append_call(payload["meta"])
+                if permit is not None:
+                    try:
+                        permit.commit(response.usage)
+                    finally:
+                        permit = None
+                elif self.budget is not None:
+                    self.budget.record(response.usage)
+            except BaseException:
+                if permit is not None:
+                    permit.cancel()
+                raise
             return response.text
 
     @staticmethod
@@ -420,6 +510,28 @@ class LLMCaller:
             # Strip a ResolvedPrompt subclass only after its lineage was captured.
             return [{"role": "user", "content": str(messages)}]
         return messages
+
+    @classmethod
+    def _estimate_tokens(cls, messages: list[dict[str, Any]], params: dict[str, Any]) -> int:
+        """Estimate a reservation from prompt size plus output allowance."""
+        prompt_length = sum(cls._content_length(message.get("content", "")) for message in messages)
+        # Roughly two tokens per four prompt characters; actual provider usage is
+        # authoritative at commit, so this intentionally remains a best-effort guard.
+        prompt_estimate = max(1, prompt_length // 4 * 2)
+        max_tokens = params.get("max_tokens")
+        if max_tokens is None:
+            return prompt_estimate
+        return prompt_estimate + Budget._coerce_tokens(max_tokens, name="max_tokens")
+
+    @classmethod
+    def _content_length(cls, content: Any) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            return sum(cls._content_length(part) for part in content)
+        if isinstance(content, dict):
+            return sum(cls._content_length(value) for value in content.values())
+        return len(str(content))
 
     @classmethod
     def _prepare_file_references(cls, messages: list[dict[str, Any]]) -> _PreparedMessages | None:

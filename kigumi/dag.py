@@ -59,7 +59,13 @@ from .agents import (
 )
 from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
-from .calling import DryRunError, LLMCaller, durable_side_effect_boundary, observe
+from .calling import (
+    BudgetExceeded,
+    DryRunError,
+    LLMCaller,
+    durable_side_effect_boundary,
+    observe,
+)
 from .config import KigumiConfig
 from .enforce import check_paths, check_raw_io_node_paths, check_raw_io_source, check_source
 from .errors import OutputOwnershipError
@@ -1253,8 +1259,14 @@ class Dag:
         states = {name: "waiting" for name in order}
         failures: dict[str, BaseException] = {}
         artifact_shas: dict[str, str] = {}
+        budget_abort = threading.Event()
+        budget = getattr(self.caller, "budget", None)
+        budget_limited = budget is not None and budget.max_tokens is not None
+        budget_window = max(1, workers - 1) if budget_limited else execution_workers
 
         def execute(node_name: str) -> tuple[str, str | None]:
+            if budget_abort.is_set():
+                return node_name, "skipped"
             node = self._nodes[node_name]
             evidence_policy = node.evidence_policy or self._caller_evidence_policy()
             agent_provenance: dict[str, Any] | None = None
@@ -1365,12 +1377,15 @@ class Dag:
                             envelope=envelope,
                             attempt_store=attempt_store,
                             prompt_snapshot=prompt_snapshot,
+                            budget_abort=budget_abort,
                         )
                         cache_key = item_cache_keys
                         with state_lock:
                             map_items[node.name] = item_statuses
                     elif artifact is None:
                         assert key_components is not None
+                        if budget_abort.is_set():
+                            return node_name, "skipped"
                         declaration_digest = self._attempt_declaration_digest(
                             node,
                             key_components,
@@ -1662,6 +1677,9 @@ class Dag:
                                 artifact_sha256=artifact_sha256,
                             )
                     return node_name, "success"
+            except BudgetExceeded:
+                budget_abort.set()
+                raise
             except _MapCheckpointPending as pending:
                 with state_lock:
                     pending_checkpoints.extend((node_name, name) for name in pending.names)
@@ -1704,23 +1722,29 @@ class Dag:
                     # items to this same executor. That leaves every executor
                     # worker available to service map items, avoiding nested
                     # pools and the worker-squared thread explosion.
-                    index = 0
-                    while index < len(ready) and len(in_flight) < execution_workers:
-                        node_name = ready[index]
-                        if self._nodes[node_name].items_from is not None:
-                            index += 1
-                            continue
-                        ready.pop(index)
-                        states[node_name] = "running"
-                        in_flight[execution_executor.submit(execute, node_name)] = node_name
+                    if not (budget_limited and in_flight):
+                        index = 0
+                        submission_limit = budget_window if budget_limited else execution_workers
+                        while index < len(ready) and len(in_flight) < submission_limit:
+                            node_name = ready[index]
+                            if self._nodes[node_name].items_from is not None:
+                                index += 1
+                                continue
+                            ready.pop(index)
+                            states[node_name] = "running"
+                            in_flight[execution_executor.submit(execute, node_name)] = node_name
 
-                    dynamic_index = next(
-                        (
-                            index
-                            for index, node_name in enumerate(ready)
-                            if self._nodes[node_name].items_from is not None
-                        ),
-                        None,
+                    dynamic_index = (
+                        next(
+                            (
+                                index
+                                for index, node_name in enumerate(ready)
+                                if self._nodes[node_name].items_from is not None
+                            ),
+                            None,
+                        )
+                        if not (budget_limited and in_flight)
+                        else None
                     )
                     if dynamic_index is not None:
                         node_name = ready.pop(dynamic_index)
@@ -1728,6 +1752,8 @@ class Dag:
                         try:
                             _, outcome = execute(node_name)
                         except BaseException as error:
+                            if isinstance(error, BudgetExceeded):
+                                budget_abort.set()
                             states[node_name] = "failed"
                             failures[node_name] = error
                         else:
@@ -1739,12 +1765,18 @@ class Dag:
 
                 if not in_flight:
                     break
-                done, _ = wait(in_flight, return_when="FIRST_COMPLETED")
+                done, _ = (
+                    wait(in_flight)
+                    if budget_limited
+                    else wait(in_flight, return_when="FIRST_COMPLETED")
+                )
                 for future in done:
                     node_name = in_flight.pop(future)
                     try:
                         _, outcome = future.result()
                     except BaseException as error:
+                        if isinstance(error, BudgetExceeded):
+                            budget_abort.set()
                         states[node_name] = "failed"
                         failures[node_name] = error
                     else:
@@ -3097,6 +3129,7 @@ class Dag:
         envelope: ExecutionEnvelope,
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
+        budget_abort: threading.Event,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
@@ -3115,6 +3148,8 @@ class Dag:
         )
 
         def execute_item(item_id: str, item: Any) -> dict[str, Any]:
+            if budget_abort.is_set():
+                return {"id": item_id, "status": "aborted"}
             started = time.monotonic()
             target = f"{node.name}@{item_id}"
             try:
@@ -3177,6 +3212,11 @@ class Dag:
                             evidence_policy_digest=self._caller_evidence_policy().digest,
                         )
                     if artifact is None:
+                        # No receipt is created for work that was not admitted after
+                        # the budget abort. Once prepare() starts, the item is in
+                        # flight and is allowed to finish with a durable outcome.
+                        if budget_abort.is_set():
+                            return {"id": item_id, "status": "aborted"}
                         prepared = attempt_store.prepare(
                             target,
                             policy=node.retry,
@@ -3327,15 +3367,43 @@ class Dag:
             except Exception as error:
                 # KeyboardInterrupt/SystemExit 不许伪装成单项失败被聚合吞掉:
                 # 让它按原类型冲出去,调度器 drain 后原样重抛。
+                if isinstance(error, BudgetExceeded):
+                    budget_abort.set()
                 return {"id": item_id, "status": "failed", "error": error}
 
+        outcomes: list[dict[str, Any]] = []
         if len(entries) <= 1 or workers == 1:
-            outcomes = [execute_item(item_id, item) for item_id, item in entries]
+            for item_id, item in entries:
+                outcome = execute_item(item_id, item)
+                outcomes.append(outcome)
+                if outcome["status"] == "aborted":
+                    break
+                if outcome["status"] == "failed" and isinstance(
+                    outcome.get("error"), BudgetExceeded
+                ):
+                    break
         else:
-            # Items share the run-wide executor rather than opening a nested pool:
-            # the permit plane, not a private worker count, is what bounds them.
-            futures = [executor.submit(execute_item, item_id, item) for item_id, item in entries]
-            outcomes = [future.result() for future in futures]
+            budget = getattr(self.caller, "budget", None)
+            budget_limited = budget is not None and budget.max_tokens is not None
+            # A finite budget uses closed batches. The last slot is held back so
+            # a three-item map at workers=3 cannot admit item three before the
+            # first two admissions have been observed. Items in a submitted
+            # batch are in flight and are drained before aborting later batches.
+            batch_size = max(1, workers - 1) if budget_limited else workers
+            for start in range(0, len(entries), batch_size):
+                if budget_abort.is_set():
+                    break
+                batch = entries[start : start + batch_size]
+                futures = [executor.submit(execute_item, item_id, item) for item_id, item in batch]
+                batch_outcomes = [future.result() for future in futures]
+                outcomes.extend(batch_outcomes)
+                if any(
+                    outcome["status"] == "failed"
+                    and isinstance(outcome.get("error"), BudgetExceeded)
+                    for outcome in batch_outcomes
+                ):
+                    budget_abort.set()
+                    break
 
         completed: dict[str, dict[str, Any]] = {}
         cache_keys: list[str] = []
@@ -3375,13 +3443,21 @@ class Dag:
                 pending.append(outcome["pending"])
             elif outcome["status"] == "retry_pending":
                 retry_pending.append(outcome["target"])
+            elif outcome["status"] == "aborted":
+                # An item that was never admitted has no attempt, receipt, or
+                # failure. It is intentionally absent from all public item
+                # bookkeeping collections.
+                continue
             else:
                 failures.append(outcome)
         if failures:
-            first = failures[0]["error"]
+            budget_failures = [
+                outcome for outcome in failures if isinstance(outcome.get("error"), BudgetExceeded)
+            ]
+            first = budget_failures[0]["error"] if budget_failures else failures[0]["error"]
             if isinstance(first, DryRunError):
                 raise first
-            if isinstance(first, (RetryExhausted, ProviderFailure)):
+            if isinstance(first, (RetryExhausted, ProviderFailure, BudgetExceeded)):
                 raise first
             details = ", ".join(
                 f"{outcome['id']} ({type(outcome['error']).__name__}: {outcome['error']})"
@@ -3398,7 +3474,9 @@ class Dag:
             artifact,
             node.cache == "auto"
             and not forced_all
-            and all(outcome["cache"] == "hit" for outcome in outcomes),
+            and all(
+                outcome["status"] == "success" and outcome["cache"] == "hit" for outcome in outcomes
+            ),
             cache_keys,
             item_cache_statuses,
         )
@@ -3432,6 +3510,7 @@ class Dag:
         envelope: ExecutionEnvelope,
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
+        budget_abort: threading.Event,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
@@ -3808,6 +3887,9 @@ class Dag:
             except OutputOwnershipError:
                 raise
             except Exception as error:
+                if isinstance(error, BudgetExceeded):
+                    budget_abort.set()
+                    raise
                 if isinstance(error, (RetryExhausted, ProviderFailure, AgentExecutionFailure)):
                     raise
                 raise RuntimeError(

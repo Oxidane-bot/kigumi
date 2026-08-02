@@ -64,7 +64,15 @@ from .bench import (
     bench,
 )
 from .blobs import BlobStore
-from .calling import Budget, BudgetExceeded, Caller, DryRunError, LLMCaller, observe
+from .calling import (
+    Budget,
+    BudgetExceeded,
+    BudgetPermit,
+    Caller,
+    DryRunError,
+    LLMCaller,
+    observe,
+)
 from .config import KigumiConfig, find_project_root, load_config, load_env
 from .dag import (
     CheckpointPending,
@@ -152,6 +160,7 @@ __all__ = [
     "BlobStore",
     "Budget",
     "BudgetExceeded",
+    "BudgetPermit",
     "CacheIntegrityError",
     "CacheLookup",
     "Candidate",

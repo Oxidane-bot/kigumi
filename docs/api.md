@@ -12,9 +12,12 @@
   `call_validated` 的首次校验与全部 `max_repairs` 修复仍失败。检查异常链中的最后一次校验
   错误，修正 schema、prompt 或 validator；需要审计各轮时传 `sink=` / `on_event=`。见
   [L2 修复环](adoption.md#2-组装调用栈)。
-- `class BudgetExceeded(RuntimeError)`（`kigumi.calling`，顶层导出）：一次已完成调用把
-  `Budget.spent` 推过 `max_tokens` 后抛出；该调用已经计费并进入缓存。停止后续调用、提高预算
-  或命中既有缓存，不能把这次异常理解为请求未发生。
+- `class BudgetPermit`（`kigumi.calling`，顶层导出）：`Budget.reserve()` 返回的预留句柄；
+  成功响应调用 `commit(actual_usage)`，失败或取消调用 `cancel()`。
+- `class BudgetExceeded(RuntimeError)`（`kigumi.calling`，顶层导出）：预留额度不足，或一次已完成
+  调用的实际用量使 `Budget.spent` 推过 `max_tokens` 时抛出。缓存命中不做预留；miss 在 provider
+  请求前按 prompt 长度加 `max_tokens` 做 best-effort 预留，实际用量可能超过预留并在 commit 时
+  被记录。预算只在进程内协调；`LLMCaller` 的同 key 锁不提供跨进程 single-flight。
 - `class DryRunError(RuntimeError)`（`kigumi.calling`，顶层导出）：`LLMCaller(dry=True)` 遇到
   L1 miss、原本必须发真实请求。先补齐缓存，或在明确允许真实请求的运行中关闭 `dry`。见
   [零真实请求的测试](adoption.md#零真实请求的测试)。

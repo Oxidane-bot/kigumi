@@ -13,9 +13,15 @@
 
 - `ResourceRequest` 与 `Dag.run(resource_limits=...)`:按节点声明资源(GPU、供应商配额等),
   运行时分别限流;未声明的节点走 `None` 默认池。多资源按名字确定序获取,不会互等。
+- `BudgetPermit` 与 `Budget.reserve()` / `commit()` / `cancel()` 预算 admission API:
+  付费调用前先预留额度,缓存命中不占额度,失败与空响应会退还预留。
 
 ### 修复
 
+- `BudgetExceeded` 现从 map、scan 和 foreach 保持原类型传播;预算超限会中止后续 fan-out
+  item,已在途 item 完成后再统一收尾,而不是把超限埋进聚合失败里。
+- `Budget` 预留估算现同时计入 prompt 与 `max_tokens`;此前声明 `max_tokens` 会让预留
+  只按输出额度计算,输入 token 不设防。
 - 副作用边界改按 executor 类型安装,不再要求节点声明 `retry`:此前未声明重试策略的节点
   在付费调用后崩溃不会留下 `side_effect_started`,恢复时会误判为「未产生副作用」。
 - 损坏与缺失现被区分:损坏的 attempt 状态抛 `StateIntegrityError`,损坏的缓存条目按
