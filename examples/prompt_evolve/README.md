@@ -1,7 +1,9 @@
-# prompt_evolve 零请求试点
+# prompt_evolve 零请求试点（实验性内容级 recipe）
 
-这是 `evolve_prompt()` 的端到端验收示例，不建立 DAG，也不发真实模型请求。`demo.py`
-用脚本化 caller 返回围栏中的候选模板；task 与 metric 都是确定性 Python 函数。
+这是 `evolve_prompt()` 的端到端验收示例，不建立 DAG，也不发真实模型请求。它只演示普通
+提示词字符串的实验性内容级进化，不是 DAG/Agent 优化器、durable run recovery 或无偏的
+泛化估计器，也不会自动晋升候选。`demo.py` 用脚本化 caller 返回围栏中的候选模板；task
+与 metric 都是确定性 Python 函数。
 
 运行：
 
@@ -12,6 +14,11 @@ uv run python examples/prompt_evolve/demo.py
 示例断言以下路径：种子验证基线、成功入池、train 涨而 val 跌的拒收、样例片段泄漏拒收、
 字符预算拒收，以及指标预算中断后的 state 续跑。续跑结果与一次性运行相同，证明同 seed 的
 父本随机选择可回放。
+
+需要函数、Caller、DAG 或 Agent 的证据时，应改用 `bench` 加
+`FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；需要把候选用于实际运行时，
+应先用 Prompt 声明记录选择，再经过明确人工审阅。这里的 state 是本地 JSON 算法检查点，
+不是带副作用感知的 durable run receipt。
 
 ## 框架摩擦与缺口
 
@@ -31,9 +38,10 @@ uv run python examples/prompt_evolve/demo.py
 4. **已文档澄清：预算中断后续跑。** 场景：需要明确上限的含义。实际：`max_metric_calls` 是跨
    state 的累计总上限；恢复调用必须传一个大于已消耗数的总额，`round` 只表示已完成轮数，未完成轮
    会从反思阶段重新进入。该语义现已写入 `evolve_prompt` docstring 与接入指南；参数暂不改名。
-5. **已修复：state 未绑定实验输入。** 场景：验证续跑仍与原实验一致。此前 state 仅校验 schema
-   与 seed，相同 seed 配上变化后的输入会复用旧候选和 judgments。现写入并校验实验指纹：种子模板、
-   train/val 样例、反思模板、字符预算、泄漏窗口和 minibatch 任一变化都会警告并从头重置。
+5. **有限澄清：state 的实验输入指纹。** 场景：验证续跑仍与原实验一致。state 现在写入并校验
+   实验指纹：种子模板、train/val 样例、反思模板、字符预算、泄漏窗口和 minibatch 任一变化都会
+   警告并从头重置。但它不绑定 task、metric、caller、reflection model 或外部状态；因此只是本地
+   算法检查点，不是完整的 evaluator identity，也不是带副作用感知的 durable run receipt。
 6. **观察中：Metric 缺少 split 上下文。** 场景：度量函数要表达“训练升、验证降”。期望：metric
    能显式知道 split，避免样例自带标记。实际：`Metric(example, output)` 没有 split 参数，demo 只能
    用样例 id 前缀区分。建议：等真实指标需求出现后，再评估可选 split 上下文或 train/val 分别接收

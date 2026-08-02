@@ -7,7 +7,7 @@
 [CHANGELOG.md](../CHANGELOG.md)。
 
 想先在零真实请求下看完整路径，可运行[客服工单抽取 DAG](https://github.com/Oxidane-bot/kigumi/blob/master/examples/ticket_extract/README.md)
-或[提示词进化环](https://github.com/Oxidane-bot/kigumi/blob/master/examples/prompt_evolve/README.md)（示例只在仓库里，不随 wheel 交付）。前者用 150 张固定 seed 合成工单测量
+或[实验性内容级提示词进化 recipe](https://github.com/Oxidane-bot/kigumi/blob/master/examples/prompt_evolve/README.md)（示例只在仓库里，不随 wheel 交付）。前者用 150 张固定 seed 合成工单测量
 map/cache/GC，后者验收 train/val 隔离、拒收与 state 续跑；两者都保留已知框架摩擦。
 
 ## 进场协议（改节点前先做这三步）
@@ -1269,6 +1269,16 @@ def repair_gate(inputs, ctx):
 
 ## 四、评估与提示词进化(evals / optimize)
 
+`evals.py` 提供指标、评委与门禁；其中 `evolve_prompt` 只是实验性、内容级 recipe：它接收普通
+prompt 字符串和调用方提供的 `task`、`metric`、`caller`，演化字符串候选。它不是 DAG/Agent
+优化器、durable run recovery 或无偏的泛化估计器，也不会自动晋升任何候选；现有
+`Candidate`、`EvolveResult` 与 `evolve_prompt` 导入继续保留。
+
+需要函数、Caller、DAG 或 Agent 的可比较证据时，用 `bench` 加
+`FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。需要把候选用于实际运行时，先用
+`PromptSpec` 等 Prompt 声明记录选择，再经过明确人工审阅；不要把这条 recipe 当作框架级的
+Prompt、DAG 或 Agent 选型器。
+
 ### 指标怎么写
 
 双轴,不混:
@@ -1334,6 +1344,8 @@ pairwise verdict 的固定分数映射是
 
 ### 进化怎么跑
 
+下面只说明这条实验性内容级 recipe 的现有行为，不把它当作通用优化器或工作流恢复机制。
+
 ```python
 from kigumi import evolve_prompt
 
@@ -1346,13 +1358,15 @@ result = evolve_prompt(
     caller=caller,
     state_path=Path("artifacts/evolve_state.json"),  # 断点续跑
 )
-print(result.generalization_gap)  # train 均分 - val 均分,过拟合观测值
+print(result.generalization_gap)  # 当前已记录分数的 train - val 均值差,不是无偏泛化估计
 ```
 
 必须知道的机制(这些是代码闸门,不是建议):
 
 1. **train/val 由你切**,库不猜。两侧都不许为空。经验起点:小测评集
-   对半切;样例总数 < 6 时先扩测评集再谈优化。
+   对半切;样例总数 < 6 时先扩测评集再谈优化。这个验证均值闸门不构成无偏的
+   泛化估计;没有 untouched test set、统计比较或多 seed 证据时,不要把
+   `generalization_gap` 当成通用泛化结论。
 2. **val 的内容与评语永远不会进反思 prompt**;候选 val 均分低于父本直接
    拒收;候选新增文本含 ≥ `leak_run_chars`(默认 12)字的样例原文直接拒收。
    这三道闸不可配置关闭。`leak_run_chars` 是可调的防泄漏闸，窗口按字符计：
@@ -1361,16 +1375,19 @@ print(result.generalization_gap)  # train 均分 - val 均分,过拟合观测值
 3. **同分更短者胜**:简洁性是 Pareto 前沿的一个维度。种子模板本身也可能
    被更短的同分候选剪掉。
 4. `max_chars` 默认是种子长度的 2 倍——想要更紧的指令就调小它。
-5. **胜出文本不落盘**:`result.best` 由你人工审阅后决定是否写进
-   prompts/ 并提交 git。优化器改提示词是生产变更,必须过人手。
+5. **胜出文本不落盘**:`result.best` 由你人工审阅后决定是否通过
+   `PromptSpec` 等 Prompt 声明写入项目并提交 git。优化器改提示词是项目变更,
+   必须过人手,不会自动晋升。
 6. 反思模板与评委措辞都是参数(`reflection_template` / `wording`),
    默认常量只是合理起点;自定义反思模板槽位必须恰好是
    `current_template` / `merged_feedback` / `max_chars`。
-7. 成本账:每轮 ≈ minibatch 次父本评估 + 1 次反思调用 + (过闸后)
-   train+val 全量评估。用 `max_metric_calls` 设硬顶;`(候选, 样例)` 对
-   全程只评一次,含续跑。使用 `state_path` 时，`max_metric_calls` 是跨续跑的**累计总上限**，
-   恢复时须传入大于已消耗次数的总额；state 的 `round` 只表示已完成轮数，未完成轮会从反思阶段
-   重进。
+7. **有界评估**:每轮约为 minibatch 次父本评估 + 1 次反思调用 + (过闸后)
+   train+val 全量评估。用 `max_metric_calls` 设指标评估的硬顶;`(候选, 样例)` 对
+   全程只评一次,含续跑。`metric_calls` 是未命中的候选-样例判断计数,不是 provider
+   调用数或成本数,也不包含反思调用。使用 `state_path` 时，`max_metric_calls` 是跨续跑的
+   **累计总上限**，恢复时须传入大于已消耗次数的总额；state 的 `round` 只表示已完成轮数，
+   未完成轮会从反思阶段重进。这个 state 是本地 JSON 算法检查点，不是带 attempt receipt、
+   side-effect 边界或证据绑定的 durable run recovery；有副作用的工作流应使用 DAG 的恢复机制。
 
 ### 统一实验主体：workflow 与 Agent 使用同一证据网格
 

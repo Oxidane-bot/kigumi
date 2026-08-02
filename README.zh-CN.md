@@ -60,8 +60,15 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 
 0.10.1,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
 
+`Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入继续保留；但它们只组成一条
+实验性、content-only 的普通提示词文本进化 recipe。它不是 DAG/Agent 优化器、durable run
+recovery 或无偏的泛化估计器，也不会自动晋升候选。需要函数、Caller、DAG 或 Agent 的证据时，
+应使用 `bench` 加 `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`；需要晋升时，
+用 `PromptSpec` 等 Prompt 声明并经过明确人工审阅。它仍提供验证反馈隔离、有界指标评估、手工晋升
+与可续跑的本地 JSON 状态；后者只是本地算法检查点，不是带副作用感知的 durable run receipt。
+
 内置 judge、pairwise 与 reflection prompt 默认使用中文文本，三者都可覆盖；参数与槽位契约见
-[评估与提示词进化](docs/adoption.md#四评估与提示词进化evals--optimize)。
+[实验性评估与提示词进化 recipe](docs/adoption.md#四评估与提示词进化evals--optimize)。
 
 ## 分层 Prompt 示例
 
@@ -113,7 +120,7 @@ pending，不在进程内 sleep；外部 supervisor 到期调用 `Dag.resume()`�
 run 直接 fail closed，不能 resume。
 
 想先零真实请求跑通一遍，可从[客服工单抽取 DAG](examples/ticket_extract/README.md)或
-[提示词进化环](examples/prompt_evolve/README.md)开始。两者都记录了实际接入时遇到的框架摩擦；
+[实验性内容级提示词进化 recipe](examples/prompt_evolve/README.md)开始。两者都记录了实际接入时遇到的框架摩擦；
 工单示例还保留了本地实测数字。
 
 ## 文档地图

@@ -94,9 +94,15 @@ adoption.md 的"设计边界"一节。
 | 实验主体(函数/caller/DAG/Agent) | `FunctionSubject` / `CallerSubject` / `DagSubject` / `AgentSubject` |
 | LLM 评委 | `llm_judge` / `pairwise_judge` / `Judgment` |
 | 闸门没过就不烧评委调用 | `gated_metric` |
-| 提示词自动进化(可续跑) | `evolve_prompt` |
+| 实验性、内容级提示词文本进化(可续跑) | `evolve_prompt` |
 
 内置评委与反思提示词默认是中文文本,三者都可覆盖,见 adoption.md。
+
+`evolve_prompt` 只演化普通提示词字符串，保留 `Candidate`、`EvolveResult` 与
+`evolve_prompt` 的导入兼容性；它不是 DAG/Agent 优化器、durable run recovery 或无偏的泛化
+估计器，也不自动晋升候选。它仍提供验证反馈隔离、有界指标评估、手工晋升与可续跑的本地 JSON
+状态，但 state 只是本地算法检查点，不是带副作用感知的 durable run receipt。需要证据时使用
+`bench` 与上面的四类实验主体；需要晋升时用 Prompt 声明并进行明确人工审阅。
 
 ## 测试与守卫
 

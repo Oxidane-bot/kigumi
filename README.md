@@ -76,9 +76,20 @@ with no further API cost.
 0.10.1, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
 
+The retained `Candidate`, `EvolveResult`, and `evolve_prompt` imports form an
+experimental, content-only recipe for evolving plain prompt strings. It is not a
+DAG/Agent optimizer, durable run recovery, or an unbiased generalization estimator,
+and it never promotes a candidate automatically. For evidence about functions,
+callers, DAGs, or Agents, use `bench` with `FunctionSubject`, `CallerSubject`,
+`DagSubject`, or `AgentSubject`; promote through Prompt declarations such as
+`PromptSpec` and explicit human review. The recipe still provides validation-
+feedback isolation, bounded metric evaluation, manual promotion, and resumable
+local JSON state; that state is a local algorithm checkpoint, not a durable
+side-effect-aware run receipt.
+
 The built-in judge, pairwise, and reflection prompts default to Chinese text;
 all three are overridable. See the
-[evaluation and prompt-evolution guide](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md#%E5%9B%9B%E8%AF%84%E4%BC%B0%E4%B8%8E%E6%8F%90%E7%A4%BA%E8%AF%8D%E8%BF%9B%E5%8C%96evals--optimize).
+[experimental evaluation and prompt-evolution recipe](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md#%E5%9B%9B%E8%AF%84%E4%BC%B0%E4%B8%8E%E6%8F%90%E7%A4%BA%E8%AF%8D%E8%BF%9B%E5%8C%96evals--optimize).
 
 ## Layered Prompt example
 
@@ -137,7 +148,7 @@ retention after mandatory secret scrubbing, but is not encryption or access
 For a zero-request first run, try the
 [ticket-extraction DAG](https://github.com/Oxidane-bot/kigumi/tree/master/examples/ticket_extract)
 or the
-[prompt-evolution loop](https://github.com/Oxidane-bot/kigumi/tree/master/examples/prompt_evolve).
+[experimental content-only prompt-evolution recipe](https://github.com/Oxidane-bot/kigumi/tree/master/examples/prompt_evolve).
 Both examples record the framework friction found while putting the workflow into practice;
 the ticket example also includes measured local-run numbers.
 

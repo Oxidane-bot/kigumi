@@ -54,7 +54,7 @@ kigumi/
 ├── evidence.py     #     EvidencePolicy、credential scrub 与证据缩减
 ├── failures.py     #     CALL/Agent 共用 typed failure
 ├── inspect.py      #     run sidecar 与 L1 载荷的只读联接,不触运行时
-├── optimize.py     #     评估与进化层的提示词候选演化
+├── optimize.py     #     实验性、内容级的提示词候选演化 recipe
 ├── prompt.py       # L1.5 拼接:inject / 严格渲染 / Section / schema 格式段 / clip
 ├── profile.py      #     canonical WorkflowProfile 校验与 JSON/Markdown/Mermaid 投影
 ├── repair.py       # L2  修复环:repair_loop + call_validated;rebuild/continue 双模式
@@ -217,10 +217,16 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   strict=False 控制字符容错)。
 
 ### 评估与进化(evals / optimize)
-- `evals.py` 与 `optimize.py` 是库内的评估与进化层，不是独立产品；它们骑在
-  L1 caller 之上，评委调用天然复用 L1 缓存。
-- optimize 的 `(候选, 样例)` 判分状态文件只服务断点续跑，不绕过 L1；胜出文本
-  不自动落盘，须经人工审阅后才进入 `prompts/`。
+- `evals.py` 是库内的指标、评委与门禁层；`optimize.py` 只是实验性、内容级的
+  prompt-string 演化 recipe。它保留 `Candidate`、`EvolveResult` 与 `evolve_prompt`
+  的导入兼容性，但不是 DAG/Agent 优化器、durable run recovery 或无偏的泛化估计器，
+  也不自动晋升候选。
+- optimize 的 `(候选, 样例)` 判分状态文件只服务本地算法检查点与续跑；它不产生
+  DAG/Agent 的 provenance、attempt receipt 或 side-effect-aware durable recovery。
+  胜出文本不自动落盘，须经人工审阅并通过 Prompt 声明后才进入项目。
+- 这条 recipe 仍提供验证反馈隔离、有界指标评估、手工晋升与本地 JSON 续跑；需要函数、
+  Caller、DAG 或 Agent 的可比较证据时，应使用 `bench` 加
+  `FunctionSubject`/`CallerSubject`/`DagSubject`/`AgentSubject`。
 - `bench.py` 为同一流水线的结构切法生产变体×样例×种子的可归档证据，不裁决胜负，
   不自动接线；每个变体独立持有 caller，固定种子仍可复用 L1。
 
@@ -387,7 +393,7 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
   docstring/注释后按 AST 哈希，语法残破文件退回原文；此变更让 libs 成分
   全体换族，既有节点缓存一次性失效（greenfield 内无外部用户，直接执行）。
 
-- 2026-07-13 第一轮整改：包结构补齐为实际 16 个模块；明确 evals/optimize、
+- 2026-07-13 第一轮整改：包结构补齐为实际 16 个模块；明确 evals 与实验性 optimize recipe、
   store/blobs/slots 的边界；守卫三环如实区分注册环与 source_dirs 启发式 raw-io
   扫描；记录双 CLI 分工与 `live` 标记统一为双确认门。
 
