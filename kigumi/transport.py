@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from .failures import (
@@ -270,6 +271,21 @@ class StdlibTransport(_RetryingTransport):
             max_length_retries=max_length_retries,
             max_empty_retries=max_empty_retries,
         )
+        parsed_api_base = urlsplit(api_base)
+        if not parsed_api_base.scheme:
+            raise ValueError("api_base must include an http or https scheme")
+        if parsed_api_base.scheme not in {"http", "https"}:
+            if not parsed_api_base.netloc:
+                raise ValueError(
+                    f"api_base scheme {parsed_api_base.scheme!r} is not supported; "
+                    "the address may be missing an http:// or https:// prefix"
+                )
+            raise ValueError(
+                f"api_base scheme {parsed_api_base.scheme!r} is not supported; "
+                "expected http or https"
+            )
+        if not parsed_api_base.netloc:
+            raise ValueError("api_base must include a host")
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self._timeout = timeout
@@ -291,7 +307,8 @@ class StdlibTransport(_RetryingTransport):
             },
             method="POST",
         )
-        with urlopen(request, timeout=self._timeout) as http_response:  # noqa: S310 -- caller supplies endpoint.
+        # Construction validates api_base as HTTP(S), so the caller cannot select local handlers.
+        with urlopen(request, timeout=self._timeout) as http_response:  # nosec B310
             raw_response = json.loads(http_response.read().decode("utf-8"))
         return _response_from_provider(raw_response, model)
 

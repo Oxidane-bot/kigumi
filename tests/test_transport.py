@@ -200,6 +200,43 @@ def test_stdlib_retry_exhaustion_returns_typed_failure_without_endpoint_secret(
     assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
 
 
+def test_stdlib_transport_rejects_non_http_api_base() -> None:
+    with pytest.raises(ValueError, match="file"):
+        StdlibTransport("file:///etc/passwd", "secret")
+
+
+@pytest.mark.parametrize("api_base", ["/v1", "localhost:8080"])
+def test_stdlib_transport_rejects_scheme_less_api_base(api_base: str) -> None:
+    with pytest.raises(ValueError, match="scheme"):
+        StdlibTransport(api_base, "secret")
+
+
+def test_stdlib_transport_suggests_http_scheme_for_host_port() -> None:
+    with pytest.raises(ValueError, match="http://"):
+        StdlibTransport("localhost:8080", "secret")
+
+
+@pytest.mark.parametrize("api_base", ["http://", "https://"])
+def test_stdlib_transport_rejects_http_api_base_without_host(api_base: str) -> None:
+    with pytest.raises(ValueError, match="host"):
+        StdlibTransport(api_base, "secret")
+
+
+@pytest.mark.parametrize(
+    ("api_base", "expected_api_base"),
+    [
+        ("http://localhost:8080/v1/", "http://localhost:8080/v1"),
+        ("https://api.example.com/", "https://api.example.com"),
+    ],
+)
+def test_stdlib_transport_accepts_http_api_base_schemes(
+    api_base: str, expected_api_base: str
+) -> None:
+    transport = StdlibTransport(api_base, "secret")
+
+    assert transport.api_base == expected_api_base
+
+
 def test_transient_errors_adjust_adaptive_capacity_before_success(monkeypatch) -> None:
     """教训 adaptive_transport: 静态槽数在长跑生产会被 429 打死，容量必须是跨进程共享的活值。"""
     attempts = 0
