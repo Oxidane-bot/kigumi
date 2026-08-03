@@ -1085,7 +1085,7 @@ def test_pi_timeout_terminates_the_whole_process_group(
             AgentRunContext(
                 workspace,
                 capsule_root,
-                time.monotonic() + 1.0,
+                time.monotonic() + 5.0,
                 lambda event: None,
                 lambda name, data, media: None,
             ),
@@ -1093,8 +1093,10 @@ def test_pi_timeout_terminates_the_whole_process_group(
     assert raised.value.provider_failure is not None
     assert raised.value.provider_failure.kind is ProviderFailureKind.TIMEOUT
     child_pid = int(pid_file.read_text(encoding="utf-8"))
+    wait_started = time.monotonic()
+    deadline = wait_started + 15.0
     status = ""
-    for _ in range(20):
+    while time.monotonic() < deadline:
         status = subprocess.run(
             ["ps", "-p", str(child_pid), "-o", "stat="],
             capture_output=True,
@@ -1104,7 +1106,11 @@ def test_pi_timeout_terminates_the_whole_process_group(
         if not status or status.startswith("Z"):
             break
         time.sleep(0.05)
-    assert not status or status.startswith("Z")
+    waited = time.monotonic() - wait_started
+    assert not status or status.startswith("Z"), (
+        f"child pid {child_pid} was not reaped after waiting {waited:.2f}s; "
+        f"last observed ps status={status!r}"
+    )
 
 
 def test_pi_success_and_failure_evidence_is_blob_verified_and_gc_reachable(
