@@ -429,6 +429,7 @@ def _init(root: Path, *, hooks: bool) -> int:
         (directory / ".gitkeep").touch(exist_ok=True)
     _append_gitignore(root / ".gitignore", f"{config.artifacts_dir.rstrip('/')}/")
     entry_path = _write_dag_entry(root)
+    _write_agent_docs(root)
     if hooks:
         hook_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n")
@@ -451,6 +452,31 @@ def _write_dag_entry(root: Path) -> Path | None:
     (package / "__init__.py").touch(exist_ok=True)
     atomic_write_text(entry_path, DAG_ENTRY_TEMPLATE)
     return entry_path
+
+
+_AGENT_DOCS_SENTINEL = "<!-- kigumi-agent-docs -->"
+
+
+def _write_agent_docs(root: Path) -> None:
+    """Append kigumi framework guidance to CLAUDE.md and AGENTS.md (idempotent).
+
+    Called unconditionally by ``kigumi init``.  The HTML sentinel prevents
+    double-injection if the pyproject ``[tool.kigumi]`` block is ever manually
+    removed and ``init`` is re-run.
+    """
+    brief = read_doc("brief")
+    # Demote the top heading so it sits as a subsection of any existing document.
+    body = brief.replace("# kigumi brief (read this first)", "## kigumi", 1).strip()
+    block = f"\n{_AGENT_DOCS_SENTINEL}\n{body}\n"
+    for filename in ("CLAUDE.md", "AGENTS.md"):
+        path = root / filename
+        if path.is_file():
+            existing = path.read_text(encoding="utf-8")
+            if _AGENT_DOCS_SENTINEL in existing:
+                continue
+            atomic_write_text(path, existing.rstrip() + "\n" + block)
+        else:
+            atomic_write_text(path, block.lstrip("\n"))
 
 
 def _append_gitignore(path: Path, entry: str) -> None:

@@ -193,6 +193,42 @@ def test_init_hooks_refuses_existing_hook_and_missing_pyproject(
     assert existing.read_text(encoding="utf-8") == "custom hook\n"
 
 
+def test_init_writes_agent_docs_for_claude_and_codex(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """教训 agent_docs_auto: init always writes kigumi guidance into CLAUDE.md and AGENTS.md."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert main(["init"]) == 0
+
+    for filename in ("CLAUDE.md", "AGENTS.md"):
+        text = (tmp_path / filename).read_text(encoding="utf-8")
+        assert "kigumi" in text
+        assert "kigumi brief" in text
+        assert "kigumi plan" in text
+        assert "ctx.call" in text
+
+
+def test_init_appends_to_existing_agent_docs_without_duplication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """教训 agent_docs_append: existing CLAUDE.md/AGENTS.md gets section appended, not replaced."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    existing = "# My Project\n\nCustom rules here.\n"
+    (tmp_path / "CLAUDE.md").write_text(existing, encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text(existing, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert main(["init"]) == 0
+
+    for filename in ("CLAUDE.md", "AGENTS.md"):
+        text = (tmp_path / filename).read_text(encoding="utf-8")
+        assert text.startswith(existing)
+        assert "kigumi" in text
+        # No duplicate section on repeat init (tool.kigumi already exists → exit 1)
+
+
 def test_guard_reports_violations_waivers_and_new_changed_waivers(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
