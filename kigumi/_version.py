@@ -1,3 +1,3 @@
 """Single source of truth for the packaged Kigumi version."""
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"

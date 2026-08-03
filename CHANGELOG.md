@@ -4,10 +4,14 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-03
+
 ### 文档
 
 - 对齐 Agent node 与 WorkflowProfile 契约文档中的 schema 声明，并新增测试守卫，自动核对活动文档
   的 schema 值与源码常量；`docs/reviews/` 中的历史记录不纳入检查。
+- 将契约文档中 30 处陈旧的数值行号引用（`dag.py:123-456`）替换为稳定的符号引用（`Dag.run`、
+  `_execute_map` 等），避免代码演进后引用漂移；测试守卫现扫描活动契约文档，拒绝新增数值引用。
 - 将 `optimize.py` / `evolve_prompt` 定位为实验性、内容级提示词 recipe：保留
   `Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入兼容性，不再将其描述为
   DAG/Agent 优化器、durable run recovery 或无偏的泛化估计器，也不提供自动晋升。证据建议
@@ -63,6 +67,8 @@
 
 ### 修复
 
+- 修复 Python 3.13 深层嵌套共享结构的测试挂起：120 层共享 tuple 树在 3.13 触发指数级哈希
+  行为，改用 frozenset 图避开该问题；3.13 全套测试通过，不影响 Python 3.10-3.12。
 - 修复静态 `libs` 闭包成功时跳过 runtime state 的 stale replay：现在只有静态闭包与所有已到达配置 callable 的
   defaults、closure、annotations、wrapper、partial、receiver 和 class state 都可表示时才允许 L3 复用。
 - 修复自定义容器隐藏配置 callable 的情况：遇到带配置源码 provenance 的非内建迭代/映射容器时保守关闭
