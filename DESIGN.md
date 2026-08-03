@@ -248,7 +248,7 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
 - `RetryPolicy` 默认缺席；显式启用后每个 node/item 有 durable attempt state。Kigumi 不常驻
   sleep，到期由外部 supervisor 再调 `Dag.resume()`。retry/checkpoint pending 只阻断下游。
 - schema-2 `_run.json` 固定 graph/targets/force/source/libs/retry/evidence、完整 Prompt
-  候选 universe 与 WorkflowProfile identity；schema-1/0.6 run 只读不可恢复，声明漂移拒绝。
+  候选 universe 与 WorkflowProfile identity；缺少 schema-2 manifest 的旧 run 不可恢复，声明漂移拒绝。
   provider/Pi side effect 前写 schema-2 receipt；成功先写 schema-2 candidate，
   因而 crash-after-success 可提交而不重请求。side effect 后无 terminal receipt 时必须人工
   `retry-resolve`，不假装 exactly-once。
@@ -377,7 +377,7 @@ source_dirs 级扫描只属于 dag check、测试环与提交环。raw-io 在这
 `kigumi`(cli.py) 是不需要图注册表的项目运维入口:init、guard、doctor、render、runs、
 approve、diff、trace、call、gc。`dag.cli()` 是需要注册表的图入口:check、plan、graph、
 profile、explain、describe、resume、retry-resolve;两者不互相代替。完整命令、参数、
-默认值与退出码见 [CLI 参考](docs/cli.md)。schema-1
+默认值与退出码见 [CLI 参考](docs/cli.md)。schema-2
 `WorkflowProfile` 是 profile、describe、Prompt Mermaid/Markdown、trace 与 runs show 的
 共同 IR；0.7 receipt digest 损坏一律 fail closed。
 `kigumi init` 是 developing-ai-workflows skill 的落地点:新项目起步从

@@ -38,7 +38,8 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 2. Agent 复用普通 node 的拓扑、cache lookup、seal、output claim、materialize、sidecar 和 run。
 3. `external` 摘要包含 `agent_executor_schema=5`、adapter/Pi expected version、bridge 与路径
    policy digest、capsule digest、provider/model/thinking、工具和 limits；普通 L3
-   `CACHE_SCHEMA=6`。
+   `CACHE_SCHEMA=7`，该未发布轮换绑定 managed request 的附件内容哈希、typed message 摘要、
+   response schema identity，并按节点细化静态 import `libs` 闭包。
 4. miss 只 staging 声明文件、canonical upstream 和 capsule snapshot；scratch 不保留。
 5. collect 产生无项目目标路径的 `kigumi_attachment`；`AgentCompletion.outputs` 必须全部来自
    本次 collect，并覆盖全部 publish source；只有 exact publish 进入普通物化。

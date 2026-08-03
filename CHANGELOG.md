@@ -6,6 +6,8 @@
 
 ### 文档
 
+- 对齐 Agent node 与 WorkflowProfile 契约文档中的 schema 声明，并新增测试守卫，自动核对活动文档
+  的 schema 值与源码常量；`docs/reviews/` 中的历史记录不纳入检查。
 - 将 `optimize.py` / `evolve_prompt` 定位为实验性、内容级提示词 recipe：保留
   `Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入兼容性，不再将其描述为
   DAG/Agent 优化器、durable run recovery 或无偏的泛化估计器，也不提供自动晋升。证据建议

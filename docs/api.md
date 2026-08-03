@@ -85,7 +85,7 @@
   取得 slot。降低并发、提高 timeout 或检查共享 lock/capacity 配置；Agent 路径会把它转成
   `AgentRuntimeFailureCode.CAPACITY`。见 [Agent 容量契约](contracts/agent-capacity.md)。
 - `class WorkflowProfileError(RuntimeError)`（仅
-  `from kigumi.profile import WorkflowProfileError`）：schema-1 WorkflowProfile 或关联
+  `from kigumi.profile import WorkflowProfileError`）：schema-2 WorkflowProfile 或关联
   receipt 缺失、schema 不支持、结构无效或 digest 不匹配。保留损坏现场并重新生成可信 run；
   不要手改摘要。见 [WorkflowProfile 契约](contracts/workflow-profile.md)。
 - `class RunManifestError(RuntimeError)`（仅
