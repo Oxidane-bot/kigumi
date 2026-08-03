@@ -11,7 +11,7 @@ def test_version_has_one_package_source() -> None:
     with (root / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)
 
-    assert __version__ == "0.11.0"
+    assert __version__ == "0.12.0"
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "kigumi/_version.py"

@@ -58,7 +58,7 @@ verdict = call_validated(caller, "给这段开场白打分并给出理由:……
 
 ## 状态
 
-0.11.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
+0.12.0,API 未冻结。Agent 边界只负责执行兼容与实验取证，不是 Agent factory 或优化器。
 
 `Candidate`、`EvolveResult` 与 `evolve_prompt` 的现有导入继续保留；但它们只组成一条
 实验性、content-only 的普通提示词文本进化 recipe。它不是 DAG/Agent 优化器、durable run
