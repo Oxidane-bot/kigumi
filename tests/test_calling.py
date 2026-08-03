@@ -86,12 +86,20 @@ print(caller.call("same request"), flush=True)
 
 
 def _wait_for_markers(state_dir: Path, prefix: str, count: int = 1) -> None:
-    deadline = time.monotonic() + 5
+    def marker_count() -> int:
+        marker_prefix = f"{prefix}-"
+        return sum(
+            1
+            for path in state_dir.glob(f"{prefix}-*")
+            if path.name.removeprefix(marker_prefix).isdigit()
+        )
+
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if len(list(state_dir.glob(f"{prefix}-*"))) >= count:
+        if marker_count() >= count:
             return
         time.sleep(0.01)
-    assert len(list(state_dir.glob(f"{prefix}-*"))) >= count
+    assert marker_count() >= count
 
 
 def _start_caller_worker(
@@ -473,7 +481,9 @@ def test_cross_process_key_lock_is_default_off(tmp_path: Path) -> None:
 
     try:
         _wait_for_markers(state_dir, "ready", 2)
-        _wait_for_markers(state_dir, "provider")
+        # Both no-lock workers must enter complete() before release, or the first
+        # worker can write the L1 cache before the second performs its lookup.
+        _wait_for_markers(state_dir, "provider", 2)
         (state_dir / "release").touch()
         results = [process.communicate(timeout=20) for process in processes]
     finally:
