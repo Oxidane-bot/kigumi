@@ -3938,6 +3938,34 @@ def test_representable_callable_instance_state_remains_cache_reusable(
         sys.modules.pop(helper_name, None)
 
 
+def test_safe_type_attribute_reads_every_slot_descriptor_kind() -> None:
+    """教训 mro_member_descriptor: type slot 读取不得因 descriptor 种类而 fail closed。
+
+    ``type.__mro__`` 在 3.11 是 member_descriptor、3.12+ 是 getset_descriptor。
+    只接受后者会让 ``_safe_type_mro`` 在 3.11 整体返回 None，
+    使所有 runtime state 判为 unrepresentable 并静默丢失缓存复用。
+    """
+
+    class Runner:
+        def __call__(self) -> str:
+            return "stable"
+
+    for name in ("__mro__", "__module__", "__qualname__", "__dict__"):
+        descriptor = type.__dict__.get(name)
+        assert type(descriptor) in (
+            types.GetSetDescriptorType,
+            types.MemberDescriptorType,
+        ), f"unexpected descriptor kind for type.{name}: {type(descriptor).__name__}"
+        assert dag_module._safe_type_attribute(Runner, name) is not (
+            dag_module._UNRESOLVED_RUNTIME_VALUE
+        ), f"type.{name} must resolve on this interpreter"
+
+    mro = dag_module._safe_type_mro(Runner)
+    assert mro is not None
+    assert mro[0] is Runner
+    assert mro[-1] is object
+
+
 def test_called_nested_body_binds_owner_module_identity(tmp_path: Path) -> None:
     """教训 libs_nested_call: 实际调用的 nested body 可观察 owner identity。"""
     source = tmp_path / "src"

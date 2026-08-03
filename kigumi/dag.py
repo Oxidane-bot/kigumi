@@ -4805,9 +4805,17 @@ def _is_builtin(value: Any) -> bool:
 
 
 def _safe_type_attribute(value: type[Any], name: str) -> Any:
-    """Read an exact ``type`` getset descriptor without metaclass dispatch."""
+    """Read an exact ``type`` slot descriptor without metaclass dispatch.
+
+    Both descriptor kinds are exact C-level slot readers taken from
+    ``type.__dict__``, so neither can route through user code. Accepting
+    ``member_descriptor`` as well as ``getset_descriptor`` is required because
+    ``type.__mro__`` is a ``member_descriptor`` on Python 3.11 and a
+    ``getset_descriptor`` from 3.12 onward; rejecting it made every runtime
+    state capture fail closed on 3.11 and silently lost cache reuse.
+    """
     descriptor = type.__dict__.get(name)
-    if type(descriptor) is not types.GetSetDescriptorType:
+    if type(descriptor) not in (types.GetSetDescriptorType, types.MemberDescriptorType):
         return _UNRESOLVED_RUNTIME_VALUE
     try:
         return descriptor.__get__(value, type(value))
