@@ -62,6 +62,35 @@ def test_explain_map_item_uses_its_own_sidecar(tmp_path: Path) -> None:
     assert changed.changed == ["params"]
 
 
+@pytest.mark.parametrize("kind", ["map", "scan"])
+def test_explain_empty_dynamic_aggregate_has_no_singular_key(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """空 map/scan aggregate 没有 singular key，explain 仍须诚实返回状态。"""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, list[Any]]:
+        return {"items": []}
+
+    decorator = (
+        dag.map("work", items_from=("source", "items"))
+        if kind == "map"
+        else dag.scan("work", items_from=("source", "items"))
+    )
+
+    @decorator
+    def work(*args: Any) -> dict[str, str]:
+        raise AssertionError("empty dynamic aggregate has no item to execute")
+
+    result = dag.run()
+    explained = dag.explain("work", result.run_id)
+    assert explained.status == dag.plan().nodes["work"]
+    assert explained.changed == []
+    assert explained.details == {}
+
+
 def test_explain_reports_unknown_and_no_entry_without_guessing(tmp_path: Path) -> None:
     """教训 explain_honesty: 无法取得上游时不能伪造变化原因。"""
 

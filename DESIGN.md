@@ -259,16 +259,54 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   `sha(external_fingerprint)` 作为可选 `external` 成分，原值不落 sidecar。普通依赖边声明
   `consumes` 时，`upstream:<dep>` 改为投影视图摘要，节点也只收到该 canonical 视图；未声明边
   仍按完整上游产物入键和传值。
-- `libs` 从节点函数所属模块出发沿静态 import 图计算传递闭包；只有模块顶层且无歧义的
-  import 才缩小文件集合。语法残破、节点模块无法定位、条件/嵌套或动态 import、动态
-  导入别名、已识别的动态可调用引用（无论是否调用，也不论赋值目标是简单名、walrus、属性、
-  下标/容器、解构或链式赋值）、`importlib` 及其子模块、star-import、模块级 `__getattr__`、相对导入无法解析、导入解析
-  有多个配置候选，或已加载模块的 `__file__` 偏离静态候选且仍在项目/配置源码范围内时，
-  节点退回旧的全文件 digest。模块 AST 中只要出现常见反射原语（`getattr`、`globals`、
-  `locals`、`vars`、`__dict__`、`__getattribute__`、`__builtins__`、显式
-  `builtins` 导入或模块注册表属性如 `sys.modules`），即使与导入无关或名称/键是计算出来的，
-  也退回精确全文件 digest；不做脆弱的常量传播。这里宁可多失效也不漏失效是刻意的安全边界，
-  但它仍只是源码 AST 分析，不是对整个 Python 运行时或任意外部/native 代码的证明。
+- `libs` 从节点函数所属模块出发沿静态 import 图计算传递闭包；它管理的源码宇宙严格是
+  `config.source_paths`。项目根下未列入这些配置路径的 imported helper 不由 `libs` 跟踪；独立的
+  `source` 成分只覆盖注册节点函数本身，其他外部输入必须加入 `source_dirs` 或声明显式指纹。
+  只有模块顶层且无歧义的 import 才缩小文件集合。语法残破、
+  节点模块无法定位、条件/嵌套或动态 import、动态导入别名、已识别的动态可调用引用（无论是否
+  调用，也不论赋值目标是简单名、walrus、属性、下标/容器、解构或链式赋值）、`importlib` 及其
+  子模块、star-import、模块级 `__getattr__`、相对导入无法在所有配置源码根中唯一解析、相对导入
+  存在多个候选、`ImportFrom` child 未能独立解析（即使 base package 已解析）、导入解析有多个
+  配置源码候选，已加载模块的 `__file__` 偏离静态候选且仍在配置源码路径内，或表面为外部的已加载
+  package 通过运行时 `__path__` 伸入配置源码宇宙时，节点退回旧的全文件 digest。普通
+  `ImportFrom` 属性只在 base 模块顶层 AST 明确证明函数、类、赋值或安全
+  import binding 时保持闭包粒度；相对导入携带实际限定模块 identity 并校验所有 dotted loaded
+  prefixes，向上相对导入按 climb 后的 package suffix 校验；缺失 expected `sys.modules` 条目也按
+  不确定处理。选中闭包同时绑定限定模块名；owner identity 从当前注册节点函数出发，只跟进实际
+  到达的 nested function、class body 与直接调用的 Python function graph，避免未调用 sibling
+  污染粒度。剥除 docstring 后的可执行 AST 直接观察 `__name__`、`__package__`、`__file__`、
+  `__spec__`、`__loader__`，通过函数对象的 `__module__`/`__globals__` 观察 owner，或通过直接、
+  属性、partial 绑定、closure 别名及保守下标选择形式调用 `globals`、`locals`、`vars`、`eval`、
+  `exec`、`compile`、`getattr`/`object.__getattribute__` 观察实际 owner/registered-function receiver
+  时，还绑定 owner 的限定模块名与稳定项目相对/canonical 路径。判断遵守 Load/Store 与词法局部
+  绑定，所以 `getattr(helper, "__name__")`、`helper.eval(...)`、`obj.globals` 和局部 `__name__`
+  不会自动绑定 owner；docstring、非查找字符串或常量 `getattr(helper, "VALUE")` 仍不污染粒度。
+  detached function 只有在 `__module__`、函数 globals 名称及 code/source path 事实一致时恢复
+  owner；冲突事实进入 fail-closed fallback。
+  fallback 绑定当前已加载/函数实际引用的配置源码模块选择，以及 retained function/class、partial、
+  wrapper outer/target 的 provenance 与 executable code digest。运行时状态通过一张跨 callable/global
+  root 共享的确定性对象图表示，覆盖 closure、defaults/kwdefaults、annotations、function dict、
+  bound method function/receiver、partial 参数、wrapper、实例 dict、每个 MRO slot、class/base/
+  metaclass state 与 slot/container 中到达的 callable；保留 dict insertion order、普通
+  `"__wrapped__"` 数据键、float bit pattern、cycle 和 shared-alias topology。遍历设有 node/depth/
+  member 硬上限并对 code DAG、源码归一化、`sys.modules` provenance 和同一 query 中重复 node
+  function 做 memoization；超预算或遇到 native container subclass、custom descriptor/property/
+  `__getattribute__`、不安全路径对象等无法通过 exact built-in type/getset/member descriptor 读取的
+  状态时，保留稳定 `libs` digest，但把 L3 reusability 单独降为 `off`。可动态观察完整 globals
+  namespace 的函数同样降级，不声称已证明任意 namespace 等价。run、plan、explain、普通 node、
+  map 与 scan 共用这项有效策略：不读写 L3，也不让空 item 集合通过 `all([])` 伪造 aggregate hit；
+  不得用随机 key 破坏 run manifest、resume/recover 或 explain。
+  fallback 还绑定实际引用的简单全局值，以及配置源码根或 package parent 在 `sys.path` 中的相对
+  顺序。运行时路径只接受 exact string；取证不调用 `__fspath__`、truthiness、用户 equality/hash、
+  mapping hook、descriptor、partial subclass `__getattribute__` 或 custom metaclass hook。外部 dotted
+  import 的每个已加载 package prefix 都校验 `__path__` 是否触及 managed source。
+  两种摘要都绑定 `source_dirs` 顺序的稳定 source-root/file identity；项目内源码根使用相对项目根
+  路径，项目外配置根使用 canonical identity，不把临时绝对路径写入项目内键。模块 AST 中只要出现常见反射原语（`getattr`、
+  `globals`、`locals`、`vars`、`__dict__`、`__getattribute__`、
+  `__builtins__`、显式 `builtins` 导入或模块注册表属性如 `sys.modules`），即使与导入无关或
+  名称/键是计算出来的，也退回精确全文件 digest；不做脆弱的常量传播。这里宁可多失效也不漏失效
+  是刻意的安全边界，但它仍只是源码 AST 分析，不是对整个 Python 运行时或任意外部/native 代码
+  的证明。
 - `PromptSpec` 使用 selected-only L3 成分：base、固定 layer、selector/binding、实际 variant、
   material 与 rendered digest 入键，未选中 variant 内容不入该节点 key；完整候选 universe
   仍进入 run identity，因此可以安全复用同 selection 的 cache，却不能用漂移声明 resume。

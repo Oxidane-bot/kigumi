@@ -7,19 +7,23 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import copy
+import functools
 import getpass
 import inspect
 import json
 import os
+import struct
 import sys
 import textwrap
 import threading
 import time
+import types
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -1246,7 +1250,8 @@ class Dag:
                 return allocated_archive[0]
 
         # 源码只在 run 开始读一次:中途改文件不得让同一 run 内的缓存键漂移。
-        libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
+        libs_identities = self._libs_identities(self._nodes[name] for name in order)
+        libs_hashes = {name: identity.digest for name, identity in libs_identities.items()}
         prompt_snapshot = self._prompt_snapshot()
         attempt_store = AttemptStore(
             run_dir,
@@ -1284,9 +1289,11 @@ class Dag:
             if budget_abort.is_set():
                 return node_name, "skipped"
             node = self._nodes[node_name]
+            libs_cache_reusable = libs_identities[node.name].cache_reusable
             evidence_policy = node.evidence_policy or self._caller_evidence_policy()
             agent_provenance: dict[str, Any] | None = None
             resumed_completed = False
+            checkpoint_used = False
             with state_lock:
                 inputs = {dependency: artifacts[dependency] for dependency in node.deps}
                 upstream_shas = {dependency: artifact_shas[dependency] for dependency in node.deps}
@@ -1297,6 +1304,7 @@ class Dag:
             prompt_resolutions: dict[str, ResolvedPrompt] = {}
             prompt_resolution_records: dict[str, Any] = {}
             function_inputs: dict[str, dict[str, Any]] = {}
+            effective_cache_policy = node.cache if libs_cache_reusable else "off"
             if node.items_from is None:
                 function_inputs = self._function_inputs(node, inputs)
                 file_contents = self._file_contents(node)
@@ -1351,7 +1359,7 @@ class Dag:
                     artifact, cache_hit = envelope.lookup(
                         cache_key,
                         forced=node.name in forced_nodes,
-                        cache_policy=node.cache,
+                        cache_policy=(node.cache if libs_cache_reusable else "off"),
                         evidence_policy_digest=evidence_policy.digest,
                     )
             else:
@@ -1379,12 +1387,19 @@ class Dag:
                 with observe() as calls:
                     if node.items_from is not None:
                         execute_dynamic = self._execute_scan if node.scan else self._execute_map
-                        artifact, cache_hit, item_cache_keys, item_statuses = execute_dynamic(
+                        (
+                            artifact,
+                            cache_hit,
+                            item_cache_keys,
+                            item_statuses,
+                            effective_cache_policy,
+                        ) = execute_dynamic(
                             node,
                             inputs,
                             upstream_shas,
                             current_run_id,
                             libs_hashes[node.name],
+                            libs_cache_reusable,
                             workers,
                             permit_plane=permit_plane,
                             executor=execution_executor,
@@ -1638,6 +1653,10 @@ class Dag:
                                     "prompt_resolutions": prompt_resolution_records,
                                 },
                             )
+                        if node.items_from is None:
+                            effective_cache_policy = (
+                                "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                            )
                         if not resumed_completed:
                             # miss 路径喂下游的必须与命中路径同形态:命中读的是
                             # 排序后的磁盘 JSON,活字典键序不能让下游 prompt 漂移。
@@ -1646,7 +1665,7 @@ class Dag:
                                 cache_key,
                                 label=f"Node {node.name!r}",
                                 calls=calls,
-                                cache_policy=("off" if checkpoint_used else node.cache),
+                                cache_policy=effective_cache_policy,
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
@@ -1682,7 +1701,7 @@ class Dag:
                                 calls=calls,
                                 key_components=key_components,
                                 outputs=outputs,
-                                cache_policy=node.cache,
+                                cache_policy=effective_cache_policy,
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
@@ -2254,7 +2273,8 @@ class Dag:
         selected = tuple(self._nodes) if targets is None else tuple(targets)
         order = self._topological_order(selected)
         forced_nodes, forced_items = self._parse_forced(force)
-        libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
+        libs_identities = self._libs_identities(self._nodes[name] for name in order)
+        libs_hashes = {name: identity.digest for name, identity in libs_identities.items()}
         prompt_snapshot = _prompt_snapshot or self._prompt_snapshot(
             self._nodes[name] for name in order
         )
@@ -2265,6 +2285,7 @@ class Dag:
 
         for node_name in order:
             node = self._nodes[node_name]
+            libs_cache_reusable = libs_identities[node.name].cache_reusable
             if any(dependency not in artifact_shas for dependency in node.deps):
                 waiting_on = tuple(
                     dependency
@@ -2294,14 +2315,14 @@ class Dag:
                         prompt_snapshot=prompt_snapshot,
                     )
                 )
-                cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
-                artifact = (
-                    None
-                    if node.cache != "auto" or node_name in forced_nodes
-                    else cache_lookup.data
-                    if cache_lookup.state == "VALID"
-                    else None
-                )
+                artifact = None
+                if node.cache == "auto" and libs_cache_reusable and node_name not in forced_nodes:
+                    cache_lookup = store.read_node_cache(
+                        self.config.artifacts_path,
+                        cache_key,
+                    )
+                    if cache_lookup.state == "VALID":
+                        artifact = cache_lookup.data
                 if artifact is None:
                     nodes[node_name] = "miss"
                     continue
@@ -2365,16 +2386,19 @@ class Dag:
                             prompt_snapshot=prompt_snapshot,
                         )
                     )
-                    cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
-                    artifact = (
-                        None
-                        if node.cache != "auto"
-                        or node_name in forced_nodes
-                        or item_id in forced_items.get(node_name, set())
-                        else cache_lookup.data
-                        if cache_lookup.state == "VALID"
-                        else None
-                    )
+                    artifact = None
+                    if (
+                        node.cache == "auto"
+                        and libs_cache_reusable
+                        and node_name not in forced_nodes
+                        and item_id not in forced_items.get(node_name, set())
+                    ):
+                        cache_lookup = store.read_node_cache(
+                            self.config.artifacts_path,
+                            cache_key,
+                        )
+                        if cache_lookup.state == "VALID":
+                            artifact = cache_lookup.data
                     if artifact is None:
                         nodes[expanded_name] = "miss"
                         previous_pending = expanded_name
@@ -2390,9 +2414,7 @@ class Dag:
                             f"Scan node {node_name!r} failed item {item_id!r}: "
                             f"{type(error).__name__}: {error}"
                         ) from error
-                if previous_pending is None and (
-                    entries or (node.cache == "auto" and node_name not in forced_nodes)
-                ):
+                if previous_pending is None and entries:
                     aggregate = self._aggregate_map_artifact(node, completed, item_ids)
                     nodes[node_name] = "hit"
                     artifacts[node_name] = aggregate
@@ -2417,16 +2439,19 @@ class Dag:
                     prompt_snapshot=prompt_snapshot,
                 )
                 cache_key = sha(key_components)
-                cache_lookup = store.read_node_cache(self.config.artifacts_path, cache_key)
-                artifact = (
-                    None
-                    if node.cache != "auto"
-                    or node_name in forced_nodes
-                    or item_id in forced_items.get(node_name, set())
-                    else cache_lookup.data
-                    if cache_lookup.state == "VALID"
-                    else None
-                )
+                artifact = None
+                if (
+                    node.cache == "auto"
+                    and libs_cache_reusable
+                    and node_name not in forced_nodes
+                    and item_id not in forced_items.get(node_name, set())
+                ):
+                    cache_lookup = store.read_node_cache(
+                        self.config.artifacts_path,
+                        cache_key,
+                    )
+                    if cache_lookup.state == "VALID":
+                        artifact = cache_lookup.data
                 status = "hit" if artifact is not None else "miss"
                 nodes[f"{node_name}@{item_id}"] = status
                 item_statuses.append(status)
@@ -2435,7 +2460,9 @@ class Dag:
                     completed[item_id] = artifact
             if (
                 node.cache == "auto"
+                and libs_cache_reusable
                 and node_name not in forced_nodes
+                and item_statuses
                 and all(status == "hit" for status in item_statuses)
             ):
                 aggregate = self._aggregate_map_artifact(node, completed, item_ids)
@@ -2467,6 +2494,12 @@ class Dag:
         metadata = self._read_explain_sidecar(name, run_id)
         if metadata is None:
             return ExplainResult("no_entry", [], {})
+        if item_id is None and self._nodes[node_name].items_from is not None:
+            # Dynamic aggregates have an ordered list of item keys, not one
+            # singular cache key/components object.  Their item sidecars carry
+            # the actionable components; aggregate explain only reports the
+            # forecast status and an empty diff.
+            return ExplainResult(status, [], {})
         previous = metadata.get("key_components")
         if not isinstance(previous, dict) or not all(
             isinstance(label, str) and isinstance(digest, str) for label, digest in previous.items()
@@ -3340,6 +3373,7 @@ class Dag:
         upstream_shas: Mapping[str, str],
         run_id: str,
         libs_hash: str,
+        libs_cache_reusable: bool,
         workers: int,
         *,
         permit_plane: _PermitPlane,
@@ -3350,7 +3384,7 @@ class Dag:
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
-    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
+    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
         source_name, _ = node.items_from
@@ -3372,6 +3406,7 @@ class Dag:
                 return {"id": item_id, "status": "aborted"}
             started = time.monotonic()
             target = f"{node.name}@{item_id}"
+            checkpoint_used = False
             try:
                 with observe() as calls:
                     item_files = (
@@ -3421,6 +3456,8 @@ class Dag:
                             prompt_resolutions=prompt_resolution_records,
                         )
                         cache_hit = prior_metadata.get("cache") == "hit"
+                        if prior_metadata.get("cache_policy") == "off":
+                            checkpoint_used = True
                         resumed_completed = True
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
@@ -3428,7 +3465,7 @@ class Dag:
                         artifact, cache_hit = envelope.lookup(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
-                            cache_policy=node.cache,
+                            cache_policy=(node.cache if libs_cache_reusable else "off"),
                             evidence_policy_digest=self._caller_evidence_policy().digest,
                         )
                     if artifact is None:
@@ -3567,7 +3604,11 @@ class Dag:
                                 cache_key,
                                 label=(f"Map node {node.name!r} item {item_id!r}"),
                                 calls=calls,
-                                cache_policy=("off" if checkpoint_used else node.cache),
+                                cache_policy=(
+                                    "off"
+                                    if checkpoint_used or not libs_cache_reusable
+                                    else node.cache
+                                ),
                                 evidence_policy=self._caller_evidence_policy(),
                                 prompt_resolutions=prompt_resolution_records,
                             )
@@ -3583,6 +3624,9 @@ class Dag:
                         "resumed_completed": resumed_completed,
                         "target": target,
                         "prompt_resolutions": prompt_resolution_records,
+                        "cache_policy": (
+                            "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                        ),
                     }
             except Exception as error:
                 # KeyboardInterrupt/SystemExit 不许伪装成单项失败被聚合吞掉:
@@ -3650,7 +3694,7 @@ class Dag:
                         calls=outcome["calls"],
                         key_components=outcome["key_components"],
                         outputs=outputs,
-                        cache_policy=node.cache,
+                        cache_policy=outcome["cache_policy"],
                         evidence_policy=self._caller_evidence_policy(),
                         prompt_resolutions=outcome["prompt_resolutions"],
                     )
@@ -3690,15 +3734,28 @@ class Dag:
             raise _MapRetryPending(retry_pending)
 
         artifact = self._aggregate_map_artifact(node, completed, ids)
+        effective_cache_policy = (
+            "off"
+            if not libs_cache_reusable
+            or any(
+                outcome.get("cache_policy") == "off"
+                for outcome in outcomes
+                if outcome["status"] == "success"
+            )
+            else node.cache
+        )
         return (
             artifact,
             node.cache == "auto"
+            and libs_cache_reusable
             and not forced_all
+            and bool(outcomes)
             and all(
                 outcome["status"] == "success" and outcome["cache"] == "hit" for outcome in outcomes
             ),
             cache_keys,
             item_cache_statuses,
+            effective_cache_policy,
         )
 
     def _aggregate_map_artifact(
@@ -3721,6 +3778,7 @@ class Dag:
         upstream_shas: Mapping[str, str],
         run_id: str,
         libs_hash: str,
+        libs_cache_reusable: bool,
         workers: int,
         *,
         permit_plane: _PermitPlane,
@@ -3731,7 +3789,7 @@ class Dag:
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
-    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str]]:
+    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
         assert node.items_from is not None
@@ -3760,10 +3818,12 @@ class Dag:
         completed: dict[str, dict[str, Any]] = {}
         cache_keys: list[str] = []
         item_cache_statuses: dict[str, str] = {}
+        effective_cache_policy = node.cache if libs_cache_reusable else "off"
 
         for item_id, item in entries:
             started = time.monotonic()
             target = f"{node.name}@{item_id}"
+            checkpoint_used = False
             evidence_policy = (
                 node.evidence_policy
                 if node.executor == "agent" and node.evidence_policy is not None
@@ -3825,6 +3885,8 @@ class Dag:
                         if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
                             agent_provenance = copy.deepcopy(origin["agent"])
                         cache_hit = prior_metadata.get("cache") == "hit"
+                        if prior_metadata.get("cache_policy") == "off":
+                            effective_cache_policy = "off"
                         resumed_completed = True
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
@@ -3832,7 +3894,7 @@ class Dag:
                         artifact, cache_hit = envelope.lookup(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
-                            cache_policy=node.cache,
+                            cache_policy=(node.cache if libs_cache_reusable else "off"),
                             evidence_policy_digest=evidence_policy.digest,
                         )
                     if artifact is None:
@@ -4067,7 +4129,11 @@ class Dag:
                                 cache_key,
                                 label=(f"Scan node {node.name!r} item {item_id!r}"),
                                 calls=calls,
-                                cache_policy=("off" if checkpoint_used else node.cache),
+                                cache_policy=(
+                                    "off"
+                                    if checkpoint_used or not libs_cache_reusable
+                                    else node.cache
+                                ),
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
@@ -4077,6 +4143,8 @@ class Dag:
                         if isinstance(agent_provenance, dict):
                             validate_agent_provenance(agent_provenance, self.blob_store)
                     completed[item_id] = artifact
+                    if checkpoint_used:
+                        effective_cache_policy = "off"
                     cache_keys.append(cache_key)
                     item_cache_statuses[item_id] = "hit" if cache_hit else "miss"
                     label = f"{node.name}@{item_id}"
@@ -4091,7 +4159,9 @@ class Dag:
                             calls=calls,
                             key_components=key_components,
                             outputs=outputs,
-                            cache_policy=node.cache,
+                            cache_policy=(
+                                "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                            ),
                             evidence_policy=evidence_policy,
                             agent_provenance=agent_provenance,
                             prompt_resolutions=prompt_resolution_records,
@@ -4121,10 +4191,13 @@ class Dag:
         return (
             artifact,
             node.cache == "auto"
+            and libs_cache_reusable
             and not forced_all
+            and bool(item_cache_statuses)
             and all(status == "hit" for status in item_cache_statuses.values()),
             cache_keys,
             item_cache_statuses,
+            effective_cache_policy,
         )
 
     def _key_components(
@@ -4293,21 +4366,39 @@ class Dag:
 
     def _libs_hash(self, node: _Node) -> str:
         """Hash the configured library files statically reachable from one node."""
-        return self._libs_hashes((node,))[node.name]
+        return self._libs_identities((node,))[node.name].digest
 
     def _libs_hashes(self, nodes: Iterable[_Node]) -> dict[str, str]:
-        """Compute one immutable per-node library snapshot for a run or read-only query."""
+        """Compute deterministic per-node library digests for durable identity."""
+        return {name: identity.digest for name, identity in self._libs_identities(nodes).items()}
+
+    def _libs_identities(self, nodes: Iterable[_Node]) -> dict[str, _LibsIdentity]:
+        """Compute per-node digests and keep L3 reusability outside key material."""
         selected = tuple(nodes)
-        snapshot = _capture_libs_source_snapshot(self.config.source_paths)
-        all_files_hash = _all_libs_hash(snapshot.entries)
-        if snapshot.has_syntax_error:
-            return {node.name: all_files_hash for node in selected}
+        snapshot = _capture_libs_source_snapshot(
+            self.config.source_paths,
+            project_root=self.config.project_root,
+        )
+        all_files_hash = _all_libs_hash(snapshot.entries, snapshot.entry_identities)
         analyzer = _StaticLibsAnalyzer(
             self.config.project_root,
             self.config.source_paths,
             snapshot,
         )
-        return {node.name: analyzer.hash_for(node.function, all_files_hash) for node in selected}
+        identities_by_function: dict[int, _LibsIdentity] = {}
+        identities: dict[str, _LibsIdentity] = {}
+        for node in selected:
+            function_identity = id(node.function)
+            identity = identities_by_function.get(function_identity)
+            if identity is None:
+                identity = (
+                    analyzer.fallback_identity_for(node.function, all_files_hash)
+                    if snapshot.has_syntax_error
+                    else analyzer.identity_for(node.function, all_files_hash)
+                )
+                identities_by_function[function_identity] = identity
+            identities[node.name] = identity
+        return identities
 
     def _prompt_path(self, template_name: str) -> Path:
         return self.config.prompts_path / f"{template_name}.md"
@@ -4637,11 +4728,2041 @@ def _module_code_text(text: str) -> str:
     return ast.dump(normalized, annotate_fields=True, include_attributes=False)
 
 
+_MODULE_IDENTITY_NAMES = frozenset(
+    {"__name__", "__package__", "__file__", "__spec__", "__loader__"}
+)
+_MODULE_IDENTITY_REFLECTION_NAMES = frozenset(
+    {"compile", "eval", "exec", "globals", "locals", "vars"}
+)
+_MODULE_IDENTITY_LOOKUP_CALLS = frozenset({"__getattribute__", "getattr"})
+_MODULE_IDENTITY_FUNCTION_ATTRIBUTES = frozenset({"__globals__", "__module__"})
+_MODULE_IDENTITY_REFLECTION_CALLABLES = tuple(
+    getattr(builtins, name) for name in _MODULE_IDENTITY_REFLECTION_NAMES
+)
+_MODULE_IDENTITY_LOOKUP_CALLABLES = (builtins.getattr, object.__getattribute__)
+_UNRESOLVED_RUNTIME_VALUE = object()
+_SAFE_FUNCTION_RUNTIME_ATTRIBUTES = frozenset(
+    {
+        "__code__",
+        "__defaults__",
+        "__globals__",
+        "__kwdefaults__",
+        "__module__",
+        "__name__",
+        "__qualname__",
+        "__wrapped__",
+    }
+)
+_SAFE_PARTIAL_RUNTIME_ATTRIBUTES = frozenset({"args", "func", "keywords"})
+
+
+def _type_has_base(value: Any, base: type[Any]) -> bool:
+    """Check a runtime type hierarchy without consulting ``value.__class__``."""
+    value_type = type(value)
+    if value_type is base:
+        return True
+    raw_mro = _safe_type_attribute(value_type, "__mro__")
+    if type(raw_mro) is not tuple:
+        return False
+    return any(item is base for item in raw_mro)
+
+
+def _is_function(value: Any) -> bool:
+    return type(value) is types.FunctionType
+
+
+def _is_method(value: Any) -> bool:
+    return type(value) is types.MethodType
+
+
+def _is_code(value: Any) -> bool:
+    return type(value) is types.CodeType
+
+
+def _is_module(value: Any) -> bool:
+    return type(value) is types.ModuleType
+
+
+def _safe_sys_modules() -> dict[str, Any] | None:
+    """Return the process registry only when it is the exact built-in dict."""
+    registry = sys.modules
+    return registry if type(registry) is dict else None
+
+
+def _is_class(value: Any) -> bool:
+    value_type = type(value)
+    if value_type is type:
+        return True
+    raw_mro = _safe_type_attribute(value_type, "__mro__")
+    if type(raw_mro) is not tuple:
+        return False
+    return any(item is type for item in raw_mro)
+
+
+def _is_builtin(value: Any) -> bool:
+    value_type = type(value)
+    return value_type is types.BuiltinFunctionType or value_type is types.BuiltinMethodType
+
+
+def _safe_type_attribute(value: type[Any], name: str) -> Any:
+    """Read an exact ``type`` getset descriptor without metaclass dispatch."""
+    descriptor = type.__dict__.get(name)
+    if type(descriptor) is not types.GetSetDescriptorType:
+        return _UNRESOLVED_RUNTIME_VALUE
+    try:
+        return descriptor.__get__(value, type(value))
+    except (AttributeError, TypeError):
+        return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _safe_type_mro(value: type[Any]) -> tuple[type[Any], ...] | None:
+    raw_mro = _safe_type_attribute(value, "__mro__")
+    if type(raw_mro) is not tuple or len(raw_mro) > 4096:
+        return None
+    for item in raw_mro:
+        if not isinstance(item, type):
+            return None
+    return raw_mro
+
+
+def _runtime_type_identity(value_type: type[Any]) -> dict[str, str]:
+    """Return a JSON-safe identity for a runtime type without metaclass dispatch."""
+    namespace = _safe_class_namespace(value_type)
+    module_name = namespace.get("__module__") if namespace is not None else None
+    qualname = namespace.get("__qualname__") if namespace is not None else None
+    if not isinstance(module_name, str):
+        module_name = _safe_type_attribute(value_type, "__module__")
+    if not isinstance(qualname, str):
+        qualname = _safe_type_attribute(value_type, "__qualname__")
+    return {
+        "module": module_name if isinstance(module_name, str) else "",
+        "qualname": qualname if isinstance(qualname, str) else "",
+    }
+
+
+def _runtime_type_state_identity(value_type: type[Any]) -> dict[str, str]:
+    """Identify a state shape without binding an otherwise unobservable module alias."""
+    identity = _runtime_type_identity(value_type)
+    return {"qualname": identity["qualname"]}
+
+
+def _function_globals(function: Any) -> dict[str, Any] | None:
+    """Return a real function's globals without invoking user attributes."""
+    if _is_function(function):
+        globals_map = function.__globals__
+        return globals_map if type(globals_map) is dict else None
+    if _is_method(function):
+        globals_map = function.__func__.__globals__
+        return globals_map if type(globals_map) is dict else None
+    return None
+
+
+def _function_code(function: Any) -> types.CodeType | None:
+    """Return a real function or bound method's code object directly."""
+    if _is_function(function):
+        return function.__code__
+    if _is_method(function):
+        return function.__func__.__code__
+    return None
+
+
+def _safe_class_namespace(value: Any) -> Mapping[str, Any] | None:
+    """Read a class namespace through the exact ``type`` getset descriptor."""
+    if not _is_class(value):
+        return None
+    namespace = _safe_type_attribute(value, "__dict__")
+    return namespace if type(namespace) is types.MappingProxyType else None
+
+
+def _safe_module_namespace(value: Any) -> dict[str, Any] | None:
+    """Read a module dictionary through the built-in module implementation."""
+    if not _is_module(value):
+        return None
+    try:
+        namespace = types.ModuleType.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    return namespace if type(namespace) is dict else None
+
+
+def _safe_instance_dict(value: Any) -> dict[str, Any] | None:
+    """Read an ordinary instance dictionary through its built-in getset descriptor."""
+    value_type = type(value)
+    raw_mro = _safe_type_mro(value_type)
+    if raw_mro is None:
+        return None
+    for owner in raw_mro:
+        namespace = _safe_class_namespace(owner)
+        static_dict = namespace.get("__dict__") if namespace is not None else None
+        if type(static_dict) is not types.GetSetDescriptorType:
+            continue
+        try:
+            instance_dict = static_dict.__get__(value, value_type)
+        except (AttributeError, TypeError):
+            return None
+        return instance_dict if type(instance_dict) is dict else None
+    return None
+
+
+def _safe_partial_attribute(value: Any, name: str) -> Any:
+    """Read a partial's built-in member descriptor without subclass hooks."""
+    if not _type_has_base(value, functools.partial) or name not in _SAFE_PARTIAL_RUNTIME_ATTRIBUTES:
+        return _UNRESOLVED_RUNTIME_VALUE
+    descriptor = functools.partial.__dict__.get(name)
+    if type(descriptor) is not types.MemberDescriptorType:
+        return _UNRESOLVED_RUNTIME_VALUE
+    try:
+        return descriptor.__get__(value, type(value))
+    except (AttributeError, TypeError):
+        return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _exact_descriptor_function(value: Any) -> tuple[str, Any] | None:
+    """Read only the two exact CPython function descriptors."""
+    value_type = type(value)
+    if value_type is classmethod:
+        return "classmethod", value.__func__
+    if value_type is staticmethod:
+        return "staticmethod", value.__func__
+    return None
+
+
+def _has_static_descriptor_protocol(value: Any) -> bool:
+    """Inspect descriptor hooks across the complete static type MRO."""
+    value_type = type(value)
+    raw_mro = _safe_type_mro(value_type)
+    if raw_mro is None:
+        return True
+    for owner in raw_mro:
+        namespace = _safe_class_namespace(owner)
+        if namespace is None:
+            return True
+        if "__get__" in namespace or "__set__" in namespace or "__delete__" in namespace:
+            return True
+    return False
+
+
+def _is_builtin_descriptor(value: Any) -> bool:
+    """Return whether a member is an exact built-in descriptor we can skip."""
+    value_type = type(value)
+    return (
+        value_type is types.MemberDescriptorType
+        or value_type is types.GetSetDescriptorType
+        or value_type is types.WrapperDescriptorType
+        or value_type is types.MethodDescriptorType
+        or value_type is types.ClassMethodDescriptorType
+    )
+
+
+def _safe_runtime_attribute(value: Any, name: str) -> Any:
+    """Read only known built-in attributes or static data, never descriptors."""
+    if _is_function(value):
+        if name in _SAFE_FUNCTION_RUNTIME_ATTRIBUTES:
+            return getattr(value, name, _UNRESOLVED_RUNTIME_VALUE)
+        return _UNRESOLVED_RUNTIME_VALUE
+    if _is_method(value):
+        if name == "__func__":
+            return value.__func__
+        if name == "__self__":
+            return value.__self__
+        if name in {"__module__", "__name__", "__qualname__", "__wrapped__"}:
+            return _safe_runtime_attribute(value.__func__, name)
+        return _UNRESOLVED_RUNTIME_VALUE
+    if _is_code(value):
+        if name.startswith("co_"):
+            return getattr(value, name, _UNRESOLVED_RUNTIME_VALUE)
+        return _UNRESOLVED_RUNTIME_VALUE
+    if _is_builtin(value):
+        if name in {"__module__", "__name__", "__qualname__"}:
+            return getattr(value, name, _UNRESOLVED_RUNTIME_VALUE)
+        return _UNRESOLVED_RUNTIME_VALUE
+    if _type_has_base(value, functools.partial):
+        return _safe_partial_attribute(value, name)
+    if _is_module(value):
+        namespace = _safe_module_namespace(value)
+        if namespace is not None:
+            if name in namespace:
+                return namespace[name]
+            # A module-level __getattr__ can synthesize an otherwise absent
+            # attribute.  Do not execute it, and keep that uncertainty visible
+            # to callers that validate loaded runtime provenance.
+            if "__getattr__" in namespace:
+                return _UNRESOLVED_RUNTIME_VALUE
+            return None
+        return _UNRESOLVED_RUNTIME_VALUE
+    if _is_class(value):
+        namespace = _safe_class_namespace(value)
+        if namespace is not None and name in namespace:
+            return namespace[name]
+        if name in {"__module__", "__name__", "__qualname__"}:
+            return _safe_type_attribute(value, name)
+        return _UNRESOLVED_RUNTIME_VALUE
+    if name == "__dict__":
+        instance_dict = _safe_instance_dict(value)
+        if instance_dict is not None:
+            return instance_dict
+        return _UNRESOLVED_RUNTIME_VALUE
+
+    return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _safe_runtime_subscript(value: Any, key: Any) -> Any:
+    """Resolve exact containers only when lookup cannot call user equality/hash hooks."""
+    try:
+        if type(value) is dict and type(key) is str:
+            return value[key]
+        value_type = type(value)
+        if (
+            value_type is tuple or value_type is list or value_type is str or value_type is bytes
+        ) and type(key) is int:
+            return value[key]
+    except (KeyError, IndexError, TypeError):
+        return _UNRESOLVED_RUNTIME_VALUE
+    return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _safe_runtime_path_entries(value: Any) -> tuple[str, ...] | object:
+    """Copy exact string path entries without invoking ``__fspath__`` or truthiness."""
+    value_type = type(value)
+    if value_type is list or value_type is tuple:
+        if len(value) > 4096:
+            return _UNRESOLVED_RUNTIME_VALUE
+        entries: list[str] = []
+        for item in value:
+            if type(item) is not str:
+                return _UNRESOLVED_RUNTIME_VALUE
+            entries.append(item)
+        return tuple(entries)
+    return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _ast_bound_names(node: ast.AST) -> set[str]:
+    """Return simple comprehension/assignment target names."""
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in node.elts:
+            names.update(_ast_bound_names(element))
+        return names
+    if isinstance(node, ast.Starred):
+        return _ast_bound_names(node.value)
+    return set()
+
+
+def _function_scope_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Return local and explicit-global names for one function source tree."""
+    root: ast.FunctionDef | ast.AsyncFunctionDef | None
+    if isinstance(tree, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        root = tree
+    else:
+        root = (
+            next(
+                (
+                    node
+                    for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ),
+                None,
+            )
+            if isinstance(tree, ast.Module)
+            else None
+        )
+    if root is None:
+        return set(), set()
+
+    local_names = {
+        argument.arg
+        for argument in (
+            *root.args.posonlyargs,
+            *root.args.args,
+            *root.args.kwonlyargs,
+        )
+    }
+    if root.args.vararg is not None:
+        local_names.add(root.args.vararg.arg)
+    if root.args.kwarg is not None:
+        local_names.add(root.args.kwarg.arg)
+    global_names: set[str] = set()
+
+    class BindingVisitor(ast.NodeVisitor):
+        """Collect bindings in the function scope, not nested scopes."""
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is root:
+                self._visit_body(node.body)
+            else:
+                local_names.add(node.name)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is root:
+                self._visit_body(node.body)
+            else:
+                local_names.add(node.name)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            del node
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            local_names.add(node.name)
+
+        def visit_Global(self, node: ast.Global) -> None:
+            global_names.update(node.names)
+
+        def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+            for name in node.names:
+                local_names.discard(name)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if isinstance(node.name, str):
+                local_names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                local_names.add(alias.asname or alias.name.split(".", 1)[0])
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                if alias.name != "*":
+                    local_names.add(alias.asname or alias.name)
+
+        def _visit_comprehension(
+            self, generators: list[ast.comprehension], tail: Iterable[ast.AST]
+        ) -> None:
+            for generator in generators:
+                self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for expression in tail:
+                self.visit(expression)
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node.generators, (node.key, node.value))
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                local_names.add(node.id)
+
+        def _visit_body(self, body: Iterable[ast.stmt]) -> None:
+            for statement in body:
+                self.visit(statement)
+
+    BindingVisitor().visit(root)
+    local_names.difference_update(global_names)
+    return local_names, global_names
+
+
+def _function_global_value(function: Callable[..., Any], name: str) -> Any:
+    """Resolve one function closure/global without invoking user mapping hooks."""
+    target = function.__func__ if _is_method(function) else function
+    if _is_function(target):
+        closure = target.__closure__ or ()
+        for free_name, cell in zip(target.__code__.co_freevars, closure, strict=True):
+            if free_name != name:
+                continue
+            try:
+                return cell.cell_contents
+            except ValueError:
+                return _UNRESOLVED_RUNTIME_VALUE
+    globals_map = _function_globals(function)
+    if type(globals_map) is dict and name in globals_map:
+        return globals_map[name]
+    return builtins.__dict__.get(name, _UNRESOLVED_RUNTIME_VALUE)
+
+
+def _unwrap_reflection_callable(value: Any) -> Any:
+    """Unwrap only a partial when identifying a builtin reflection alias."""
+    if not _type_has_base(value, functools.partial):
+        return value
+    return _safe_partial_attribute(value, "func")
+
+
+def _is_builtin_reflection_callable(value: Any) -> bool:
+    """Return whether a runtime value is one of the supported builtin reflectors."""
+    unwrapped = _unwrap_reflection_callable(value)
+    return any(unwrapped is primitive for primitive in _MODULE_IDENTITY_REFLECTION_CALLABLES)
+
+
+def _is_builtin_lookup_callable(value: Any) -> bool:
+    """Return whether a runtime value is the builtin dynamic attribute lookup."""
+    unwrapped = _unwrap_reflection_callable(value)
+    return any(unwrapped is primitive for primitive in _MODULE_IDENTITY_LOOKUP_CALLABLES)
+
+
+def _lookup_callable_bound_args(value: Any) -> tuple[Any, ...]:
+    """Return safely bound positional arguments from nested partial wrappers."""
+    bound: list[Any] = []
+    current = value
+    seen: set[int] = set()
+    while _type_has_base(current, functools.partial):
+        if len(seen) >= _RUNTIME_STATE_MAX_NODES:
+            return ()
+        identity = id(current)
+        if identity in seen:
+            return ()
+        seen.add(identity)
+        raw_args = _safe_partial_attribute(current, "args")
+        target = _safe_partial_attribute(current, "func")
+        if type(raw_args) is not tuple or target is _UNRESOLVED_RUNTIME_VALUE:
+            return ()
+        if len(bound) + len(raw_args) > _RUNTIME_PROVENANCE_MAX_MEMBERS:
+            return ()
+        bound.extend(raw_args)
+        current = target
+    return tuple(bound)
+
+
+def _lookup_accesses_function_identity(
+    function: Callable[..., Any],
+    receiver: Any,
+    node: ast.Call,
+    bound_args: tuple[Any, ...],
+    local_names: set[str],
+) -> bool:
+    """Recognize safe getattr/object.__getattribute__ access on the node function."""
+    if not _registered_function_value(function, receiver):
+        return False
+    offset = 1 if not bound_args else 0
+    if bound_args and len(bound_args) > 1:
+        attribute = bound_args[1]
+    elif len(node.args) > offset:
+        attribute = _resolve_function_runtime_value(node.args[offset], function, local_names)
+    else:
+        return True
+    if attribute is _UNRESOLVED_RUNTIME_VALUE:
+        return True
+    return type(attribute) is not str or attribute in _MODULE_IDENTITY_FUNCTION_ATTRIBUTES
+
+
+def _resolve_function_runtime_value(
+    node: ast.AST,
+    function: Callable[..., Any] | None,
+    local_names: set[str],
+) -> Any:
+    """Resolve simple runtime receivers without executing arbitrary user code."""
+    if function is None:
+        return _UNRESOLVED_RUNTIME_VALUE
+    if isinstance(node, ast.Name):
+        if not isinstance(node.ctx, ast.Load) or node.id in local_names:
+            return _UNRESOLVED_RUNTIME_VALUE
+        return _function_global_value(function, node.id)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Attribute):
+        base = _resolve_function_runtime_value(node.value, function, local_names)
+        if base is _UNRESOLVED_RUNTIME_VALUE:
+            return base
+        return _safe_runtime_attribute(base, node.attr)
+    if isinstance(node, ast.Subscript):
+        base = _resolve_function_runtime_value(node.value, function, local_names)
+        if base is _UNRESOLVED_RUNTIME_VALUE:
+            return base
+        key_node: ast.AST = node.slice
+        key = _resolve_function_runtime_value(key_node, function, local_names)
+        if key is _UNRESOLVED_RUNTIME_VALUE:
+            return _UNRESOLVED_RUNTIME_VALUE
+        return _safe_runtime_subscript(base, key)
+    return _UNRESOLVED_RUNTIME_VALUE
+
+
+def _owner_module_value(function: Callable[..., Any], value: Any) -> bool:
+    """Return whether a runtime value is this function's actual module namespace."""
+    globals_map = _function_globals(function)
+    if value is globals_map:
+        return True
+    facts = _function_owner_facts(function)
+    if not facts.consistent or facts.module_name is None:
+        return False
+    if not _is_module(value):
+        return False
+    value_name = _safe_runtime_attribute(value, "__name__")
+    if value_name != facts.module_name:
+        return False
+    module_file = _safe_runtime_attribute(value, "__file__")
+    if module_file is _UNRESOLVED_RUNTIME_VALUE:
+        module_file = None
+    if module_file is None or facts.module_path is None:
+        return module_file is None and facts.module_path is None
+    if type(module_file) is not str:
+        return False
+    try:
+        return Path(module_file).resolve() == facts.module_path
+    except (OSError, RuntimeError):
+        return False
+
+
+def _registered_function_value(function: Callable[..., Any], value: Any) -> bool:
+    """Return whether a receiver resolves to the registered function itself."""
+    return value is function
+
+
+@dataclass
+class _CallGraphBudget:
+    """Bound recursive Python-callable owner analysis."""
+
+    seen: set[int]
+    nodes: int = 0
+    max_nodes: int = 256
+    max_depth: int = 64
+    overflow: bool = False
+
+    def enter(self, function: Any, depth: int) -> bool:
+        if self.overflow:
+            return False
+        if depth > self.max_depth or self.nodes >= self.max_nodes:
+            self.overflow = True
+            return False
+        identity = id(function)
+        if identity in self.seen:
+            return False
+        self.seen.add(identity)
+        self.nodes += 1
+        return True
+
+
+def _reached_nested_callable_nodes(
+    root_node: ast.AST | None,
+) -> tuple[set[int], bool]:
+    """Resolve the small, statically visible local-call shapes we can prove."""
+    if root_node is None:
+        return set(), False
+    functions: dict[str, ast.AST] = {}
+    classes: dict[str, ast.ClassDef] = {}
+    members: dict[tuple[str, str], ast.AST] = {}
+    aliases: dict[str, str] = {}
+    calls: set[str] = set()
+    member_calls: set[tuple[str, str]] = set()
+    visited = 0
+    overflow = False
+
+    def resolve_name(name: str) -> str:
+        seen: set[str] = set()
+        current = name
+        while current in aliases and current not in seen:
+            seen.add(current)
+            current = aliases[current]
+        return current
+
+    class Discovery(ast.NodeVisitor):
+        def _claim(self) -> bool:
+            nonlocal visited, overflow
+            visited += 1
+            if visited > _RUNTIME_STATE_MAX_NODES:
+                overflow = True
+                return False
+            return True
+
+        def generic_visit(self, node: ast.AST) -> None:
+            # Custom visitors below claim their semantic node and then call
+            # generic_visit; claiming here also bounds otherwise uninteresting
+            # expression/constant subtrees.
+            if not self._claim():
+                return
+            super().generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if not self._claim():
+                return
+            if node is root_node:
+                for statement in node.body:
+                    self.visit(statement)
+            else:
+                functions.setdefault(node.name, node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if not self._claim():
+                return
+            if node is root_node:
+                for statement in node.body:
+                    self.visit(statement)
+            else:
+                functions.setdefault(node.name, node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            if not self._claim():
+                return
+            if node is root_node:
+                self.visit(node.body)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            if not self._claim():
+                return
+            classes.setdefault(node.name, node)
+            for statement in node.body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    members.setdefault((node.name, statement.name), statement)
+                else:
+                    self.visit(statement)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if not self._claim():
+                return
+            value = node.value
+            source_name: str | None = value.id if isinstance(value, ast.Name) else None
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if source_name is not None:
+                    aliases[target.id] = source_name
+                elif isinstance(value, ast.Lambda):
+                    functions[target.id] = value
+                elif isinstance(value, ast.Name) and value.id in classes:
+                    aliases[target.id] = value.id
+            if not isinstance(value, ast.Lambda):
+                self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if not self._claim():
+                return
+            if isinstance(node.func, ast.Name):
+                calls.add(resolve_name(node.func.id))
+            elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                member_calls.add((resolve_name(node.func.value.id), node.func.attr))
+            self.generic_visit(node)
+
+        def visit_callable_body(self, node: ast.AST) -> None:
+            """Scan only a callable already proven to be reached by a call."""
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for statement in node.body:
+                    self.visit(statement)
+            elif isinstance(node, ast.Lambda):
+                self.visit(node.body)
+
+    try:
+        discovery = Discovery()
+        discovery.visit(root_node)
+    except RecursionError:
+        return set(), True
+
+    reached: set[int] = set()
+    expanded: set[int] = set()
+    while not overflow:
+        pending: list[ast.AST] = []
+        for name in tuple(calls):
+            target = functions.get(resolve_name(name))
+            if target is not None:
+                target_id = id(target)
+                if target_id not in reached:
+                    reached.add(target_id)
+                if target_id not in expanded:
+                    pending.append(target)
+        for class_name, member_name in tuple(member_calls):
+            target = members.get((resolve_name(class_name), member_name))
+            if target is not None:
+                target_id = id(target)
+                if target_id not in reached:
+                    reached.add(target_id)
+                if target_id not in expanded:
+                    pending.append(target)
+        if not pending:
+            break
+        for target in pending:
+            target_id = id(target)
+            if target_id in expanded:
+                continue
+            expanded.add(target_id)
+            try:
+                discovery.visit_callable_body(target)
+            except RecursionError:
+                return set(), True
+            if overflow:
+                break
+    return reached, overflow
+
+
+def _tree_uses_module_identity(
+    tree: ast.AST,
+    function: Callable[..., Any] | None = None,
+    seen_functions: set[int] | None = None,
+    call_budget: _CallGraphBudget | None = None,
+    call_depth: int = 0,
+) -> bool:
+    """Return whether executable source can observe its owner identity.
+
+    Name load/store context and the registered function's runtime globals are both
+    required here.  Merely seeing an attribute called ``globals`` on an unrelated
+    object is not evidence that the node observes its owner module.
+    """
+    normalized = _DocstringStripper().visit(copy.deepcopy(tree))
+    local_names, _global_names = _function_scope_bindings(normalized)
+
+    def resolve(node: ast.AST) -> Any:
+        return _resolve_function_runtime_value(node, function, local_names)
+
+    def is_owner_receiver(node: ast.AST) -> bool:
+        return function is not None and _owner_module_value(function, resolve(node))
+
+    def is_function_receiver(node: ast.AST) -> bool:
+        return function is not None and _registered_function_value(function, resolve(node))
+
+    root_node: ast.AST | None = (
+        normalized
+        if isinstance(normalized, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        else next(
+            (
+                node
+                for node in getattr(normalized, "body", ())
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            None,
+        )
+    )
+    if root_node is None and function is not None:
+        code = _function_code(function)
+        if _is_code(code) and code.co_name == "<lambda>":
+            root_node = next(
+                (node for node in ast.walk(normalized) if isinstance(node, ast.Lambda)),
+                None,
+            )
+
+    reached_nodes, reached_overflow = _reached_nested_callable_nodes(root_node)
+
+    class IdentityVisitor(ast.NodeVisitor):
+        found = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.comprehension_names: set[str] = set()
+
+        def _is_local(self, name: str) -> bool:
+            return name in local_names or name in self.comprehension_names
+
+        def _visit_comprehension(
+            self, generators: list[ast.comprehension], tail: Iterable[ast.AST]
+        ) -> None:
+            previous = self.comprehension_names
+            self.comprehension_names = set(previous)
+            try:
+                for generator in generators:
+                    self.visit(generator.iter)
+                    self.comprehension_names.update(_ast_bound_names(generator.target))
+                    for condition in generator.ifs:
+                        self.visit(condition)
+                for expression in tail:
+                    self.visit(expression)
+            finally:
+                self.comprehension_names = previous
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node.generators, (node.key, node.value))
+
+        def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            ):
+                if argument.annotation is not None:
+                    self.visit(argument.annotation)
+            if node.args.vararg is not None and node.args.vararg.annotation is not None:
+                self.visit(node.args.vararg.annotation)
+            if node.args.kwarg is not None and node.args.kwarg.annotation is not None:
+                self.visit(node.args.kwarg.annotation)
+            if node.returns is not None:
+                self.visit(node.returns)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is root_node or id(node) in reached_nodes:
+                self.generic_visit(node)
+            else:
+                self._visit_function_signature(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is root_node or id(node) in reached_nodes:
+                self.generic_visit(node)
+            else:
+                self._visit_function_signature(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            if node is root_node or id(node) in reached_nodes:
+                self.visit(node.body)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            for statement in node.body:
+                self.visit(statement)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if self.found or not isinstance(node.ctx, ast.Load) or self._is_local(node.id):
+                return
+            if node.id in _MODULE_IDENTITY_NAMES:
+                self.found = True
+                return
+            if node.id in _MODULE_IDENTITY_REFLECTION_NAMES:
+                value = (
+                    _function_global_value(function, node.id)
+                    if function is not None
+                    else _UNRESOLVED_RUNTIME_VALUE
+                )
+                if function is None or _is_builtin_reflection_callable(value):
+                    self.found = True
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if self.found:
+                return
+            receiver_is_owner = is_owner_receiver(node.value)
+            receiver_is_function = is_function_receiver(node.value)
+            receiver_is_builtins = function is not None and resolve(node.value) is builtins
+            is_function_code_filename = (
+                node.attr == "co_filename"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "__code__"
+                and is_function_receiver(node.value.value)
+            )
+            if is_function_code_filename:
+                self.found = True
+            elif node.attr in _MODULE_IDENTITY_FUNCTION_ATTRIBUTES:
+                if receiver_is_function or function is None:
+                    self.found = True
+            elif node.attr in _MODULE_IDENTITY_NAMES:
+                if receiver_is_owner or function is None:
+                    self.found = True
+            elif node.attr in _MODULE_IDENTITY_REFLECTION_NAMES:
+                if receiver_is_owner or receiver_is_builtins or function is None:
+                    self.found = True
+            elif node.attr in {"__dict__", "__getattribute__", "__builtins__"} and (
+                receiver_is_owner or function is None
+            ):
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.found:
+                return
+            call_value = resolve(node.func)
+            if _is_builtin_reflection_callable(call_value):
+                self.found = True
+                return
+            if _is_builtin_lookup_callable(call_value):
+                bound_args = _lookup_callable_bound_args(call_value)
+                receiver = (
+                    bound_args[0]
+                    if bound_args
+                    else resolve(node.args[0])
+                    if node.args
+                    else _UNRESOLVED_RUNTIME_VALUE
+                )
+                if (
+                    function is None
+                    or _owner_module_value(function, receiver)
+                    or (
+                        _lookup_accesses_function_identity(
+                            function,
+                            receiver,
+                            node,
+                            bound_args,
+                            local_names,
+                        )
+                    )
+                ):
+                    self.found = True
+                    return
+            if isinstance(node.func, ast.Subscript) and call_value is _UNRESOLVED_RUNTIME_VALUE:
+                # A dynamically selected callable can hide globals/getattr aliases.  Bind
+                # owner identity rather than proving a brittle negative.
+                self.found = True
+                return
+            if isinstance(node.func, ast.Attribute) and call_value is _UNRESOLVED_RUNTIME_VALUE:
+                self.found = True
+                return
+            if (
+                function is not None
+                and (_is_function(call_value) or _is_method(call_value))
+                and call_value is not function
+                and _function_uses_module_identity(
+                    call_value,
+                    seen_functions,
+                    call_budget,
+                    call_depth + 1,
+                )
+            ):
+                self.found = True
+                return
+            if isinstance(node.func, ast.Attribute):
+                receiver = node.func.value
+                receiver_is_owner = is_owner_receiver(receiver)
+                receiver_is_builtins = function is not None and resolve(receiver) is builtins
+                if node.func.attr in _MODULE_IDENTITY_REFLECTION_NAMES and (
+                    receiver_is_owner or receiver_is_builtins or function is None
+                ):
+                    self.found = True
+                    return
+            self.generic_visit(node)
+
+    visitor = IdentityVisitor()
+    visitor.visit(normalized)
+    return visitor.found or reached_overflow
+
+
+def _tree_observes_all_globals(
+    tree: ast.AST,
+    function: Callable[..., Any],
+    seen_functions: set[int] | None = None,
+    call_budget: _CallGraphBudget | None = None,
+    call_depth: int = 0,
+) -> bool:
+    """Return whether the registered function can dynamically inspect its globals."""
+    normalized = _DocstringStripper().visit(copy.deepcopy(tree))
+    local_names, _global_names = _function_scope_bindings(normalized)
+
+    def resolve(node: ast.AST) -> Any:
+        return _resolve_function_runtime_value(node, function, local_names)
+
+    root_node = (
+        normalized
+        if isinstance(normalized, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else next(
+            (
+                node
+                for node in getattr(normalized, "body", ())
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            None,
+        )
+    )
+    reached_nodes, reached_overflow = _reached_nested_callable_nodes(root_node)
+
+    class GlobalObservationVisitor(ast.NodeVisitor):
+        found = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.comprehension_names: set[str] = set()
+
+        def _is_local(self, name: str) -> bool:
+            return name in local_names or name in self.comprehension_names
+
+        def _visit_comprehension(
+            self, generators: list[ast.comprehension], tail: Iterable[ast.AST]
+        ) -> None:
+            previous = self.comprehension_names
+            self.comprehension_names = set(previous)
+            try:
+                for generator in generators:
+                    self.visit(generator.iter)
+                    self.comprehension_names.update(_ast_bound_names(generator.target))
+                    for condition in generator.ifs:
+                        self.visit(condition)
+                for expression in tail:
+                    self.visit(expression)
+            finally:
+                self.comprehension_names = previous
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node.generators, (node.key, node.value))
+
+        def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            if node.returns is not None:
+                self.visit(node.returns)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is root_node or id(node) in reached_nodes:
+                self.generic_visit(node)
+            else:
+                self._visit_function_signature(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is root_node or id(node) in reached_nodes:
+                self.generic_visit(node)
+            else:
+                self._visit_function_signature(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            if node is root_node or id(node) in reached_nodes:
+                self.visit(node.body)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            for statement in node.body:
+                self.visit(statement)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if self.found or not isinstance(node.ctx, ast.Load) or self._is_local(node.id):
+                return
+            if node.id == "__builtins__" or (
+                node.id in _MODULE_IDENTITY_REFLECTION_NAMES
+                and _is_builtin_reflection_callable(resolve(node))
+            ):
+                self.found = True
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if self.found:
+                return
+            receiver = resolve(node.value)
+            if (node.attr == "__globals__" and _registered_function_value(function, receiver)) or (
+                node.attr == "__dict__" and _owner_module_value(function, receiver)
+            ):
+                self.found = True
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.found:
+                return
+            call_value = resolve(node.func)
+            if _is_builtin_reflection_callable(call_value):
+                self.found = True
+                return
+            if _is_builtin_lookup_callable(call_value):
+                bound_args = _lookup_callable_bound_args(call_value)
+                receiver = (
+                    bound_args[0]
+                    if bound_args
+                    else resolve(node.args[0])
+                    if node.args
+                    else _UNRESOLVED_RUNTIME_VALUE
+                )
+                if _owner_module_value(function, receiver):
+                    self.found = True
+                    return
+            if isinstance(node.func, ast.Subscript) and call_value is _UNRESOLVED_RUNTIME_VALUE:
+                self.found = True
+                return
+            if (
+                (_is_function(call_value) or _is_method(call_value))
+                and call_value is not function
+                and _function_observes_all_globals(
+                    call_value,
+                    seen_functions,
+                    call_budget,
+                    call_depth + 1,
+                )
+            ):
+                self.found = True
+                return
+            if isinstance(node.func, ast.Attribute):
+                receiver = resolve(node.func.value)
+                if node.func.attr in _MODULE_IDENTITY_REFLECTION_NAMES and (
+                    receiver is builtins or _owner_module_value(function, receiver)
+                ):
+                    self.found = True
+                    return
+            self.generic_visit(node)
+
+    visitor = GlobalObservationVisitor()
+    visitor.visit(normalized)
+    return visitor.found or reached_overflow
+
+
+def _function_uses_module_identity(
+    function: Callable[..., Any],
+    seen_functions: set[int] | None = None,
+    call_budget: _CallGraphBudget | None = None,
+    call_depth: int = 0,
+) -> bool:
+    """Inspect the called Python-function graph for owner identity observation."""
+    if seen_functions is None:
+        seen_functions = set()
+    if call_budget is None:
+        call_budget = _CallGraphBudget(seen_functions)
+    target = function.__func__ if _is_method(function) else function
+    identity = id(target)
+    if identity in seen_functions:
+        return False
+    if not call_budget.enter(target, call_depth):
+        return True
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
+        return True
+    return _tree_uses_module_identity(
+        tree,
+        function,
+        seen_functions,
+        call_budget,
+        call_depth,
+    )
+
+
+def _function_observes_all_globals(
+    function: Callable[..., Any],
+    seen_functions: set[int] | None = None,
+    call_budget: _CallGraphBudget | None = None,
+    call_depth: int = 0,
+) -> bool:
+    """Decide whether the called Python-function graph can inspect all globals."""
+    if seen_functions is None:
+        seen_functions = set()
+    if call_budget is None:
+        call_budget = _CallGraphBudget(seen_functions)
+    target = function.__func__ if _is_method(function) else function
+    identity = id(target)
+    if identity in seen_functions:
+        return False
+    if not call_budget.enter(target, call_depth):
+        return True
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
+        return True
+    return _tree_observes_all_globals(
+        tree,
+        function,
+        seen_functions,
+        call_budget,
+        call_depth,
+    )
+
+
+def _referenced_global_names(
+    code: Any,
+    overflow: list[bool] | None = None,
+) -> set[str]:
+    """Collect global names from executable code and nested callables."""
+    names: set[str] = set()
+    pending: list[tuple[Any, int]] = [(code, 0)]
+    seen: set[int] = set()
+    visited = 0
+    members = 0
+    while pending:
+        current, depth = pending.pop()
+        if not _is_code(current) or id(current) in seen:
+            continue
+        if depth > _RUNTIME_STATE_MAX_DEPTH or visited >= _RUNTIME_STATE_MAX_NODES:
+            if overflow is not None:
+                overflow[0] = True
+            break
+        visited += 1
+        seen.add(id(current))
+        for name in current.co_names:
+            if members >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                if overflow is not None:
+                    overflow[0] = True
+                return names
+            names.add(name)
+            members += 1
+        for constant in current.co_consts:
+            if members >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                if overflow is not None:
+                    overflow[0] = True
+                return names
+            members += 1
+            if _is_code(constant):
+                pending.append((constant, depth + 1))
+    return names
+
+
+def _code_constant_material(
+    value: Any,
+    memo: dict[int, str],
+    depth: int,
+    constant_memo: dict[int, int] | None = None,
+    constant_nodes: list[int] | None = None,
+    overflow: list[bool] | None = None,
+) -> Any:
+    """Return bounded deterministic material for constants embedded in code."""
+    if depth > _RUNTIME_STATE_MAX_DEPTH:
+        if overflow is not None:
+            overflow[0] = True
+        return {"type": "depth-limit"}
+    if constant_memo is None:
+        constant_memo = {}
+    if constant_nodes is None:
+        constant_nodes = [0]
+    if _is_code(value):
+        return {
+            "type": "code",
+            "code": _code_object_digest(
+                value,
+                memo,
+                depth + 1,
+                constant_memo=constant_memo,
+                constant_nodes=constant_nodes,
+                overflow=overflow,
+            ),
+        }
+    value_type = type(value)
+    if value is None or value_type is bool or value_type is int or value_type is str:
+        return {"type": type(value).__name__, "value": value}
+    if value_type is float:
+        return {"type": "float", "bits": struct.pack(">d", value).hex()}
+    if value_type is complex:
+        return {
+            "type": "complex",
+            "bits": struct.pack(">dd", value.real, value.imag).hex(),
+        }
+    if value_type is bytes:
+        return {
+            "type": "bytes",
+            "size": len(value),
+            "sha256": sha256(value).hexdigest(),
+        }
+    if value_type is tuple or value_type is frozenset:
+        identity = id(value)
+        prior = constant_memo.get(identity)
+        if prior is not None:
+            return {"type": "reference", "ref": prior}
+        if constant_nodes[0] >= _RUNTIME_STATE_MAX_NODES:
+            if overflow is not None:
+                overflow[0] = True
+            return {"type": "node-limit"}
+        reference = len(constant_memo)
+        constant_memo[identity] = reference
+        constant_nodes[0] += 1
+        items: list[Any] = []
+        for item in value:
+            if constant_nodes[0] >= _RUNTIME_STATE_MAX_NODES:
+                if overflow is not None:
+                    overflow[0] = True
+                return {"type": "node-limit"}
+            constant_nodes[0] += 1
+            material = _code_constant_material(
+                item,
+                memo,
+                depth + 1,
+                constant_memo,
+                constant_nodes,
+                overflow,
+            )
+            items.append(material)
+            if material.get("type") == "node-limit" or material.get("type") == "depth-limit":
+                return {"type": "node-limit"}
+        if value_type is frozenset:
+            items.sort(key=canonical_json)
+        return {"type": value_type.__name__, "ref": reference, "items": items}
+    return {"type": type(value).__qualname__}
+
+
+def _code_constants_material(
+    constants: tuple[Any, ...],
+    memo: dict[int, str],
+    depth: int,
+    constant_memo: dict[int, int],
+    constant_nodes: list[int],
+    *,
+    ignore_docstring: bool,
+    overflow: list[bool] | None,
+) -> list[Any]:
+    """Materialize code constants incrementally, ignoring a code docstring."""
+    material: list[Any] = []
+    for index, value in enumerate(constants):
+        if constant_nodes[0] >= _RUNTIME_STATE_MAX_NODES:
+            if overflow is not None:
+                overflow[0] = True
+            material.append({"type": "node-limit"})
+            break
+        constant_nodes[0] += 1
+        if ignore_docstring and index == 0 and type(value) is str:
+            # co_consts[0] is the function/module/class docstring.  It is
+            # intentionally outside executable code identity, matching
+            # _module_code_text().
+            material.append({"type": "docstring"})
+            continue
+        material.append(
+            _code_constant_material(
+                value,
+                memo,
+                depth,
+                constant_memo,
+                constant_nodes,
+                overflow,
+            )
+        )
+        if material[-1].get("type") in {"node-limit", "depth-limit"}:
+            break
+    return material
+
+
+def _code_object_digest(
+    code: Any,
+    memo: dict[int, str] | None = None,
+    depth: int = 0,
+    *,
+    constant_memo: dict[int, int] | None = None,
+    constant_nodes: list[int] | None = None,
+    overflow: list[bool] | None = None,
+) -> str:
+    """Hash executable code with per-walk DAG memoization and a depth bound."""
+    if not _is_code(code) or depth > _RUNTIME_STATE_MAX_DEPTH:
+        if overflow is not None:
+            overflow[0] = True
+        return ""
+    if memo is None:
+        memo = {}
+    if constant_memo is None:
+        constant_memo = {}
+    if constant_nodes is None:
+        constant_nodes = [0]
+    identity = id(code)
+    cached = memo.get(identity)
+    if cached is not None:
+        return cached
+    # Code constants form an acyclic compiler-owned graph, but reserve the identity
+    # before descending so crafted shared DAGs cannot expand exponentially.
+    memo[identity] = "pending"
+    exception_table = getattr(code, "co_exceptiontable", b"")
+    digest = sha(
+        {
+            "argcount": code.co_argcount,
+            "posonlyargcount": code.co_posonlyargcount,
+            "kwonlyargcount": code.co_kwonlyargcount,
+            "flags": code.co_flags,
+            "bytecode": sha256(code.co_code).hexdigest(),
+            "exception_table": sha256(exception_table).hexdigest(),
+            "constants": _code_constants_material(
+                code.co_consts,
+                memo,
+                depth + 1,
+                constant_memo,
+                constant_nodes,
+                ignore_docstring=code.co_name != "<lambda>",
+                overflow=overflow,
+            ),
+            "names": code.co_names,
+            "varnames": code.co_varnames,
+            "freevars": code.co_freevars,
+            "cellvars": code.co_cellvars,
+        }
+    )
+    if overflow is not None and overflow[0]:
+        return digest
+    memo[identity] = digest
+    return digest
+
+
+_UNREPRESENTABLE_RUNTIME_STATE = object()
+_RUNTIME_STATE_MAX_NODES = 4096
+_RUNTIME_STATE_MAX_DEPTH = 96
+_RUNTIME_PROVENANCE_MAX_MEMBERS = 4096
+_RUNTIME_STATE_STRUCTURAL_CLASS_NAMES = frozenset(
+    {
+        "__dict__",
+        "__doc__",
+        "__firstlineno__",
+        "__module__",
+        "__qualname__",
+        "__slots__",
+        "__static_attributes__",
+        "__weakref__",
+    }
+)
+
+
+@dataclass
+class _RuntimeStateContext:
+    """Share deterministic references and hard traversal bounds for one identity."""
+
+    references: dict[int, int]
+    nodes: int = 0
+    members: int = 0
+    max_nodes: int = _RUNTIME_STATE_MAX_NODES
+    max_depth: int = _RUNTIME_STATE_MAX_DEPTH
+    max_members: int = _RUNTIME_PROVENANCE_MAX_MEMBERS
+    overflow: bool = False
+
+    def claim(self, value: Any, depth: int) -> tuple[int, bool] | None:
+        if self.overflow:
+            return None
+        if depth > self.max_depth:
+            self.overflow = True
+            return None
+        identity = id(value)
+        existing = self.references.get(identity)
+        if existing is not None:
+            return existing, False
+        if self.nodes >= self.max_nodes:
+            self.overflow = True
+            return None
+        reference = len(self.references)
+        self.references[identity] = reference
+        self.nodes += 1
+        return reference, True
+
+    def claim_member(self) -> bool:
+        if self.overflow:
+            return False
+        if self.members >= self.max_members:
+            self.overflow = True
+            return False
+        self.members += 1
+        return True
+
+
+@dataclass
+class _RuntimeTraversalContext:
+    """Shared bounded work budget for provenance and callable discovery."""
+
+    expanded: set[int]
+    nodes: int = 0
+    members: int = 0
+    max_nodes: int = _RUNTIME_STATE_MAX_NODES
+    max_depth: int = _RUNTIME_STATE_MAX_DEPTH
+    max_members: int = _RUNTIME_PROVENANCE_MAX_MEMBERS
+    overflow: bool = False
+
+    def claim(self, value: Any, depth: int) -> bool:
+        if self.overflow:
+            return False
+        if depth > self.max_depth or self.nodes >= self.max_nodes:
+            self.overflow = True
+            return False
+        identity = id(value)
+        if identity in self.expanded:
+            return False
+        self.expanded.add(identity)
+        self.nodes += 1
+        return True
+
+    def claim_member(self) -> bool:
+        if self.overflow:
+            return False
+        if self.members >= self.max_members:
+            self.overflow = True
+            return False
+        self.members += 1
+        return True
+
+
+@dataclass
+class _RuntimeStateSortContext:
+    """Bound and memoize one nested set-ordering walk."""
+
+    memo: dict[tuple[int, int], tuple[Any, ...]] = field(default_factory=dict)
+    nodes: int = 0
+    max_nodes: int = _RUNTIME_STATE_MAX_NODES
+    max_depth: int = _RUNTIME_STATE_MAX_DEPTH
+    max_members: int = _RUNTIME_PROVENANCE_MAX_MEMBERS
+    overflow: bool = False
+
+
+def _runtime_state_sort_key(
+    value: Any,
+    depth: int = 0,
+    context: _RuntimeStateSortContext | None = None,
+) -> tuple[Any, ...]:
+    """Return a safe ordering key for exact set members."""
+    if context is None:
+        context = _RuntimeStateSortContext()
+    if context.overflow or depth > context.max_depth:
+        context.overflow = True
+        return (5, "depth-limit")
+    value_type = type(value)
+    if value is None:
+        return (0, "")
+    if value_type is bool or value_type is int or value_type is str:
+        return (1, value_type.__name__, value)
+    if value_type is float:
+        return (1, "float", struct.pack(">d", value).hex())
+    if value_type is complex:
+        return (1, "complex", struct.pack(">dd", value.real, value.imag).hex())
+    if value_type is bytes:
+        return (1, "bytes", value.hex())
+    if value_type is tuple:
+        if len(value) > context.max_members:
+            context.overflow = True
+            return (5, "member-limit")
+        memo_key = (id(value), depth)
+        cached = context.memo.get(memo_key)
+        if cached is not None:
+            return cached
+        if context.nodes >= context.max_nodes:
+            context.overflow = True
+            return (5, "node-limit")
+        context.nodes += 1
+        result = (2, tuple(_runtime_state_sort_key(item, depth + 1, context) for item in value))
+        context.memo[memo_key] = result
+        return result
+    if value_type is frozenset:
+        if len(value) > context.max_members:
+            context.overflow = True
+            return (5, "member-limit")
+        memo_key = (id(value), depth)
+        cached = context.memo.get(memo_key)
+        if cached is not None:
+            return cached
+        if context.nodes >= context.max_nodes:
+            context.overflow = True
+            return (5, "node-limit")
+        context.nodes += 1
+        member_keys = tuple(_runtime_state_sort_key(item, depth + 1, context) for item in value)
+        result = (2, tuple(sorted(member_keys)))
+        context.memo[memo_key] = result
+        return result
+    if _is_function(value):
+        return (3, _code_object_digest(value.__code__))
+    if _is_method(value):
+        return (3, _code_object_digest(value.__func__.__code__))
+    identity = _runtime_type_identity(value_type)
+    return (4, identity["module"], identity["qualname"])
+
+
+def _runtime_sort_key_has_overflow(value: tuple[Any, ...]) -> bool:
+    """Check a bounded sort key for a nested overflow marker."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if current and current[0] == 5:
+            return True
+        if current and current[0] == 2 and len(current) > 1 and type(current[1]) is tuple:
+            pending.extend(current[1])
+    return False
+
+
+def _runtime_state_value_material(
+    value: Any,
+    context: _RuntimeStateContext | None = None,
+    depth: int = 0,
+) -> Any:
+    """Materialize a bounded, safe runtime object graph without user dispatch."""
+    if context is None:
+        context = _RuntimeStateContext({})
+    if context.overflow:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    claimed = context.claim(value, depth)
+    if claimed is None:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    reference, first_visit = claimed
+    if not first_visit:
+        return {"type": "reference", "ref": reference}
+
+    value_type = type(value)
+    if value is None or value_type is bool or value_type is int or value_type is str:
+        return {"type": value_type.__name__, "ref": reference, "value": value}
+    if value_type is float:
+        return {
+            "type": "float",
+            "ref": reference,
+            "bits": struct.pack(">d", value).hex(),
+        }
+    if value_type is bytes:
+        return {
+            "type": "bytes",
+            "ref": reference,
+            "size": len(value),
+            "sha256": sha256(value).hexdigest(),
+        }
+    if value_type is list or value_type is tuple:
+        items: list[Any] = []
+        for item in value:
+            if context.overflow:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if not context.claim_member():
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            material = _runtime_state_value_material(item, context, depth + 1)
+            if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                return material
+            items.append(material)
+        return {"type": value_type.__name__, "ref": reference, "items": items}
+    if value_type is dict:
+        items: list[Any] = []
+        string_keys = True
+        for key, nested in value.items():
+            if context.overflow:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if not context.claim_member():
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if type(key) is not str:
+                string_keys = False
+                key_material = _runtime_state_value_material(key, context, depth + 1)
+                if key_material is _UNREPRESENTABLE_RUNTIME_STATE:
+                    return key_material
+            else:
+                key_material = key
+            material = _runtime_state_value_material(nested, context, depth + 1)
+            if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                return material
+            items.append((key_material, material))
+        return {
+            "type": "dict" if string_keys else "dict-unsupported-key",
+            "ref": reference,
+            "items": items,
+        }
+    if value_type is set or value_type is frozenset:
+        if len(value) > context.max_nodes:
+            context.overflow = True
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        members: list[Any] = []
+        ordered_values = list(value)
+        sort_context = _RuntimeStateSortContext(
+            max_nodes=context.max_nodes,
+            max_depth=context.max_depth,
+            max_members=context.max_members,
+        )
+        ordered_keys = [
+            _runtime_state_sort_key(item, depth + 1, sort_context) for item in ordered_values
+        ]
+        if sort_context.overflow or any(
+            _runtime_sort_key_has_overflow(key) for key in ordered_keys
+        ):
+            context.overflow = True
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        ordered_values = [
+            item
+            for _key, item in sorted(
+                zip(ordered_keys, ordered_values, strict=True), key=lambda pair: pair[0]
+            )
+        ]
+        for item in ordered_values:
+            if context.overflow:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if not context.claim_member():
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            material = _runtime_state_value_material(item, context, depth + 1)
+            if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                return material
+            members.append(material)
+        return {"type": value_type.__name__, "ref": reference, "items": members}
+    if _is_code(value):
+        digest_overflow = [False]
+        digest = _code_object_digest(value, overflow=digest_overflow)
+        if digest_overflow[0]:
+            context.overflow = True
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        return {
+            "type": "code",
+            "ref": reference,
+            "digest": digest,
+        }
+    if _type_has_base(value, functools.partial):
+        raw_args = _safe_partial_attribute(value, "args")
+        raw_keywords = _safe_partial_attribute(value, "keywords")
+        raw_target = _safe_partial_attribute(value, "func")
+        if (
+            raw_args is _UNRESOLVED_RUNTIME_VALUE
+            or raw_keywords is _UNRESOLVED_RUNTIME_VALUE
+            or raw_target is _UNRESOLVED_RUNTIME_VALUE
+        ):
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        entries = {
+            "args": _runtime_state_value_material(raw_args, context, depth + 1),
+            "keywords": _runtime_state_value_material(raw_keywords, context, depth + 1),
+            "target": _runtime_state_value_material(raw_target, context, depth + 1),
+            "instance": _runtime_instance_state_material(value, context, depth + 1),
+        }
+        for item in entries.values():
+            if item is _UNREPRESENTABLE_RUNTIME_STATE:
+                return item
+        return {"type": "partial", "ref": reference, **entries}
+    if _is_function(value):
+        closure_material: list[Any] = []
+        if value.__closure__ is not None:
+            for cell in value.__closure__:
+                if not context.claim_member():
+                    return _UNREPRESENTABLE_RUNTIME_STATE
+                try:
+                    cell_value = cell.cell_contents
+                except ValueError:
+                    closure_material.append({"type": "empty-cell"})
+                    continue
+                material = _runtime_state_value_material(cell_value, context, depth + 1)
+                if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                    return _UNREPRESENTABLE_RUNTIME_STATE
+                closure_material.append(material)
+        entries = {
+            "defaults": _runtime_state_value_material(value.__defaults__, context, depth + 1),
+            "kwdefaults": _runtime_state_value_material(value.__kwdefaults__, context, depth + 1),
+            "annotations": _runtime_state_value_material(value.__annotations__, context, depth + 1),
+            "dict": _runtime_state_value_material(value.__dict__, context, depth + 1),
+        }
+        wrapped = _safe_runtime_attribute(value, "__wrapped__")
+        entries["wrapped"] = (
+            None
+            if wrapped is _UNRESOLVED_RUNTIME_VALUE
+            else _runtime_state_value_material(wrapped, context, depth + 1)
+        )
+        for item in entries.values():
+            if item is _UNREPRESENTABLE_RUNTIME_STATE:
+                return item
+        return {
+            "type": "function",
+            "ref": reference,
+            "code": _runtime_state_value_material(value.__code__, context, depth + 1),
+            "closure": closure_material,
+            **entries,
+        }
+    if _is_method(value):
+        function_material = _runtime_state_value_material(value.__func__, context, depth + 1)
+        receiver_material = _runtime_state_value_material(value.__self__, context, depth + 1)
+        if (
+            function_material is _UNREPRESENTABLE_RUNTIME_STATE
+            or receiver_material is _UNREPRESENTABLE_RUNTIME_STATE
+        ):
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        return {
+            "type": "bound-method",
+            "ref": reference,
+            "function": function_material,
+            "receiver": receiver_material,
+        }
+    if _is_builtin(value):
+        module_name = _safe_runtime_attribute(value, "__module__")
+        qualname = _safe_runtime_attribute(value, "__qualname__")
+        if not isinstance(module_name, str) or not isinstance(qualname, str):
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        return {
+            "type": "builtin",
+            "ref": reference,
+            "module": module_name,
+            "qualname": qualname,
+        }
+    if _is_module(value):
+        module_name = _safe_runtime_attribute(value, "__name__")
+        module_file = _safe_runtime_attribute(value, "__file__")
+        if not isinstance(module_name, str) or (
+            module_file is not None
+            and module_file is not _UNRESOLVED_RUNTIME_VALUE
+            and type(module_file) is not str
+        ):
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        return {
+            "type": "module",
+            "ref": reference,
+            "name": module_name,
+            "file": module_file if type(module_file) is str else None,
+        }
+    if _is_class(value):
+        class_state = _runtime_class_state_material(value, context, depth + 1)
+        if class_state is _UNREPRESENTABLE_RUNTIME_STATE:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        metaclass = type(value)
+        metaclass_state: Any = None
+        if metaclass is not type:
+            metaclass_state = _runtime_state_value_material(metaclass, context, depth + 1)
+            if metaclass_state is _UNREPRESENTABLE_RUNTIME_STATE:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+        return {
+            "type": "class",
+            "ref": reference,
+            "identity": _runtime_type_state_identity(value),
+            "state": class_state,
+            "metaclass": metaclass_state,
+        }
+    if (
+        _type_has_base(value, list)
+        or _type_has_base(value, tuple)
+        or _type_has_base(value, dict)
+        or _type_has_base(value, set)
+        or _type_has_base(value, frozenset)
+        or _type_has_base(value, bytearray)
+    ):
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    instance_material = _runtime_instance_state_material(value, context, depth + 1)
+    if instance_material is _UNREPRESENTABLE_RUNTIME_STATE:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    return {
+        "type": "callable-instance" if callable(value) else "instance",
+        "ref": reference,
+        "class": _runtime_type_state_identity(type(value)),
+        "state": instance_material,
+    }
+
+
+def _transactional_runtime_state_material(
+    value: Any,
+    context: _RuntimeStateContext,
+) -> Any:
+    """Commit shared references only when one complete root is representable."""
+    trial = _RuntimeStateContext(
+        dict(context.references),
+        nodes=context.nodes,
+        members=context.members,
+        max_nodes=context.max_nodes,
+        max_depth=context.max_depth,
+        max_members=context.max_members,
+    )
+    material = _runtime_state_value_material(value, trial)
+    context.overflow = context.overflow or trial.overflow
+    if material is not _UNREPRESENTABLE_RUNTIME_STATE:
+        context.references = trial.references
+        context.nodes = trial.nodes
+        context.members = trial.members
+    return material
+
+
+def _runtime_class_state_material(
+    value_type: type[Any],
+    context: _RuntimeStateContext,
+    depth: int,
+) -> Any:
+    """Capture bounded class and base-class state without metaclass dispatch."""
+    raw_mro = _safe_type_mro(value_type)
+    if raw_mro is None:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    classes: list[dict[str, Any]] = []
+    for owner in raw_mro:
+        if owner is object:
+            continue
+        namespace = _safe_class_namespace(owner)
+        if namespace is None:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        fields: list[tuple[str, Any]] = []
+        for name, raw_member in namespace.items():
+            if not context.claim_member():
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if name in _RUNTIME_STATE_STRUCTURAL_CLASS_NAMES:
+                continue
+            descriptor = _exact_descriptor_function(raw_member)
+            member = descriptor[1] if descriptor is not None else raw_member
+            if _is_builtin_descriptor(raw_member):
+                continue
+            if type(raw_member) is property or (
+                descriptor is None
+                and not _is_function(member)
+                and not _is_builtin(member)
+                and _has_static_descriptor_protocol(raw_member)
+            ):
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            material = _runtime_state_value_material(member, context, depth + 1)
+            if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if descriptor is not None:
+                material = {
+                    "type": "descriptor",
+                    "kind": descriptor[0],
+                    "value": material,
+                }
+            fields.append((name, material))
+        if fields:
+            classes.append({"class": _runtime_type_state_identity(owner), "fields": fields})
+    return {"type": "class-state", "classes": classes}
+
+
+def _runtime_instance_state_material(
+    value: Any,
+    context: _RuntimeStateContext,
+    depth: int,
+) -> Any:
+    """Read exact instance dictionaries and each MRO slot descriptor once."""
+    if _is_module(value) or _is_class(value):
+        return _UNREPRESENTABLE_RUNTIME_STATE
+
+    fields: list[Any] = []
+    instance_dict = _safe_instance_dict(value)
+    if instance_dict is not None:
+        material = _runtime_state_value_material(instance_dict, context, depth + 1)
+        if material is _UNREPRESENTABLE_RUNTIME_STATE:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        fields.append({"owner": None, "name": "__dict__", "value": material})
+
+    value_type = type(value)
+    raw_mro = _safe_type_mro(value_type)
+    if raw_mro is None:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    for owner in raw_mro:
+        namespace = _safe_class_namespace(owner)
+        if namespace is None:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        if context.overflow:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        custom_getattribute = namespace.get("__getattribute__")
+        if custom_getattribute is not None and custom_getattribute is not object.__getattribute__:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        if "__getattr__" in namespace:
+            return _UNREPRESENTABLE_RUNTIME_STATE
+        for member_name, member in namespace.items():
+            if not context.claim_member():
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if member_name in {"__dict__", "__weakref__"}:
+                continue
+            if type(member) is property:
+                return _UNREPRESENTABLE_RUNTIME_STATE
+            if type(member) is types.MemberDescriptorType:
+                try:
+                    slot_value = member.__get__(value, value_type)
+                except (AttributeError, TypeError):
+                    slot_material: Any = {"type": "empty-slot"}
+                else:
+                    slot_material = _runtime_state_value_material(slot_value, context, depth + 1)
+                    if slot_material is _UNREPRESENTABLE_RUNTIME_STATE:
+                        return _UNREPRESENTABLE_RUNTIME_STATE
+                fields.append(
+                    {
+                        "owner": _runtime_type_state_identity(owner),
+                        "name": member_name,
+                        "value": slot_material,
+                    }
+                )
+                continue
+            if (
+                not _is_function(member)
+                and not _is_builtin(member)
+                and _exact_descriptor_function(member) is None
+                and not _is_builtin_descriptor(member)
+                and _has_static_descriptor_protocol(member)
+            ):
+                return _UNREPRESENTABLE_RUNTIME_STATE
+
+    class_material = _runtime_state_value_material(value_type, context, depth + 1)
+    if class_material is _UNREPRESENTABLE_RUNTIME_STATE:
+        return _UNREPRESENTABLE_RUNTIME_STATE
+    return {"type": "instance-state", "fields": fields, "class": class_material}
+
+
+@dataclass(frozen=True)
+class _LibsIdentity:
+    """Deterministic libs digest plus whether L3 reuse is safe."""
+
+    digest: str
+    cache_reusable: bool = True
+
+
 @dataclass(frozen=True)
 class _LibsSourceSnapshot:
     """One read-only view of configured source files for one keying operation."""
 
     entries: tuple[tuple[Path, str], ...]
+    entry_identities: tuple[tuple[int, str, str], ...]
+    path_identities: dict[Path, tuple[tuple[int, str, str], ...]]
     texts: dict[Path, str]
     trees: dict[Path, ast.Module | None]
     source_files: frozenset[Path]
@@ -4655,15 +6776,44 @@ class _ImportResolution:
     paths: tuple[Path, ...] = ()
     ambiguous: bool = False
     candidate: Path | None = None
+    module_names: tuple[tuple[Path, str], ...] = ()
 
 
-def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSnapshot:
-    """Read configured Python files once, retaining the legacy ordered all-files view."""
+_RuntimeModuleRecord = tuple[
+    str,
+    str,
+    str,
+    tuple[tuple[int, str, str], ...],
+    tuple[tuple[int, str, str], ...],
+    tuple[str, str],
+]
+
+
+def _capture_libs_source_snapshot(
+    source_dirs: Iterable[Path],
+    *,
+    project_root: Path | None = None,
+) -> _LibsSourceSnapshot:
+    """Read configured Python files once, retaining ordered stable source identities."""
+    resolved_project_root = project_root.resolve() if project_root is not None else None
+    resolved_source_dirs = tuple(Path(source_dir).resolve() for source_dir in source_dirs)
     entries: list[tuple[Path, str]] = []
+    entry_identities: list[tuple[int, str, str]] = []
+    path_identities: dict[Path, list[tuple[int, str, str]]] = {}
     texts: dict[Path, str] = {}
-    for source_dir in source_dirs:
+    for source_index, source_dir in enumerate(resolved_source_dirs):
         if not source_dir.is_dir():
             continue
+        if resolved_project_root is not None:
+            try:
+                source_identity = source_dir.relative_to(resolved_project_root).as_posix()
+            except ValueError:
+                source_identity = source_dir.as_posix()
+        else:
+            # An absolute configured source outside project_root has no shorter
+            # project-relative spelling; retaining its configured identity is
+            # necessary to distinguish two otherwise identical external roots.
+            source_identity = source_dir.as_posix()
         for raw_path in sorted(source_dir.rglob("*.py")):
             path = raw_path.resolve()
             text = texts.get(path)
@@ -4671,6 +6821,15 @@ def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSna
                 text = path.read_text(encoding="utf-8")
                 texts[path] = text
             entries.append((path, text))
+            try:
+                relative_path = path.relative_to(source_dir).as_posix()
+            except ValueError:
+                # Symlinked files outside the configured root are unusual, but
+                # their absolute path is the only collision-free identity.
+                relative_path = path.as_posix()
+            identity = (source_index, source_identity, relative_path)
+            entry_identities.append(identity)
+            path_identities.setdefault(path, []).append(identity)
 
     trees: dict[Path, ast.Module | None] = {}
     has_syntax_error = False
@@ -4682,6 +6841,8 @@ def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSna
             has_syntax_error = True
     return _LibsSourceSnapshot(
         tuple(entries),
+        tuple(entry_identities),
+        {path: tuple(identities) for path, identities in path_identities.items()},
         texts,
         trees,
         frozenset(texts),
@@ -4689,9 +6850,28 @@ def _capture_libs_source_snapshot(source_dirs: Iterable[Path]) -> _LibsSourceSna
     )
 
 
-def _all_libs_hash(entries: Iterable[tuple[Path, str]]) -> str:
-    """Preserve the pre-granularity all-files digest byte-for-byte in its inputs."""
-    return sha([_module_code_text(text) for _, text in entries])
+def _all_libs_hash(
+    entries: Iterable[tuple[Path, str]],
+    identities: Iterable[tuple[int, str, str]] | None = None,
+) -> str:
+    """Hash normalized source with ordered configured-root/file identity."""
+    material = tuple(entries)
+    source_identities = (
+        tuple(identities)
+        if identities is not None
+        else tuple((0, "", path.as_posix()) for path, _ in material)
+    )
+    if len(source_identities) != len(material):
+        raise ValueError("libs source identities must align with source entries")
+    return sha(
+        [
+            {
+                "identity": identity,
+                "source": _module_code_text(text),
+            }
+            for identity, (_path, text) in zip(source_identities, material, strict=True)
+        ]
+    )
 
 
 class _StaticLibsAnalyzer:
@@ -4710,63 +6890,1038 @@ class _StaticLibsAnalyzer:
     ):
         self.project_root = project_root.resolve()
         self.source_dirs = tuple(dict.fromkeys(path.resolve() for path in source_dirs))
+        self._source_identities = tuple(
+            (
+                index,
+                (
+                    source_dir.relative_to(self.project_root).as_posix()
+                    if _path_is_within(source_dir, self.project_root)
+                    else source_dir.as_posix()
+                ),
+                source_dir,
+            )
+            for index, source_dir in enumerate(self.source_dirs)
+        )
         self.source_files = snapshot.source_files
+        self._path_identities = dict(snapshot.path_identities)
         self._texts = dict(snapshot.texts)
+        self._normalized_texts = {
+            path: _module_code_text(text) for path, text in self._texts.items()
+        }
         self._trees = dict(snapshot.trees)
-        self._reachable_cache: dict[tuple[Path, str], set[Path] | None] = {}
+        self._reachable_cache: dict[tuple[Path, str], dict[Path, str] | None] = {}
+        self._registry_records: set[_RuntimeModuleRecord] | None = None
+        self._registry_records_overflow = False
 
-    def hash_for(self, function: Callable[..., Any], fallback: str) -> str:
-        """Return a selected-files hash, or the exact all-files fallback on uncertainty."""
+    def _owner_module_identity(
+        self,
+        function: Callable[..., Any],
+        module_path: Path | None,
+        module_name: str | None,
+    ) -> dict[str, str] | None:
+        """Bind a stable owner identity only when the node function can observe it."""
+        facts = _function_owner_facts(function)
+        if (
+            not facts.consistent
+            or module_path is None
+            or module_name is None
+            or facts.module_path != module_path
+            or facts.module_name != module_name
+            or not _function_uses_module_identity(function)
+        ):
+            return None
+        try:
+            stable_path = module_path.resolve().relative_to(self.project_root).as_posix()
+        except ValueError:
+            stable_path = module_path.resolve().as_posix()
+        return {"module": module_name, "path": stable_path}
+
+    def fallback_identity_for(
+        self,
+        function: Callable[..., Any],
+        fallback: str,
+    ) -> _LibsIdentity:
+        """Bind deterministic fallback material and retain L3 reusability separately."""
+        module_path = _function_module_path(function)
+        module_name = _function_module_name(function)
+        owner_module = self._owner_module_identity(function, module_path, module_name)
+        runtime, cache_reusable = self._runtime_selection_material(function)
+        return _LibsIdentity(
+            sha(
+                {
+                    "fallback": fallback,
+                    "owner_module": owner_module,
+                    "runtime": runtime,
+                }
+            ),
+            cache_reusable=cache_reusable,
+        )
+
+    def fallback_hash_for(self, function: Callable[..., Any], fallback: str) -> str:
+        """Return the deterministic digest portion of a fallback identity."""
+        return self.fallback_identity_for(function, fallback).digest
+
+    def identity_for(self, function: Callable[..., Any], fallback: str) -> _LibsIdentity:
+        """Return selected-files identity, or runtime-bound fallback on uncertainty."""
         module_path = _function_module_path(function)
         module_name = _function_module_name(function)
         if module_path is None or module_name is None:
-            return fallback
+            return self.fallback_identity_for(function, fallback)
         reachable = self._reachable_paths(module_path, module_name)
         if reachable is None:
-            return fallback
-        return sha([_module_code_text(self._texts[path]) for path in sorted(reachable)])
+            return self.fallback_identity_for(function, fallback)
+        material: list[dict[str, Any]] = []
+        for path, reachable_module_name in sorted(
+            reachable.items(), key=lambda item: item[0].as_posix()
+        ):
+            identities = self._path_identities.get(path, ())
+            if len(identities) != 1:
+                return self.fallback_identity_for(function, fallback)
+            material.append(
+                {
+                    "identity": identities[0],
+                    "module": reachable_module_name,
+                    "source": self._normalized_texts[path],
+                }
+            )
+        owner_module = self._owner_module_identity(function, module_path, module_name)
+        selected_identity = {"selected": material}
+        if owner_module is not None:
+            selected_identity["owner_module"] = owner_module
+        runtime, cache_reusable = self._runtime_selection_material(function)
+        selected_identity["runtime"] = runtime
+        return _LibsIdentity(sha(selected_identity), cache_reusable=cache_reusable)
 
-    def _reachable_paths(self, root: Path, module_name: str) -> set[Path] | None:
+    def hash_for(self, function: Callable[..., Any], fallback: str) -> str:
+        """Return the deterministic digest portion of a libs identity."""
+        return self.identity_for(function, fallback).digest
+
+    def _reachable_paths(self, root: Path, module_name: str) -> dict[Path, str] | None:
         cache_key = (root, module_name)
         if cache_key in self._reachable_cache:
             cached = self._reachable_cache[cache_key]
-            return None if cached is None else set(cached)
+            return None if cached is None else dict(cached)
 
-        initial = {root}
+        initial: list[tuple[Path, str]] = [(root, module_name)]
         if root in self.source_files:
             module_resolution = self._resolve_absolute(tuple(module_name.split(".")))
             if module_resolution.ambiguous:
                 self._reachable_cache[cache_key] = None
                 return None
             if root in module_resolution.paths:
-                initial.update(module_resolution.paths)
+                initial_bindings = self._module_bindings(
+                    tuple(module_name.split(".")), module_resolution
+                )
+                if initial_bindings is None or initial_bindings.get(root) != module_name:
+                    self._reachable_cache[cache_key] = None
+                    return None
+                initial.extend(initial_bindings.items())
             else:
-                initial.update(self._ancestor_package_inits(root))
+                for ancestor in self._ancestor_package_inits(root):
+                    ancestor_name = self._ancestor_module_name(root, module_name, ancestor)
+                    if ancestor_name is None:
+                        self._reachable_cache[cache_key] = None
+                        return None
+                    initial.append((ancestor, ancestor_name))
         queue = list(initial)
-        seen: set[Path] = set()
-        reachable: set[Path] = set()
+        seen: dict[Path, str] = {}
+        reachable: dict[Path, str] = {}
         while queue:
-            path = queue.pop()
-            if path in seen:
+            path, current_module_name = queue.pop()
+            prior_name = seen.get(path)
+            if prior_name is not None:
+                if prior_name != current_module_name:
+                    self._reachable_cache[cache_key] = None
+                    return None
                 continue
-            seen.add(path)
+            seen[path] = current_module_name
             tree = self._tree(path)
             if tree is None or _module_imports_are_ambiguous(tree):
                 self._reachable_cache[cache_key] = None
                 return None
             if path in self.source_files:
-                reachable.add(path)
+                reachable[path] = current_module_name
             for statement in tree.body:
                 if not isinstance(statement, (ast.Import, ast.ImportFrom)):
                     continue
-                resolution = self._resolve_import(path, statement)
-                if resolution.ambiguous:
+                resolution = self._resolve_import(path, current_module_name, statement)
+                if resolution.ambiguous or set(resolution.paths) != {
+                    target_path for target_path, _target_name in resolution.module_names
+                }:
                     self._reachable_cache[cache_key] = None
                     return None
-                queue.extend(resolution.paths)
+                queue.extend(resolution.module_names)
 
-        self._reachable_cache[cache_key] = set(reachable)
+        self._reachable_cache[cache_key] = dict(reachable)
         return reachable
+
+    def _configured_location_identities(self, path: Path) -> tuple[tuple[int, str, str], ...]:
+        """Return stable configured-root identities for one runtime path."""
+        resolved = path.resolve()
+        exact = self._path_identities.get(resolved)
+        if exact is not None:
+            return exact
+        identities: list[tuple[int, str, str]] = []
+        for source_index, source_identity, source_dir in self._source_identities:
+            try:
+                relative = resolved.relative_to(source_dir).as_posix()
+            except ValueError:
+                continue
+            identities.append((source_index, source_identity, relative))
+        return tuple(identities)
+
+    def _runtime_module_record(
+        self,
+        scope: str,
+        binding: str,
+        value: Any,
+        seen: frozenset[int] | None = None,
+        traversal: _RuntimeTraversalContext | None = None,
+    ) -> _RuntimeModuleRecord | None:
+        """Describe runtime module or binding provenance touching configured sources."""
+        if seen is None:
+            seen = frozenset()
+        if id(value) in seen:
+            return None
+        is_module = _is_module(value)
+        if is_module:
+            module_name = _safe_runtime_attribute(value, "__name__")
+        else:
+            module_name = _safe_runtime_attribute(value, "__module__")
+            if not isinstance(module_name, str):
+                module_name = _safe_runtime_attribute(type(value), "__module__")
+        if not isinstance(module_name, str):
+            module_name = ""
+        callable_name = ""
+        callable_code_digests: set[str] = set()
+        if not is_module:
+            raw_callable_name = _safe_runtime_attribute(value, "__qualname__")
+            if not isinstance(raw_callable_name, str):
+                raw_callable_name = _safe_runtime_attribute(type(value), "__qualname__")
+            if isinstance(raw_callable_name, str):
+                callable_name = raw_callable_name
+
+        file_identities: set[tuple[int, str, str]] = set()
+        source_candidates: list[str] = []
+        if is_module:
+            module_file = _safe_runtime_attribute(value, "__file__")
+            if isinstance(module_file, str) and module_file:
+                source_candidates.append(module_file)
+        else:
+            code = _function_code(value)
+            code_file = _safe_runtime_attribute(code, "co_filename")
+            if isinstance(code_file, str) and code_file:
+                source_candidates.append(code_file)
+                with suppress(OSError, RuntimeError):
+                    file_identities.update(self._configured_location_identities(Path(code_file)))
+            code_overflow = [False]
+            code_digest = (
+                _code_object_digest(code, overflow=code_overflow) if _is_code(code) else ""
+            )
+            if code_overflow[0]:
+                if not file_identities:
+                    return None
+                return (
+                    scope,
+                    binding,
+                    module_name,
+                    (),
+                    ((-1, "", "invalid"),),
+                    (callable_name, ""),
+                )
+            if code_digest:
+                callable_code_digests.add(code_digest)
+            registry = _safe_sys_modules()
+            owner_module = registry.get(module_name) if registry is not None else None
+            owner_file = _safe_runtime_attribute(owner_module, "__file__")
+            if isinstance(owner_file, str) and owner_file:
+                source_candidates.append(owner_file)
+                with suppress(OSError, RuntimeError):
+                    file_identities.update(self._configured_location_identities(Path(owner_file)))
+            if module_name:
+                resolution = self._resolve_absolute(tuple(module_name.split(".")))
+                if not resolution.ambiguous:
+                    for path in resolution.paths:
+                        try:
+                            file_identities.update(self._configured_location_identities(path))
+                        except (OSError, RuntimeError):
+                            continue
+            provenance_type = value if _is_class(value) else type(value)
+            static_namespace = _safe_class_namespace(provenance_type)
+            if (
+                static_namespace is not None
+                and len(static_namespace) > _RUNTIME_PROVENANCE_MAX_MEMBERS
+            ):
+                if not file_identities:
+                    return None
+                return (
+                    scope,
+                    binding,
+                    module_name,
+                    (),
+                    ((-1, "", "invalid"),),
+                    (callable_name, ""),
+                )
+            members = tuple(static_namespace.values()) if static_namespace is not None else ()
+            for raw_member in members:
+                if traversal is not None and not traversal.claim_member():
+                    if not file_identities:
+                        return None
+                    return (
+                        scope,
+                        binding,
+                        module_name,
+                        (),
+                        ((-1, "", "invalid"),),
+                        (callable_name, ""),
+                    )
+                descriptor = _exact_descriptor_function(raw_member)
+                member = descriptor[1] if descriptor is not None else raw_member
+                member_code = _function_code(member)
+                member_file = _safe_runtime_attribute(member_code, "co_filename")
+                member_overflow = [False]
+                member_digest = (
+                    _code_object_digest(member_code, overflow=member_overflow)
+                    if _is_code(member_code)
+                    else ""
+                )
+                if member_overflow[0]:
+                    if not file_identities:
+                        return None
+                    return (
+                        scope,
+                        binding,
+                        module_name,
+                        (),
+                        ((-1, "", "invalid"),),
+                        (callable_name, ""),
+                    )
+                if member_digest:
+                    callable_code_digests.add(member_digest)
+                if isinstance(member_file, str) and member_file:
+                    source_candidates.append(member_file)
+                    with suppress(OSError, RuntimeError):
+                        file_identities.update(
+                            self._configured_location_identities(Path(member_file))
+                        )
+            registry = _safe_sys_modules()
+            owner_module = registry.get(module_name) if registry is not None else None
+            owner_file = _safe_runtime_attribute(owner_module, "__file__")
+            if isinstance(owner_file, str) and owner_file:
+                source_candidates.append(owner_file)
+            if module_name:
+                resolution = self._resolve_absolute(tuple(module_name.split(".")))
+                if not resolution.ambiguous:
+                    for path in resolution.paths:
+                        try:
+                            file_identities.update(self._configured_location_identities(path))
+                        except (OSError, RuntimeError):
+                            continue
+
+        for source_candidate in source_candidates:
+            try:
+                file_identities.update(self._configured_location_identities(Path(source_candidate)))
+            except (OSError, RuntimeError):
+                continue
+
+        search_identities: set[tuple[int, str, str]] = set()
+        if is_module:
+            runtime_search_path = _safe_runtime_attribute(value, "__path__")
+            if runtime_search_path is not None:
+                path_entries = _safe_runtime_path_entries(runtime_search_path)
+                if path_entries is _UNRESOLVED_RUNTIME_VALUE:
+                    if not file_identities:
+                        return None
+                    return (
+                        scope,
+                        binding,
+                        module_name,
+                        tuple(sorted(file_identities)),
+                        ((-1, "", "invalid"),),
+                        (
+                            callable_name,
+                            sha(sorted(callable_code_digests)) if callable_code_digests else "",
+                        ),
+                    )
+                try:
+                    for entry in path_entries:
+                        search_identities.update(self._configured_location_identities(Path(entry)))
+                except (OSError, RuntimeError, TypeError):
+                    if not file_identities:
+                        return None
+                    return (
+                        scope,
+                        binding,
+                        module_name,
+                        tuple(sorted(file_identities)),
+                        ((-1, "", "invalid"),),
+                        (
+                            callable_name,
+                            sha(sorted(callable_code_digests)) if callable_code_digests else "",
+                        ),
+                    )
+
+        if not file_identities and not search_identities:
+            return None
+        return (
+            scope,
+            binding,
+            module_name,
+            tuple(sorted(file_identities)),
+            tuple(sorted(search_identities)),
+            (callable_name, sha(sorted(callable_code_digests)) if callable_code_digests else ""),
+        )
+
+    def _runtime_module_records(
+        self,
+        scope: str,
+        binding: str,
+        value: Any,
+        traversal: _RuntimeTraversalContext | None = None,
+    ) -> set[_RuntimeModuleRecord]:
+        """Collect outer and wrapped callable provenance without following cycles."""
+        records: set[_RuntimeModuleRecord] = set()
+        pending = [(value, 0)]
+        seen: set[int] = set()
+        while pending:
+            if traversal is not None and traversal.overflow:
+                break
+            current, depth = pending.pop()
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            newly_expanded = True
+            if traversal is not None and identity not in traversal.expanded:
+                if not traversal.claim(current, depth):
+                    continue
+            elif traversal is not None:
+                newly_expanded = False
+            record = self._runtime_module_record(scope, binding, current, traversal=traversal)
+            if record is not None:
+                records.add(record)
+            if not newly_expanded:
+                continue
+            if _type_has_base(current, functools.partial):
+                partial_target = _safe_partial_attribute(current, "func")
+                if partial_target is not _UNRESOLVED_RUNTIME_VALUE:
+                    pending.append((partial_target, depth + 1))
+            wrapped = _safe_runtime_attribute(current, "__wrapped__")
+            if wrapped is not _UNRESOLVED_RUNTIME_VALUE:
+                pending.append((wrapped, depth + 1))
+            for child in self._runtime_callable_functions(current, traversal):
+                pending.append((child, depth + 1))
+        return records
+
+    @staticmethod
+    def _runtime_callable_functions(
+        value: Any,
+        traversal: _RuntimeTraversalContext | None = None,
+    ) -> tuple[Callable[..., Any], ...]:
+        """Return statically stored Python function state for a callable graph node."""
+        if _is_function(value):
+            return (value,)
+        if _is_method(value):
+            return (value.__func__,)
+        if not callable(value):
+            return ()
+
+        value_type = value if _is_class(value) else type(value)
+        owners: list[type[Any]] = []
+        raw_mro = _safe_type_mro(value_type)
+        if raw_mro is not None:
+            owners.extend(raw_mro)
+        if _is_class(value):
+            metaclass_mro = _safe_type_mro(type(value))
+            if metaclass_mro is not None:
+                owners.extend(metaclass_mro)
+
+        functions: list[Callable[..., Any]] = []
+        seen: set[int] = set()
+        for owner in owners:
+            if traversal is not None and not traversal.claim_member():
+                return ()
+            namespace = _safe_class_namespace(owner)
+            if namespace is None:
+                continue
+            if len(namespace) > _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                return ()
+            for raw_member in namespace.values():
+                if traversal is not None and not traversal.claim_member():
+                    return ()
+                descriptor = _exact_descriptor_function(raw_member)
+                member = descriptor[1] if descriptor is not None else raw_member
+                if not _is_function(member) or id(member) in seen:
+                    continue
+                seen.add(id(member))
+                functions.append(member)
+        return tuple(functions)
+
+    def _runtime_nested_callables(
+        self,
+        value: Any,
+        traversal: _RuntimeTraversalContext | None = None,
+        depth: int = 0,
+    ) -> tuple[Any, ...]:
+        """Find nested callable values without crossing opaque external boundaries."""
+        found: list[Any] = []
+        pending = [(value, depth)]
+        seen: set[int] = set()
+
+        def has_container_protocol(current: Any) -> bool:
+            current_type = type(current)
+            raw_mro = _safe_type_mro(current_type)
+            if raw_mro is None:
+                return False
+            return any(
+                (namespace := _safe_class_namespace(owner)) is not None
+                and ("__iter__" in namespace or "values" in namespace)
+                for owner in raw_mro
+            )
+
+        def has_configured_provenance(current: Any) -> bool:
+            record = self._runtime_module_record("nested", "container", current)
+            return record is not None and bool(record[3] or record[4])
+
+        while pending:
+            if traversal is not None and traversal.overflow:
+                break
+            current, current_depth = pending.pop()
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if (
+                traversal is not None
+                and id(current) not in traversal.expanded
+                and not traversal.claim(current, current_depth)
+            ):
+                continue
+            if callable(current) and not _is_module(current):
+                found.append(current)
+                continue
+            current_type = type(current)
+            if current_type is list or current_type is tuple:
+                for item in current:
+                    if traversal is not None and not traversal.claim_member():
+                        break
+                    pending.append((item, current_depth + 1))
+            elif current_type is dict:
+                for key, nested in current.items():
+                    if traversal is not None and not traversal.claim_member():
+                        break
+                    pending.append((nested, current_depth + 1))
+                    pending.append((key, current_depth + 1))
+            elif current_type is set or current_type is frozenset:
+                if len(current) > _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                    if traversal is not None:
+                        traversal.overflow = True
+                    break
+                for item in current:
+                    if traversal is not None and not traversal.claim_member():
+                        break
+                    pending.append((item, current_depth + 1))
+            elif (
+                traversal is not None
+                and has_container_protocol(current)
+                and has_configured_provenance(current)
+            ):
+                # Exact protocol execution would call user code.  A configured
+                # opaque container must therefore fail closed instead of hiding
+                # a callable that can change the node's result.
+                traversal.overflow = True
+                break
+        return tuple(found)
+
+    def _runtime_callable_children(
+        self,
+        value: Any,
+        traversal: _RuntimeTraversalContext | None = None,
+        depth: int = 0,
+    ) -> tuple[Any, ...]:
+        """Return wrapper, closure, partial, dictionary, and slot-held callables."""
+        children: list[Any] = []
+        if _type_has_base(value, functools.partial):
+            partial_target = _safe_partial_attribute(value, "func")
+            raw_args = _safe_partial_attribute(value, "args")
+            raw_keywords = _safe_partial_attribute(value, "keywords")
+            if partial_target is not _UNRESOLVED_RUNTIME_VALUE:
+                children.append(partial_target)
+            if raw_args is not _UNRESOLVED_RUNTIME_VALUE:
+                children.extend(self._runtime_nested_callables(raw_args, traversal, depth + 1))
+            if raw_keywords is not _UNRESOLVED_RUNTIME_VALUE:
+                children.extend(self._runtime_nested_callables(raw_keywords, traversal, depth + 1))
+        wrapped = _safe_runtime_attribute(value, "__wrapped__")
+        if wrapped is not _UNRESOLVED_RUNTIME_VALUE:
+            children.append(wrapped)
+        if _is_function(value):
+            if value.__closure__ is not None:
+                for cell in value.__closure__:
+                    if traversal is not None and not traversal.claim_member():
+                        break
+                    try:
+                        children.extend(
+                            self._runtime_nested_callables(cell.cell_contents, traversal, depth + 1)
+                        )
+                    except ValueError:
+                        continue
+            children.extend(
+                self._runtime_nested_callables(value.__defaults__, traversal, depth + 1)
+            )
+            children.extend(
+                self._runtime_nested_callables(value.__kwdefaults__, traversal, depth + 1)
+            )
+            for key, nested in value.__dict__.items():
+                if traversal is not None and not traversal.claim_member():
+                    break
+                if key != "__wrapped__":
+                    children.extend(self._runtime_nested_callables(nested, traversal, depth + 1))
+        elif _is_method(value):
+            children.extend(self._runtime_nested_callables(value.__self__, traversal, depth + 1))
+        elif callable(value) and not _is_class(value):
+            instance_dict = _safe_instance_dict(value)
+            if instance_dict is not None:
+                children.extend(self._runtime_nested_callables(instance_dict, traversal, depth + 1))
+            raw_mro = _safe_type_mro(type(value))
+            if raw_mro is not None:
+                for owner in raw_mro:
+                    namespace = _safe_class_namespace(owner)
+                    if namespace is None:
+                        continue
+                    for member in namespace.values():
+                        if traversal is not None and not traversal.claim_member():
+                            break
+                        if type(member) is not types.MemberDescriptorType:
+                            continue
+                        try:
+                            slot_value = member.__get__(value, type(value))
+                        except (AttributeError, TypeError):
+                            continue
+                        children.extend(
+                            self._runtime_nested_callables(slot_value, traversal, depth + 1)
+                        )
+        return tuple(children)
+
+    def _runtime_callable_owner_material(
+        self, function: Callable[..., Any]
+    ) -> dict[str, Any] | None:
+        """Bind owner facts for a retained callable only when its code observes them."""
+        if not _function_uses_module_identity(function):
+            return None
+        facts = _function_owner_facts(function)
+        if not facts.consistent:
+            return self._inconsistent_owner_fact_material(function)
+        if facts.module_name is None or facts.module_path is None:
+            return None
+        try:
+            stable_path = facts.module_path.relative_to(self.project_root).as_posix()
+        except ValueError:
+            stable_path = facts.module_path.as_posix()
+        return {"module": facts.module_name, "path": stable_path}
+
+    def _collect_runtime_callable(
+        self,
+        scope: str,
+        binding: str,
+        value: Any,
+        records: set[_RuntimeModuleRecord],
+        callable_states: list[dict[str, Any]],
+        global_values: list[tuple[str, Any]],
+        seen_callables: set[int],
+        uncacheable: list[bool],
+        state_context: _RuntimeStateContext,
+        traversal: _RuntimeTraversalContext | None = None,
+    ) -> None:
+        """Collect callable provenance and bind configured-source runtime state."""
+        if not callable(value) or _is_module(value):
+            return
+        if traversal is None:
+            traversal = _RuntimeTraversalContext(set())
+        pending: list[tuple[str, str, Any, int]] = [(scope, binding, value, 0)]
+        while pending:
+            if traversal.overflow:
+                uncacheable[0] = True
+                break
+            current_scope, current_binding, current, depth = pending.pop()
+            if not callable(current) or _is_module(current):
+                continue
+            identity = id(current)
+            runtime_records = self._runtime_module_records(
+                current_scope,
+                current_binding,
+                current,
+                traversal,
+            )
+            records.update(runtime_records)
+            has_configured_provenance = any(record[3] or record[4] for record in runtime_records)
+            callable_functions = self._runtime_callable_functions(current, traversal)
+            if has_configured_provenance:
+                state = _transactional_runtime_state_material(current, state_context)
+                if state is _UNREPRESENTABLE_RUNTIME_STATE:
+                    uncacheable[0] = True
+                    state = {
+                        "type": "unrepresentable",
+                        "class": _runtime_type_identity(type(current)),
+                    }
+                owner_materials = [
+                    owner
+                    for callable_function in callable_functions
+                    if (owner := self._runtime_callable_owner_material(callable_function))
+                    is not None
+                ]
+                entry: dict[str, Any] = {
+                    "scope": current_scope,
+                    "binding": current_binding,
+                    "state": state,
+                }
+                if owner_materials:
+                    entry["owners"] = owner_materials
+                callable_states.append(entry)
+
+            if identity in seen_callables:
+                continue
+            seen_callables.add(identity)
+            if has_configured_provenance:
+                for callable_function in callable_functions:
+                    self._collect_callable_globals(
+                        f"{current_binding}:function",
+                        callable_function,
+                        records,
+                        callable_states,
+                        global_values,
+                        seen_callables,
+                        uncacheable,
+                        state_context,
+                        traversal,
+                        pending,
+                        depth + 1,
+                    )
+            children = self._runtime_callable_children(current, traversal, depth)
+            for index, child in enumerate(children):
+                pending.append(
+                    (
+                        f"{current_scope}:child",
+                        f"{current_binding}:{index}",
+                        child,
+                        depth + 1,
+                    )
+                )
+
+    def _collect_callable_globals(
+        self,
+        binding: str,
+        function: Callable[..., Any],
+        records: set[_RuntimeModuleRecord],
+        callable_states: list[dict[str, Any]],
+        global_values: list[tuple[str, Any]],
+        seen_callables: set[int],
+        uncacheable: list[bool],
+        state_context: _RuntimeStateContext,
+        traversal: _RuntimeTraversalContext,
+        pending: list[tuple[str, str, Any, int]],
+        depth: int,
+    ) -> None:
+        """Capture referenced globals with one shared bounded object-graph context."""
+        globals_map = _function_globals(function)
+        code = _function_code(function)
+        if globals_map is None or not _is_code(code):
+            if globals_map is None:
+                uncacheable[0] = True
+            return
+        referenced_overflow = [False]
+        referenced_names = (
+            _referenced_global_names(code, referenced_overflow) - _MODULE_IDENTITY_NAMES
+        )
+        if referenced_overflow[0]:
+            uncacheable[0] = True
+        all_globals_observable = _function_observes_all_globals(function)
+        safe_global_names: set[str] = set()
+        for name in globals_map:
+            if len(safe_global_names) >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                uncacheable[0] = True
+                break
+            if type(name) is str:
+                safe_global_names.add(name)
+            else:
+                uncacheable[0] = True
+        if len(safe_global_names) != len(globals_map):
+            uncacheable[0] = True
+        if all_globals_observable:
+            uncacheable[0] = True
+            selected_names = sorted(safe_global_names)
+        else:
+            selected_names = sorted(referenced_names & safe_global_names)
+        for name in selected_names:
+            if traversal.overflow:
+                uncacheable[0] = True
+                break
+            value = globals_map[name]
+            runtime_records = self._runtime_module_records(
+                "callable-global",
+                f"{binding}:{name}",
+                value,
+                traversal,
+            )
+            records.update(runtime_records)
+            has_configured_provenance = any(record[3] or record[4] for record in runtime_records)
+            material = _transactional_runtime_state_material(value, state_context)
+            if material is _UNREPRESENTABLE_RUNTIME_STATE:
+                if has_configured_provenance or all_globals_observable:
+                    uncacheable[0] = True
+                    material = {
+                        "type": "unrepresentable",
+                        "class": _runtime_type_identity(type(value)),
+                    }
+                else:
+                    material = None
+            if material is not None:
+                global_values.append((f"{binding}:{name}", material))
+            nested_callables = self._runtime_nested_callables(value, traversal, depth + 1)
+            for index, child in enumerate(nested_callables):
+                if not _is_module(child):
+                    pending.append(
+                        (
+                            "callable-global",
+                            f"{binding}:{name}:{index}",
+                            child,
+                            depth + 1,
+                        )
+                    )
+
+    def _inconsistent_owner_fact_material(
+        self,
+        function: Callable[..., Any],
+    ) -> dict[str, Any] | None:
+        """Expose conflicting retained facts only as fail-closed fallback material."""
+        facts = _function_owner_facts(function)
+        if facts.consistent:
+            return None
+
+        def stable_path(path: Path) -> str:
+            try:
+                return path.relative_to(self.project_root).as_posix()
+            except ValueError:
+                return path.as_posix()
+
+        return {
+            "function_module": facts.function_module,
+            "globals_name": facts.globals_name,
+            "paths": tuple(stable_path(path) for path in facts.path_facts),
+        }
+
+    def _runtime_registry_records(
+        self,
+        traversal: _RuntimeTraversalContext | None = None,
+    ) -> set[_RuntimeModuleRecord]:
+        """Snapshot configured-source provenance in ``sys.modules`` once per query."""
+        if self._registry_records is not None:
+            if traversal is not None and self._registry_records_overflow:
+                traversal.overflow = True
+            return set(self._registry_records)
+
+        records: set[_RuntimeModuleRecord] = set()
+        if not self.source_dirs:
+            self._registry_records = records
+            return set(records)
+        registry = _safe_sys_modules()
+        if registry is None:
+            if traversal is not None:
+                traversal.overflow = True
+                self._registry_records_overflow = True
+            self._registry_records = records
+            return set(records)
+        try:
+            for registry_name, module in registry.items():
+                if traversal is not None and not traversal.claim_member():
+                    break
+                if module is None:
+                    continue
+                # The registry is an index for configured-source
+                # provenance, not a reason to inspect every unrelated
+                # module in the process. Filtering on exact string paths
+                # also prevents an opaque external module from consuming
+                # the shared member budget before a managed value is
+                # examined.
+                configured = False
+                module_file = _safe_runtime_attribute(module, "__file__")
+                if type(module_file) is str and module_file:
+                    try:
+                        configured = (
+                            len(self._configured_location_identities(Path(module_file))) != 0
+                        )
+                    except (OSError, RuntimeError):
+                        configured = False
+                if not configured:
+                    module_path = _safe_runtime_attribute(module, "__path__")
+                    path_entries = _safe_runtime_path_entries(module_path)
+                    if path_entries is not _UNRESOLVED_RUNTIME_VALUE:
+                        for path_entry in path_entries:
+                            try:
+                                if len(self._configured_location_identities(Path(path_entry))) != 0:
+                                    configured = True
+                                    break
+                            except (OSError, RuntimeError):
+                                continue
+                if not configured:
+                    continue
+                records.update(
+                    self._runtime_module_records(
+                        "registry",
+                        registry_name,
+                        module,
+                        traversal,
+                    )
+                )
+        except RuntimeError:
+            if traversal is not None:
+                traversal.overflow = True
+        self._registry_records_overflow = traversal is not None and traversal.overflow
+        self._registry_records = records
+        return set(records)
+
+    def _runtime_selection_material(
+        self,
+        function: Callable[..., Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Capture deterministic runtime choices and whether their L3 cache is reusable."""
+        traversal = _RuntimeTraversalContext(set())
+        records: set[_RuntimeModuleRecord] = self._runtime_registry_records(traversal)
+        callable_states: list[dict[str, Any]] = []
+        seen_callables: set[int] = set()
+        uncacheable = [False]
+        global_values: list[tuple[str, Any]] = []
+        state_context = _RuntimeStateContext({})
+
+        self._collect_runtime_callable(
+            "registered",
+            "function",
+            function,
+            records,
+            callable_states,
+            global_values,
+            seen_callables,
+            uncacheable,
+            state_context,
+            traversal,
+        )
+
+        globals_map = _function_globals(function)
+        code = _function_code(function)
+        referenced_overflow = [False]
+        referenced_globals = (
+            _referenced_global_names(code, referenced_overflow) - _MODULE_IDENTITY_NAMES
+        )
+        if referenced_overflow[0]:
+            uncacheable[0] = True
+        all_globals_observable = _function_observes_all_globals(function)
+        if globals_map is None:
+            uncacheable[0] = True
+        else:
+            safe_global_names: set[str] = set()
+            for name in globals_map:
+                if len(safe_global_names) >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                    uncacheable[0] = True
+                    break
+                if type(name) is str:
+                    safe_global_names.add(name)
+                else:
+                    uncacheable[0] = True
+            if len(safe_global_names) != len(globals_map):
+                uncacheable[0] = True
+            if all_globals_observable:
+                uncacheable[0] = True
+                selected_names = sorted(safe_global_names)
+            else:
+                selected_names = sorted(referenced_globals & safe_global_names)
+            for binding_name in selected_names:
+                if traversal.overflow:
+                    uncacheable[0] = True
+                    break
+                value = globals_map[binding_name]
+                runtime_records = self._runtime_module_records(
+                    "global",
+                    binding_name,
+                    value,
+                    traversal,
+                )
+                records.update(runtime_records)
+                has_configured_provenance = any(
+                    record[3] or record[4] for record in runtime_records
+                )
+                value_material = _transactional_runtime_state_material(value, state_context)
+                if value_material is _UNREPRESENTABLE_RUNTIME_STATE:
+                    if has_configured_provenance or all_globals_observable:
+                        uncacheable[0] = True
+                        value_material = {
+                            "type": "unrepresentable",
+                            "class": _runtime_type_identity(type(value)),
+                        }
+                    else:
+                        value_material = None
+                if value_material is not None:
+                    global_values.append((binding_name, value_material))
+                nested_callables = self._runtime_nested_callables(value, traversal, 1)
+                for index, child in enumerate(nested_callables):
+                    if not _is_module(child):
+                        self._collect_runtime_callable(
+                            "global",
+                            f"{binding_name}:{index}",
+                            child,
+                            records,
+                            callable_states,
+                            global_values,
+                            seen_callables,
+                            uncacheable,
+                            state_context,
+                            traversal,
+                        )
+
+        source_order: list[tuple[str, int, str]] = []
+        source_by_selector: dict[Path, list[tuple[str, int, str]]] = {}
+        for source_index, source_identity, source_dir in self._source_identities:
+            source_by_selector.setdefault(source_dir, []).append(
+                ("source", source_index, source_identity)
+            )
+            source_by_selector.setdefault(source_dir.parent, []).append(
+                ("package-parent", source_index, source_identity)
+            )
+        runtime_path = sys.path
+        if (
+            not (type(runtime_path) is list or type(runtime_path) is tuple)
+            or len(runtime_path) > _RUNTIME_PROVENANCE_MAX_MEMBERS
+        ):
+            uncacheable[0] = True
+        else:
+            for raw_entry in runtime_path:
+                if type(raw_entry) is not str:
+                    uncacheable[0] = True
+                    continue
+                try:
+                    entry = Path(os.getcwd() if raw_entry == "" else raw_entry).resolve()
+                except (OSError, RuntimeError):
+                    uncacheable[0] = True
+                    continue
+                source_order.extend(source_by_selector.get(entry, ()))
+
+        if any((-1, "", "invalid") in record[4] for record in records):
+            uncacheable[0] = True
+        if traversal.overflow or state_context.overflow:
+            uncacheable[0] = True
+        material: dict[str, Any] = {
+            "configured_modules": sorted(records),
+            "global_values": sorted(global_values, key=lambda item: item[0]),
+            "callable_states": sorted(
+                callable_states,
+                key=lambda entry: (entry["scope"], entry["binding"]),
+            ),
+            "source_path_order": source_order,
+        }
+        if uncacheable[0]:
+            material["uncacheable"] = True
+        owner_facts = self._inconsistent_owner_fact_material(function)
+        if owner_facts is not None:
+            material["owner_facts"] = owner_facts
+        return material, not uncacheable[0]
 
     def _tree(self, path: Path) -> ast.Module | None:
         if path in self._trees:
@@ -4794,77 +7949,482 @@ class _StaticLibsAnalyzer:
             parent = parent.parent
         return result
 
+    def _module_bindings(
+        self,
+        parts: tuple[str, ...],
+        resolution: _ImportResolution,
+    ) -> dict[Path, str] | None:
+        """Attach each resolved file to the module identity it executes as."""
+        if resolution.ambiguous:
+            return None
+        if not resolution.paths:
+            return {}
+        candidate = resolution.candidate
+        if candidate is None:
+            return None
+        package_parts = len(parts) if candidate.name == "__init__.py" else len(parts) - 1
+        if package_parts < 0:
+            return None
+        bindings: dict[Path, str] = {}
+        for path in resolution.paths:
+            if path == candidate:
+                name = ".".join(parts)
+            elif path.name == "__init__.py":
+                try:
+                    distance = len(candidate.parent.relative_to(path.parent).parts)
+                except ValueError:
+                    return None
+                prefix_length = package_parts - distance
+                if prefix_length <= 0:
+                    return None
+                name = ".".join(parts[:prefix_length])
+            else:
+                return None
+            prior = bindings.get(path)
+            if prior is not None and prior != name:
+                return None
+            bindings[path] = name
+        return bindings
+
+    def _resolution_for(
+        self,
+        parts: tuple[str, ...],
+        paths: Iterable[Path],
+        candidate: Path | None,
+    ) -> _ImportResolution:
+        """Create a resolution only when all selected paths have stable names."""
+        normalized_paths = tuple(sorted(set(paths)))
+        resolution = _ImportResolution(normalized_paths, candidate=candidate)
+        bindings = self._module_bindings(parts, resolution)
+        if bindings is None:
+            return _ImportResolution(ambiguous=True)
+        return _ImportResolution(
+            normalized_paths,
+            candidate=candidate,
+            module_names=tuple(sorted(bindings.items(), key=lambda item: item[0].as_posix())),
+        )
+
+    @staticmethod
+    def _merge_resolution_bindings(
+        bindings: dict[Path, str], resolution: _ImportResolution
+    ) -> bool:
+        """Merge a resolution while rejecting one file with competing identities."""
+        if resolution.ambiguous:
+            return False
+        if set(resolution.paths) != {path for path, _name in resolution.module_names}:
+            return False
+        for path, name in resolution.module_names:
+            prior = bindings.get(path)
+            if prior is not None and prior != name:
+                return False
+            bindings[path] = name
+        return True
+
+    @staticmethod
+    def _ancestor_module_name(path: Path, module_name: str, ancestor: Path) -> str | None:
+        """Return the qualified name of an ancestor initializer for one module."""
+        if ancestor.name != "__init__.py":
+            return None
+        module_parts = tuple(module_name.split("."))
+        package_length = len(module_parts) if path.name == "__init__.py" else len(module_parts) - 1
+        try:
+            distance = len(path.parent.relative_to(ancestor.parent).parts)
+        except ValueError:
+            return None
+        prefix_length = package_length - distance
+        if prefix_length <= 0:
+            return None
+        return ".".join(module_parts[:prefix_length])
+
+    def _module_proves_binding(self, path: Path, binding_name: str) -> bool:
+        """Prove a direct ImportFrom attribute from a base module's top-level AST."""
+        tree = self._tree(path)
+        if tree is None or _module_imports_are_ambiguous(tree):
+            return False
+
+        for statement in tree.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if statement.name == binding_name:
+                    return True
+            elif isinstance(statement, ast.Import):
+                if any(
+                    (alias.asname or alias.name.split(".", 1)[0]) == binding_name
+                    for alias in statement.names
+                ):
+                    return True
+            elif isinstance(statement, ast.ImportFrom):
+                if any(
+                    alias.name != "*" and (alias.asname or alias.name) == binding_name
+                    for alias in statement.names
+                ):
+                    return True
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets: Iterable[ast.AST]
+                if isinstance(statement, ast.Assign):
+                    targets = statement.targets
+                else:
+                    targets = (statement.target,)
+                if any(binding_name in self._assigned_names(target) for target in targets):
+                    return True
+        return False
+
+    @staticmethod
+    def _assigned_names(target: ast.AST) -> set[str]:
+        """Return simple names bound by a top-level assignment target."""
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: set[str] = set()
+            for element in target.elts:
+                names.update(_StaticLibsAnalyzer._assigned_names(element))
+            return names
+        return set()
+
+    def _validate_loaded_prefixes(
+        self,
+        parts: tuple[str, ...],
+        importer_module_name: str,
+        binding_name: str | None,
+        bound_module_name: str | None = None,
+    ) -> bool:
+        """Validate every loaded configured module prefix of a dotted import."""
+        for index in range(1, len(parts) + 1):
+            prefix_parts = parts[:index]
+            resolution = self._resolve_absolute(prefix_parts)
+            if resolution.ambiguous:
+                return False
+            if not resolution.paths and self._loaded_prefix_reaches_source(prefix_parts):
+                return False
+            if resolution.paths and self._loaded_module_mismatch(
+                (".".join(prefix_parts),),
+                resolution,
+                importer_module_name=importer_module_name,
+                binding_name=binding_name,
+                bound_module_name=bound_module_name,
+                require_loaded=True,
+            ):
+                return False
+        return True
+
+    def _loaded_prefix_reaches_source(self, parts: tuple[str, ...]) -> bool:
+        """Return whether a loaded dotted package prefix reaches configured sources."""
+        registry = _safe_sys_modules()
+        if registry is None:
+            return True
+        module = registry.get(".".join(parts))
+        if module is None:
+            return False
+        runtime_search_path = _safe_runtime_attribute(module, "__path__")
+        if runtime_search_path is None:
+            return False
+        path_entries = _safe_runtime_path_entries(runtime_search_path)
+        if path_entries is _UNRESOLVED_RUNTIME_VALUE:
+            return True
+        try:
+            search_paths = tuple(Path(entry).resolve() for entry in path_entries)
+        except (OSError, RuntimeError, TypeError):
+            return True
+        return any(
+            _path_is_within(path, source_dir) or _path_is_within(source_dir, path)
+            for path in search_paths
+            for source_dir in self.source_dirs
+        )
+
     def _resolve_import(
         self,
         importer: Path,
+        importer_module_name: str,
         statement: ast.Import | ast.ImportFrom,
     ) -> _ImportResolution:
         if isinstance(statement, ast.Import):
-            paths: set[Path] = set()
+            bindings: dict[Path, str] = {}
             for alias in statement.names:
-                resolution = self._resolve_absolute(tuple(alias.name.split(".")))
+                parts = tuple(alias.name.split("."))
+                if not self._validate_loaded_prefixes(
+                    parts,
+                    importer_module_name,
+                    alias.asname or parts[0],
+                    alias.name if alias.asname else parts[0],
+                ):
+                    return _ImportResolution(ambiguous=True)
+                resolution = self._resolve_absolute(parts)
                 if resolution.ambiguous:
                     return resolution
-                if self._loaded_module_mismatch((alias.name,), resolution):
+                if not resolution.paths and not self._known_external(parts[0]):
                     return _ImportResolution(ambiguous=True)
-                if not resolution.paths and not self._known_external(alias.name.split(".")[0]):
+                if not self._merge_resolution_bindings(bindings, resolution):
                     return _ImportResolution(ambiguous=True)
-                paths.update(resolution.paths)
-            return _ImportResolution(tuple(sorted(paths)))
+            return _ImportResolution(
+                tuple(sorted(bindings)),
+                module_names=tuple(sorted(bindings.items(), key=lambda item: item[0].as_posix())),
+            )
 
         if any(alias.name == "*" for alias in statement.names):
             return _ImportResolution(ambiguous=True)
         module_parts = tuple(statement.module.split(".")) if statement.module else ()
         if statement.level:
-            base_dir = importer.parent
-            for _ in range(statement.level - 1):
-                base_dir = base_dir.parent
-            base_path = base_dir.joinpath(*module_parts).resolve()
-            base_resolution = self._resolve_path(base_path, self.project_root)
-            if base_resolution.ambiguous:
-                return base_resolution
-            paths = set(base_resolution.paths)
-            for alias in statement.names:
-                child_resolution = self._resolve_path(
-                    (base_path / alias.name).resolve(), self.project_root
-                )
-                if child_resolution.ambiguous:
-                    return child_resolution
-                paths.update(child_resolution.paths)
-            return _ImportResolution(tuple(sorted(paths)), ambiguous=not paths)
+            return self._resolve_relative_import(importer, importer_module_name, statement)
 
         base_resolution = self._resolve_absolute(module_parts)
         if base_resolution.ambiguous:
             return base_resolution
-        runtime_names = [statement.module] if statement.module else []
-        if self._loaded_module_mismatch(runtime_names, base_resolution):
+        if module_parts and not self._validate_loaded_prefixes(
+            module_parts, importer_module_name, None
+        ):
             return _ImportResolution(ambiguous=True)
-        paths = set(base_resolution.paths)
+        bindings: dict[Path, str] = {}
+        if not self._merge_resolution_bindings(bindings, base_resolution):
+            return _ImportResolution(ambiguous=True)
         for alias in statement.names:
-            child_resolution = self._resolve_absolute((*module_parts, alias.name))
+            child_parts = (*module_parts, alias.name)
+            child_resolution = self._resolve_absolute(child_parts)
             if child_resolution.ambiguous:
                 return child_resolution
-            if module_parts and self._loaded_module_mismatch(
-                (".".join((*module_parts, alias.name)),), child_resolution
+            if child_resolution.paths:
+                if not self._validate_loaded_prefixes(
+                    child_parts,
+                    importer_module_name,
+                    alias.asname or alias.name,
+                    ".".join(child_parts),
+                ):
+                    return _ImportResolution(ambiguous=True)
+                if not self._merge_resolution_bindings(bindings, child_resolution):
+                    return _ImportResolution(ambiguous=True)
+            elif (
+                base_resolution.candidate is not None
+                and self._module_proves_binding(base_resolution.candidate, alias.name)
+            ) or (
+                not base_resolution.paths and module_parts and self._known_external(module_parts[0])
             ):
+                continue
+            else:
+                # A resolved package/module does not prove that an ImportFrom
+                # child is merely an attribute.  It may be a runtime-supplied
+                # submodule through an extended package path.
                 return _ImportResolution(ambiguous=True)
-            paths.update(child_resolution.paths)
-        if not paths and module_parts and not self._known_external(module_parts[0]):
+        if not bindings and module_parts and not self._known_external(module_parts[0]):
             return _ImportResolution(ambiguous=True)
-        return _ImportResolution(tuple(sorted(paths)))
+        return _ImportResolution(
+            tuple(sorted(bindings)),
+            module_names=tuple(sorted(bindings.items(), key=lambda item: item[0].as_posix())),
+        )
+
+    def _resolve_relative_import(
+        self,
+        importer: Path,
+        importer_module_name: str,
+        statement: ast.ImportFrom,
+    ) -> _ImportResolution:
+        """Resolve relative imports across every configured package root."""
+        context = self._relative_package_context(importer, importer_module_name)
+        if context is None:
+            return _ImportResolution(ambiguous=True)
+        identity_package_parts, filesystem_package_parts = context
+        climb = statement.level - 1
+        if climb >= len(identity_package_parts) or climb > len(filesystem_package_parts):
+            return _ImportResolution(ambiguous=True)
+        identity_base_parts = identity_package_parts[: len(identity_package_parts) - climb]
+        filesystem_base_parts = filesystem_package_parts[: len(filesystem_package_parts) - climb]
+        if statement.module:
+            module_parts = tuple(statement.module.split("."))
+            identity_base_parts = (*identity_base_parts, *module_parts)
+            filesystem_base_parts = (*filesystem_base_parts, *module_parts)
+
+        bindings: dict[Path, str] = {}
+        roots = (self.project_root, *self.source_dirs)
+        base_resolution = self._resolve_relative_target(
+            identity_base_parts, filesystem_base_parts, roots
+        )
+        if base_resolution.ambiguous:
+            return base_resolution
+        if not self._merge_resolution_bindings(bindings, base_resolution):
+            return _ImportResolution(ambiguous=True)
+        if not self._validate_relative_loaded_prefixes(
+            identity_base_parts,
+            len(identity_package_parts) - climb,
+            filesystem_base_parts,
+            importer_module_name,
+            None,
+            roots=roots,
+        ):
+            return _ImportResolution(ambiguous=True)
+
+        for alias in statement.names:
+            identity_child_parts = (*identity_base_parts, alias.name)
+            filesystem_child_parts = (*filesystem_base_parts, alias.name)
+            child_resolution = self._resolve_relative_target(
+                identity_child_parts, filesystem_child_parts, roots
+            )
+            if child_resolution.ambiguous:
+                return child_resolution
+            if child_resolution.paths:
+                if not self._validate_relative_loaded_prefixes(
+                    identity_child_parts,
+                    len(identity_package_parts) - climb,
+                    filesystem_base_parts,
+                    importer_module_name,
+                    alias.asname or alias.name,
+                    ".".join(identity_child_parts),
+                    roots,
+                ):
+                    return _ImportResolution(ambiguous=True)
+                if not self._merge_resolution_bindings(bindings, child_resolution):
+                    return _ImportResolution(ambiguous=True)
+            elif base_resolution.candidate is not None and self._module_proves_binding(
+                base_resolution.candidate, alias.name
+            ):
+                continue
+            else:
+                # A resolved package/module does not prove that an ImportFrom
+                # child is merely an attribute.  It may be supplied through a
+                # runtime package path extension.
+                return _ImportResolution(ambiguous=True)
+
+        if not bindings:
+            return _ImportResolution(ambiguous=True)
+        return _ImportResolution(
+            tuple(sorted(bindings)),
+            module_names=tuple(sorted(bindings.items(), key=lambda item: item[0].as_posix())),
+        )
+
+    def _resolve_relative_target(
+        self,
+        identity_parts: tuple[str, ...],
+        filesystem_parts: tuple[str, ...],
+        roots: Iterable[Path],
+    ) -> _ImportResolution:
+        """Resolve one relative target while retaining its qualified identity."""
+        paths: set[Path] = set()
+        candidates: set[Path] = set()
+        for root in dict.fromkeys(roots):
+            resolution = self._resolve_path(root.joinpath(*filesystem_parts).resolve(), root)
+            if resolution.ambiguous:
+                return resolution
+            paths.update(resolution.paths)
+            if resolution.candidate is not None:
+                candidates.add(resolution.candidate)
+                if len(candidates) > 1:
+                    return _ImportResolution(ambiguous=True)
+        return self._resolution_for(identity_parts, paths, next(iter(candidates), None))
+
+    @staticmethod
+    def _relative_filesystem_prefix(
+        identity_parts: tuple[str, ...],
+        package_length: int,
+        filesystem_package_parts: tuple[str, ...],
+        prefix_length: int,
+    ) -> tuple[str, ...] | None:
+        """Map a qualified relative prefix back to the selected root suffix."""
+        if prefix_length > len(identity_parts):
+            return None
+        omitted = package_length - len(filesystem_package_parts)
+        if prefix_length <= package_length:
+            return identity_parts[omitted:prefix_length] if prefix_length > omitted else ()
+        return (
+            *filesystem_package_parts,
+            *identity_parts[package_length:prefix_length],
+        )
+
+    def _validate_relative_loaded_prefixes(
+        self,
+        identity_parts: tuple[str, ...],
+        package_length: int,
+        filesystem_package_parts: tuple[str, ...],
+        importer_module_name: str,
+        binding_name: str | None,
+        bound_module_name: str | None = None,
+        roots: Iterable[Path] = (),
+    ) -> bool:
+        """Validate loaded modules against relative targets for every qualified prefix."""
+        for index in range(1, len(identity_parts) + 1):
+            prefix_filesystem_parts = self._relative_filesystem_prefix(
+                identity_parts,
+                package_length,
+                filesystem_package_parts,
+                index,
+            )
+            if prefix_filesystem_parts is None:
+                return False
+            resolution = self._resolve_relative_target(
+                identity_parts[:index], prefix_filesystem_parts, roots
+            )
+            if resolution.ambiguous:
+                return False
+            if not resolution.paths and self._loaded_prefix_reaches_source(identity_parts[:index]):
+                return False
+            if resolution.paths and self._loaded_module_mismatch(
+                (".".join(identity_parts[:index]),),
+                resolution,
+                importer_module_name=importer_module_name,
+                binding_name=binding_name,
+                bound_module_name=bound_module_name,
+                require_loaded=True,
+            ):
+                return False
+        return True
+
+    def _relative_package_context(
+        self, importer: Path, importer_module_name: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """Return qualified package identity and the nearest filesystem suffix."""
+        module_parts = tuple(importer_module_name.split("."))
+        identity_package_parts = (
+            module_parts if importer.name == "__init__.py" else module_parts[:-1]
+        )
+        if not identity_package_parts:
+            return None
+
+        candidates: list[tuple[int, int, Path, tuple[str, ...]]] = []
+        roots = (self.project_root, *self.source_dirs)
+        for index, root in enumerate(dict.fromkeys(roots)):
+            try:
+                relative = importer.relative_to(root)
+            except ValueError:
+                continue
+            if not relative.parts:
+                continue
+            candidates.append((len(root.parts), -index, root, relative.parent.parts))
+        if not candidates:
+            return None
+        depth = max(candidate[0] for candidate in candidates)
+        deepest = [candidate for candidate in candidates if candidate[0] == depth]
+        filesystem_suffixes = {candidate[3] for candidate in deepest}
+        if len(filesystem_suffixes) != 1:
+            return None
+        _depth, _order, _root, filesystem_package_parts = max(deepest)
+        return identity_package_parts, filesystem_package_parts
 
     def _loaded_module_mismatch(
         self,
         module_names: Iterable[str],
         resolution: _ImportResolution,
+        *,
+        importer_module_name: str | None = None,
+        binding_name: str | None = None,
+        bound_module_name: str | None = None,
+        require_loaded: bool = False,
     ) -> bool:
         """Reject a loaded configured module whose file differs from static resolution."""
         static_paths = set(resolution.paths)
+        registry = _safe_sys_modules()
+        if registry is None:
+            return True
         for module_name in module_names:
-            module = sys.modules.get(module_name)
+            module = registry.get(module_name)
             if module is None:
-                continue
-            module_file = getattr(module, "__file__", None)
+                if not require_loaded:
+                    continue
+                module = self._importer_binding(
+                    importer_module_name,
+                    module_name,
+                    binding_name,
+                    bound_module_name,
+                )
+                if module is None:
+                    return True
+            if self._loaded_package_path_mismatch(module, resolution):
+                return True
+            module_file = _safe_runtime_attribute(module, "__file__")
             if not isinstance(module_file, str) or not module_file:
                 continue
             try:
@@ -4877,23 +8437,100 @@ class _StaticLibsAnalyzer:
                 return True
         return False
 
-    def _is_source_universe_path(self, path: Path) -> bool:
-        """Return whether a runtime module belongs to project or configured sources."""
-        return _path_is_within(path, self.project_root) or any(
-            _path_is_within(path, source_dir) for source_dir in self.source_dirs
+    @staticmethod
+    def _loaded_package_path_mismatch(module: Any, resolution: _ImportResolution) -> bool:
+        """Reject a package search path that is not the statically selected one."""
+        runtime_search_path = _safe_runtime_attribute(module, "__path__")
+        if runtime_search_path is None:
+            return False
+        path_entries = _safe_runtime_path_entries(runtime_search_path)
+        if path_entries is _UNRESOLVED_RUNTIME_VALUE:
+            return True
+        try:
+            runtime_paths = {Path(entry).resolve() for entry in path_entries}
+        except (OSError, RuntimeError, TypeError):
+            return True
+        expected_paths = (
+            {resolution.candidate.parent}
+            if resolution.candidate is not None and resolution.candidate.name == "__init__.py"
+            else set()
         )
+        return runtime_paths != expected_paths
+
+    @staticmethod
+    def _importer_binding(
+        importer_module_name: str | None,
+        module_name: str,
+        binding_name: str | None,
+        bound_module_name: str | None,
+    ) -> Any | None:
+        """Inspect a static importer binding when its canonical registry entry is absent."""
+        if importer_module_name is None or binding_name is None or bound_module_name is None:
+            return None
+        registry = _safe_sys_modules()
+        if registry is None:
+            return None
+        importer = registry.get(importer_module_name)
+        if importer is None:
+            return None
+        namespace = _safe_runtime_attribute(importer, "__dict__")
+        if type(namespace) is not dict:
+            return None
+        value = namespace.get(binding_name)
+        if value is None:
+            return None
+        if module_name == bound_module_name:
+            return value
+        if not bound_module_name or not module_name.startswith(bound_module_name + "."):
+            return None
+        suffix = module_name[len(bound_module_name) + 1 :].split(".")
+        for part in suffix:
+            namespace = _safe_runtime_attribute(value, "__dict__")
+            if type(namespace) is not dict:
+                return None
+            value = namespace.get(part)
+            if value is None:
+                return None
+        return value
+
+    def _is_source_universe_path(self, path: Path) -> bool:
+        """Return whether a runtime module belongs to a configured source path."""
+        return any(_path_is_within(path, source_dir) for source_dir in self.source_dirs)
 
     def _known_external(self, top_level: str) -> bool:
         """Accept only imports proven outside the configured project source universe."""
+        registry = _safe_sys_modules()
+        if registry is None:
+            return False
+        module = registry.get(top_level)
+        if module is not None:
+            runtime_search_path = _safe_runtime_attribute(module, "__path__")
+            if runtime_search_path is not None:
+                path_entries = _safe_runtime_path_entries(runtime_search_path)
+                if path_entries is _UNRESOLVED_RUNTIME_VALUE:
+                    return False
+                try:
+                    search_paths = tuple(Path(entry).resolve() for entry in path_entries)
+                except (OSError, RuntimeError, TypeError):
+                    return False
+                if any(
+                    _path_is_within(path, source_dir) or _path_is_within(source_dir, path)
+                    for path in search_paths
+                    for source_dir in self.source_dirs
+                ):
+                    return False
         if top_level in sys.builtin_module_names or top_level in sys.stdlib_module_names:
             return True
-        module = sys.modules.get(top_level)
         if module is None:
             return False
-        module_file = getattr(module, "__file__", None)
+        module_file = _safe_runtime_attribute(module, "__file__")
         if not isinstance(module_file, str) or not module_file:
             return False
-        return not self._is_source_universe_path(Path(module_file))
+        try:
+            runtime_path = Path(module_file).resolve()
+        except (OSError, RuntimeError):
+            return False
+        return not self._is_source_universe_path(runtime_path)
 
     def _resolve_absolute(self, parts: tuple[str, ...]) -> _ImportResolution:
         if not parts:
@@ -4910,7 +8547,7 @@ class _StaticLibsAnalyzer:
                 if len(candidates) > 1:
                     return _ImportResolution(ambiguous=True)
             paths.update(resolution.paths)
-        return _ImportResolution(tuple(sorted(paths)))
+        return self._resolution_for(parts, paths, next(iter(candidates), None))
 
     def _resolve_path(self, base: Path, package_root: Path) -> _ImportResolution:
         file_path = (base.parent / f"{base.name}.py").resolve()
@@ -5050,35 +8687,108 @@ def _static_string(node: ast.AST) -> str | None:
     return None
 
 
-def _function_module_path(function: Callable[..., Any]) -> Path | None:
-    """Return a function's owning Python module path, or None when that fact is unavailable."""
+@dataclass(frozen=True)
+class _FunctionOwnerFacts:
+    """Retained function facts used to validate owner identity after detachment."""
+
+    module_name: str | None
+    module_path: Path | None
+    consistent: bool
+    function_module: str | None
+    globals_name: str | None
+    path_facts: tuple[Path, ...]
+
+
+def _function_owner_facts(function: Callable[..., Any]) -> _FunctionOwnerFacts:
+    """Recover and cross-check a function's module/name/path facts.
+
+    ``inspect.getmodule`` is only a live-registry convenience: it is unavailable
+    for retained functions after their module is removed from ``sys.modules``.
+    The function attributes, its globals namespace and its code/source path are
+    retained facts; disagreement between them is treated as untrusted.
+    """
+    raw_module = _safe_runtime_attribute(function, "__module__")
+    function_module = raw_module if isinstance(raw_module, str) and raw_module else None
+    globals_map = _function_globals(function)
+    raw_globals_name = globals_map.get("__name__") if type(globals_map) is dict else None
+    globals_name = (
+        raw_globals_name if isinstance(raw_globals_name, str) and raw_globals_name else None
+    )
+    module_name = function_module or globals_name
+    consistent = function_module is None or globals_name is None or function_module == globals_name
+
+    code = _function_code(function)
+    candidate_paths: list[Path] = []
+    code_filename = _safe_runtime_attribute(code, "co_filename")
+    if isinstance(code_filename, str) and code_filename and not code_filename.startswith("<"):
+        try:
+            candidate_paths.append(Path(code_filename).resolve())
+        except (OSError, RuntimeError):
+            consistent = False
     try:
-        module = inspect.getmodule(function)
-        source = inspect.getsourcefile(function)
-    except (OSError, TypeError):
+        source_filename = inspect.getsourcefile(function)
+    except (OSError, TypeError, ValueError):
+        source_filename = None
+    if isinstance(source_filename, str) and source_filename and not source_filename.startswith("<"):
+        try:
+            candidate_paths.append(Path(source_filename).resolve())
+        except (OSError, RuntimeError):
+            consistent = False
+
+    path_facts = tuple(dict.fromkeys(candidate_paths))
+    if len(path_facts) > 1:
+        consistent = False
+    module_path = path_facts[0] if path_facts and path_facts[0].suffix == ".py" else None
+    if path_facts and module_path is None:
+        consistent = False
+
+    registry = _safe_sys_modules()
+    if registry is None:
+        consistent = False
+    for name in {function_module, globals_name} - {None}:
+        module = registry.get(name) if registry is not None else None
+        if module is None:
+            continue
+        if _safe_runtime_attribute(module, "__name__") not in {name, _UNRESOLVED_RUNTIME_VALUE}:
+            consistent = False
+        module_file = _safe_runtime_attribute(module, "__file__")
+        if module_file is _UNRESOLVED_RUNTIME_VALUE:
+            module_file = None
+        if module_file is not None and type(module_file) is not str:
+            consistent = False
+            continue
+        if module_path is None or module_file is None:
+            continue
+        try:
+            if Path(module_file).resolve() != module_path:
+                consistent = False
+        except (OSError, RuntimeError):
+            consistent = False
+
+    return _FunctionOwnerFacts(
+        module_name=module_name,
+        module_path=module_path,
+        consistent=consistent,
+        function_module=function_module,
+        globals_name=globals_name,
+        path_facts=path_facts,
+    )
+
+
+def _function_module_path(function: Callable[..., Any]) -> Path | None:
+    """Return a validated function module path, including detached functions."""
+    facts = _function_owner_facts(function)
+    if not facts.consistent or facts.module_name is None:
         return None
-    if module is None or source is None:
-        return None
-    module_file = getattr(module, "__file__", None)
-    if not isinstance(module_file, str) or not module_file:
-        return None
-    source_path = Path(source).resolve()
-    module_path = Path(module_file).resolve()
-    if source_path.suffix != ".py":
-        return None
-    if module_path.suffix == ".py" and module_path != source_path:
-        return None
-    return source_path
+    return facts.module_path
 
 
 def _function_module_name(function: Callable[..., Any]) -> str | None:
-    """Return the import name paired with a function's owning module path."""
-    try:
-        module = inspect.getmodule(function)
-    except (OSError, TypeError):
+    """Return a validated function module name, including detached functions."""
+    facts = _function_owner_facts(function)
+    if not facts.consistent or facts.module_path is None:
         return None
-    name = getattr(module, "__name__", None) if module is not None else None
-    return name if isinstance(name, str) and name else None
+    return facts.module_name
 
 
 def _path_is_within(path: Path, directory: Path) -> bool:

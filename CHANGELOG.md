@@ -51,15 +51,62 @@
 
 ### 修复
 
+- 修复静态 `libs` 闭包成功时跳过 runtime state 的 stale replay：现在只有静态闭包与所有已到达配置 callable 的
+  defaults、closure、annotations、wrapper、partial、receiver 和 class state 都可表示时才允许 L3 复用。
+- 修复自定义容器隐藏配置 callable 的情况：遇到带配置源码 provenance 的非内建迭代/映射容器时保守关闭
+  L3 复用，外部 provenance 容器仍保持边界隔离。
+- 修复 `sys.modules` provenance 扫描预算溢出状态在 analyzer memoization 后丢失的问题：重复 identity 查询现在
+  始终保持相同的不可复用结论。
+- 修复 complete-globals 观察传播：class body 会被检查，且实际调用的 nested callable 会递归追踪到所有传递
+  层级，避免 reflection 观察漏出缓存键分析。
+- 修复 set/frozenset 排序展开缺少共享预算与 memo 的问题：深层或共享别名 tuple 结构遇到稳定 overflow marker
+  即 fail closed，不再无界工作或触发 `RecursionError`。
+
 - `libs` 静态闭包遇到多个配置源码候选、已加载模块路径偏离静态候选、已识别的动态可调用引用
   （`__import__`、`import_module`、`find_spec`、`eval`、`exec`、`compile`，无论是否实际调用、
   也不论赋值目标是简单名、walrus、属性、下标/容器、解构或链式赋值），或模块 AST 中出现
   常见反射原语（`getattr`、`globals`、`locals`、`vars`、`__dict__`、
   `__getattribute__`、`__builtins__`、显式 `builtins` 导入、`importlib` 子模块导入及模块注册表访问如
-  `sys.modules`）时，现在统一退回精确全文件摘要，即使名称/键是计算出来的也不尝试常量传播；
-  保守的额外失效是有意的，避免动态 helper 编辑复用陈旧节点产物。这是
-  `CACHE_SCHEMA=7` 尚未发布期间的正确性修复，不新增缓存族轮换；该边界是源码 AST 分析，
-  不宣称覆盖任意外部/native 运行时代码。
+  `sys.modules`）时，或表面为外部的已加载 package 通过运行时 `__path__` 伸入配置源码宇宙时，
+  现在统一退回精确全文件摘要，即使名称/键是计算出来的也不尝试常量传播；
+  保守的额外失效是有意的，避免动态 helper 编辑复用陈旧节点产物。libs 只管理
+  `config.source_paths`，项目根下未列入配置源码路径的文件不属于该成分；选中闭包和全文件
+  fallback 都绑定按 `source_dirs` 顺序排列的稳定源码根/文件 identity（项目内使用相对项目根路径，
+  项目外使用配置的 canonical identity）；选中闭包另绑定限定模块名。owner identity 只分析当前注册
+  节点函数，避免未注册 sibling 污染粒度；该函数剥除 docstring 后直接观察 `__name__`、
+  `__package__`、`__file__`、`__spec__`、`__loader__`，通过函数对象的 `__module__`/`__globals__`
+  观察 owner，或通过直接、属性及被函数引用的全局别名形式调用 `globals`、`locals`、`vars`、
+  `eval`、`exec`、`compile`，以及动态 `getattr`/`__getattribute__` 查找观察这些值时，还绑定
+  owner 限定名与稳定项目相对/canonical 路径。只在 docstring/非查找字符串中提到这些名称，或执行
+  常量且无关的 `getattr(helper, "VALUE")` 的等价函数仍可跨模块名或文件名复用。fallback 另绑定
+  当前已加载/函数全局可见的配置源码模块选择、脱离 `sys.modules` 后保留的 function/class 与已识别
+  callable wrapper 的源文件 provenance、callable 限定名与不含文件名/行表噪声的可执行 code
+  digest、函数及嵌套 code object 实际引用的简单全局值，以及配置源码根本身或 package parent
+  在 `sys.path` 中的相对顺序。相对导入携带实际限定模块名并校验所有加载前缀，
+  向上导入使用 climb 后的 package suffix；`ImportFrom` child 只有在 base 模块顶层 AST 明确
+  证明为属性绑定时才保持节点粒度，缺失的 canonical `sys.modules` 条目也按不确定处理。这是
+  `CACHE_SCHEMA=7` 尚未发布期间的正确性修复，
+  不新增缓存族轮换；该边界是源码 AST 分析，不宣称覆盖任意外部/native 运行时代码。
+- 继续修复 `libs` 残余粒度与 owner 边界：单参数/partial 绑定的 owner 查找、closure 别名、
+  下标选择 lookup、实际到达的 nested function/class body/直接调用 Python function graph 都参与
+  owner 判断；脱离 `sys.modules` 的注册函数只在 `__module__`、globals 名称与 code/source 路径
+  一致时恢复 owner，事实冲突进入 fail-closed fallback。判断继续区分 Load/Store、词法局部绑定和
+  实际 receiver，避免把 `getattr(helper, "__name__")`、`helper.eval(...)`、`obj.globals` 或局部
+  `__name__` 误当 owner。
+- fallback 的 retained callable 状态改为一张跨 callable/global root 共享、带 node/depth/member
+  硬上限的确定性对象图：覆盖 closure、defaults/kwdefaults、annotations、function dict、bound method、
+  partial/wrapper、实例 dict、每个 MRO slot、class/base/metaclass state 与 slot/container 中的
+  callable；保留 dict insertion order、普通 `"__wrapped__"` 数据键、float bit pattern、cycle 与
+  shared-alias topology，并对 code DAG、源码归一化、模块注册表和重复 node function 做 query 内
+  复用。遍历超预算，或遇到 native container subclass、custom descriptor/property/
+  `__getattribute__`、不安全路径对象等无法静态读取的状态时，使用稳定声明 identity 并把有效 L3
+  策略单独降为 `off`；完整 globals namespace 观察同样降级，不再声称任意 namespace 已被证明
+  等价。运行时取证只接受 exact string path，不调用 `__fspath__`、truthiness、用户 equality/hash、
+  mapping hook、descriptor、partial subclass hook 或 custom metaclass hook。
+- 普通节点、map、scan、plan 与 explain 现在共用上述有效 L3 策略：不可复用时不再读取/写入残留
+  cache，空 map/scan 也不会因 `all([])` 被误报为 aggregate hit。确定性 key、run manifest 与
+  resume/recover 保持稳定，不使用随机 nonce。这些修复搭载未发布的 `CACHE_SCHEMA=7`，不新增
+  缓存族轮换。
 - 修复 `kigumi runs show` 的 recovery 建议：参数改为 shell-safe 命令渲染，要求在 `recover` 与
   随后的 `resume` 两条命令中都补回构造该 run 时使用的同一组实际重复
   `--graph-arg KEY=VALUE`（放在 `--` 之前，以支持 option-like ID）；不涉及 `CACHE_SCHEMA`。

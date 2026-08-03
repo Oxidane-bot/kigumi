@@ -35,14 +35,57 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 3. `items_from` 与 scan 的 `carry_from` 源不入共享 `upstream`；`item` 按内容入键；`carry` 只按
    本项实收内容入键，`carry_fn` 源码不入键。消费投影的源码同样不入键；节点函数收到 canonical
    JSON round-trip 后的投影视图而非完整上游产物，未声明投影的依赖输入形态不变。
-4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 只纳入从节点函数所属
-   模块出发、在 `config.source_paths` 内由静态 import 图可达的文件，并按传递闭包计算。
+4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 管理的源码宇宙严格是
+   `config.source_paths`，只纳入从节点函数所属模块出发、在其中由静态 import 图可达的文件，并
+   按传递闭包计算。项目根下未列入配置源码路径的 imported helper 不进入 `libs`；独立的 `source`
+   成分只覆盖注册节点函数本身，其他外部输入必须加入 `source_dirs` 或声明显式指纹。
    静态分析只接受模块顶层、无歧义的 import；配置源码快照中任一文件语法残破、节点模块
    无法定位或读取、可达模块无法解析，或发现条件/嵌套 import、`importlib` 及其子模块/动态导入调用、
    已识别的动态可调用引用（无论是否调用，也不论赋值目标是简单名、walrus、属性、下标/容器、
-   解构或链式赋值）、动态导入别名、star-import、模块级 `__getattr__`、相对导入无法解析、同一导入对应多个
-   配置源码候选，或已加载模块的 `__file__` 偏离静态候选且仍落在项目/配置源码范围内等
-   不确定情形时，该节点退回当前全文件 digest。模块 AST 中出现常见反射原语
+   解构或链式赋值）、动态导入别名、star-import、模块级 `__getattr__`、相对导入无法在所有配置源码根中
+   唯一解析、相对导入存在多个配置候选、`ImportFrom` child 未能独立解析（即使 base package 已解析）、同一导入对应多个
+   配置源码候选，已加载模块的 `__file__` 偏离静态候选且仍落在配置源码路径内，或表面为外部的
+   已加载 package 通过运行时 `__path__` 伸入配置源码宇宙等不确定情形时，该节点退回当前全文件
+   digest。普通 `ImportFrom` 属性只有在 base 模块顶层 AST 明确证明函数、
+   类、赋值或安全 import binding 时才保持闭包粒度；未解析 child、动态 `__getattr__`、star import
+   和反射仍然 fallback。相对导入携带实际限定模块 identity 并校验所有 dotted loaded prefixes；
+   向上相对导入按 climb 后的 package suffix 校验，缺失 expected `sys.modules` 条目也按不确定处理。
+   选中闭包额外绑定每个文件的限定模块名；owner 分析从当前注册节点函数出发，只跟进实际到达的
+   nested function、class body 与直接调用的 Python callable，不让未调用 sibling 污染粒度。剥除
+   docstring 后的可执行 AST 若直接观察 `__name__`、`__package__`、`__file__`、`__spec__`、
+   `__loader__`，通过函数对象的 `__module__`/`__globals__` 观察 owner，或通过直接、属性、partial
+   绑定、closure 别名及保守的下标选择形式调用 `globals`、`locals`、`vars`、`eval`、`exec`、
+   `compile`、`getattr`/`object.__getattribute__` 观察实际 owner-module/registered-function receiver，
+   两种路径还会绑定 owner 的限定模块名与稳定项目相对/canonical 路径；判断遵守 Load/Store 与
+   词法局部绑定，所以 `getattr(helper, "__name__")`、`helper.eval(...)`、`obj.globals` 和局部
+   `__name__` 不会自动绑定 owner。只在 docstring、非查找字符串中提到这些名称，或执行常量且
+   无关的 `getattr(helper, "VALUE")` 的等价函数，仍可跨模块名或文件名复用。
+   detached function 只有在 `__module__`、函数 globals 名称及 `co_filename`/inspect source path
+   事实一致时恢复 owner；冲突事实不作 owner 证明而进入 fail-closed fallback。全文件 fallback
+   额外绑定当前已加载/函数实际引用的配置源码模块选择、脱离 `sys.modules` 后仍保留的
+   function/class 与已识别 callable wrapper 的 outer、partial target 和 `__wrapped__` target
+   provenance；callable provenance 同时包含限定名与不含文件名/行表噪声的可执行 code digest，
+   避免同一配置文件甚至同一源码行内切换 callable 仍复用旧产物。纳入 configured-source
+   provenance 的 retained callable 通过一张共享、确定性且有 node/depth/member 硬上限的对象图绑定
+   closure、defaults/kwdefaults、annotations、function dict、bound method 的 function/receiver、
+   partial 参数、wrapper target、实例 dict、每个 MRO slot、class/base/metaclass state，以及 slot
+   或容器中实际到达的 callable；dict insertion order、普通 `"__wrapped__"` 数据键、float bit
+   pattern、cycle 与跨多个 callable/global root 的 shared-alias topology 都保留。图超预算，或
+   遇到 native container subclass、custom descriptor/property/`__getattribute__`、不安全路径对象
+   等无法通过 exact built-in type/getset/member descriptor 静态读取的状态时，确定性 `libs`
+   identity 标记为不可复用，并单独强制对应节点及 map/scan item 跳过 L3 读写；该标记不随机化
+   cache key、run manifest、resume/recover 或 explain 所依赖的声明 identity。可动态观察完整
+   globals namespace 的函数也一律按不可复用处理，而不是声称已经证明任意 namespace 等价。
+   不属于 configured-source provenance、且不能安全表示的外部复杂 global 仍在 managed `libs`
+   源码宇宙之外：fallback 跳过其值状态而不因此关闭整个节点的 L3；若该值具有 configured-source
+   provenance，或完整 globals namespace 可观察，则仍按不可复用 fail closed。
+   fallback 仍绑定函数及嵌套 code object 实际引用的简单全局值，以及配置源码根本身或 package
+   parent 在 `sys.path` 中的相对顺序；运行时路径条目只接受 exact string，不调用 `__fspath__`、
+   truthiness、用户 equality/hash 或 mapping hooks。外部 dotted import 的每个已加载 package
+   prefix 也校验运行时 `__path__` 是否触及 managed source；运行时取证不得执行用户代码。
+   两种摘要都绑定按 `source_dirs` 顺序的稳定 source-root/file identity：项目内源码根使用相对
+   项目根路径和文件相对路径，不把临时绝对路径引入键；项目外配置根使用其 canonical identity，
+   配置根顺序本身是运行时选择语义的一部分。模块 AST 中出现常见反射原语
    （`getattr`、`globals`、`locals`、`vars`、`__dict__`、`__getattribute__`、
    `__builtins__`、显式 `builtins` 导入或模块注册表属性如 `sys.modules`）也一律回退，
    即使反射与导入无关，或被查找的名称/键是计算出来的；不做常量传播。无配置源码候选且
@@ -51,7 +94,11 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    陈旧产物。该规则是源码 AST 分析边界，不宣称覆盖整个 Python 运行时或任意外部/native
    代码。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
-   refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。L1 不变。
+   refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。若 `libs` fallback
+   遇到不可安全/有限表示的运行时状态、完整 globals namespace 观察或遍历预算耗尽，框架内部把
+   该节点视为本次 `off`，且 run、plan、explain、普通节点、map 与 scan 必须使用同一有效策略：
+   不读取/写入 L3，不报告空 item 集合的 vacuous aggregate hit，但仍使用同一确定性声明 identity
+   支持 durable resume/recovery。L1 不变。
 6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=7, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
@@ -87,9 +134,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 撕裂、摘要不匹配或 schema/provenance 无效的缓存属于 `CORRUPT`，必须 fail closed，不能按
 miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`CORRUPT` 三态。未在
 `CHANGELOG.md` 记录的键成分演进不得进入发布件。非法 cache 值或不可 canonical JSON
-序列化的 external fingerprint 在注册期抛 `ValueError`。`libs` 静态分析遇到上述无法证明的
-情况时必须使用当前全文件 digest，不得猜测较小闭包；全文件 digest 仍沿用
-`_module_code_text`，语法残破文件使用原文。
+序列化的 external fingerprint 在注册期抛 `ValueError`。`libs` 静态分析遇到上述无法证明的情况时
+必须使用当前全文件 digest，不得猜测较小闭包；全文件 digest 仍沿用 `_module_code_text`，语法残破
+文件使用原文，并绑定有序的稳定源码根/文件 identity 与当前可观察的配置源码运行时选择。
 
 ## Affected surfaces
 
@@ -124,6 +171,70 @@ miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`C
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_ambiguous_imports`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_when_node_module_is_unknown`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_multiple_configured_candidates`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_distinguishes_equal_candidates_by_source_identity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_invalidates_relative_import_across_configured_roots`、
+`tests/test_dag_cache_keys.py::test_libs_hash_invalidates_unresolved_importfrom_child_on_extended_package_path`、
+`tests/test_dag_cache_keys.py::test_libs_hash_external_package_path_into_configured_source_falls_back`、
+`tests/test_dag_cache_keys.py::test_libs_hash_preserves_importfrom_attribute_granularity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_unresolved_importfrom_child_is_ambiguous`、
+`tests/test_dag_cache_keys.py::test_libs_hash_relative_import_uses_qualified_package_identity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_upward_relative_import_validates_qualified_sibling`、
+`tests/test_dag_cache_keys.py::test_libs_hash_selected_closure_binds_source_identity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_selected_closure_binds_qualified_module_name`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_loaded_configured_candidate`、
+`tests/test_dag_cache_keys.py::test_libs_hash_selected_closure_binds_identity_sensitive_unmanaged_owner`、
+`tests/test_dag_cache_keys.py::test_libs_hash_binds_reflective_owner_identity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_binds_bound_owner_getattribute_lookup`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_aliased_builtin_getattr_dynamic_owner`、
+`tests/test_dag_cache_keys.py::test_libs_hash_recovers_detached_owner_from_retained_function_facts`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fails_closed_for_inconsistent_detached_owner_facts`、
+`tests/test_dag_cache_keys.py::test_libs_hash_selected_closure_binds_registered_code_filename`、
+`tests/test_dag_cache_keys.py::test_libs_hash_code_filename_ignores_unrelated_callable_receiver`、
+`tests/test_dag_cache_keys.py::test_libs_hash_ignores_identity_sensitive_sibling_function`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_referenced_sibling_owner_identity`、
+`tests/test_dag_cache_keys.py::test_libs_hash_ignores_module_identity_name_in_docstring`、
+`tests/test_dag_cache_keys.py::test_libs_hash_ignores_non_identity_reflection_for_owner_name`、
+`tests/test_dag_cache_keys.py::test_libs_hash_owner_reflection_is_receiver_and_scope_aware`、
+`tests/test_dag_cache_keys.py::test_libs_hash_selected_closure_binds_identity_sensitive_owner_path`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_retained_imported_function_origin`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_callable_within_configured_file`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_retained_partial_origin`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_configured_wrapped_target`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_wrapper_cycle_is_safe`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_retained_callable_runtime_state`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_retained_callable_own_globals`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_ignores_unreferenced_callable_global`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_dynamically_observable_globals`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_retained_imported_value`、
+`tests/test_dag_cache_keys.py::test_libs_hash_retained_callable_ignores_prefix_comments_and_docstrings`、
+`tests/test_dag_cache_keys.py::test_libs_hash_fallback_binds_package_parent_sys_path_order`、
+`tests/test_dag_cache_keys.py::test_libs_hash_validates_descendant_external_package_prefix_path`、
+`tests/test_dag_cache_keys.py::test_libs_hash_comprehension_target_does_not_shadow_owner_load`、
+`tests/test_dag_cache_keys.py::test_libs_hash_ignores_unexecuted_nested_identity_bodies`、
+`tests/test_dag_cache_keys.py::test_libs_hash_does_not_execute_custom_receiver_during_analysis`、
+`tests/test_dag_cache_keys.py::test_unrepresentable_callable_state_is_stable_but_not_cache_reusable`、
+`tests/test_dag_cache_keys.py::test_unrepresentable_callable_state_can_resume_same_run`、
+`tests/test_dag_cache_keys.py::test_libs_hash_binds_mutable_callable_class_state`、
+`tests/test_dag_cache_keys.py::test_libs_hash_binds_callable_alias_topology`、
+`tests/test_dag_cache_keys.py::test_libs_hash_does_not_execute_partial_subclass_attributes`、
+`tests/test_dag_cache_keys.py::test_libs_hash_does_not_execute_custom_metaclass_during_analysis`、
+`tests/test_dag_cache_keys.py::test_representable_callable_instance_state_remains_cache_reusable`、
+`tests/test_dag_cache_keys.py::test_called_nested_body_binds_owner_module_identity`、
+`tests/test_dag_cache_keys.py::test_owner_identity_tracks_reached_reflection_forms`、
+`tests/test_dag_cache_keys.py::test_callable_state_preserves_dict_order_and_wrapped_data`、
+`tests/test_dag_cache_keys.py::test_bound_method_defaults_are_part_of_callable_state`、
+`tests/test_dag_cache_keys.py::test_callable_state_preserves_aliases_across_global_roots`、
+`tests/test_dag_cache_keys.py::test_runtime_provenance_does_not_execute_pathlike_entries`、
+`tests/test_dag_cache_keys.py::test_runtime_state_depth_limit_is_stable_and_non_reusable`、
+`tests/test_dag_cache_keys.py::test_runtime_state_node_limit_is_stable_and_non_reusable`、
+`tests/test_dag_cache_keys.py::test_runtime_provenance_member_limit_is_stable_and_non_reusable`、
+`tests/test_dag_cache_keys.py::test_complete_globals_observation_disables_l3_reuse`、
+`tests/test_dag_cache_keys.py::test_non_reusable_map_plan_skips_item_cache_reads`、
+`tests/test_dag_cache_keys.py::test_empty_map_never_reports_vacuous_cache_hit`、
+`tests/test_dag_cache_keys.py::test_empty_scan_never_reports_vacuous_cache_hit`、
+`tests/test_dag_cache_keys.py::test_libs_source_universe_matches_configured_snapshot`、
+`tests/test_dag_cache_keys.py::test_libs_hash_validates_loaded_dotted_import_prefixes`、
+`tests/test_dag_cache_keys.py::test_libs_hash_missing_canonical_import_entry_fails_closed`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_loaded_runtime_module_mismatch`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_aliased_dynamic_imports`、
 `tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_importlib_submodule_alias`、
@@ -133,7 +244,13 @@ miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`C
 注册校验、错误上下文、标签集与 schema 的锁定测试。
 
 ```bash
-uv run pytest -q tests/test_consumes.py tests/test_calling.py::test_cache_key_ignores_param_order tests/test_calling.py::test_resolved_model_changes_cache_key_and_provenance tests/test_calling.py::test_seed_changes_cache_key tests/test_dag_cache_keys.py::test_docstring_does_not_change_cache_but_code_does tests/test_dag_cache_keys.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema tests/test_dag_cache_keys.py::test_key_components_lock_exact_label_set tests/test_cache_policy.py::test_key_component_labels_add_only_external_when_supplied tests/test_cache_policy.py::test_external_fingerprint_changes_owner_then_downstream_and_uses_exact_digest tests/test_cache_policy.py::test_cache_policy_repeated_runs_and_plan tests/test_cache_policy.py::test_map_item_cache_policy_executes_every_item_and_plan_reports_miss tests/test_cache_policy.py::test_scan_explain_without_initial_carry_uses_run_key_components tests/test_dag_cache_keys.py::test_kigumi_component_tracks_prompt_bytes_and_pydantic_version tests/test_dag_plan_explain.py::test_explain_records_key_components_and_reports_one_changed_input tests/test_dag_scan.py::test_scan_carry_fn_code_is_irrelevant_when_extracted_content_is_equal tests/test_dag_scan.py::test_scan_carry_from_content_invalidates_the_whole_chain tests/test_dag_cache_keys.py::test_libs_hash_ignores_comment_and_docstring_edits tests/test_dag_cache_keys.py::test_libs_hash_tolerates_broken_syntax_by_hashing_raw_text tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_multiple_configured_candidates tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_loaded_runtime_module_mismatch tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_aliased_dynamic_imports tests/test_dag_cache_keys.py::test_libs_hash_falls_back_for_importlib_submodule_alias tests/test_dag_cache_keys.py::test_libs_hash_tracks_ancestor_package_init tests/test_dag_cache_keys.py::test_libs_hash_tracks_unresolved_import_inside_source_tree
+uv run --extra dev pytest -q \
+  tests/test_calling.py \
+  tests/test_cache_policy.py \
+  tests/test_consumes.py \
+  tests/test_dag_cache_keys.py \
+  tests/test_dag_plan_explain.py \
+  tests/test_dag_scan.py
 ```
 
 ## Change policy

@@ -300,6 +300,81 @@ def test_sidecar_and_trace_expose_outputs_and_cache_policy(tmp_path: Path) -> No
     assert by_name["work"]["cache_policy"] == "refresh"
 
 
+def test_sidecar_and_trace_report_effective_off_for_non_reusable_libs(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """libs 不可复用时，落盘可观测策略必须是 off 而不是声明的 auto。"""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return {"value": "fresh"}
+
+    original = dag._libs_identities
+
+    def non_reusable(nodes: Any) -> dict[str, Any]:
+        identities = original(nodes)
+        identities["work"] = identities["work"].__class__(
+            identities["work"].digest,
+            cache_reusable=False,
+        )
+        return identities
+
+    monkeypatch.setattr(dag, "_libs_identities", non_reusable)
+    result = dag.run()
+    metadata = json.loads(
+        (tmp_path / "artifacts" / "runs" / result.run_id / "work.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    traced = trace_run(tmp_path / "artifacts", tmp_path / "llm", result.run_id)
+    entry = next(node for node in traced["nodes"] if node["name"] == "work")
+    assert metadata["cache_policy"] == "off"
+    assert entry["cache_policy"] == "off"
+
+
+@pytest.mark.parametrize("kind", ["map", "scan"])
+def test_dynamic_sidecars_report_off_after_checkpoint_use(tmp_path: Path, kind: str) -> None:
+    """动态 aggregate 与 item 都要反映实际使用 checkpoint 后的 off 策略。"""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        return {"items": [{"id": "review"}]}
+
+    if kind == "map":
+
+        @dag.map("work", items_from=("source", "items"), key_fn=lambda item: item["id"])
+        def work(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            return {"approval": ctx.checkpoint("editor", {"id": item["id"]})}
+
+    else:
+
+        @dag.scan("work", items_from=("source", "items"), key_fn=lambda item: item["id"])
+        def work(
+            item: dict[str, str],
+            carry: Any,
+            inputs: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, Any]:
+            return {"approval": ctx.checkpoint("editor", {"id": item["id"]})}
+
+    pending = dag.run(run_id=f"checkpoint-{kind}")
+    assert pending.pending_checkpoints == ["editor@review"]
+    dag.approve(pending.run_id, "editor@review", {"accepted": True})
+    resumed = dag.run(run_id=pending.run_id)
+
+    run_dir = tmp_path / "artifacts" / "runs" / resumed.run_id
+    aggregate = json.loads((run_dir / "work.json.meta.json").read_text(encoding="utf-8"))
+    item = json.loads((run_dir / "work@review.json.meta.json").read_text(encoding="utf-8"))
+    traced = trace_run(tmp_path / "artifacts", tmp_path / "llm", resumed.run_id)
+    by_name = {entry["name"]: entry for entry in traced["nodes"]}
+    assert aggregate["cache_policy"] == "off"
+    assert item["cache_policy"] == "off"
+    assert by_name["work"]["cache_policy"] == "off"
+
+
 def test_cache_policy_rejects_every_non_literal_value_at_registration(tmp_path: Path) -> None:
     invalid: list[Any] = [True, False, "read", "AUTO", None, 1]
     decorators: list[Callable[[Dag, Any], Any]] = [
