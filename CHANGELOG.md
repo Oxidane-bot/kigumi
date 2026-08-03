@@ -4,14 +4,6 @@
 
 ## [Unreleased]
 
-### 重大变更
-
-- `StdlibTransport` 现在在构造时校验 `api_base`：scheme 必须是 `http` 或 `https`，且必须带
-  host。传入 `file:` 等非 HTTP scheme、不带 scheme 的地址，或 `http://` 这类缺 host 的地址，
-  都会抛出 `ValueError`。这是有意的破坏性变更，一方面阻止 `urlopen` 通过本地或其他非 HTTP
-  handler 处理调用方提供的 endpoint，另一方面把原先要到真正发请求时才暴露的无效 endpoint
-  提前到构造期。
-
 ### 文档
 
 - 对齐 Agent node 与 WorkflowProfile 契约文档中的 schema 声明，并新增测试守卫，自动核对活动文档
@@ -29,6 +21,11 @@
 
 ### 重大变更
 
+- `StdlibTransport` 现在在构造时校验 `api_base`：scheme 必须是 `http` 或 `https`，且必须带
+  host。传入 `file:` 等非 HTTP scheme、不带 scheme 的地址，或 `http://` 这类缺 host 的地址，
+  都会抛出 `ValueError`。这是有意的破坏性变更，一方面阻止 `urlopen` 通过本地或其他非 HTTP
+  handler 处理调用方提供的 endpoint，另一方面把原先要到真正发请求时才暴露的无效 endpoint
+  提前到构造期。
 - `bench` 报告 schema 升至 3：每个 variant 新增 stage-aware `outcome_summary`，把质量聚合与
   subject/metric 运行结果覆盖分开；这是报告格式变化，不轮换缓存族，`CACHE_SCHEMA` 不变。
 - **缓存族轮换**:`CACHE_SCHEMA` 升至 7。提示摘要现纳入附件内容哈希与响应 schema 标识,
