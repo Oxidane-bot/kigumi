@@ -44,14 +44,14 @@ Status: Active (0.9.0)
 
 ## Affected surfaces
 
-- `kigumi/dag.py:198-212`
-- `kigumi/dag.py:288-305`
-- `kigumi/dag.py:730-938`
-- `kigumi/dag.py:1514-1516`
-- `kigumi/dag.py:1629-1774`
-- `kigumi/dag.py:1789-1908`
-- `kigumi/dag.py:1985-1986`
-- `kigumi/dag.py:2088-2112`
+- `kigumi/dag.py` 的 `NodeContext.__init__()`
+- `kigumi/dag.py` 的 `NodeContext.checkpoint()`
+- `kigumi/dag.py` 的 `Dag.run()`
+- `kigumi/dag.py` 的 `Dag.approve()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`、`Dag._aggregate_map_artifact()` 与 `Dag._execute_scan()`
+- `kigumi/dag.py` 的 `Dag._execute_scan()`
+- `kigumi/dag.py` 的 `Dag._approval_path()`
 - `kigumi/_execution.py:49-63`
 - `kigumi/_execution.py:65-67`
 - `kigumi/store.py:30-33`

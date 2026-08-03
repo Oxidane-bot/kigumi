@@ -55,6 +55,7 @@ _DIRECT_NAMES = "|".join(
 DIRECT_SCHEMA_PATTERN = re.compile(
     rf"(?<![A-Za-z0-9_])(?P<name>{_DIRECT_NAMES})\s*=\s*(?P<value>\d+)"
 )
+NUMERIC_DAG_CITATION_PATTERN = re.compile(r"kigumi/dag\.py:[0-9]")
 
 _MARKDOWN_HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
 _MARKDOWN_LIST_ITEM_PATTERN = re.compile(r"^\s{0,3}(?:[-+*]|\d+[.)])(?:\s+|$)")
@@ -169,6 +170,18 @@ def _live_document_lines(path: Path):
         if historical_design_entry:
             continue
         yield line_number, line
+
+
+def test_live_docs_do_not_cite_numeric_dag_lines() -> None:
+    """契约引用必须指向 dag.py 符号，避免源码增删后静默指错位置。"""
+    findings: list[str] = []
+    for path in _live_document_paths():
+        relative_path = path.relative_to(ROOT).as_posix()
+        for line_number, line in _live_document_lines(path):
+            if NUMERIC_DAG_CITATION_PATTERN.search(line):
+                findings.append(f"{relative_path}:{line_number}: {line}")
+
+    assert not findings, "Numeric kigumi/dag.py citations in live docs:\n" + "\n".join(findings)
 
 
 def _document_blocks(lines):

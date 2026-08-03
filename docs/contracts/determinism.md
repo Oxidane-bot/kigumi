@@ -49,10 +49,10 @@ Status: Active (0.8.0)
 - `kigumi/calling.py:141-223`
 - `kigumi/_execution.py:49-63`
 - `kigumi/_execution.py:108-140`
-- `kigumi/dag.py:730-938`
-- `kigumi/dag.py:1629-1774`
-- `kigumi/dag.py:1776-1787`
-- `kigumi/dag.py:1789-1908`
+- `kigumi/dag.py` 的 `Dag.run()`
+- `kigumi/dag.py` 的 `Dag._consumed_view()`、`Dag._function_inputs()`、`Dag._map_entries()` 与 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`、`Dag._aggregate_map_artifact()` 与 `Dag._execute_scan()`
 - `kigumi/transport.py:125-177`
 - `kigumi/prompt.py:18-24`
 

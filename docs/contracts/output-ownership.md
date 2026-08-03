@@ -47,11 +47,11 @@ Status: Active (0.8.0)
 - `kigumi/_execution.py:69-106`
 - `kigumi/_execution.py:108-140`
 - `kigumi/store.py:117-234`
-- `kigumi/dag.py:307-317`
-- `kigumi/dag.py:730-938`
-- `kigumi/dag.py:1629-1774`
-- `kigumi/dag.py:1776-1787`
-- `kigumi/dag.py:1789-1908`
+- `kigumi/dag.py` 的 `NodeContext.emit_file()` 与 `NodeContext.ingest_file()`
+- `kigumi/dag.py` 的 `Dag.run()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`、`Dag._aggregate_map_artifact()` 与 `Dag._execute_scan()`
 - `kigumi/inspect.py:17-66`
 - `kigumi/inspect.py:112-164`
 

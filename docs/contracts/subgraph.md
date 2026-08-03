@@ -51,15 +51,15 @@ Status: Active (0.8.0)
 
 - `kigumi/_declarations.py:30-40`
 - `kigumi/subgraph.py:23-225`
-- `kigumi/dag.py:288-305`
-- `kigumi/dag.py:597-728`
-- `kigumi/dag.py:730-938`
-- `kigumi/dag.py:1327-1356`
-- `kigumi/dag.py:1572-1584`
-- `kigumi/dag.py:1629-1774`
-- `kigumi/dag.py:1776-1908`
-- `kigumi/dag.py:1910-1970`
-- `kigumi/dag.py:2157-2164`
+- `kigumi/dag.py` 的 `NodeContext.checkpoint()`
+- `kigumi/dag.py` 的 `Dag._register_node()` 与 `Dag.mount()`
+- `kigumi/dag.py` 的 `Dag.mount()` 与 `Dag.run()`
+- `kigumi/dag.py` 的 `Dag._current_key_components()`
+- `kigumi/dag.py` 的 `Dag._topological_order()`
+- `kigumi/dag.py` 的 `Dag._consumed_view()`、`Dag._function_inputs()`、`Dag._map_entries()` 与 `Dag._execute_map()`
+- `kigumi/dag.py` 的 `Dag._execute_map()`、`Dag._aggregate_map_artifact()` 与 `Dag._execute_scan()`
+- `kigumi/dag.py` 的 `Dag._execute_scan()`
+- `kigumi/dag.py` 的 `_describe_models()`
 - `kigumi/views.py:12-65`
 - `kigumi/views.py:262-266`
 
