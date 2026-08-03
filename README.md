@@ -150,6 +150,16 @@ an external supervisor calls `Dag.resume()` when due. `EvidencePolicy` controls
 retention after mandatory secret scrubbing, but is not encryption or access
  control. Runs without a schema-2 manifest fail closed and cannot be resumed.
 
+For multi-process L1 callers, pass an enabled `FileSlots` (for example,
+`FileSlots.from_env()` with the existing `KIGUMI_REQUEST_LOCK_DIR` and
+`KIGUMI_REQUEST_SLOTS`) to `LLMCaller`. It adds per-key single-flight around the
+cache check, provider request, and cache write; the lock is released by the OS
+if its process dies. Without an enabled `FileSlots`, no key-lock files are
+created. This does not make `Budget` a durable cross-process ledger: different
+keys and processes can still reserve independently, and there is no crash
+recovery/refund protocol. Operators who need a hard shared spend ceiling must
+add an external or durable quota coordinator.
+
 For a zero-request first run, try the
 [ticket-extraction DAG](https://github.com/Oxidane-bot/kigumi/tree/master/examples/ticket_extract)
 or the

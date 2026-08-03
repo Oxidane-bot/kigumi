@@ -19,6 +19,13 @@
   明确它不是带副作用感知的 durable run receipt。本次仅变更定位，不修改运行时、state schema
   或算法，也不改变任何缓存族。
 
+### 新增
+
+- `LLMCaller` 复用已配置的 `FileSlots` lock root，为 L1 cache key 增加可选的跨进程
+  single-flight：同 key 的第二个进程会在二次 cache check 后重放首个结果；未启用时不创建
+  锁文件。预算预留仍是进程内协调，没有跨进程 durable 总账、崩溃恢复或失败退款协议；本次
+  不改变 L1/L3 cache key、`CACHE_SCHEMA` 保持 7。
+
 ### 重大变更
 
 - `StdlibTransport` 现在在构造时校验 `api_base`：scheme 必须是 `http` 或 `https`，且必须带

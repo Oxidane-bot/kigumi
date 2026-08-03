@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,98 @@ from kigumi.artifacts import sha
 from kigumi.calling import Budget, BudgetExceeded, CacheIntegrityError, DryRunError, LLMCaller
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
+
+_CROSS_PROCESS_CALLER = """
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from kigumi.calling import LLMCaller
+from kigumi.slots import FileSlots
+from kigumi.testing import FakeTransport
+
+cache_dir = Path(sys.argv[1])
+lock_dir = Path(sys.argv[2])
+state_dir = Path(sys.argv[3])
+mode = sys.argv[4]
+state_dir.mkdir(parents=True, exist_ok=True)
+counter = state_dir / "provider-count.json"
+guard = state_dir / "provider-count.guard"
+
+
+def mark(name: str) -> None:
+    (state_dir / f"{name}-{os.getpid()}").touch()
+
+
+def wait_for_release() -> None:
+    while not (state_dir / "release").exists():
+        time.sleep(0.01)
+
+
+def increment_provider_count() -> None:
+    with guard.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if counter.exists():
+            value = json.loads(counter.read_text(encoding="utf-8"))
+        else:
+            value = {"calls": 0}
+        value["calls"] += 1
+        counter.write_text(json.dumps(value), encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class CountingTransport(FakeTransport):
+    def complete(self, messages, model, **params):
+        increment_provider_count()
+        mark("provider")
+        if mode in {"flight", "disabled"}:
+            wait_for_release()
+        elif mode == "hold":
+            while True:
+                time.sleep(1)
+        return super().complete(messages, model, **params)
+
+
+if mode in {"flight", "disabled"}:
+    mark("ready")
+    while len(list(state_dir.glob("ready-*"))) < 2:
+        time.sleep(0.01)
+
+slots = None if mode == "disabled" else FileSlots(lock_dir, slots=2)
+caller = LLMCaller(CountingTransport(), cache_dir, slots=slots)
+print(caller.call("same request"), flush=True)
+"""
+
+
+def _wait_for_markers(state_dir: Path, prefix: str, count: int = 1) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len(list(state_dir.glob(f"{prefix}-*"))) >= count:
+            return
+        time.sleep(0.01)
+    assert len(list(state_dir.glob(f"{prefix}-*"))) >= count
+
+
+def _start_caller_worker(
+    script: Path,
+    cache_dir: Path,
+    lock_dir: Path,
+    state_dir: Path,
+    mode: str,
+) -> subprocess.Popen[str]:
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.Popen(
+        [sys.executable, str(script), str(cache_dir), str(lock_dir), str(state_dir), mode],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def test_file_reference_contract_is_documented() -> None:
@@ -330,6 +425,99 @@ def test_inflight_same_key_calls_transport_once(tmp_path: Path) -> None:
     assert not second.is_alive()
     assert results == ["answer", "answer"]
     assert len(caller.transport.requests) == 1
+
+
+def test_cross_process_same_key_calls_provider_once(tmp_path: Path) -> None:
+    """教训 cross_process_single_flight: 同一 L1 键跨进程只允许一次穿透。"""
+    script = tmp_path / "caller_worker.py"
+    script.write_text(_CROSS_PROCESS_CALLER, encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    lock_dir = tmp_path / "locks"
+    state_dir = tmp_path / "state"
+    processes = [
+        _start_caller_worker(script, cache_dir, lock_dir, state_dir, "flight") for _ in range(2)
+    ]
+
+    try:
+        _wait_for_markers(state_dir, "ready", 2)
+        _wait_for_markers(state_dir, "provider")
+        (state_dir / "release").touch()
+        results = [process.communicate(timeout=20) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    assert all(process.returncode == 0 for process in processes), results
+    assert [stdout.strip() for stdout, _ in results] == ["answer", "answer"]
+    assert json.loads((state_dir / "provider-count.json").read_text(encoding="utf-8")) == {
+        "calls": 1
+    }
+    key_lock_files = list(lock_dir.glob("key_*.lock"))
+    assert len(key_lock_files) == 1
+    assert len(key_lock_files[0].stem.removeprefix("key_")) == 64
+    assert key_lock_files[0].parent == lock_dir
+
+
+def test_cross_process_key_lock_is_default_off(tmp_path: Path) -> None:
+    """教训 opt_in_key_lock: 没有 FileSlots 配置时不创建键锁文件。"""
+    script = tmp_path / "caller_worker.py"
+    script.write_text(_CROSS_PROCESS_CALLER, encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    lock_dir = tmp_path / "locks"
+    state_dir = tmp_path / "state"
+    processes = [
+        _start_caller_worker(script, cache_dir, lock_dir, state_dir, "disabled") for _ in range(2)
+    ]
+
+    try:
+        _wait_for_markers(state_dir, "ready", 2)
+        _wait_for_markers(state_dir, "provider")
+        (state_dir / "release").touch()
+        results = [process.communicate(timeout=20) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    assert all(process.returncode == 0 for process in processes), results
+    assert [stdout.strip() for stdout, _ in results] == ["answer", "answer"]
+    assert json.loads((state_dir / "provider-count.json").read_text(encoding="utf-8")) == {
+        "calls": 2
+    }
+    assert not lock_dir.exists()
+
+
+def test_cross_process_key_lock_releases_after_holder_dies(tmp_path: Path) -> None:
+    """教训 flock_crash_release: 持锁进程死亡后下一个 miss 仍可继续。"""
+    script = tmp_path / "caller_worker.py"
+    script.write_text(_CROSS_PROCESS_CALLER, encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    lock_dir = tmp_path / "locks"
+    state_dir = tmp_path / "state"
+    holder = _start_caller_worker(script, cache_dir, lock_dir, state_dir, "hold")
+
+    try:
+        _wait_for_markers(state_dir, "provider")
+        holder.kill()
+        holder_stdout, holder_stderr = holder.communicate(timeout=10)
+        assert holder.returncode != 0, (holder_stdout, holder_stderr)
+
+        follower = _start_caller_worker(script, cache_dir, lock_dir, state_dir, "follow")
+        try:
+            follower_stdout, follower_stderr = follower.communicate(timeout=10)
+        finally:
+            if follower.poll() is None:
+                follower.kill()
+                follower.wait()
+        assert follower.returncode == 0, (follower_stdout, follower_stderr)
+        assert follower_stdout.strip() == "answer"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
 
 
 def test_kigumi_file_cache_key_uses_content_hash(tmp_path: Path) -> None:

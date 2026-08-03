@@ -127,6 +127,11 @@ positional-only 时都以 2 退出并指名问题所在，完整规则见
 `ACME_LLM_SLOTS`，不是固定读取默认三项。后四个 Pi 变量由 adapter 在 spawn 前覆盖写入，
 Extension 只应读取，不应要求操作者手工设置。
 
+需要多进程 L1 同 key single-flight 时，把同一个启用的 `FileSlots` 传给
+`LLMCaller(..., slots=slots)`；它会复用该对象的 lock root。`slots` 未传，或
+`FileSlots.enabled` 为假时，不创建键锁文件，也不改变原有的进程内 `threading.Lock` 行为。
+这里沿用 `KIGUMI_REQUEST_*`，不使用只属于 Agent capacity 的 `agent_lock_path`。
+
 ### 2. 组装调用栈
 
 自下而上三层,每层都可以单独用:
@@ -182,9 +187,10 @@ cache hit 不预留，provider/transport 失败会 `cancel`，成功响应按实
 预估值是 prompt 长度加显式 `max_tokens` 的 best effort；provider 实际用量可能更高，
 所以 `commit` 仍可能在请求完成后抛 `BudgetExceeded`，但响应已经写入缓存。
 
-不要把它当作跨进程或跨主机的总账：预留和同 key single-flight 只在当前进程内协调。
-已经有 file lock、分布式 quota 服务，或调用根本不产生 provider 费用时，不要再叠一层
-`BudgetPermit`；跨进程限流应使用应用自己的协调器。
+不要把它当作跨进程或跨主机的总账：`Budget` 预留/commit/cancel 仍只在当前进程内协调；
+只有传入启用 `FileSlots` 时，同 key single-flight 才跨进程生效。它不覆盖不同 key 的预算，
+也没有进程崩溃后的 durable refund/recovery。需要硬性跨进程花费上限时，必须使用应用自己的
+file lock、分布式 quota 或 durable coordinator；不能把 `BudgetPermit` 当总账。
 
 ### 3. 声明节点(DAG 项目)
 
@@ -1664,9 +1670,10 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
 - **`Budget` 在 miss 发 provider 请求前先预留额度**:显式 `max_tokens` 优先作为预估值,
   否则按 prompt 长度保守估算。成功调用把 provider 实际用量 commit 到 `Budget.spent`,
   失败调用释放预留；实际用量可能超过预估值,因此 commit 仍可能抛 `BudgetExceeded`,但该次
-  调用已经完成并进入缓存。缓存命中不做预留。预留与同 key single-flight 都只在当前进程
-  内协调；多个进程可能同时为同一个 key 预留并请求 provider,需要 file lock 或分布式协调
-  时由应用层另行提供。
+  调用已经完成并进入缓存。缓存命中不做预留。预留/commit/cancel 仍只在当前进程内协调；
+  传入启用 `FileSlots` 后，同 key single-flight 才跨进程保护二次 cache check、provider
+  请求和缓存写入。它不协调不同 key 的预算，也不提供崩溃后的 durable refund/recovery；硬性
+  共享花费上限由应用层另配。
 - **缓存损坏不是普通 miss**：`CacheIntegrityError` 会阻止节点或 L1 调用缓存静默
   重放/重新计费；`CacheLookup` 的 `CORRUPT` 必须先核对现场。`_run.json`、attempt state、
   candidate 或已完成 artifact 摘要不一致时同样 fail closed，不能把可能已经产生外部

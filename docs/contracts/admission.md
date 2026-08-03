@@ -5,11 +5,12 @@ Status: Draft (Unreleased)
 ## Purpose
 
 在节点执行或付费 provider 请求开始前，先完成进程内的预算与资源准入；并发调度不能
-因为 map/scan 的动态展开而绕过同一组资源上限。
+因为 map/scan 的动态展开而绕过同一组资源上限。可选的 `FileSlots` key lock 另负责
+多进程同一 L1 key 的 single-flight，但不把预算变成跨进程总账。
 
 ## Scope
 
-适用于 `Budget`/`BudgetPermit`、`LLMCaller(budget=...)`、`ResourceRequest`、
+适用于 `Budget`/`BudgetPermit`、`LLMCaller(budget=..., slots=...)`、`ResourceRequest`、
 `Dag.run(resource_limits=...)`，以及普通节点、map/scan/foreach 和 Agent 节点的
 run-local 调度。
 
@@ -27,6 +28,14 @@ run-local 调度。
 `None` 默认池。`ResourceRequest.scope` 只接受 `host`、`account`、`global` 三个声明值；
 它不会把这个 run-local permit plane 变成跨进程或跨主机锁。
 
+`LLMCaller` 保留进程内同 key `threading.Lock`；当传入启用的 `FileSlots` 时，再按同一
+lock root 取得 `acquire_key(key)`。该文件锁覆盖二次 L1 cache check、预算 admission、
+provider 请求和缓存写入；未启用时 `acquire_key` 是 no-op。与
+`acquire(timeout_seconds=...)` 不同，`acquire_key()` 没有 timeout，也不会抛
+`SlotTimeoutError`；等待方会一直阻塞到持锁方释放锁或进程消失。正常情况下持锁时长由 transport
+timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上界。等待方没有 timeout 诊断；
+运维应检查 lock root 下对应的 `key_<sha256>.lock` 文件及其持锁进程。
+
 ## Invariants
 
 1. L1 cache hit 在 provider 前返回且不预留预算。L1 miss 必须在 provider 请求前以
@@ -36,8 +45,10 @@ run-local 调度。
    `Budget.spent`；失败、空响应、取消或写入前的异常调用 `cancel()` 释放预留。估算是
    best-effort，实际用量可以超过预留；此时 commit 记录实际用量后仍可抛 `BudgetExceeded`，
    不能把已发生的 provider effect 当成未发生。
-3. 预算 admission 只在当前进程内协调；它不是跨进程、跨主机或分布式 quota。需要这些
-   边界时，调用方必须另配 file lock、`FileSlots` 或外部 quota；不能把 `Budget` 当总账。
+3. 预算 admission 只在当前进程内协调；它不是跨进程、跨主机或分布式 quota。启用的
+   `FileSlots` 只保证同一 L1 key 的 single-flight，不协调不同 key 的预算，也不提供进程
+   崩溃后的 durable refund/recovery。需要这些边界时，调用方必须另配外部 quota 或 durable
+   coordinator；不能把 `Budget` 当总账。
 4. map、scan、foreach 的预算不足保持 `BudgetExceeded`，停止尚未 admission 的后续 item；
    已经 admission 的 item 按自己的成功/失败路径收尾，不把预算拒绝伪装成普通 item failure。
 5. 一次 `Dag.run()` 建立一个 run-wide permit plane。未声明资源的节点与其他未声明节点
@@ -60,7 +71,8 @@ run-local 调度。
 ## Verification
 
 锁定测试见 `tests/test_budget_admission.py`、`tests/test_resource_limits.py`、
-`tests/test_calling.py::test_cache_hit_skips_transport_and_budget` 与
+`tests/test_calling.py::test_cache_hit_skips_transport_and_budget`、
+`tests/test_calling.py::test_cross_process_same_key_calls_provider_once` 与
 `tests/test_dag_cache_keys.py::test_resource_declarations_do_not_change_cache_key`。
 
 ```bash
@@ -69,7 +81,7 @@ uv run --extra dev pytest -q tests/test_budget_admission.py tests/test_resource_
 
 ## Change policy
 
-修改预算 reserve/commit/cancel 顺序、资源池归属、map/scan 共享 plane 或资源是否进入 cache
+修改预算 reserve/commit/cancel 顺序、资源池归属、map/scan 共享 plane、key lock nesting 或资源是否进入 cache
 key 时，必须先更新锁定测试，再同步本契约、`docs/adoption.md`、`docs/api.md` 与
 `docs/capabilities.md`；若改变 cache key 成分，还须按缓存键契约更新 `CACHE_SCHEMA` 和
 `CHANGELOG.md`。

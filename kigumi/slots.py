@@ -1,8 +1,9 @@
-"""Cross-process file-lock request slots for explicitly configured throttling."""
+"""Cross-process file-lock request slots and optional L1 key single-flight."""
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import tempfile
 import time
@@ -109,7 +110,7 @@ class AdaptiveCapacity:
 
 
 class FileSlots:
-    """Acquire one advisory file-lock slot only when a project enables it."""
+    """Acquire advisory request slots and L1 key locks only when enabled."""
 
     def __init__(
         self,
@@ -159,6 +160,23 @@ class FileSlots:
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
+
+    @contextmanager
+    def acquire_key(self, key: str) -> Iterator[None]:
+        """Hold one advisory lock for a cache key when this root is enabled."""
+        if not self.enabled:
+            yield
+            return
+        assert self._lock_dir is not None
+        self._lock_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        path = self._lock_dir / f"key_{digest}.lock"
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _acquire_handle(self, started: float, timeout_seconds: float | None) -> tuple[TextIO, str]:
         assert self._lock_dir is not None

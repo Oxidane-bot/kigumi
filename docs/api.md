@@ -17,7 +17,8 @@
 - `class BudgetExceeded(RuntimeError)`（`kigumi.calling`，顶层导出）：预留额度不足，或一次已完成
   调用的实际用量使 `Budget.spent` 推过 `max_tokens` 时抛出。缓存命中不做预留；miss 在 provider
   请求前按 prompt 长度加 `max_tokens` 做 best-effort 预留，实际用量可能超过预留并在 commit 时
-  被记录。预算只在进程内协调；`LLMCaller` 的同 key 锁不提供跨进程 single-flight。
+  被记录。预算只在进程内协调；`LLMCaller` 只有在传入启用的 `FileSlots` 时，才用同一 lock root
+  对同 key 做跨进程 single-flight。
 - `class DryRunError(RuntimeError)`（`kigumi.calling`，顶层导出）：`LLMCaller(dry=True)` 遇到
   L1 miss、原本必须发真实请求。先补齐缓存，或在明确允许真实请求的运行中关闭 `dry`。见
   [零真实请求的测试](adoption.md#零真实请求的测试)。
@@ -92,6 +93,14 @@
   `from kigumi._runstate import RunManifestError`）：既有 schema-2 run 与当前声明不匹配，
   或 manifest、attempt state、candidate、artifact/Prompt lineage 摘要损坏。用原声明恢复，
   声明已变则新建 run；损坏一律 fail closed。见 [retry/resume 契约](contracts/retry-resume.md)。
+
+`FileSlots.acquire_key(key)` 与 `acquire()` 使用同一启用条件和 lock root：未配置时是 no-op，启用
+时用 `key_<sha256(key)>.lock` 保护一次 L1 key 的二次 cache check、provider 请求和缓存写入，
+并在 `finally` 中释放。它只消除同 key 的重复穿透，不提供跨进程预算总账。与
+`acquire(timeout_seconds=...)` 不同，`acquire_key()` 没有 timeout，也不会抛
+`SlotTimeoutError`；等待方会一直阻塞到持锁方释放锁或进程消失。正常情况下持锁时长由 transport
+timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上界。等待方没有 timeout 诊断；
+运维应检查 lock root 下对应的 `key_<sha256>.lock` 文件及其持锁进程。
 
 ### Agent
 

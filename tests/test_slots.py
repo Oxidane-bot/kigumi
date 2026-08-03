@@ -78,6 +78,8 @@ def test_disabled_slots_pass_through_without_filesystem_side_effects(
     disabled_path = tmp_path / "disabled"
     with FileSlots(disabled_path, 0).acquire():
         pass
+    with FileSlots(disabled_path, 0).acquire_key("../../outside"):
+        pass
     assert not disabled_path.exists()
 
     for key in ("KIGUMI_REQUEST_LOCK_DIR", "KIGUMI_REQUEST_SLOTS", "KIGUMI_REQUEST_CAPACITY_FILE"):

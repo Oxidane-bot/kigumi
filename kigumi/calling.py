@@ -338,10 +338,10 @@ class LLMCaller:
         # 键锁只增不减:caller 与一次 run 同生命周期,键集有界;若改成常驻服务需先加回收。
         self._key_locks: dict[str, threading.Lock] = {}
         self._key_locks_lock = threading.Lock()
-        # LIMITATION: _key_locks provides in-process concurrency control only.
-        # Multiple processes may simultaneously reserve budget for the same call key.
-        # For cross-process single-flight, replace with file-based locks or
-        # distributed coordination (TODO: consider fcntl-based lock file).
+        # The threading lock is the fast in-process layer. When FileSlots is enabled,
+        # acquire_key adds cross-process single-flight for this L1 key. Budget
+        # reservation remains process-local; there is no durable cross-process budget
+        # ledger or crash-recovery/refund protocol here.
 
     def call(
         self,
@@ -416,7 +416,7 @@ class LLMCaller:
                 prompt_lineage=prompt_lineage,
             )
 
-        with self._lock_for_key(key):
+        with self._lock_for_key(key), self._file_lock_for_key(key):
             cached = self._read_cached_response(cache_path)
             if cached is not None:
                 return self._record_cache_hit(
@@ -929,6 +929,18 @@ class LLMCaller:
     def _lock_for_key(self, key: str) -> threading.Lock:
         with self._key_locks_lock:
             return self._key_locks.setdefault(key, threading.Lock())
+
+    @contextmanager
+    def _file_lock_for_key(self, key: str) -> Iterator[None]:
+        if self.slots is None:
+            yield
+            return
+        acquire_key = getattr(self.slots, "acquire_key", None)
+        if not callable(acquire_key):
+            yield
+            return
+        with acquire_key(key):
+            yield
 
     def _append_call(self, metadata: dict[str, Any]) -> None:
         with self._calls_lock:

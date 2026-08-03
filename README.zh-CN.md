@@ -122,6 +122,13 @@ pending，不在进程内 sleep；外部 supervisor 到期调用 `Dag.resume()`�
 在强制 secret scrub 后控制保留形态，但不是加密或访问控制。缺少 schema-2 manifest 的旧
 run 直接 fail closed，不能 resume。
 
+多进程共享 L1 时，可把启用的 `FileSlots`（例如用现有的
+`KIGUMI_REQUEST_LOCK_DIR` 与 `KIGUMI_REQUEST_SLOTS` 调用 `FileSlots.from_env()`）传给
+`LLMCaller`。它会把同一 key 的 cache check、provider 请求和缓存写入做成 single-flight；
+持锁进程死亡时由操作系统释放锁。没有启用 `FileSlots` 时不会创建键锁文件。这不等于
+`Budget` 已成为跨进程 durable 总账：不同 key、不同进程仍可能各自预留，且没有崩溃恢复/失败
+退款协议。需要硬性共享花费上限的部署，必须另配外部或 durable quota 协调器。
+
 想先零真实请求跑通一遍，可从[客服工单抽取 DAG](examples/ticket_extract/README.md)或
 [实验性内容级提示词进化 recipe](examples/prompt_evolve/README.md)开始。两者都记录了实际接入时遇到的框架摩擦；
 工单示例还保留了本地实测数字。
