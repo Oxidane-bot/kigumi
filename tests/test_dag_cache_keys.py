@@ -5174,15 +5174,18 @@ def test_complete_globals_propagates_through_multi_level_nested_calls(tmp_path: 
 
 
 def test_deeply_nested_set_sorting_is_bounded_and_non_reusable(tmp_path: Path) -> None:
-    """共享别名的深层 tuple 树排序必须有界，并稳定降级为不可复用。"""
+    """共享别名的深层 frozenset 图排序必须有界，并稳定降级为不可复用。"""
+    # Keep the sorting walk deep without triggering Python 3.13's exponential
+    # tuple hash for the old shared-child tuple tree.
     source = tmp_path / "src"
     source.mkdir()
     helper_name = "libs_deep_set_sort_helper"
     node_name = "libs_deep_set_sort_node"
     (source / f"{helper_name}.py").write_text(
-        "nested = (0,)\n"
+        "anchor = frozenset({'anchor'})\n"
+        "nested = frozenset({0})\n"
         "for _ in range(120):\n"
-        "    nested = (nested, nested)\n"
+        "    nested = frozenset({nested, anchor})\n"
         "state = {nested}\n\n"
         "def runner():\n"
         "    return 'stable'\n\n"
