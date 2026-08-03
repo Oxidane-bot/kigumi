@@ -299,6 +299,21 @@ def _fake_pi(path: Path) -> Path:
             if "--version" in sys.argv:
                 print("1.2.3")
                 raise SystemExit(0)
+            config_dump_file = os.environ.get("CONFIG_DUMP_FILE")
+            pi_config_dir = os.environ.get("PI_CODING_AGENT_DIR")
+            if config_dump_file and pi_config_dir:
+                config_dir = pathlib.Path(pi_config_dir)
+                pathlib.Path(config_dump_file).write_text(
+                    json.dumps(
+                        {
+                            child.name: child.read_text(encoding="utf-8")
+                            for child in sorted(config_dir.iterdir())
+                            if child.is_file()
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
             if os.environ.get("ARGS_FILE"):
                 pathlib.Path(os.environ["ARGS_FILE"]).write_text(
                     json.dumps(sys.argv[1:]), encoding="utf-8"
