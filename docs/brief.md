@@ -8,6 +8,23 @@ Agent nodes. It already owns the plumbing below. Do not write your own.
 
 Print this page any time with `kigumi brief`. Other shipped pages: `kigumi docs`.
 
+## Code the framework cannot see
+
+kigumi only analyzes what you declare. Two boundaries decide what it can do
+for you:
+
+- `kigumi guard` scans only the directories listed in `[tool.kigumi] source_dirs`
+  (default `["nodes", "lib"]`). A bare model loop in main.py or in an ad-hoc
+  `scripts/` file is never reported.
+- Graph commands (describe, plan, explain, graph, profile) only see nodes
+  registered through `@dag.node` / `@dag.map` / `@dag.scan` / `@dag.agent` in the
+  module named by `[tool.kigumi] dag_entry`.
+
+Pipeline code written outside those boundaries gets no caching, no plan forecast,
+no explain, no guard and no resume. It is not a lighter way to use kigumi; it is
+not using kigumi. Put pipeline code in a source_dirs directory and register it as
+a node.
+
 ## Do not reimplement
 
 | If you are about to write | Use instead |
@@ -33,16 +50,28 @@ Full index with one grep-able line per capability: `kigumi docs capabilities`.
 If nothing there matches, kigumi likely does not do it on purpose — see the
 design boundaries in `kigumi docs adoption`.
 
-## Before you edit a node
+## Run these before and after every change
 
 These are read-only. They send no requests and cost nothing.
 
 ```bash
-kigumi trace <run_id>              # current state: nodes, map items, every LLM call
-kigumi trace <run_id> --node NAME --json
+kigumi describe                    # what exists: nodes, edges, models, prompts
 kigumi plan                        # what would recompute (and cost money) next run
 kigumi explain <node>              # why this node hit or missed the cache
 kigumi explain <node@item>         # one map/scan item
+kigumi check                       # are declarations, files, guards, docstrings sound
+```
+
+Before you edit: `kigumi describe` to see the graph you are changing, then
+`kigumi plan` to see what your edit will force to recompute.
+After you edit: `kigumi check`, then `kigumi plan` again to confirm the
+blast radius is what you intended.
+
+To inspect a run that already happened:
+
+```bash
+kigumi trace <run_id>              # current state: nodes, map items, every LLM call
+kigumi trace <run_id> --node NAME --json
 ```
 
 Skipping `kigumi plan` before a change to a shared upstream node is how an agent

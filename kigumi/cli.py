@@ -6,6 +6,7 @@ import argparse
 import importlib
 import inspect
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -455,6 +456,31 @@ def _write_dag_entry(root: Path) -> Path | None:
 
 
 _AGENT_DOCS_SENTINEL = "<!-- kigumi-agent-docs -->"
+_BRIEF_ROOT_HEADING = "# kigumi brief (read this first)"
+_ATX_HEADING_PATTERN = re.compile(r"^( {0,3})(#{1,6})(?=[ \t]|$)")
+
+
+def _demote_brief_headings(brief: str) -> str:
+    """Nest brief headings below the host document without changing fenced code."""
+    lines: list[str] = []
+    in_fence = False
+    for line in brief.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            lines.append(line)
+            continue
+        if in_fence:
+            lines.append(line)
+            continue
+
+        if line.startswith(_BRIEF_ROOT_HEADING):
+            line = "## kigumi" + line[len(_BRIEF_ROOT_HEADING) :]
+        else:
+            match = _ATX_HEADING_PATTERN.match(line)
+            if match:
+                line = f"{match.group(1)}#{match.group(2)}{line[match.end() :]}"
+        lines.append(line)
+    return "".join(lines)
 
 
 def _write_agent_docs(root: Path) -> None:
@@ -464,9 +490,7 @@ def _write_agent_docs(root: Path) -> None:
     double-injection if the pyproject ``[tool.kigumi]`` block is ever manually
     removed and ``init`` is re-run.
     """
-    brief = read_doc("brief")
-    # Demote the top heading so it sits as a subsection of any existing document.
-    body = brief.replace("# kigumi brief (read this first)", "## kigumi", 1).strip()
+    body = _demote_brief_headings(read_doc("brief")).strip()
     block = f"\n{_AGENT_DOCS_SENTINEL}\n{body}\n"
     for filename in ("CLAUDE.md", "AGENTS.md"):
         path = root / filename

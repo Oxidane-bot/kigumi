@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -10,9 +11,10 @@ import pytest
 
 from kigumi import PromptRef, PromptSpec
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
-from kigumi.cli import _parser, _recovery_advice, main
+from kigumi.cli import _demote_brief_headings, _parser, _recovery_advice, main
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.docs import read_doc
 
 
 def _project(tmp_path: Path, *, source_dirs: str = '["nodes"]') -> Path:
@@ -43,6 +45,49 @@ def _run_dag_cli(dag: Dag, argv: list[str]) -> int:
     with pytest.raises(SystemExit) as exited:
         dag.cli(argv)
     return int(exited.value.code)
+
+
+def _markdown_headings(text: str) -> list[tuple[int, str]]:
+    headings: list[tuple[int, str]] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            headings.append((len(match.group(1)), match.group(2)))
+    return headings
+
+
+def test_demote_brief_headings_preserves_leading_comments_in_fences() -> None:
+    """Fenced comment lines remain exact while headings outside fences are demoted."""
+    brief = (
+        "# kigumi brief (read this first)\n\n"
+        "## Section one\n\n"
+        "```bash\n"
+        "# this comment must not be demoted\n"
+        "kigumi plan\n"
+        "```\n\n"
+        "```toml\n"
+        "# neither must this one\n"
+        'dag_entry = "nodes.graph:build_dag"\n'
+        "```\n\n"
+        "## Section two\n"
+    )
+
+    output = _demote_brief_headings(brief)
+    output_lines = output.encode().splitlines()
+
+    assert output_lines[0] == b"## kigumi"
+    assert b"### Section one" in output_lines
+    assert b"### Section two" in output_lines
+    assert b"# this comment must not be demoted" in output_lines
+    assert b"# neither must this one" in output_lines
+    assert b"## this comment must not be demoted" not in output_lines
+    assert b"## neither must this one" not in output_lines
 
 
 @pytest.mark.parametrize(
@@ -227,6 +272,68 @@ def test_init_appends_to_existing_agent_docs_without_duplication(
         assert text.startswith(existing)
         assert "kigumi" in text
         # No duplicate section on repeat init (tool.kigumi already exists → exit 1)
+
+
+def test_init_demotes_injected_headings_into_kigumi_section(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Injected brief sections are nested below the kigumi root heading."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert main(["init"]) == 0
+
+    headings = _markdown_headings((tmp_path / "CLAUDE.md").read_text(encoding="utf-8"))
+
+    assert [level for level, _ in headings] == [2, 3, 3, 3, 3, 3, 3]
+    assert headings[0] == (2, "kigumi")
+    assert [title for _, title in headings[1:]] == [
+        "Code the framework cannot see",
+        "Do not reimplement",
+        "Run these before and after every change",
+        "Project commands and graph commands",
+        "Working rules",
+        "Where to read more",
+    ]
+
+
+def test_init_preserves_fenced_code_comments_when_demoting_headings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Heading demotion leaves fenced code, including comments, byte-identical."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert main(["init"]) == 0
+
+    text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+
+    assert "### Project commands and graph commands" in text
+    brief = read_doc("brief")
+    for comment in (
+        "# kigumi init scaffolds this",
+        "# current state: nodes, map items, every LLM call",
+    ):
+        original_line = next(line for line in brief.splitlines() if comment in line)
+        injected_line = next(line for line in text.splitlines() if comment in line)
+        assert injected_line.encode() == original_line.encode()
+    assert "## kigumi init scaffolds this" not in text
+    assert "## current state: nodes, map items, every LLM call" not in text
+
+
+def test_init_injects_framework_boundaries_guidance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Injected guidance names both source scanning and graph registration boundaries."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert main(["init"]) == 0
+
+    text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+
+    assert "source_dirs" in text
+    assert "dag_entry" in text
 
 
 def test_guard_reports_violations_waivers_and_new_changed_waivers(
