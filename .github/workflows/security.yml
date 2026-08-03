@@ -1,0 +1,45 @@
+name: Security
+
+on:
+  # Weekly checks balance prompt CVE coverage with the rate of external index queries.
+  # 04:17 UTC avoids the busiest top-of-hour scheduling window.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: Dependency audit and static security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Install the project and dev dependency set
+        run: uv sync --extra dev --python 3.13
+      - name: Audit dependencies (CVE findings fail)
+        run: |
+          # Resolve the venv target instead of duplicating its Python-version path in YAML.
+          site_packages="$(uv run --python 3.13 python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          if [ ! -d "$site_packages" ]; then
+            echo "::error::pip-audit target does not exist: $site_packages"
+            exit 1
+          fi
+          # Prevent an empty target from producing pip-audit's misleading green result.
+          if [ -z "$(find "$site_packages" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo "::error::pip-audit target is empty: $site_packages"
+            exit 1
+          fi
+          echo "Auditing installed dependencies in $site_packages"
+          uvx --python 3.13 pip-audit==2.9.0 \
+            --strict --path "$site_packages"
+      - name: Scan kigumi with Bandit (medium and high findings fail)
+        if: ${{ !cancelled() }}
+        run: |
+          # --severity-level medium keeps known low-only findings visible without failing CI.
+          uvx --python 3.13 bandit==1.8.3 \
+            -q -r kigumi --severity-level medium

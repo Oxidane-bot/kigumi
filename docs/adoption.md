@@ -1228,6 +1228,15 @@ pytest 插件激活后会追加 `kigumi_guard`：未豁免 finding 使该测试�
 精确边界；helper 内仍应通过 `ctx.read_text`/`ctx.read_bytes` 和 `files=` 声明输入。
 也不要在只需要统一 `workers` 上限时额外手写守卫调用，或把两类豁免混用。
 
+### 仓库 CI 的定时安全扫描
+
+本仓库的 `.github/workflows/security.yml` 独立于 push/pull_request CI，每周一
+04:17 UTC 自动运行，也支持 `workflow_dispatch` 手动运行。它审计 `uv sync --extra dev`
+解析出的环境依赖，并运行只扫描 `kigumi/` 的 Bandit：pip-audit 使用固定版本，发现 CVE
+即失败；Bandit 的门槛是 medium 及以上，避免既有 low-only findings 让首日 job 失效。
+定时 workflow 失败会按默认分支 GitHub Actions 的常规失败状态和通知设置呈现，不依赖第三方
+通知 action。
+
 ### 人工检查点
 
 `ctx.checkpoint(name, payload)` 抛出 `CheckpointPending` 中断本轮;
