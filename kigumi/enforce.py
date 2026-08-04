@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-_WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-llm-ok(?P<reason>.*?)\s*$")
-_RAW_IO_WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-io-ok(?P<reason>.*?)\s*$")
+_WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-llm-ok(?=\s|$)(?P<reason>.*?)\s*$")
+_RAW_IO_WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-io-ok(?=\s|$)(?P<reason>.*?)\s*$")
 _DYNAMIC_BUILTIN_NAMES = frozenset({"eval", "exec", "__import__", "globals", "locals"})
 _DYNAMIC_CALLABLE_NAMES = _DYNAMIC_BUILTIN_NAMES | {"getattr"}
 _RAW_METHOD_NAMES = frozenset({"open", "read_text", "read_bytes"})
+_DYNAMIC_DICT_METHOD_NAMES = frozenset({"get", "__getitem__"})
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,31 @@ class RawIOFinding:
     waived: bool
     waiver_reason: str | None
     _col_offset: int = field(default=0, init=False, repr=False, compare=False)
+
+
+def _source_comments(text: str) -> dict[int, str]:
+    """Return tokenizer-confirmed source comments keyed by physical line."""
+    comments: dict[int, str] = {}
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type == tokenize.COMMENT:
+                comments[token.start[0]] = token.string
+    except (StopIteration, tokenize.TokenError):
+        # Callers parse the source with ast first. This fallback keeps the
+        # standalone waiver helpers best-effort for incomplete editor buffers
+        # without treating string contents as comments.
+        pass
+    return comments
+
+
+def _waiver_match(
+    comments: dict[int, str],
+    lineno: int,
+    pattern: re.Pattern[str],
+) -> re.Match[str] | None:
+    comment = comments.get(lineno)
+    return pattern.fullmatch(comment) if comment is not None else None
 
 
 class _CallableKind(Enum):
@@ -209,27 +237,30 @@ class _ScopeFacts(ast.NodeVisitor):
 
 def waiver_reasons(text: str) -> list[str]:
     """Return every waiver reason text in *text*, in line order, including duplicates."""
+    comments = _source_comments(text)
     return [
         match.group("reason").strip()
-        for line in text.splitlines()
-        if (match := _WAIVER_PATTERN.search(line))
+        for lineno in sorted(comments)
+        if (match := _waiver_match(comments, lineno, _WAIVER_PATTERN))
     ]
 
 
 def raw_io_waiver_reasons(text: str) -> list[str]:
     """Return raw-I/O waiver reasons without mixing them with raw-LLM waivers."""
+    comments = _source_comments(text)
     return [
         match.group("reason").strip()
-        for line in text.splitlines()
-        if (match := _RAW_IO_WAIVER_PATTERN.search(line))
+        for lineno in sorted(comments)
+        if (match := _waiver_match(comments, lineno, _RAW_IO_WAIVER_PATTERN))
     ]
 
 
 def check_source(text: str, path: Path) -> list[Finding]:
     """Find ``.call`` and ``.llm`` method calls nested beneath any loop."""
     lines = text.splitlines()
+    comments = _source_comments(text)
     tree = ast.parse(text, filename=str(path))
-    visitor = _LoopCallVisitor(path, lines)
+    visitor = _LoopCallVisitor(path, lines, comments)
     visitor.visit(tree)
     return visitor.findings
 
@@ -262,6 +293,7 @@ def check_raw_io_node_paths(source_dirs: list[Path]) -> list[RawIOFinding]:
 def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
     """检查一个模块内带 DAG 装饰器的顶层节点函数体。"""
     lines = text.splitlines()
+    comments = _source_comments(text)
     tree = ast.parse(text, filename=str(path))
     module_aliases = _collect_callable_aliases(
         _collect_scope_facts(tree.body),
@@ -277,7 +309,12 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
             continue
         if not any(_is_node_decorator(decorator) for decorator in statement.decorator_list):
             continue
-        visitor = _RawIOVisitor(path, lines, _last_parameter_name(statement.args))
+        visitor = _RawIOVisitor(
+            path,
+            lines,
+            _last_parameter_name(statement.args),
+            comments,
+        )
         visitor.visit_function_body(
             statement,
             state=_ScopeState(
@@ -301,17 +338,19 @@ def check_raw_io_source(
 ) -> list[RawIOFinding]:
     """找出节点及其可达局部 helper/lambda 中绕过上下文方法的文件读取。"""
     lines = text.splitlines()
+    comments = _source_comments(text)
     tree = ast.parse(text, filename=str(path))
-    visitor = _RawIOVisitor(path, lines, context_name)
+    visitor = _RawIOVisitor(path, lines, context_name, comments)
     visitor.visit(tree)
     _sort_raw_io_findings(visitor.findings)
     return visitor.findings
 
 
 class _LoopCallVisitor(ast.NodeVisitor):
-    def __init__(self, path: Path, lines: list[str]) -> None:
+    def __init__(self, path: Path, lines: list[str], comments: dict[int, str]) -> None:
         self.path = path
         self.lines = lines
+        self.comments = comments
         self.loop_depth = 0
         self.findings: list[Finding] = []
 
@@ -344,7 +383,7 @@ class _LoopCallVisitor(ast.NodeVisitor):
             and node.func.attr in {"call", "llm"}
         ):
             snippet = self.lines[node.lineno - 1].strip()
-            waiver = _WAIVER_PATTERN.search(self.lines[node.lineno - 1])
+            waiver = _waiver_match(self.comments, node.lineno, _WAIVER_PATTERN)
             reason = waiver.group("reason").strip() if waiver else None
             waiver_reason = reason if reason else "豁免必须写理由" if waiver else None
             self.findings.append(
@@ -377,10 +416,17 @@ class _RawIOVisitor(ast.NodeVisitor):
     ``globals()[name](...)``.
     """
 
-    def __init__(self, path: Path, lines: list[str], context_name: str | None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        lines: list[str],
+        context_name: str | None,
+        comments: dict[int, str],
+    ) -> None:
         self.path = path
         self.lines = lines
         self.context_name = context_name
+        self.comments = comments
         self.findings: list[RawIOFinding] = []
         self._scanned_functions: set[int] = set()
         self._scanned_classes: set[int] = set()
@@ -502,6 +548,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             self.path,
             self.lines,
             context_name,
+            self.comments,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
             builtin_module_aliases=aliases.builtin_modules,
@@ -621,6 +668,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             self.path,
             self.lines,
             self.context_name,
+            self.comments,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
             builtin_module_aliases=aliases.builtin_modules,
@@ -669,6 +717,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         path: Path,
         lines: list[str],
         context_name: str | None,
+        comments: dict[int, str],
         *,
         raw_aliases: set[str],
         dynamic_aliases: set[str],
@@ -681,6 +730,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.path = path
         self.lines = lines
         self.context_name = context_name
+        self.comments = comments
         self.raw_aliases = raw_aliases
         self.dynamic_aliases = dynamic_aliases
         self.builtin_module_aliases = builtin_module_aliases
@@ -731,6 +781,55 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self._record_assignment(node.target, node.value)
         self.generic_visit(node)
         self._invalidate_context_target(node.target)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_comprehension(node.generators, (node.key, node.value))
+
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        tail: tuple[ast.expr, ...],
+    ) -> None:
+        previous_context_name = self.context_name
+        try:
+            for generator in generators:
+                self.visit(generator.iter)
+                self._invalidate_context_target(generator.target)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for expression in tail:
+                self.visit(expression)
+        finally:
+            # Comprehension targets live in their own implicit scope and do not
+            # rebind the node context after the comprehension completes.
+            self.context_name = previous_context_name
+
+    def visit_Match(self, node: ast.Match) -> None:  # noqa: N802 -- ast protocol.
+        self.visit(node.subject)
+        outer_context_name = self.context_name
+        context_rebound = False
+        for case in node.cases:
+            self.context_name = outer_context_name
+            self.visit(case.pattern)
+            if outer_context_name in _pattern_bound_names(case.pattern):
+                self.context_name = None
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
+            context_rebound |= self.context_name is None
+        # Match bindings are visible after the match statement, so any case
+        # that can bind the context invalidates the controlled-read exemption.
+        self.context_name = None if context_rebound else outer_context_name
 
     def visit_For(self, node: ast.For) -> None:  # noqa: N802 -- ast protocol.
         self.visit(node.iter)
@@ -869,8 +968,13 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 -- ast protocol.
         self._record_class_method_reference(node)
-        if not self._visiting_call_target and _is_dynamic_builtin_attribute(
-            node, self.builtin_module_aliases
+        if not self._visiting_call_target and (
+            _is_dynamic_builtin_attribute(node, self.builtin_module_aliases)
+            or _is_dynamic_dict_lookup_attribute(
+                node,
+                dynamic_aliases=self.dynamic_aliases,
+                builtin_module_aliases=self.builtin_module_aliases,
+            )
         ):
             self._append_structural_finding(node)
         self.generic_visit(node)
@@ -1033,7 +1137,9 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
     def _finding(self, node: ast.AST, *, allow_waiver: bool) -> RawIOFinding:
         line = self.lines[node.lineno - 1].strip()
         waiver = (
-            _RAW_IO_WAIVER_PATTERN.search(self.lines[node.lineno - 1]) if allow_waiver else None
+            _waiver_match(self.comments, node.lineno, _RAW_IO_WAIVER_PATTERN)
+            if allow_waiver
+            else None
         )
         reason = waiver.group("reason").strip() if waiver else None
         finding = RawIOFinding(
@@ -1428,7 +1534,7 @@ def _resolve_static_mapping(
     expression: ast.AST,
     sequence_aliases: dict[str, _StaticContainer],
 ) -> dict[object, ast.expr] | None:
-    direct_values = _mapping_elements(expression)
+    direct_values = _mapping_elements(expression, sequence_aliases)
     if direct_values is not None:
         return direct_values
     if isinstance(expression, ast.Name):
@@ -1593,6 +1699,12 @@ def _classify_callable_expression(
                 return _CallableKind.OPAQUE
 
     if isinstance(expression, ast.Attribute):
+        if _is_dynamic_dict_lookup_attribute(
+            expression,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        ):
+            return _CallableKind.DYNAMIC
         if expression.attr in {*_RAW_METHOD_NAMES, "__dict__", "modules"} and (
             _is_dynamic_value_expression(
                 expression.value,
@@ -1676,6 +1788,18 @@ def _is_dynamic_lookup_call(
     builtin_module_aliases: set[str],
 ) -> bool:
     """Recognize dynamic lookup producers without banning ordinary data reads."""
+    if _is_dynamic_dict_lookup_attribute(
+        expression,
+        dynamic_aliases=dynamic_aliases,
+        builtin_module_aliases=builtin_module_aliases,
+    ):
+        return True
+    if isinstance(expression, ast.Call) and _is_dynamic_dict_lookup_attribute(
+        expression.func,
+        dynamic_aliases=dynamic_aliases,
+        builtin_module_aliases=builtin_module_aliases,
+    ):
+        return True
     if _is_builtin_dict_attribute(expression, builtin_module_aliases):
         return True
     if _is_dynamic_dict_attribute(expression, dynamic_aliases):
@@ -1719,7 +1843,7 @@ def _is_dynamic_value_expression(
             dynamic_aliases=dynamic_aliases,
             builtin_module_aliases=builtin_module_aliases,
         )
-    if isinstance(expression, ast.Attribute) and expression.attr == "__dict__":
+    if isinstance(expression, ast.Attribute) and expression.attr in {"__dict__", "modules"}:
         return _is_dynamic_lookup_call(
             expression,
             dynamic_aliases=dynamic_aliases,
@@ -1780,6 +1904,23 @@ def _is_dynamic_dict_attribute(expression: ast.AST, dynamic_aliases: set[str]) -
         and isinstance(expression.value, ast.Name)
         and expression.value.id in dynamic_aliases
         and expression.attr == "__dict__"
+    )
+
+
+def _is_dynamic_dict_lookup_attribute(
+    expression: ast.AST,
+    *,
+    dynamic_aliases: set[str],
+    builtin_module_aliases: set[str],
+) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr in _DYNAMIC_DICT_METHOD_NAMES
+        and _is_dynamic_value_expression(
+            expression.value,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        )
     )
 
 
@@ -1914,11 +2055,20 @@ def _sequence_elements(expression: ast.AST) -> list[ast.expr] | None:
     return None
 
 
-def _mapping_elements(expression: ast.AST) -> dict[object, ast.expr] | None:
-    if not isinstance(expression, ast.Dict) or any(key is None for key in expression.keys):
+def _mapping_elements(
+    expression: ast.AST,
+    sequence_aliases: dict[str, _StaticContainer] | None = None,
+) -> dict[object, ast.expr] | None:
+    if not isinstance(expression, ast.Dict):
         return None
     result: dict[object, ast.expr] = {}
     for key, value in zip(expression.keys, expression.values, strict=True):
+        if key is None:
+            unpacked = _resolve_static_mapping(value, sequence_aliases or {})
+            if unpacked is None:
+                return None
+            result.update(unpacked)
+            continue
         is_static, static_key = _static_subscript_key(key)
         if not is_static:
             return None
@@ -1964,6 +2114,40 @@ def _target_names(target: ast.AST) -> set[str]:
         return names
     if isinstance(target, ast.Starred):
         return _target_names(target.value)
+    return set()
+
+
+def _pattern_bound_names(pattern: ast.AST) -> set[str]:
+    """Return names introduced by a structural-pattern match."""
+    if isinstance(pattern, ast.MatchAs):
+        names = {pattern.name} if pattern.name is not None else set()
+        if pattern.pattern is not None:
+            names.update(_pattern_bound_names(pattern.pattern))
+        return names
+    if isinstance(pattern, ast.MatchStar):
+        return {pattern.name} if pattern.name is not None else set()
+    if isinstance(pattern, ast.MatchMapping):
+        names = set()
+        if pattern.rest is not None:
+            names.add(pattern.rest)
+        for child in pattern.patterns:
+            names.update(_pattern_bound_names(child))
+        return names
+    if isinstance(pattern, ast.MatchSequence):
+        names: set[str] = set()
+        for child in pattern.patterns:
+            names.update(_pattern_bound_names(child))
+        return names
+    if isinstance(pattern, ast.MatchClass):
+        names: set[str] = set()
+        for child in [*pattern.patterns, *pattern.kwd_patterns]:
+            names.update(_pattern_bound_names(child))
+        return names
+    if isinstance(pattern, ast.MatchOr):
+        names: set[str] = set()
+        for child in pattern.patterns:
+            names.update(_pattern_bound_names(child))
+        return names
     return set()
 
 

@@ -229,6 +229,57 @@ def test_registration_hard_fails_raw_io_fact_propagation_escapes(tmp_path: Path)
             return {"value": ctx.read_text("declared.txt")}
 
 
+def test_registration_hard_fails_p1_ast_boundary_escapes(tmp_path: Path) -> None:
+    """注册环必须同步收口精确豁免、动态 lookup、嵌套 kwargs 与 pattern 重绑定。"""
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("string-waiver")
+        def string_waiver(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            return {
+                "text": Path("secret.txt").read_text()
+                if "# kigumi: raw-io-ok string content"
+                else ""
+            }
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("hidden-waiver")
+        def hidden_waiver(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            return {"text": Path("secret.txt").read_text()}  # kigumi: raw-io-okhidden fixture
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("dict-lookup")
+        def dict_lookup(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            import builtins
+
+            return {"text": builtins.__dict__.get("open")("secret.txt")}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("nested-kwargs")
+        def nested_kwargs(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            def helper(reader: Any, **kwargs: Any) -> str:
+                return reader("secret.txt")
+
+            base = {"reader": open}
+            nested = {**base}
+            return {"text": helper(**{**nested})}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("pattern-context")
+        def pattern_context(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            values = [ctx.read_text("secret.txt") for ctx in [Path("rebound.txt")]]
+            candidate = {"ctx": Path("match-rebound.txt")}
+            match candidate:
+                case {"ctx": ctx}:
+                    matched = ctx.read_text()
+            return {"values": str(values), "matched": matched}
+
+
 def test_registration_hard_fails_nested_classes_and_reachable_instance_method_alias(
     tmp_path: Path,
 ) -> None:

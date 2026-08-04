@@ -9,6 +9,8 @@ from kigumi.enforce import (
     check_raw_io_node_source,
     check_raw_io_source,
     check_source,
+    raw_io_waiver_reasons,
+    waiver_reasons,
 )
 
 
@@ -44,6 +46,36 @@ def test_waiver_reason_is_visible_and_empty_waiver_remains_violation() -> None:
     assert findings[0].waiver_reason == "fixture replay"
     assert findings[1].waived is False
     assert findings[1].waiver_reason == "豁免必须写理由"
+
+
+def test_waivers_require_source_comments_and_exact_tokens() -> None:
+    """字符串中的伪注释和 token 前缀不能制造跨类或隐式豁免。"""
+    source = """
+for item in items:
+    fake = "# kigumi: raw-llm-ok string content"
+    client.call([])  # kigumi: raw-llm-okhidden not a token
+    client.llm("x")  # kigumi: raw-llm-ok loop fixture
+
+def node(inputs, ctx):
+    fake = "# kigumi: raw-io-ok string content"
+    first = Path("first.txt").read_text() if "# kigumi: raw-io-ok string content" else ""
+    second = Path("second.txt").read_text()  # kigumi: raw-io-ok file fixture
+    return first, second
+"""
+
+    llm_findings = check_source(source, Path("nodes/waiver-boundary.py"))
+    raw_io_findings = check_raw_io_source(source, Path("nodes/waiver-boundary.py"))
+
+    assert [(finding.waived, finding.waiver_reason) for finding in llm_findings] == [
+        (False, None),
+        (True, "loop fixture"),
+    ]
+    assert [(finding.waived, finding.waiver_reason) for finding in raw_io_findings] == [
+        (False, None),
+        (True, "file fixture"),
+    ]
+    assert waiver_reasons(source) == ["loop fixture"]
+    assert raw_io_waiver_reasons(source) == ["file fixture"]
 
 
 def test_helpers_and_async_loops_are_scanned_recursively(tmp_path: Path) -> None:
@@ -914,6 +946,49 @@ def node(inputs, ctx):
     assert all(not finding.waived for finding in findings)
 
 
+def test_raw_io_hard_cuts_dict_method_and_module_open_lookup_chains() -> None:
+    """动态 dict lookup 的 get/__getitem__ 变体不能丢掉 hard-cut。"""
+    source = """
+import builtins
+import importlib
+import sys
+
+def node(inputs, ctx):
+    builtin_get = builtins.__dict__.get("open")
+    first = builtin_get("builtin-get-secret.txt").read()
+    builtin_getitem = builtins.__dict__.__getitem__("open")
+    second = builtin_getitem("builtin-getitem-secret.txt").read()
+    sys_get = sys.modules.get("builtins").__dict__.get("open")
+    third = sys_get("sys-get-secret.txt").read()
+    sys_getitem = sys.modules.__getitem__("builtins").__dict__.__getitem__("open")
+    fourth = sys_getitem("sys-getitem-secret.txt").read()
+    importlib_get = importlib.import_module("builtins").__dict__.get("open")
+    fifth = importlib_get("importlib-get-secret.txt").read()
+    importlib_getitem = importlib.import_module("builtins").__dict__.__getitem__("open")
+    sixth = importlib_getitem("importlib-getitem-secret.txt").read()
+    return first, second, third, fourth, fifth, sixth
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/dynamic-open-lookups.py"))
+
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'builtin_get = builtins.__dict__.get("open")',
+        'first = builtin_get("builtin-get-secret.txt").read()',
+        'builtin_getitem = builtins.__dict__.__getitem__("open")',
+        'second = builtin_getitem("builtin-getitem-secret.txt").read()',
+        'sys_get = sys.modules.get("builtins").__dict__.get("open")',
+        'third = sys_get("sys-get-secret.txt").read()',
+        'sys_getitem = sys.modules.__getitem__("builtins").__dict__.__getitem__("open")',
+        'fourth = sys_getitem("sys-getitem-secret.txt").read()',
+        'importlib_get = importlib.import_module("builtins").__dict__.get("open")',
+        'fifth = importlib_get("importlib-get-secret.txt").read()',
+        'importlib_getitem = importlib.import_module("builtins").__dict__.__getitem__("open")',
+        'sixth = importlib_getitem("importlib-getitem-secret.txt").read()',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
 def test_raw_io_does_not_expand_import_module_names_into_ordinary_attributes() -> None:
     """importlib/sys 的普通属性保持 unknown，不把模块名本身变成无界误报。"""
     source = """
@@ -949,4 +1024,50 @@ def node(inputs, ctx):
         'return reader("keyword-secret.txt").read()',
         'callbacks = [lambda: Path("lambda-secret.txt").read_text()]',
     } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_propagates_nested_static_dict_unpack_callable_arguments() -> None:
+    """嵌套静态 dict unpack 仍必须把 callable fact 传入 helper。"""
+    source = """
+def node(inputs, ctx):
+    def invoke(reader, **ignored):
+        return reader("nested-keyword-secret.txt").read()
+
+    base = {"reader": open}
+    nested = {"unused": "value", **base}
+    deeply_nested = {**nested}
+    unknown = inputs["kwargs"]
+    invoke(**deeply_nested)
+    invoke(**unknown)
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/nested-static-kwargs.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'return reader("nested-keyword-secret.txt").read()',
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_invalidates_context_for_comprehension_and_match_bindings() -> None:
+    """推导式和 match pattern 的 ctx 重绑定不能继续伪装成受控读取。"""
+    source = """
+def node(inputs, ctx):
+    values = [ctx.read_text("comprehension-secret.txt") for ctx in [Path("rebound.txt")]]
+    candidate = {"ctx": Path("match-rebound.txt")}
+    match candidate:
+        case {"ctx": ctx}:
+            matched = ctx.read_text()
+    after = ctx.read_text("after-match-secret.txt")
+    return values, matched, after
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/context-rebindings.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'values = [ctx.read_text("comprehension-secret.txt") for ctx in [Path("rebound.txt")]]',
+        "matched = ctx.read_text()",
+        'after = ctx.read_text("after-match-secret.txt")',
+    ]
     assert all(not finding.waived for finding in findings)
