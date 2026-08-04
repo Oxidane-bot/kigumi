@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install locked dev dependency set without the local project
-        run: uv sync --locked --extra dev --no-install-project --python 3.13
+        run: uv sync --locked --extra dev --extra litellm --no-install-project --python 3.13
       - name: Audit dependencies (CVE findings fail)
         run: |
           # Resolve the dependency-only venv target instead of duplicating its Python-version
