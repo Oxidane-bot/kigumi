@@ -374,6 +374,126 @@ def test_kigumi_component_tracks_prompt_bytes_and_pydantic_version(
     assert pydantic_changed != prompt_changed
 
 
+def test_external_pydantic_model_changes_invalidate_node_cache(
+    tmp_path: Path,
+) -> None:
+    """Pydantic models outside source_dirs are still executable cache inputs."""
+    module_name = "external_model_cache_case"
+    module_path = tmp_path / f"{module_name}.py"
+
+    def load_node(extra_field: bool) -> Any:
+        field = '    extra: str = "default"\n' if extra_field else ""
+        module_path.write_text(
+            "from pydantic import BaseModel\n\n"
+            "class Answer(BaseModel):\n"
+            "    value: str\n"
+            f"{field}\n"
+            "def run(inputs, ctx):\n"
+            '    answer = ctx.call_validated("return JSON", Answer)\n'
+            "    return answer.model_dump()\n",
+            encoding="utf-8",
+        )
+        sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module.run
+
+    transport = FakeTransport(repeat(Response('{"value":"ok"}', {"total_tokens": 1}, "stop")))
+    config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+
+    try:
+        first_dag = Dag(config, LLMCaller(transport, tmp_path / "llm"))
+        first_dag.node("work")(load_node(False))
+        first = first_dag.run(run_id="model-v1")
+        assert first.cache_hits == []
+        assert first.artifacts["work"] == {"value": "ok"}
+
+        second_dag = Dag(config, LLMCaller(transport, tmp_path / "llm"))
+        second_dag.node("work")(load_node(True))
+        second = second_dag.run(run_id="model-v2")
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"value": "ok", "extra": "default"}
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_external_pydantic_model_method_changes_invalidate_node_cache(
+    tmp_path: Path,
+) -> None:
+    """A Pydantic class global outside source_dirs must not disappear from the key."""
+    module_name = "external_model_method_cache_case"
+    module_path = tmp_path / f"{module_name}.py"
+
+    def load_node(multiplier: int) -> Any:
+        module_path.write_text(
+            "from pydantic import BaseModel\n\n"
+            "class Payload(BaseModel):\n"
+            "    value: int\n\n"
+            "    def scaled(self):\n"
+            f"        return self.value * {multiplier}\n\n"
+            "def run(inputs, ctx):\n"
+            '    return {"n": Payload(value=2).scaled()}\n',
+            encoding="utf-8",
+        )
+        sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module.run
+
+    try:
+        first_dag = _make_dag(tmp_path)
+        first_dag.node("work")(load_node(1))
+        first = first_dag.run(run_id="model-method-v1")
+        assert first.artifacts["work"] == {"n": 2}
+
+        second_dag = _make_dag(tmp_path)
+        second_dag.node("work")(load_node(1000))
+        second = second_dag.run(run_id="model-method-v2")
+        assert second.cache_hits == []
+        assert second.artifacts["work"] == {"n": 2000}
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_pydantic_model_in_source_dirs_keeps_l3_reusable(tmp_path: Path) -> None:
+    """A representable Pydantic model should not disable the whole node cache."""
+    source_dir = tmp_path / "lib"
+    source_dir.mkdir()
+    module_name = "source_model_cache_case"
+    module_path = source_dir / f"{module_name}.py"
+    module_path.write_text(
+        "from pydantic import BaseModel\n\n"
+        "class Payload(BaseModel):\n"
+        "    value: int\n\n"
+        "def run(inputs, ctx):\n"
+        '    return {"n": Payload(value=2).value}\n',
+        encoding="utf-8",
+    )
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    try:
+        config = KigumiConfig(project_root=tmp_path, source_dirs=["lib"])
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        dag.node("work")(module.run)
+        identity = dag._libs_identities((dag._nodes["work"],))["work"]
+        assert identity.cache_reusable is True
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_prompt_upstream_and_params_changes_invalidate_caches(tmp_path: Path) -> None:
     """教训 cache_inputs: 声明输入任一变化都必须级联换节点键。"""
     prompts = tmp_path / "prompts"

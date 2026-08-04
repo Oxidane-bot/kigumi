@@ -97,6 +97,29 @@ you to add it. Importing your module is the cost of asking about the graph.
 dag_entry = "nodes.graph:build_dag"   # kigumi init scaffolds this
 ```
 
+外部 Agent 也可以在项目里只绑定一次 Capsule，节点按名字复用：
+
+```toml
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+```
+
+```python
+from kigumi import AgentTask
+
+
+@dag.agent("draft", profile="writer")
+def draft(inputs, ctx):
+    return AgentTask("完成任务")
+```
+
+command 默认是 `["pi"]`，session_carry 默认关闭；`@dag.agent_scan` 也接受同一个
+`profile=`。项目配置只绑定 Capsule 与 Pi adapter，Capsule 的 "agent.toml" 仍是
+provider、model、thinking、system prompt 及其它 Agent 行为设置的唯一来源。需要 secrets 或
+extra_config_files 时，继续显式传 `adapter=` 和 `spec=`，不要把它们放进项目 TOML。
+
 If the graph's shape or params depend on runtime input, give the factory
 keyword parameters and pass them per invocation with `--graph-arg`, which every
 graph command accepts:

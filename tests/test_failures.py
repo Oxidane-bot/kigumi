@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from urllib.error import HTTPError
 
+import pytest
+
 from kigumi import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
@@ -9,7 +11,7 @@ from kigumi import (
     ProviderFailureKind,
     ProviderFailureStage,
 )
-from kigumi.failures import provider_failure_from_exception
+from kigumi.failures import AgentRuntimeFailureSubCode, provider_failure_from_exception
 
 
 def test_provider_failure_classifies_structured_status_and_transport_types() -> None:
@@ -96,8 +98,36 @@ def test_provider_and_agent_failures_have_canonical_typed_metadata() -> None:
             "retryable_hint": False,
         },
         "runtime_code": None,
+        "runtime_subcode": None,
     }
 
     runtime = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.CAPACITY)
     assert runtime.canonical()["runtime_code"] == "capacity"
+    assert runtime.canonical()["runtime_subcode"] is None
     assert runtime.provider_failure is None
+
+
+def test_agent_runtime_subcodes_are_closed_canonical_and_code_compatible() -> None:
+    cases = (
+        (AgentRuntimeFailureCode.PROTOCOL, AgentRuntimeFailureSubCode.ENVELOPE),
+        (AgentRuntimeFailureCode.POLICY, AgentRuntimeFailureSubCode.BRIDGE_POLICY),
+        (AgentRuntimeFailureCode.PROTOCOL, AgentRuntimeFailureSubCode.SUBMIT_CONTRACT),
+        (AgentRuntimeFailureCode.POLICY, AgentRuntimeFailureSubCode.CONFIG_POLICY),
+    )
+    canonical = []
+    for runtime_code, runtime_subcode in cases:
+        failure = AgentExecutionFailure(
+            runtime_code=runtime_code,
+            runtime_subcode=runtime_subcode,
+        )
+        value = failure.canonical()
+        assert value["runtime_code"] == runtime_code.value
+        assert value["runtime_subcode"] == runtime_subcode.value
+        canonical.append(value)
+
+    assert len({(item["runtime_code"], item["runtime_subcode"]) for item in canonical}) == 4
+    with pytest.raises(ValueError, match="requires runtime_code"):
+        AgentExecutionFailure(
+            runtime_code=AgentRuntimeFailureCode.PROTOCOL,
+            runtime_subcode=AgentRuntimeFailureSubCode.BRIDGE_POLICY,
+        )

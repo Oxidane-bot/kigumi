@@ -135,6 +135,38 @@ class AgentRuntimeFailureCode(StrEnum):
     CAPACITY = "capacity"
 
 
+class AgentRuntimeFailureSubCode(StrEnum):
+    """Stable source detail for a closed Agent runtime failure."""
+
+    ENVELOPE = "envelope"
+    BRIDGE_POLICY = "bridge_policy"
+    SUBMIT_CONTRACT = "submit_contract"
+    CONFIG_POLICY = "config_policy"
+
+
+# Keep the spelling used by callers that write ``subcode`` as one word while
+# using the more readable ``SubCode`` spelling internally.
+AgentRuntimeFailureSubcode = AgentRuntimeFailureSubCode
+
+
+_RUNTIME_SUBCODE_CODES = {
+    AgentRuntimeFailureSubCode.ENVELOPE: AgentRuntimeFailureCode.PROTOCOL,
+    AgentRuntimeFailureSubCode.BRIDGE_POLICY: AgentRuntimeFailureCode.POLICY,
+    AgentRuntimeFailureSubCode.SUBMIT_CONTRACT: AgentRuntimeFailureCode.PROTOCOL,
+    AgentRuntimeFailureSubCode.CONFIG_POLICY: AgentRuntimeFailureCode.POLICY,
+}
+
+
+def runtime_code_for_subcode(
+    subcode: AgentRuntimeFailureSubCode,
+) -> AgentRuntimeFailureCode:
+    """Return the stable broad runtime code for a known sub-code."""
+    try:
+        return _RUNTIME_SUBCODE_CODES[subcode]
+    except KeyError as error:
+        raise ValueError(f"unsupported Agent runtime sub-code: {subcode!r}") from error
+
+
 _RUNTIME_MESSAGES = {
     AgentRuntimeFailureCode.SPAWN_NOT_FOUND: "Agent executable was not found",
     AgentRuntimeFailureCode.SPAWN_PERMISSION: "Agent executable could not be started",
@@ -155,6 +187,7 @@ class AgentExecutionFailure(RuntimeError):
         *,
         provider_failure: ProviderFailure | None = None,
         runtime_code: AgentRuntimeFailureCode | None = None,
+        runtime_subcode: AgentRuntimeFailureSubCode | None = None,
     ) -> None:
         if (provider_failure is None) == (runtime_code is None):
             raise ValueError("exactly one of provider_failure or runtime_code is required")
@@ -162,8 +195,22 @@ class AgentExecutionFailure(RuntimeError):
             raise TypeError("provider_failure must be ProviderFailure")
         if runtime_code is not None and not isinstance(runtime_code, AgentRuntimeFailureCode):
             raise TypeError("runtime_code must be AgentRuntimeFailureCode")
+        if runtime_subcode is not None and not isinstance(
+            runtime_subcode, AgentRuntimeFailureSubCode
+        ):
+            raise TypeError("runtime_subcode must be AgentRuntimeFailureSubCode or null")
+        if runtime_subcode is not None:
+            expected_code = runtime_code_for_subcode(runtime_subcode)
+            if runtime_code is None:
+                raise ValueError("runtime_subcode requires runtime_code")
+            if runtime_code is not expected_code:
+                raise ValueError(
+                    f"runtime_subcode {runtime_subcode.value!r} requires "
+                    f"runtime_code {expected_code.value!r}"
+                )
         self.provider_failure = provider_failure
         self.runtime_code = runtime_code
+        self.runtime_subcode = runtime_subcode
         message = (
             str(provider_failure)
             if provider_failure is not None
@@ -179,6 +226,9 @@ class AgentExecutionFailure(RuntimeError):
                 self.provider_failure.canonical() if self.provider_failure is not None else None
             ),
             "runtime_code": self.runtime_code.value if self.runtime_code is not None else None,
+            "runtime_subcode": (
+                self.runtime_subcode.value if self.runtime_subcode is not None else None
+            ),
         }
 
     @classmethod
@@ -186,11 +236,19 @@ class AgentExecutionFailure(RuntimeError):
         """Restore a validated Agent failure from a receipt."""
         provider = value.get("provider_failure")
         runtime = value.get("runtime_code")
+        runtime_subcode = value.get("runtime_subcode")
+        if runtime_subcode is not None and not isinstance(runtime_subcode, str):
+            raise ValueError("runtime_subcode must be a string or null")
         return cls(
             provider_failure=(
                 ProviderFailure.from_canonical(provider) if isinstance(provider, Mapping) else None
             ),
             runtime_code=AgentRuntimeFailureCode(runtime) if isinstance(runtime, str) else None,
+            runtime_subcode=(
+                AgentRuntimeFailureSubCode(runtime_subcode)
+                if isinstance(runtime_subcode, str)
+                else None
+            ),
         )
 
 
@@ -255,6 +313,7 @@ def canonical_failure(error: BaseException) -> dict[str, Any]:
             "failure_type": "provider",
             "provider_failure": error.canonical(),
             "runtime_code": None,
+            "runtime_subcode": None,
         }
     return {
         "failure_type": "runtime",

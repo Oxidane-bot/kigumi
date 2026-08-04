@@ -343,10 +343,8 @@ def test_recovery_advice_graph_args_can_be_added_before_separator() -> None:
     assert resume_args.run_id == "--historical-run"
 
 
-def test_init_creates_default_layout_and_refuses_repeat(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """教训 explicit_init: 脚手架只能显式激活一次，不能静默改已有配置。"""
+def test_init_creates_default_layout_and_is_idempotent(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Init scaffolds a new project once, then only synchronizes its agent docs."""
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
@@ -361,8 +359,9 @@ def test_init_creates_default_layout_and_refuses_repeat(
     config_text = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
     assert "agent_slots = 1" in config_text
     assert 'agent_lock_dir = "artifacts/_locks/agents"' in config_text
-    assert main(["init"]) == 1
-    assert "already exists" in capsys.readouterr().err
+    assert main(["init"]) == 0
+    assert (tmp_path / "pyproject.toml").read_text(encoding="utf-8") == config_text
+    assert "synchronized kigumi agent docs" in capsys.readouterr().out
 
 
 def test_installed_console_script_init_check_and_generated_graph_run(tmp_path: Path) -> None:
@@ -427,6 +426,35 @@ def test_init_hooks_refuses_existing_hook_and_missing_pyproject(
     monkeypatch.chdir(second)
     assert main(["init", "--hooks"]) == 1
     assert existing.read_text(encoding="utf-8") == "custom hook\n"
+
+
+def test_init_existing_project_does_not_scaffold_and_keeps_hooks_explicit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An existing config gets docs only; hooks remain an explicit opt-in."""
+    root = tmp_path / "existing"
+    root.mkdir()
+    pyproject = root / "pyproject.toml"
+    pyproject.write_text(
+        "[project]\nname = 'existing'\n\n[tool.kigumi]\nsource_dirs = ['src']\n",
+        encoding="utf-8",
+    )
+    _git(root, "init")
+    original_pyproject = pyproject.read_text(encoding="utf-8")
+    monkeypatch.chdir(root)
+
+    assert main(["init"]) == 0
+    assert pyproject.read_text(encoding="utf-8") == original_pyproject
+    assert not (root / "prompts").exists()
+    assert not (root / "artifacts").exists()
+    assert not (root / "nodes").exists()
+    assert not (root / "lib").exists()
+    hook = root / ".git" / "hooks" / "pre-commit"
+    assert not hook.exists()
+
+    assert main(["init", "--hooks"]) == 0
+    assert "uv run kigumi guard --changed" in hook.read_text(encoding="utf-8")
+    assert main(["init", "--hooks"]) == 1
 
 
 def test_init_preflights_conflicting_destinations_before_mutating(
@@ -522,12 +550,64 @@ def test_init_appends_to_existing_agent_docs_without_duplication(
     (tmp_path / "AGENTS.md").write_text(existing, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     assert main(["init"]) == 0
+    first = {
+        filename: (tmp_path / filename).read_text(encoding="utf-8")
+        for filename in ("CLAUDE.md", "AGENTS.md")
+    }
 
     for filename in ("CLAUDE.md", "AGENTS.md"):
-        text = (tmp_path / filename).read_text(encoding="utf-8")
+        text = first[filename]
         assert text.startswith(existing)
         assert "kigumi" in text
-        # No duplicate section on repeat init (tool.kigumi already exists → exit 1)
+
+    assert main(["init"]) == 0
+    for filename, text in first.items():
+        repeated = (tmp_path / filename).read_text(encoding="utf-8")
+        assert repeated == text
+        assert repeated.count("<!-- kigumi-agent-docs -->") == 1
+
+
+def test_init_existing_kigumi_syncs_docs_without_scaffolding_or_changing_pyproject(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Existing projects receive missing guidance while config and custom text stay intact."""
+    pyproject = tmp_path / "pyproject.toml"
+    original_pyproject = (
+        "[project]\nname = 'sample'\n\n"
+        "[tool.kigumi]\nsource_dirs = ['src']\ncustom_setting = 'keep'\n"
+    )
+    pyproject.write_text(original_pyproject, encoding="utf-8")
+    custom = "# Existing project\n\nKeep this custom rule.  \n"
+    (tmp_path / "CLAUDE.md").write_text(custom, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init"]) == 0
+    assert pyproject.read_text(encoding="utf-8") == original_pyproject
+    claude = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    agents = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert claude.startswith(custom)
+    assert "<!-- kigumi-agent-docs -->" in claude
+    assert "<!-- kigumi-agent-docs -->" in agents
+    for path in (
+        tmp_path / "prompts",
+        tmp_path / "artifacts",
+        tmp_path / "nodes",
+        tmp_path / "lib",
+        tmp_path / "nodes" / "graph.py",
+        tmp_path / ".gitignore",
+    ):
+        assert not path.exists(), path
+
+    first_docs = {
+        filename: (tmp_path / filename).read_text(encoding="utf-8")
+        for filename in ("CLAUDE.md", "AGENTS.md")
+    }
+    assert main(["init"]) == 0
+    assert pyproject.read_text(encoding="utf-8") == original_pyproject
+    for filename, text in first_docs.items():
+        repeated = (tmp_path / filename).read_text(encoding="utf-8")
+        assert repeated == text
+        assert repeated.count("<!-- kigumi-agent-docs -->") == 1
 
 
 def test_init_demotes_injected_headings_into_kigumi_section(

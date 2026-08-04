@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import repeat
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,13 @@ from kigumi.agents import (
     AgentTask,
 )
 from kigumi.artifacts import sha
+from kigumi.calling import LLMCaller
+from kigumi.config import KigumiConfig
+from kigumi.dag import Dag
 from kigumi.evidence import EvidencePolicy
+from kigumi.pi import PiRpcAdapter
+from kigumi.testing import FakeTransport
+from kigumi.transport import Response
 from tests._agent_helpers import make_agent_spec
 from tests._dag_helpers import _make_dag
 
@@ -38,6 +45,116 @@ class WritingAdapter:
         (context.workspace / "draft.md").write_text("draft", encoding="utf-8")
         (context.workspace / "notes" / "reasoning.md").write_text("why", encoding="utf-8")
         return AgentRunResult(AgentCompletion("completed", "done", ("draft.md",), {}))
+
+
+def _make_profile_dag(tmp_path: Path) -> tuple[Dag, Path]:
+    capsule = tmp_path / "agents" / "writer"
+    capsule.parent.mkdir(parents=True)
+    make_agent_spec(capsule)
+    config = KigumiConfig(
+        project_root=tmp_path,
+        source_dirs=[],
+        agent_profiles={
+            "writer": {
+                "capsule": "agents/writer",
+                "runtime": "pi",
+                "expected_version": "0.83.0",
+            }
+        },
+    )
+    transport = FakeTransport(repeat(Response("model output", {"total_tokens": 1}, "stop")))
+    return Dag(config, LLMCaller(transport, tmp_path / "llm")), capsule
+
+
+def test_agent_profile_registers_call_and_scan_once_and_reuses_binding(tmp_path: Path) -> None:
+    dag, capsule = _make_profile_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "a"}]}
+
+    @dag.agent("draft", profile="writer")
+    def draft(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("draft")
+
+    @dag.agent_scan(
+        "revise",
+        profile="writer",
+        items_from=("source", "items"),
+        key_fn=lambda item: item["id"],
+    )
+    def revise(item: dict[str, Any], carry: Any, inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del item, carry, inputs, ctx
+        return AgentTask("revise")
+
+    draft_node = dag._nodes["draft"]
+    revise_node = dag._nodes["revise"]
+    assert isinstance(draft_node.agent_adapter, PiRpcAdapter)
+    assert draft_node.agent_spec is not None
+    assert draft_node.agent_spec.root == capsule.resolve()
+    assert draft_node.agent_adapter is revise_node.agent_adapter
+    assert draft_node.agent_spec is revise_node.agent_spec
+    assert revise_node.scan is True
+
+
+def test_agent_profile_and_explicit_binding_have_the_same_cache_identity(
+    tmp_path: Path,
+) -> None:
+    profile_dag, capsule = _make_profile_dag(tmp_path / "profile")
+
+    @profile_dag.agent("work", profile="writer")
+    def profile_work(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("work")
+
+    explicit_root = tmp_path / "explicit"
+    explicit_root.mkdir()
+    explicit_spec = make_agent_spec(explicit_root / "agent")
+    explicit_dag = _make_dag(explicit_root)
+
+    @explicit_dag.agent(
+        "work",
+        adapter=PiRpcAdapter(("pi",), expected_version="0.83.0"),
+        spec=explicit_spec,
+    )
+    def explicit_work(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("work")
+
+    profile_node = profile_dag._nodes["work"]
+    explicit_node = explicit_dag._nodes["work"]
+    assert profile_node.agent_identity is not None
+    assert explicit_node.agent_identity is not None
+    assert profile_node.agent_identity == explicit_node.agent_identity
+    assert profile_node.external_fingerprint_digest == explicit_node.external_fingerprint_digest
+    assert profile_node.agent_spec is not None
+    assert profile_node.agent_spec.root == capsule.resolve()
+
+
+def test_agent_profile_binding_errors_are_explicit(tmp_path: Path) -> None:
+    dag, _ = _make_profile_dag(tmp_path)
+    spec = make_agent_spec(tmp_path / "explicit-agent")
+    adapter = PiRpcAdapter(("pi",), expected_version="0.83.0")
+
+    with pytest.raises(ValueError, match="Unknown Agent profile 'missing'"):
+        dag.agent("missing", profile="missing")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        dag.agent("mixed", profile="writer", adapter=adapter, spec=spec)
+
+    with pytest.raises(TypeError, match="profile= or both adapter= and spec="):
+        dag.agent("unbound")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        dag.agent_scan(
+            "mixed-scan",
+            profile="writer",
+            adapter=adapter,
+            spec=spec,
+            items_from=("source", "items"),
+        )
 
 
 def test_dag_agent_uses_normal_cache_and_publishes_exact_attachments(tmp_path: Path) -> None:

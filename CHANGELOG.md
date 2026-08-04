@@ -17,8 +17,16 @@
 - `kigumi init` 生成的 DAG 示例可直接执行；wheel 与 sdist 的安装后 CLI、文档、生成图运行和
   metadata 均纳入发行物 smoke 验证。
 
+### 新增
+
+- 新增项目级 `[tool.kigumi.agent_profiles.<name>]`：一次绑定 Agent Capsule 与 Pi runtime，节点可用
+  `profile="name"` 复用；Capsule 的 `agent.toml` 仍是 provider、model、thinking、system prompt
+  与运行限制的唯一来源，profile 名不额外改变既有缓存身份。
+
 ### 修复
 
+- `kigumi init` 现在对已有 `[tool.kigumi]` 的项目执行幂等文档同步：只补齐 `CLAUDE.md`/`AGENTS.md`，
+  保留项目配置与目录，不再因初始化表已存在而阻断 Agent 使用规范的注入。
 - 收紧 blob 与原始文件输入的 regular-file、descriptor-bound 和 preflight 边界，避免 FIFO、设备、
   symlink、TOCTOU 与错误内容 blob 穿透校验。
 - 输出物化改为可回滚提交，失败时恢复 output ownership 与 staging；managed PromptResolution
@@ -28,6 +36,12 @@
   `ENOTSUP`。
 - `Dag.plan`、scan、EvidencePolicy、workers 与损坏 cache 的错误路径统一为不重算的 fail-closed
   行为，并补齐真实安装入口和发行物测试语义。
+- 节点引用的 Pydantic 模型（包括 `ctx.call_validated()` 使用的模型）现在把 schema 与可见模型源码
+  摘要纳入节点缓存键；模型位于 `source_dirs` 外时不会再静默复用陈旧产物，位于其中时也不会
+  仅因 Pydantic metaclass 不可展开而关闭整个节点的 L3 复用。
+- Agent 运行失败现在在保留原有宽码的同时记录受限的 `envelope`、`bridge_policy`、
+  `submit_contract` 或 `config_policy` sub-code；未知异常仍是通用 `protocol`，失败记录不保存
+  原始异常文本或凭据。
 
 ### 兼容性
 

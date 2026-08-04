@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import stat
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
 from ._safe_io import _secure_directory_absolute
 
@@ -39,6 +41,91 @@ def _safe_configured_path(path: str | Path) -> Path:
     return absolute
 
 
+def _validate_agent_profile_name(name: object) -> None:
+    path = Path(name) if isinstance(name, str) else None
+    if (
+        path is None
+        or not name.strip()
+        or "@" in name
+        or "/" in name
+        or "\\" in name
+        or path.name != name
+        or name in {".", ".."}
+    ):
+        raise ValueError(
+            "Agent profile names must be non-empty, contain no '@', and be a single "
+            "relative path component"
+        )
+
+
+@dataclass(frozen=True)
+class AgentProfileConfig:
+    """Project-level binding from a profile name to a Pi Agent capsule."""
+
+    capsule: str
+    runtime: Literal["pi"]
+    expected_version: str
+    command: tuple[str, ...] = ("pi",)
+    session_carry: bool = False
+    session_max_bytes: int = 2 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        for field_name in ("capsule", "expected_version"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Agent profile {field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        if self.runtime != "pi":
+            raise ValueError('Agent profile runtime must be "pi"')
+        if (
+            not isinstance(self.command, (list, tuple))
+            or not self.command
+            or not all(isinstance(part, str) and part for part in self.command)
+        ):
+            raise ValueError("Agent profile command must be a non-empty list of non-empty strings")
+        object.__setattr__(self, "command", tuple(self.command))
+        if not isinstance(self.session_carry, bool):
+            raise TypeError("Agent profile session_carry must be a bool")
+        if (
+            isinstance(self.session_max_bytes, bool)
+            or not isinstance(self.session_max_bytes, int)
+            or self.session_max_bytes <= 0
+        ):
+            raise ValueError("Agent profile session_max_bytes must be positive")
+
+    @classmethod
+    def from_mapping(cls, name: str, values: Mapping[str, Any]) -> AgentProfileConfig:
+        """Parse one TOML profile table with strict, user-facing errors."""
+        _validate_agent_profile_name(name)
+        known = {
+            "capsule",
+            "runtime",
+            "command",
+            "expected_version",
+            "session_carry",
+            "session_max_bytes",
+        }
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise ValueError(
+                f"Unknown Agent profile configuration keys for {name!r}: {', '.join(unknown)}"
+            )
+        required = ("capsule", "runtime", "expected_version")
+        missing = [key for key in required if key not in values]
+        if missing:
+            raise ValueError(
+                f"Agent profile {name!r} is missing required keys: {', '.join(missing)}"
+            )
+        return cls(
+            capsule=values["capsule"],
+            runtime=values["runtime"],
+            expected_version=values["expected_version"],
+            command=values.get("command", ("pi",)),
+            session_carry=values.get("session_carry", False),
+            session_max_bytes=values.get("session_max_bytes", 2 * 1024 * 1024),
+        )
+
+
 @dataclass
 class KigumiConfig:
     """Project-relative kigumi paths with resolved absolute-path accessors."""
@@ -52,6 +139,7 @@ class KigumiConfig:
     agent_lock_dir: str = "artifacts/_locks/agents"
     agent_slot_timeout_seconds: float = 300.0
     dag_entry: str | None = None
+    agent_profiles: dict[str, AgentProfileConfig] = field(default_factory=dict)
     """``module:callable`` returning the project's ``Dag``, enabling ``kigumi plan``.
 
     Optional on purpose: without it every project-operations command still works,
@@ -107,6 +195,19 @@ class KigumiConfig:
                 raise ValueError(
                     f"dag_entry must look like 'module:callable', got {self.dag_entry!r}"
                 )
+        if not isinstance(self.agent_profiles, Mapping):
+            raise ValueError("agent_profiles must be a table")
+        profiles: dict[str, AgentProfileConfig] = {}
+        for name, value in self.agent_profiles.items():
+            if isinstance(value, AgentProfileConfig):
+                _validate_agent_profile_name(name)
+                profile = value
+            elif isinstance(value, Mapping):
+                profile = AgentProfileConfig.from_mapping(name, value)
+            else:
+                raise ValueError(f"Agent profile {name!r} must be a table")
+            profiles[name] = profile
+        self.agent_profiles = profiles
 
     def resolve(self, path: str | Path) -> Path:
         """Resolve a configured project-relative path to an absolute path."""
@@ -114,6 +215,13 @@ class KigumiConfig:
         if candidate.is_absolute():
             return candidate.resolve()
         return (self.project_root / candidate).resolve()
+
+    def resolve_agent_capsule(self, path: str | Path) -> Path:
+        """Resolve a profile capsule while retaining the no-symlink boundary."""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        return _safe_configured_path(candidate)
 
     @property
     def prompts_path(self) -> Path:
@@ -185,6 +293,7 @@ def load_config(project_root: Path) -> KigumiConfig | None:
         "agent_lock_dir",
         "agent_slot_timeout_seconds",
         "dag_entry",
+        "agent_profiles",
     }
     unknown = sorted(set(values) - known)
     if unknown:

@@ -421,6 +421,7 @@ class _InitPlan:
     writes: tuple[tuple[Path, str], ...]
     entry_path: Path | None
     hook_path: Path | None
+    already_initialized: bool = False
 
 
 def _init_lstat(path: Path) -> os.stat_result | None:
@@ -607,6 +608,51 @@ class _InitTransaction:
         return errors
 
 
+def _plan_agent_doc_writes(root: Path) -> list[tuple[Path, str]]:
+    """Plan missing kigumi guidance without replacing host documentation."""
+    try:
+        brief = _demote_brief_headings(read_doc("brief")).strip()
+    except (FileNotFoundError, KeyError, OSError) as error:
+        raise _InitValidationError(f"cannot load shipped brief for init: {error}") from error
+
+    agent_block = f"\n{_AGENT_DOCS_SENTINEL}\n{brief}\n"
+    writes: list[tuple[Path, str]] = []
+    for filename in ("CLAUDE.md", "AGENTS.md"):
+        path = root / filename
+        _validate_init_destination(root, path, kind="file", label=filename)
+        info = _init_lstat(path)
+        if info is None:
+            writes.append((path, agent_block.lstrip("\n")))
+            continue
+        text = _read_init_text(path, filename)
+        if _AGENT_DOCS_SENTINEL in text:
+            continue
+        separator = "" if text.endswith("\n") else "\n"
+        writes.append((path, text + separator + agent_block.lstrip("\n")))
+    return writes
+
+
+def _plan_init_hook(
+    root: Path,
+    *,
+    hooks: bool,
+    writes: list[tuple[Path, str]],
+) -> Path | None:
+    """Plan an explicitly requested hook without changing hook ownership rules."""
+    if not hooks:
+        return None
+    git_root = root / ".git"
+    _validate_init_destination(root, git_root, kind="directory", label=".git", required=True)
+    hooks_dir = git_root / "hooks"
+    _validate_init_destination(root, hooks_dir, kind="directory", label="git hooks")
+    hook_path = hooks_dir / "pre-commit"
+    _validate_init_destination(root, hook_path, kind="file", label="pre-commit hook")
+    if _init_lstat(hook_path) is not None:
+        raise _InitValidationError("refusing to overwrite existing pre-commit hook")
+    writes.append((hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n"))
+    return hook_path
+
+
 def _plan_init(root: Path, *, hooks: bool) -> _InitPlan:
     """Validate and materialize the complete init plan without mutating disk."""
     root = Path(root).absolute()
@@ -631,7 +677,19 @@ def _plan_init(root: Path, *, hooks: bool) -> _InitPlan:
     if tool is not None and not isinstance(tool, dict):
         raise _InitValidationError("pyproject.toml [tool] must be a table")
     if isinstance(tool, dict) and "kigumi" in tool:
-        raise _InitValidationError("[tool.kigumi] already exists")
+        if not isinstance(tool["kigumi"], dict):
+            raise _InitValidationError("pyproject.toml [tool.kigumi] must be a table")
+        writes = _plan_agent_doc_writes(root)
+        hook_path = _plan_init_hook(root, hooks=hooks, writes=writes)
+        return _InitPlan(
+            root=root,
+            directories=(),
+            empty_files=(),
+            writes=tuple(writes),
+            entry_path=None,
+            hook_path=hook_path,
+            already_initialized=True,
+        )
 
     block = (
         "\n\n[tool.kigumi]\n"
@@ -705,33 +763,8 @@ def _plan_init(root: Path, *, hooks: bool) -> _InitPlan:
     if planned_entry is not None:
         writes.append((planned_entry, DAG_ENTRY_TEMPLATE))
 
-    try:
-        brief = _demote_brief_headings(read_doc("brief")).strip()
-    except (FileNotFoundError, KeyError, OSError) as error:
-        raise _InitValidationError(f"cannot load shipped brief for init: {error}") from error
-    agent_block = f"\n{_AGENT_DOCS_SENTINEL}\n{brief}\n"
-    for filename in ("CLAUDE.md", "AGENTS.md"):
-        path = root / filename
-        _validate_init_destination(root, path, kind="file", label=filename)
-        info = _init_lstat(path)
-        if info is None:
-            writes.append((path, agent_block.lstrip("\n")))
-            continue
-        text = _read_init_text(path, filename)
-        if _AGENT_DOCS_SENTINEL not in text:
-            writes.append((path, text.rstrip() + "\n" + agent_block))
-
-    hook_path: Path | None = None
-    if hooks:
-        git_root = root / ".git"
-        _validate_init_destination(root, git_root, kind="directory", label=".git", required=True)
-        hooks_dir = git_root / "hooks"
-        _validate_init_destination(root, hooks_dir, kind="directory", label="git hooks")
-        hook_path = hooks_dir / "pre-commit"
-        _validate_init_destination(root, hook_path, kind="file", label="pre-commit hook")
-        if _init_lstat(hook_path) is not None:
-            raise _InitValidationError("refusing to overwrite existing pre-commit hook")
-        writes.append((hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n"))
+    writes.extend(_plan_agent_doc_writes(root))
+    hook_path = _plan_init_hook(root, hooks=hooks, writes=writes)
 
     return _InitPlan(
         root=root,
@@ -769,7 +802,10 @@ def _init(root: Path, *, hooks: bool) -> int:
         _error(f"init failed: {error}{detail}")
         return 1
 
-    print("initialized kigumi project")
+    if plan.already_initialized:
+        print("synchronized kigumi agent docs")
+    else:
+        print("initialized kigumi project")
     if plan.entry_path is not None:
         relative = plan.entry_path.relative_to(plan.root)
         print(f"  wrote {relative} (fill in build_dag, then: kigumi describe)")

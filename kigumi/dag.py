@@ -91,6 +91,7 @@ from .failures import (
     canonical_failure,
     failure_provider_kind,
 )
+from .pi import PiRpcAdapter
 from .prompt import (
     PromptCatalogSnapshot,
     PromptResolutionError,
@@ -666,11 +667,54 @@ class Dag:
         self.post_node = post_node
         self._nodes: dict[str, _Node] = {}
         self._subgraphs: dict[str, dict[str, Any]] = {}
+        self._agent_profile_bindings: dict[str, tuple[AgentAdapter, AgentSpec]] = {}
         self.blob_store = BlobStore(store.blob_store_root(self.config.artifacts_path))
         self.agent_slots = FileSlots(
             self.config.agent_lock_path,
             self.config.agent_slots,
         )
+
+    def _resolve_agent_profile(self, profile: str) -> tuple[AgentAdapter, AgentSpec]:
+        if not isinstance(profile, str) or not profile.strip():
+            raise ValueError("Agent profile must be a non-empty name")
+        cached = self._agent_profile_bindings.get(profile)
+        if cached is not None:
+            return cached
+        profile_config = self.config.agent_profiles.get(profile)
+        if profile_config is None:
+            configured = ", ".join(sorted(self.config.agent_profiles)) or "<none>"
+            raise ValueError(
+                f"Unknown Agent profile {profile!r}; configured profiles: {configured}"
+            )
+        if profile_config.runtime != "pi":
+            raise ValueError('Agent profile runtime must be "pi"')
+        spec = AgentSpec.load(self.config.resolve_agent_capsule(profile_config.capsule))
+        adapter = PiRpcAdapter(
+            profile_config.command,
+            expected_version=profile_config.expected_version,
+            session_carry=profile_config.session_carry,
+            session_max_bytes=profile_config.session_max_bytes,
+        )
+        binding = (adapter, spec)
+        self._agent_profile_bindings[profile] = binding
+        return binding
+
+    def _resolve_agent_binding(
+        self,
+        *,
+        adapter: AgentAdapter | None,
+        spec: AgentSpec | None,
+        profile: str | None,
+    ) -> tuple[AgentAdapter, AgentSpec]:
+        if profile is not None:
+            if adapter is not None or spec is not None:
+                raise ValueError("Agent profile cannot be combined with explicit adapter or spec")
+            return self._resolve_agent_profile(profile)
+        if adapter is None and spec is None:
+            raise TypeError("Agent registration requires profile= or both adapter= and spec=")
+        if adapter is None or spec is None:
+            raise TypeError("Explicit Agent registration requires both adapter= and spec=")
+        return adapter, spec
 
     def _caller_evidence_policy(self) -> EvidencePolicy:
         """Support lightweight test/dry-run callers without weakening the default."""
@@ -731,8 +775,9 @@ class Dag:
         self,
         name: str,
         *,
-        adapter: AgentAdapter,
-        spec: AgentSpec,
+        adapter: AgentAdapter | None = None,
+        spec: AgentSpec | None = None,
+        profile: str | None = None,
         deps: Iterable[str] = (),
         prompt_specs: Iterable[PromptSpec] = (),
         files: Iterable[str | Path] = (),
@@ -747,6 +792,11 @@ class Dag:
         _validate_name(name, "Agent node")
         if name in self._nodes:
             raise ValueError(f"Node {name!r} is already registered")
+        adapter, spec = self._resolve_agent_binding(
+            adapter=adapter,
+            spec=spec,
+            profile=profile,
+        )
         node_cache = validate_cache_policy(cache)
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
@@ -799,8 +849,9 @@ class Dag:
         self,
         name: str,
         *,
-        adapter: AgentAdapter,
-        spec: AgentSpec,
+        adapter: AgentAdapter | None = None,
+        spec: AgentSpec | None = None,
+        profile: str | None = None,
         items_from: tuple[str, str],
         key_fn: Callable[[Any], str] | None = None,
         carry_from: tuple[str, str] | None = None,
@@ -824,6 +875,11 @@ class Dag:
             _validate_artifact_locator(carry_from, "carry_from")
         if name in self._nodes:
             raise ValueError(f"Node {name!r} is already registered")
+        adapter, spec = self._resolve_agent_binding(
+            adapter=adapter,
+            spec=spec,
+            profile=profile,
+        )
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
         node_resources = _validate_resources(resources, "Agent scan")
@@ -5181,6 +5237,19 @@ class Dag:
             "params": sha(node.params),
             "kigumi": sha(_kigumi_key_inputs()),
         }
+        if node.model_classes:
+            components["validated_models"] = sha(
+                [
+                    _validated_model_cache_identity(model)
+                    for model in sorted(
+                        node.model_classes,
+                        key=lambda value: (
+                            str(_safe_runtime_attribute(value, "__module__")),
+                            str(_safe_runtime_attribute(value, "__qualname__")),
+                        ),
+                    )
+                ]
+            )
         if node.external_fingerprint_digest is not None:
             components["external"] = node.external_fingerprint_digest
         snapshot = prompt_snapshot or self._prompt_snapshot((node,))
@@ -5520,6 +5589,57 @@ def _describe_models(nodes: Iterable[_Node]) -> dict[str, list[dict[str, str | N
         ]
         for name, model in sorted(models.items())
     }
+
+
+def _validated_model_cache_identity(model: type[pydantic.BaseModel]) -> dict[str, Any]:
+    """Return a bounded identity for a Pydantic model used by ``call_validated``.
+
+    Model classes are resolved from the node AST, but they need not live below a
+    configured ``source_dirs`` root.  The node source and ``libs`` digest therefore
+    cannot be relied on to notice a schema or validator edit.  Pydantic's JSON
+    schema covers the public validation contract; the normalized class source also
+    covers validators and defaults whose behavior is not represented in that schema.
+    """
+    module = _safe_runtime_attribute(model, "__module__")
+    qualname = _safe_runtime_attribute(model, "__qualname__")
+    identity: dict[str, Any] = {
+        "module": module if isinstance(module, str) else None,
+        "qualname": qualname if isinstance(qualname, str) else None,
+    }
+    try:
+        identity["schema"] = model.model_json_schema()
+    except Exception:
+        identity["schema"] = None
+    try:
+        source = textwrap.dedent(inspect.getsource(model))
+    except (OSError, TypeError):
+        source = None
+    if source is not None:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            identity["source_sha256"] = sha(source)
+        else:
+            normalized = _DocstringStripper().visit(tree)
+            identity["source_sha256"] = sha(
+                ast.dump(normalized, annotate_fields=True, include_attributes=False)
+            )
+    else:
+        identity["source_sha256"] = None
+    return identity
+
+
+def _is_pydantic_model_class(value: Any) -> bool:
+    """Recognize BaseModel subclasses without invoking a custom metaclass."""
+    if not _is_class(value):
+        return False
+    mro = _safe_type_mro(value)
+    return mro is not None and any(owner is pydantic.BaseModel for owner in mro)
+
+
+def _pydantic_model_runtime_material(model: type[pydantic.BaseModel]) -> dict[str, Any]:
+    """Keep an out-of-source Pydantic model in the runtime global identity."""
+    return {"type": "pydantic-model", **_validated_model_cache_identity(model)}
 
 
 def _read_run_metadata(
@@ -8308,13 +8428,16 @@ class _StaticLibsAnalyzer:
 
         value_type = value if _is_class(value) else type(value)
         owners: list[type[Any]] = []
-        raw_mro = _safe_type_mro(value_type)
-        if raw_mro is not None:
-            owners.extend(raw_mro)
-        if _is_class(value):
-            metaclass_mro = _safe_type_mro(type(value))
-            if metaclass_mro is not None:
-                owners.extend(metaclass_mro)
+        if _is_pydantic_model_class(value):
+            owners.append(value)
+        else:
+            raw_mro = _safe_type_mro(value_type)
+            if raw_mro is not None:
+                owners.extend(raw_mro)
+            if _is_class(value):
+                metaclass_mro = _safe_type_mro(type(value))
+                if metaclass_mro is not None:
+                    owners.extend(metaclass_mro)
 
         functions: list[Callable[..., Any]] = []
         seen: set[int] = set()
@@ -8538,11 +8661,14 @@ class _StaticLibsAnalyzer:
             if has_configured_provenance:
                 state = _transactional_runtime_state_material(current, state_context)
                 if state is _UNREPRESENTABLE_RUNTIME_STATE:
-                    uncacheable[0] = True
-                    state = {
-                        "type": "unrepresentable",
-                        "class": _runtime_type_identity(type(current)),
-                    }
+                    if _is_pydantic_model_class(current):
+                        state = _pydantic_model_runtime_material(current)
+                    else:
+                        uncacheable[0] = True
+                        state = {
+                            "type": "unrepresentable",
+                            "class": _runtime_type_identity(type(current)),
+                        }
                 owner_materials = [
                     owner
                     for callable_function in callable_functions
@@ -8646,7 +8772,9 @@ class _StaticLibsAnalyzer:
             has_configured_provenance = any(record[3] or record[4] for record in runtime_records)
             material = _transactional_runtime_state_material(value, state_context)
             if material is _UNREPRESENTABLE_RUNTIME_STATE:
-                if has_configured_provenance or all_globals_observable:
+                if _is_pydantic_model_class(value):
+                    material = _pydantic_model_runtime_material(value)
+                elif has_configured_provenance or all_globals_observable:
                     uncacheable[0] = True
                     material = {
                         "type": "unrepresentable",
@@ -8830,7 +8958,9 @@ class _StaticLibsAnalyzer:
                 )
                 value_material = _transactional_runtime_state_material(value, state_context)
                 if value_material is _UNREPRESENTABLE_RUNTIME_STATE:
-                    if has_configured_provenance or all_globals_observable:
+                    if _is_pydantic_model_class(value):
+                        value_material = _pydantic_model_runtime_material(value)
+                    elif has_configured_provenance or all_globals_observable:
                         uncacheable[0] = True
                         value_material = {
                             "type": "unrepresentable",

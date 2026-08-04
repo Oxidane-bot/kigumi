@@ -29,7 +29,8 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 1. L1 键等于 `sha({messages, model=resolved 后模型, params(调用方原样,传输层归一化不回写), seed})`；当请求带有非默认 `ResponseSpec` 时，键额外绑定其格式与 `schema_sha256`；`seed` 只是键命名空间，不发给供应商。
 2. L3 成分标签固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<t>`、
    `prompt_specs:<name>`、`files:<p>`、`params`、`item`、`item_files:<p>`、`carry`、
-   `kigumi`，声明外部指纹时额外且仅额外出现
+   `kigumi`；引用 `call_validated` 检测到的 Pydantic 模型时额外出现
+   `validated_models`，声明外部指纹时额外且仅额外出现
    `external=sha(external_fingerprint)`；普通依赖边默认取完整上游产物摘要，声明
    `consumes[dep]` 时同一 `upstream:<dep>` 标签改取 canonical 投影视图摘要，不新增标签；
    推导单点在 `dag._key_components`，原始指纹不落盘。
@@ -94,6 +95,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    这种保守 false positive 是有意的：扩大输入可以多失效，但不能用未覆盖的反射路径复用
    陈旧产物。该规则是源码 AST 分析边界，不宣称覆盖整个 Python 运行时或任意外部/native
    代码。
+   `validated_models` 对每个检测到的模型绑定限定模块名、限定类名、JSON schema 与规范化的
+   可见类源码摘要；模型位于 `source_dirs` 之外时也不能从键中静默消失。运行时展开 Pydantic
+   metaclass 的不可表示状态时，缓存身份使用同一受限模型摘要，不因此关闭整个节点的 L3 复用。
 5. `cache="auto"|"refresh"|"off"` 只控制 L3 读写，不是键成分；force 只旁路本次读取。
    refresh/off 仍计算确定性 key components/cache_key 供 provenance 与 explain。若 `libs` fallback
    遇到不可安全/有限表示的运行时状态、完整 globals namespace 观察或遍历预算耗尽，框架内部把

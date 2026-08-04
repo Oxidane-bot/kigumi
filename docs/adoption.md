@@ -63,7 +63,25 @@ agent_slots = 1                  # 外部 Agent 默认全局串行
 agent_lock_dir = "artifacts/_locks/agents"
 agent_slot_timeout_seconds = 300
 dag_entry = "nodes.graph:build_dag"  # 图命令的入口；不声明则只有项目运维命令可用
+
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"           # 相对 project_root 的 Agent Capsule 目录
+runtime = "pi"
+expected_version = "0.83.0"
+# command = ["pi"]                  # 默认值
+# session_carry = false              # 默认值
+# session_max_bytes = 2097152        # 默认沿用 PiRpcAdapter
 ```
+
+`agent_profiles` 是项目级的一次性绑定表：节点只需引用 `profile="writer"`，不必重复构造
+`AgentSpec` 和 `PiRpcAdapter`。`capsule`、`runtime`、`expected_version` 是必填项；当前
+`runtime` 只接受 `pi`，`command` 默认是 `["pi"]`，session 选项默认关闭。profile 不接受
+密钥或 `extra_config_files`；需要每个 DAG 自己解析环境或注入额外配置时，仍可显式传入
+`adapter=` 与 `spec=`，这也是保留的 escape hatch。
+
+项目配置只负责把名字绑定到运行时和 Capsule。Capsule 内的 `agent.toml` 仍是 provider、model、
+thinking、system prompt、tools、skills、hooks 和 limits 的唯一来源；修改这些内容会由
+`AgentSpec.load()` 内容寻址并进入 Agent 节点的既有缓存身份。profile 名本身不会额外进入缓存身份。
 
 `dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
 `check` / `graph` / `profile` / `resume` / `retry-resolve` / `recover` 要读内存里的图，而节点是靠
@@ -1547,21 +1565,15 @@ symlink、重复资源、credential 和 `bash|shell|terminal` 会在 `AgentSpec.
 from kigumi import (
     AgentFileSelector,
     AgentPublish,
-    AgentSpec,
     AgentTask,
     EvidencePolicy,
-    PiRpcAdapter,
     RetryPolicy,
 )
-
-spec = AgentSpec.load("agents/writer")
-adapter = PiRpcAdapter(("pi",), expected_version="0.82.1")
 
 
 @dag.agent(
     "draft",
-    adapter=adapter,
-    spec=spec,
+    profile="writer",
     deps=("brief",),
     files=("source/brief.md",),
     evidence_policy=EvidencePolicy(
@@ -1580,27 +1592,29 @@ def draft(inputs, ctx):
     )
 ```
 
-Pi 由用户显式安装。adapter 先运行 `pi --version` 并与 `expected_version` 精确匹配，不自动安装
+Pi 由用户显式安装。profile 解析出的 adapter 先运行 `pi --version` 并与 `expected_version`
+精确匹配，不自动安装
 或升级 Node/Pi。运行参数默认关闭 session，并始终关闭 project context、隐式资源发现和
 built-in tools，只加载 staged capsule 与 Kigumi bridge。bridge 的同名文件工具把模型访问限定
 到 workspace；可信 Extension 仍有宿主进程权限，因此这些限制与 staging workspace 都
 **不是 OS sandbox**。
 
-需要线性多轮修订时使用 `agent_scan`，把 session 当作 carry 值：
+需要线性多轮修订时，在项目配置中为同一个 Capsule 注册一个开启 session 的 profile，再使用
+`agent_scan` 把 session 当作 carry 值：
+
+```toml
+[tool.kigumi.agent_profiles.reviser]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+session_carry = true
+session_max_bytes = 2097152
+```
 
 ```python
-session_adapter = PiRpcAdapter(
-    ("pi",),
-    expected_version="0.82.1",
-    session_carry=True,
-    session_max_bytes=2 * 1024 * 1024,
-)
-
-
 @dag.agent_scan(
     "revise",
-    adapter=session_adapter,
-    spec=spec,
+    profile="reviser",
     items_from=("drafts", "items"),
     key_fn=lambda item: item["id"],
     carry_fn=lambda artifact: artifact["session"],

@@ -33,6 +33,7 @@ from kigumi.agents import (
     AgentTask,
 )
 from kigumi.bench import AgentSubject, TrialContext
+from kigumi.failures import AgentRuntimeFailureSubCode
 from kigumi.pi import PiRpcAdapter, normalize_pi_trajectory_event
 from kigumi.store import gc_artifacts
 from tests._dag_helpers import _make_dag
@@ -547,6 +548,19 @@ def _failing_pi(path: Path) -> Path:
                 print(json.dumps(submitted), flush=True)
                 print(json.dumps({"type": "agent_settled"}), flush=True)
                 raise SystemExit(9)
+            elif mode == "invalid_submit":
+                print(json.dumps(accepted), flush=True)
+                submitted = {
+                    "type": "tool_execution_end", "toolName": "submit_result",
+                    "result": {"details": {
+                        "completion": {
+                            "status": "completed", "summary": "done",
+                            "outputs": "not-a-list", "metrics": {},
+                        },
+                        "evidence": [],
+                    }},
+                }
+                print(json.dumps(submitted), flush=True)
             elif mode == "missing":
                 print(json.dumps(accepted), flush=True)
                 print(json.dumps({"type": "agent_settled"}), flush=True)
@@ -558,6 +572,12 @@ def _failing_pi(path: Path) -> Path:
                 }
                 print(json.dumps(request), flush=True)
                 sys.stdin.readline()
+            elif mode == "extension_error":
+                print(json.dumps(accepted), flush=True)
+                print(json.dumps({
+                    "type": "extension_error",
+                    "message": "Kigumi tools reject absolute paths",
+                }), flush=True)
             elif mode == "turns":
                 print(json.dumps(accepted), flush=True)
                 for _ in range(5):
@@ -905,6 +925,85 @@ def test_pi_rpc_adapter_extra_config_files_write_identity_and_secret_guard(
         )
     assert "endpoint.json" in str(raised.value)
     assert "fake-secret-value-not-real" not in str(raised.value)
+    assert raised.value.runtime_subcode is AgentRuntimeFailureSubCode.CONFIG_POLICY
+
+
+@pytest.mark.parametrize(
+    ("mode", "runtime_code", "runtime_subcode"),
+    (
+        (
+            "malformed",
+            AgentRuntimeFailureCode.PROTOCOL,
+            AgentRuntimeFailureSubCode.ENVELOPE,
+        ),
+        (
+            "interaction",
+            AgentRuntimeFailureCode.POLICY,
+            None,
+        ),
+        (
+            "extension_error",
+            AgentRuntimeFailureCode.POLICY,
+            AgentRuntimeFailureSubCode.BRIDGE_POLICY,
+        ),
+    ),
+)
+def test_pi_known_runtime_sources_keep_their_typed_subcode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    runtime_code: AgentRuntimeFailureCode,
+    runtime_subcode: AgentRuntimeFailureSubCode,
+) -> None:
+    spec = AgentSpec.load(_capsule(tmp_path / "agent"))
+    fake = _failing_pi(tmp_path / "fake-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    monkeypatch.setenv("FAKE_MODE", mode)
+
+    with pytest.raises(AgentExecutionFailure) as raised:
+        PiRpcAdapter((str(fake),), "1.2.3").run(
+            AgentRequest(AgentTask("write"), {}, spec),
+            AgentRunContext(
+                workspace,
+                capsule_root,
+                time.monotonic() + 5,
+                lambda event: None,
+                lambda name, data, media: None,
+            ),
+        )
+
+    assert raised.value.runtime_code is runtime_code
+    assert raised.value.runtime_subcode is runtime_subcode
+
+
+def test_pi_submit_result_validation_keeps_direct_result_error_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AgentSpec.load(_capsule(tmp_path / "agent"))
+    fake = _failing_pi(tmp_path / "fake-pi")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    monkeypatch.setenv("FAKE_MODE", "invalid_submit")
+
+    with pytest.raises(AgentResultError) as raised:
+        PiRpcAdapter((str(fake),), "1.2.3").run(
+            AgentRequest(AgentTask("write"), {}, spec),
+            AgentRunContext(
+                workspace,
+                capsule_root,
+                time.monotonic() + 5,
+                lambda event: None,
+                lambda name, data, media: None,
+            ),
+        )
+
+    assert raised.value.runtime_subcode is AgentRuntimeFailureSubCode.SUBMIT_CONTRACT
 
 
 def test_pi_rpc_adapter_session_carry_uses_explicit_file_and_normalizes_cwd(

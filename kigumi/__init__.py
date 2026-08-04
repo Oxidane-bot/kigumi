@@ -90,6 +90,7 @@ from .evidence import EvidenceMode, EvidencePolicy
 from .failures import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
+    AgentRuntimeFailureSubCode,
     ProviderFailure,
     ProviderFailureKind,
     ProviderFailureStage,
@@ -157,6 +158,7 @@ __all__ = [
     "AgentError",
     "AgentExecutionFailure",
     "AgentRuntimeFailureCode",
+    "AgentRuntimeFailureSubCode",
     "AgentFileSelector",
     "AgentLimits",
     "AgentPublish",

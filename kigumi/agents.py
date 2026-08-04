@@ -31,8 +31,10 @@ from .evidence import EvidenceMode, EvidencePolicy, capture_evidence, scrub_evid
 from .failures import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
+    AgentRuntimeFailureSubCode,
     ProviderFailure,
     canonical_failure,
+    runtime_code_for_subcode,
 )
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
 
@@ -51,6 +53,36 @@ class AgentCapabilityError(AgentError):
 
 class AgentResultError(AgentError):
     """Raised when an adapter result or captured artifact violates the contract."""
+
+
+class AgentRuntimeResultError(AgentResultError):
+    """An adapter-facing result error with a closed runtime source detail.
+
+    It intentionally remains an ``AgentResultError`` so direct adapter callers
+    keep the existing exception boundary. ``execute_agent_task`` promotes the
+    closed metadata into the durable ``AgentExecutionFailure`` shape.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        runtime_subcode: AgentRuntimeFailureSubCode,
+        runtime_code: AgentRuntimeFailureCode | None = None,
+    ) -> None:
+        if not isinstance(runtime_subcode, AgentRuntimeFailureSubCode):
+            raise TypeError("runtime_subcode must be AgentRuntimeFailureSubCode")
+        expected_code = runtime_code_for_subcode(runtime_subcode)
+        if runtime_code is None:
+            runtime_code = expected_code
+        elif runtime_code is not expected_code:
+            raise ValueError(
+                f"runtime_subcode {runtime_subcode.value!r} requires "
+                f"runtime_code {expected_code.value!r}"
+            )
+        self.runtime_code = runtime_code
+        self.runtime_subcode = runtime_subcode
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -1045,7 +1077,10 @@ def execute_agent_task(
         if not isinstance(result, AgentRunResult) or not isinstance(
             result.completion, AgentCompletion
         ):
-            raise AgentResultError(f"Agent node {node_name!r} returned an invalid result")
+            raise AgentRuntimeResultError(
+                f"Agent node {node_name!r} returned an invalid result",
+                runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
+            )
         attachments = _collect(workspace, task.collect, limits, blob_store)
         files: dict[str, str] = {}
         published: list[dict[str, Any]] = []
@@ -1053,19 +1088,25 @@ def execute_agent_task(
         completion_outputs = set(result.completion.outputs)
         unknown_outputs = completion_outputs - set(by_path)
         if unknown_outputs:
-            raise AgentResultError(
-                "Agent completion outputs were not collected: " + ", ".join(sorted(unknown_outputs))
+            raise AgentRuntimeResultError(
+                "Agent completion outputs were not collected: "
+                + ", ".join(sorted(unknown_outputs)),
+                runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
             )
         missing_publications = {mapping.source for mapping in task.publish} - completion_outputs
         if missing_publications:
-            raise AgentResultError(
+            raise AgentRuntimeResultError(
                 "Agent completion outputs do not cover publish sources: "
-                + ", ".join(sorted(missing_publications))
+                + ", ".join(sorted(missing_publications)),
+                runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
             )
         for mapping in task.publish:
             attachment = by_path.get(mapping.source)
             if attachment is None:
-                raise AgentResultError(f"Agent publish source {mapping.source!r} was not collected")
+                raise AgentRuntimeResultError(
+                    f"Agent publish source {mapping.source!r} was not collected",
+                    runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
+                )
             data = blob_store.read_verified(attachment["kigumi_attachment"])
             try:
                 text = data.decode("utf-8")
@@ -1102,7 +1143,13 @@ def execute_agent_task(
             artifact["files"] = files
         if session_reference is not None:
             artifact["session"] = session_reference
-        validate_agent_artifact(artifact, blob_store)
+        try:
+            validate_agent_artifact(artifact, blob_store)
+        except AgentResultError as error:
+            raise AgentRuntimeResultError(
+                str(error),
+                runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
+            ) from error
         duration_seconds = time.monotonic() - started
         trajectory = _capture_trajectory(
             events,
@@ -1142,6 +1189,11 @@ def execute_agent_task(
             typed_error = error
         elif isinstance(error, ProviderFailure):
             typed_error = AgentExecutionFailure(provider_failure=error)
+        elif isinstance(error, AgentRuntimeResultError):
+            typed_error = AgentExecutionFailure(
+                runtime_code=error.runtime_code,
+                runtime_subcode=error.runtime_subcode,
+            )
         else:
             typed_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.PROTOCOL)
         failure = {

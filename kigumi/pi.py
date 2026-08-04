@@ -27,10 +27,12 @@ from .agents import (
     AgentResultError,
     AgentRunContext,
     AgentRunResult,
+    AgentRuntimeResultError,
 )
 from .failures import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
+    AgentRuntimeFailureSubCode,
     ProviderFailure,
     ProviderFailureKind,
     ProviderFailureStage,
@@ -42,7 +44,9 @@ class _PiFailureCode(StrEnum):
     CONNECTION = "connection"
     MODEL_NOT_ADMITTED = "model_not_admitted"
     POLICY_VIOLATION = "policy_violation"
+    BRIDGE_POLICY_VIOLATION = "bridge_policy_violation"
     MALFORMED_RESPONSE_ENVELOPE = "malformed_response_envelope"
+    SUBMIT_RESULT_CONTRACT = "submit_result_contract"
     PROVIDER_FAILURE_UNCLASSIFIED = "provider_failure_unclassified"
     PI_SPAWN_NOT_FOUND = "pi_spawn_not_found"
     PI_SPAWN_PERMISSION = "pi_spawn_permission"
@@ -56,12 +60,19 @@ _PI_PROVIDER: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 _PI_RUNTIME_CODES = {
     _PiFailureCode.POLICY_VIOLATION: AgentRuntimeFailureCode.POLICY,
+    _PiFailureCode.BRIDGE_POLICY_VIOLATION: AgentRuntimeFailureCode.POLICY,
     _PiFailureCode.MALFORMED_RESPONSE_ENVELOPE: AgentRuntimeFailureCode.PROTOCOL,
+    _PiFailureCode.SUBMIT_RESULT_CONTRACT: AgentRuntimeFailureCode.PROTOCOL,
     _PiFailureCode.PI_SPAWN_NOT_FOUND: AgentRuntimeFailureCode.SPAWN_NOT_FOUND,
     _PiFailureCode.PI_SPAWN_PERMISSION: AgentRuntimeFailureCode.SPAWN_PERMISSION,
     _PiFailureCode.PI_SPAWN_FAILURE: AgentRuntimeFailureCode.SPAWN_FAILURE,
     _PiFailureCode.PI_PROCESS_EXIT: AgentRuntimeFailureCode.PROCESS_EXIT,
     _PiFailureCode.PI_VERSION_MISMATCH: AgentRuntimeFailureCode.VERSION_MISMATCH,
+}
+_PI_RUNTIME_SUBCODES = {
+    _PiFailureCode.BRIDGE_POLICY_VIOLATION: AgentRuntimeFailureSubCode.BRIDGE_POLICY,
+    _PiFailureCode.MALFORMED_RESPONSE_ENVELOPE: AgentRuntimeFailureSubCode.ENVELOPE,
+    _PiFailureCode.SUBMIT_RESULT_CONTRACT: AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
 }
 _PI_PROVIDER_KINDS = {
     _PiFailureCode.TIMEOUT: ProviderFailureKind.TIMEOUT,
@@ -74,7 +85,10 @@ _PI_PROVIDER_KINDS = {
 def _pi_failure(code: _PiFailureCode) -> AgentExecutionFailure:
     runtime_code = _PI_RUNTIME_CODES.get(code)
     if runtime_code is not None:
-        return AgentExecutionFailure(runtime_code=runtime_code)
+        return AgentExecutionFailure(
+            runtime_code=runtime_code,
+            runtime_subcode=_PI_RUNTIME_SUBCODES.get(code),
+        )
     kind = _PI_PROVIDER_KINDS[code]
     digest = hashlib.sha256(f"pi:{code.value}".encode()).hexdigest()
     return AgentExecutionFailure(
@@ -233,8 +247,9 @@ class PiRpcAdapter:
             for name in sorted(self.extra_config_files):
                 contents = self.extra_config_files[name]
                 if any(secret.encode() in contents for secret in secrets):
-                    raise AgentResultError(
-                        f"Pi extra config file {name!r} contains a resolved env value"
+                    raise AgentRuntimeResultError(
+                        f"Pi extra config file {name!r} contains a resolved env value",
+                        runtime_subcode=AgentRuntimeFailureSubCode.CONFIG_POLICY,
                     )
             for name in sorted(self.extra_config_files):
                 contents = self.extra_config_files[name]
@@ -350,7 +365,10 @@ class PiRpcAdapter:
                     raise _pi_failure(_PiFailureCode.CONNECTION)
                 if chunk is None:
                     if buffer:
-                        raise AgentResultError("Pi RPC stdout ended with a partial JSONL record")
+                        raise AgentRuntimeResultError(
+                            "Pi RPC stdout ended with a partial JSONL record",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                        )
                     if not settled:
                         raise _pi_failure(_PiFailureCode.PI_PROCESS_EXIT)
                     break
@@ -362,11 +380,20 @@ class PiRpcAdapter:
                     raw_line = bytes(buffer[:newline])
                     del buffer[: newline + 1]
                     if len(raw_line) + 1 > request.spec.limits.rpc_max_bytes:
-                        raise AgentResultError("Pi RPC record exceeds rpc_max_bytes")
+                        raise AgentRuntimeResultError(
+                            "Pi RPC record exceeds rpc_max_bytes",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                        )
                     if raw_line.endswith(b"\r"):
-                        raise AgentResultError("Pi RPC stdout must use strict LF framing")
+                        raise AgentRuntimeResultError(
+                            "Pi RPC stdout must use strict LF framing",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                        )
                     if not raw_line:
-                        raise AgentResultError("Pi RPC stdout contains an empty JSONL record")
+                        raise AgentRuntimeResultError(
+                            "Pi RPC stdout contains an empty JSONL record",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                        )
                     event = _decode_event(raw_line)
                     event_type = event.get("type")
                     if event_type in {"message_start", "message_update", "message_end"} and (
@@ -381,11 +408,15 @@ class PiRpcAdapter:
                         evidence_line,
                         request.spec.limits.rpc_max_bytes,
                     ):
-                        raise AgentResultError("Pi RPC evidence exceeds rpc_max_bytes")
+                        raise AgentRuntimeResultError(
+                            "Pi RPC evidence exceeds rpc_max_bytes",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                        )
                     context.emit_event(normalized_event)
                     if request.spec.thinking == "off" and thinking_events:
-                        raise AgentResultError(
-                            "Pi emitted thinking content while AgentSpec thinking=off"
+                        raise AgentRuntimeResultError(
+                            "Pi emitted thinking content while AgentSpec thinking=off",
+                            runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
                         )
                     if event_type == "response" and event.get("id") == prompt_id:
                         if event.get("command") != "prompt" or event.get("success") is not True:
@@ -403,11 +434,9 @@ class PiRpcAdapter:
                                 },
                             )
                         raise _pi_failure(_PiFailureCode.POLICY_VIOLATION)
-                    elif event_type in {
-                        "extension_error",
-                        "auto_retry_start",
-                        "auto_retry_end",
-                    }:
+                    elif event_type == "extension_error":
+                        raise _pi_failure(_PiFailureCode.BRIDGE_POLICY_VIOLATION)
+                    elif event_type in {"auto_retry_start", "auto_retry_end"}:
                         raise _pi_failure(_PiFailureCode.POLICY_VIOLATION)
                     elif event_type == "turn_start":
                         turns += 1
@@ -425,20 +454,26 @@ class PiRpcAdapter:
                         and event.get("toolName") == "submit_result"
                     ):
                         if event.get("isError") is True or completion is not None:
-                            raise _pi_failure(_PiFailureCode.MALFORMED_RESPONSE_ENVELOPE)
+                            raise _pi_failure(_PiFailureCode.SUBMIT_RESULT_CONTRACT)
                         details = event.get("result")
                         details = details.get("details") if isinstance(details, Mapping) else None
                         if not isinstance(details, Mapping) or not isinstance(
                             details.get("completion"), Mapping
                         ):
-                            raise _pi_failure(_PiFailureCode.MALFORMED_RESPONSE_ENVELOPE)
+                            raise _pi_failure(_PiFailureCode.SUBMIT_RESULT_CONTRACT)
                         completion_value = _redact_payload(details["completion"], secrets)
-                        completion = AgentCompletion.from_mapping(completion_value)
+                        try:
+                            completion = AgentCompletion.from_mapping(completion_value)
+                        except AgentResultError as error:
+                            raise AgentRuntimeResultError(
+                                _redact_text(str(error), secrets),
+                                runtime_subcode=AgentRuntimeFailureSubCode.SUBMIT_CONTRACT,
+                            ) from error
                         evidence_value = details.get("evidence", [])
                         if not isinstance(evidence_value, list) or not all(
                             isinstance(item, Mapping) for item in evidence_value
                         ):
-                            raise _pi_failure(_PiFailureCode.MALFORMED_RESPONSE_ENVELOPE)
+                            raise _pi_failure(_PiFailureCode.SUBMIT_RESULT_CONTRACT)
                         hook_evidence = _redact_payload(evidence_value, secrets)
                     elif event_type == "message_end":
                         message = event.get("message")
@@ -502,7 +537,10 @@ class PiRpcAdapter:
                     elif event_type == "agent_settled":
                         settled = True
                 if len(buffer) > request.spec.limits.rpc_max_bytes:
-                    raise AgentResultError("Pi RPC record exceeds rpc_max_bytes")
+                    raise AgentRuntimeResultError(
+                        "Pi RPC record exceeds rpc_max_bytes",
+                        runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
+                    )
             if not prompt_accepted:
                 raise _pi_failure(_PiFailureCode.MALFORMED_RESPONSE_ENVELOPE)
             if completion is None:
@@ -515,7 +553,13 @@ class PiRpcAdapter:
                 return_code = None
             if return_code not in {None, 0}:
                 raise _pi_failure(_PiFailureCode.PI_PROCESS_EXIT)
-            _assert_workspace_secrets_absent(context.workspace, secrets)
+            try:
+                _assert_workspace_secrets_absent(context.workspace, secrets)
+            except AgentResultError as error:
+                raise AgentRuntimeResultError(
+                    str(error),
+                    runtime_subcode=AgentRuntimeFailureSubCode.CONFIG_POLICY,
+                ) from error
             if session_file is not None:
                 if not session_file.is_file():
                     raise AgentResultError("Pi did not persist the requested session")
@@ -525,7 +569,10 @@ class PiRpcAdapter:
                 if len(session_data) > self.session_max_bytes:
                     raise AgentResultError("Pi session output exceeds session_max_bytes")
                 if any(secret.encode("utf-8") in session_data for secret in secrets):
-                    raise AgentResultError("Pi session contains provider credential bytes")
+                    raise AgentRuntimeResultError(
+                        "Pi session contains provider credential bytes",
+                        runtime_subcode=AgentRuntimeFailureSubCode.CONFIG_POLICY,
+                    )
                 assert context.record_session is not None
                 context.record_session(session_data)
             return AgentRunResult(
@@ -546,7 +593,14 @@ class PiRpcAdapter:
         except AgentExecutionFailure:
             raise
         except AgentResultError as error:
-            raise AgentResultError(_redact_text(str(error), secrets)) from None
+            redacted = _redact_text(str(error), secrets)
+            if isinstance(error, AgentRuntimeResultError):
+                raise AgentRuntimeResultError(
+                    redacted,
+                    runtime_code=error.runtime_code,
+                    runtime_subcode=error.runtime_subcode,
+                ) from None
+            raise AgentResultError(redacted) from None
         except ConnectionError:
             raise _pi_failure(_PiFailureCode.CONNECTION) from None
         except Exception as error:

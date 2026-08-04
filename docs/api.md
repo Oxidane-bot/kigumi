@@ -108,10 +108,11 @@ timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上�
   当前具体子类 `AgentCapabilityError` 与 `AgentResultError` 不从顶层导出。前者表示 task 请求
   adapter 不具备的 capability，后者表示 adapter result、attachment/session 或 canonical
   artifact 违反契约；修正 capsule/task/adapter，不要当作 provider transient failure 重试。
-- `AgentExecutionFailure(*, provider_failure: ProviderFailure | None = None, runtime_code: AgentRuntimeFailureCode | None = None) -> None`
+- `AgentExecutionFailure(*, provider_failure: ProviderFailure | None = None, runtime_code: AgentRuntimeFailureCode | None = None, runtime_subcode: AgentRuntimeFailureSubCode | None = None) -> None`
   （`kigumi.failures`，顶层导出）：Agent 执行恰好产生一个 provider failure 或一个封闭的
-  runtime code。检查 `provider_failure` / `runtime_code` 与 origin evidence；只有声明的
-  provider kind 可自动 retry，runtime failure 默认需修配置或人工处置。见
+  runtime code；已知的 envelope、bridge policy、submit contract、config policy 细节会以
+  `runtime_subcode` 保留。检查 `provider_failure` / `runtime_code` / `runtime_subcode` 与
+  origin evidence；只有声明的 provider kind 可自动 retry，runtime failure 默认需修配置或人工处置。见
   [Agent node 契约](contracts/agent-node.md)与 [Failure 契约](contracts/failure.md)。
 
 ## 枚举与策略值
@@ -172,6 +173,15 @@ timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上�
 - `CAPACITY = "capacity"`
 
 这些值只描述非 provider 的 Agent runtime 失败，见 [Failure 契约](contracts/failure.md)。
+
+`AgentRuntimeFailureSubCode(StrEnum)` 定义于 `kigumi.failures` 并从顶层导出：
+
+- `ENVELOPE = "envelope"`：RPC/响应信封或 framing 违约，映射到 `PROTOCOL`。
+- `BRIDGE_POLICY = "bridge_policy"`：Pi bridge 扩展策略违约，映射到 `POLICY`。
+- `SUBMIT_CONTRACT = "submit_contract"`：Agent completion 提交契约违约，映射到 `PROTOCOL`。
+- `CONFIG_POLICY = "config_policy"`：受限配置或 workspace policy 违约，映射到 `POLICY`。
+
+未知异常不生成 sub-code，只保留通用 runtime failure 的受限摘要。
 
 ### Retry schedule
 

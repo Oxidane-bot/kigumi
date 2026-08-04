@@ -87,6 +87,102 @@ def test_unknown_config_key_fails_loudly(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+def test_load_config_parses_agent_profiles_and_pi_defaults(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+
+    assert config is not None
+    profile = config.agent_profiles["writer"]
+    assert profile.capsule == "agents/writer"
+    assert profile.runtime == "pi"
+    assert profile.command == ("pi",)
+    assert profile.expected_version == "0.83.0"
+    assert profile.session_carry is False
+    assert profile.session_max_bytes == 2 * 1024 * 1024
+
+
+def test_agent_profile_config_accepts_explicit_runtime_options(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.reviewer]
+capsule = "agents/reviewer"
+runtime = "pi"
+command = ["pi", "--verbose"]
+expected_version = "0.83.1"
+session_carry = true
+session_max_bytes = 4096
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+
+    assert config is not None
+    profile = config.agent_profiles["reviewer"]
+    assert profile.command == ("pi", "--verbose")
+    assert profile.session_carry is True
+    assert profile.session_max_bytes == 4096
+
+
+def test_agent_profile_config_rejects_unknown_keys_and_invalid_types(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+extra_config_files = {}
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown Agent profile configuration keys"):
+        load_config(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+command = "pi"
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Agent profile command"):
+        load_config(tmp_path)
+
+
+def test_agent_profile_config_rejects_empty_names_and_non_pi_runtime(tmp_path: Path) -> None:
+    valid = {
+        "capsule": "agents/writer",
+        "runtime": "pi",
+        "expected_version": "0.83.0",
+    }
+    with pytest.raises(ValueError, match="Agent profile names"):
+        KigumiConfig(project_root=tmp_path, agent_profiles={"": valid})
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "other"
+expected_version = "0.83.0"
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match='Agent profile runtime must be "pi"'):
+        load_config(tmp_path)
+
+
 def test_load_env_fills_only_missing_process_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
