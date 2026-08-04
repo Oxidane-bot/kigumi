@@ -242,7 +242,9 @@ class BlobStore:
         if target_info is not None and stat.S_ISREG(target_info.st_mode):
             target_digest, target_size = _file_digest_and_size(target)
             if target_size == size and target_digest == digest:
-                return
+                same_inode = (target_info.st_dev, target_info.st_ino) == identity[:2]
+                if not same_inode:
+                    return
         temporary = self._temporary_destination(target)
         try:
             with (

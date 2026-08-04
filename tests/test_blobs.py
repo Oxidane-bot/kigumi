@@ -198,6 +198,23 @@ def test_read_verified_accepts_a_hardlink_blob(tmp_path: Path) -> None:
     assert BlobStore(root).read_verified(digest) == data
 
 
+def test_materialize_same_digest_breaks_a_hardlink_alias(tmp_path: Path) -> None:
+    data = b"hardlink materialization payload"
+    store = BlobStore(tmp_path / "blobs")
+    digest = store.put(data)
+    destination = tmp_path / "output.bin"
+    try:
+        destination.hardlink_to(store.root / digest)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support hardlinks: {error}")
+
+    store.materialize(digest, destination)
+    assert os.stat(destination).st_ino != os.stat(store.root / digest).st_ino
+    destination.write_bytes(b"modified output")
+
+    assert store.read_verified(digest) == data
+
+
 def test_put_rejects_a_symlink_destination(tmp_path: Path) -> None:
     data = b"symlink destination payload"
     target = tmp_path / "target.bin"
