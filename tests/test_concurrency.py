@@ -164,6 +164,46 @@ def test_l1_reader_accepts_replacement_after_old_descriptor_is_open(
     assert caller.transport.requests == []
 
 
+@pytest.mark.parametrize("mutation_phase", ("before_open", "after_open"))
+def test_l1_reader_rejects_complete_in_place_mutation_around_open(
+    tmp_path: Path, monkeypatch: Any, mutation_phase: str
+) -> None:
+    """A self-consistent rewrite of the same inode is never a cache hit."""
+    import kigumi._safe_io as safe_io
+
+    key = "cache-key"
+    path = tmp_path / "llm" / f"{key}.json"
+    original_payload = {
+        "meta": {"key": key},
+        "response": "original response",
+        "response_sha256": sha("original response"),
+    }
+    tampered_payload = {
+        "meta": {"key": key},
+        "response": "tampered but self-consistent response",
+        "response_sha256": sha("tampered but self-consistent response"),
+    }
+    atomic_write_json(path, original_payload)
+    original_inode = path.stat().st_ino
+    original_open = safe_io._open_regular_file_at
+
+    def mutate_around_open(directory, name, **kwargs):
+        if name == path.name and mutation_phase == "before_open":
+            path.write_text(json.dumps(tampered_payload), encoding="utf-8")
+        handle = original_open(directory, name, **kwargs)
+        if name == path.name and mutation_phase == "after_open":
+            path.write_text(json.dumps(tampered_payload), encoding="utf-8")
+        return handle
+
+    monkeypatch.setattr(safe_io, "_open_regular_file_at", mutate_around_open)
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    assert "changed" in (lookup.reason or "")
+    assert path.stat().st_ino == original_inode
+
+
 def test_l1_reader_rejects_in_place_truncation_after_read(tmp_path: Path, monkeypatch: Any) -> None:
     """An in-place truncation is not an atomic replacement and stays corrupt."""
     import kigumi._safe_io as safe_io

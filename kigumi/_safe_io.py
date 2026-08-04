@@ -23,6 +23,7 @@ _ORIGINAL_OS_STAT = os.stat
 _ORIGINAL_OS_UNLINK = os.unlink
 _ORIGINAL_OS_RMDIR = os.rmdir
 _ORIGINAL_OS_FSTAT = os.fstat
+_ATOMIC_REPLACE_MAX_ATTEMPTS = 4
 
 # macOS exposes these directories as root-level symlinks.  They are stable
 # system aliases, unlike a symlink introduced anywhere inside a project path.
@@ -552,25 +553,96 @@ def _read_regular_bytes_allowing_atomic_replace(
     phase: str,
     error: FileError,
 ) -> bytes:
-    """Read a complete cache descriptor while tolerating an atomic path swap."""
+    """Read a complete cache descriptor while tolerating an atomic path swap.
+
+    The path entry is sampled before every open and that identity is bound to
+    the descriptor.  A mismatch is retryable only when the path now names a
+    different regular inode, which is the shape produced by an atomic
+    replacement.  A changed identity on the same inode is never retried: it
+    is an in-place mutation, including one that happened between ``open`` and
+    the first descriptor check.
+    """
     with SecureDirectory(path.parent, create=False) as directory:
-        handle = _open_regular_file_at(
-            directory,
-            path.name,
-            identity=identity,
-            expected_identity=expected_identity,
-            phase=phase,
-            error=error,
-        )
-        try:
-            initial = verify_regular_descriptor(
-                handle,
-                path,
-                identity=identity,
-                expected_identity=expected_identity,
-                phase=phase,
-                error=error,
+        handle: BinaryIO | None = None
+        opened_identity: FileIdentity | None = None
+        initial: os.stat_result | None = None
+        for attempt in range(_ATOMIC_REPLACE_MAX_ATTEMPTS):
+            before = directory.stat(path.name)
+            if stat.S_ISLNK(before.st_mode):
+                raise error("must not be a symlink", path)
+            if not stat.S_ISREG(before.st_mode):
+                raise error("must reference a regular file", path)
+            bound_identity = (
+                expected_identity if expected_identity is not None else identity(before)
             )
+            try:
+                handle = _open_regular_file_at(
+                    directory,
+                    path.name,
+                    identity=identity,
+                    expected_identity=bound_identity,
+                    phase=phase,
+                    error=error,
+                )
+            except (OSError, ValueError) as opening_error:
+                # Re-stat through the already-bound directory.  If the entry
+                # became another regular inode, retry the finite race window;
+                # if it is still this inode, the identity mismatch is an
+                # in-place mutation and must fail closed.
+                current = directory.stat(path.name)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                    and attempt + 1 < _ATOMIC_REPLACE_MAX_ATTEMPTS
+                ):
+                    continue
+                raise opening_error
+            opened_identity = bound_identity
+            try:
+                initial = verify_regular_descriptor(
+                    handle,
+                    path,
+                    identity=identity,
+                    expected_identity=opened_identity,
+                    phase=phase,
+                    error=error,
+                )
+            except (OSError, ValueError) as initial_error:
+                # The old descriptor can be unlinked by a legitimate atomic
+                # replacement after open but before this first check.  Retry
+                # only that shape; an identity change while the same inode is
+                # still named is an in-place mutation.
+                try:
+                    current = directory.stat(path.name)
+                    descriptor = os.fstat(handle.fileno())
+                    atomically_replaced = (
+                        stat.S_ISREG(current.st_mode)
+                        and (current.st_dev, current.st_ino)
+                        != (descriptor.st_dev, descriptor.st_ino)
+                        and descriptor.st_nlink == 0
+                        and before.st_nlink > 0
+                        and descriptor.st_size == before.st_size
+                        and descriptor.st_mtime_ns == before.st_mtime_ns
+                    )
+                except BaseException:
+                    handle.close()
+                    handle = None
+                    raise
+                if atomically_replaced:
+                    # The descriptor is still a complete snapshot of the old
+                    # cache entry.  Its ctime/link-count changed only because
+                    # the directory entry was atomically unlinked, so retain
+                    # it instead of turning a valid old payload into CORRUPT.
+                    initial = descriptor
+                    break
+                handle.close()
+                handle = None
+                raise initial_error
+            else:
+                break
+        if handle is None or opened_identity is None or initial is None:
+            raise error(f"changed {phase}", path)
+        try:
             raw = handle.read()
             final = verify_regular_descriptor(
                 handle,
@@ -592,14 +664,23 @@ def _read_regular_bytes_allowing_atomic_replace(
             if not stat.S_ISREG(current.st_mode):
                 raise error("must reference a regular file", path)
 
-            same_inode = (current.st_dev, current.st_ino) == (
+            descriptor_still_named = (current.st_dev, current.st_ino) == (
                 final.st_dev,
                 final.st_ino,
             )
-            if same_inode and (
-                identity(final) != identity(initial) or identity(current) != identity(final)
+            descriptor_changed = identity(final) != identity(initial)
+            if descriptor_changed and not (
+                not descriptor_still_named
+                and final.st_nlink == 0
+                and initial.st_nlink > 0
+                and (final.st_dev, final.st_ino) == (initial.st_dev, initial.st_ino)
+                and final.st_size == initial.st_size
+                and final.st_mtime_ns == initial.st_mtime_ns
             ):
                 raise error(f"changed {phase}", path)
+            if descriptor_still_named and identity(current) != identity(final):
+                raise error(f"changed {phase}", path)
+            directory.verify_bound()
             return raw
         finally:
             handle.close()
