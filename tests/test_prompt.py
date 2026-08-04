@@ -63,6 +63,22 @@ class SnapshotModel(BaseModel):
     tags: list[str] = Field(description="标签")
 
 
+def test_managed_prompt_record_is_accepted_when_complete() -> None:
+    messages = [Message(role="user", parts=["hello"])]
+    attachments = [
+        Attachment(
+            path="input.txt",
+            content_hash="a" * 64,
+            mime_type="text/plain",
+            size_bytes=5,
+        )
+    ]
+    response_spec = ResponseSpec(schema_sha256="b" * 64, format="structured")
+    record = _managed_record(messages, attachments, response_spec)
+
+    validate_prompt_resolution_record(record)
+
+
 def test_managed_prompt_record_requires_all_request_fields_before_digest_validation() -> None:
     messages = [Message(role="user", parts=["hello"])]
     attachments = [
@@ -95,7 +111,7 @@ def test_managed_prompt_record_requires_all_request_fields_before_digest_validat
             validate_prompt_resolution_record(candidate)
 
 
-def test_legacy_prompt_resolution_record_remains_compatible() -> None:
+def test_legacy_prompt_resolution_record_is_rejected() -> None:
     body = {
         "prompt_resolution_schema": 1,
         "spec": "legacy",
@@ -108,7 +124,44 @@ def test_legacy_prompt_resolution_record_remains_compatible() -> None:
     }
     record = {**body, "resolution_digest": sha(body)}
 
-    validate_prompt_resolution_record(record)
+    with pytest.raises(PromptResolutionError, match="managed request fields"):
+        validate_prompt_resolution_record(record)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("messages", ()),
+        ("attachments", ()),
+        ("response_spec", {"schema_sha256": None}),
+        ("base", []),
+    ),
+)
+def test_managed_prompt_record_rejects_required_field_type_or_shape(
+    field: str,
+    value: Any,
+) -> None:
+    record = _managed_record(
+        [Message(role="user", parts=["hello"])],
+        [],
+        ResponseSpec(),
+    )
+    record[field] = value
+
+    with pytest.raises(PromptResolutionError, match="managed request fields|digest"):
+        validate_prompt_resolution_record(record)
+
+
+def test_managed_prompt_record_rejects_digest_mismatch() -> None:
+    record = _managed_record(
+        [Message(role="user", parts=["hello"])],
+        [],
+        ResponseSpec(),
+    )
+    record["messages"] = [{"role": "user", "parts": ["changed"]}]
+
+    with pytest.raises(PromptResolutionError, match="digest"):
+        validate_prompt_resolution_record(record)
 
 
 def test_attachment_manifest_metadata_is_not_prompt_lineage_identity() -> None:

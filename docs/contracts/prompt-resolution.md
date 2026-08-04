@@ -44,11 +44,11 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
 9. `PromptResolution` 保存 spec 结构摘要、base/layer/axis 来源、实际 selection、material
    来源与摘要、typed `Message`、`Attachment` manifest、`ResponseSpec`、渲染摘要和字节数；不保存
    Prompt 或 material 原文。`resolution_digest` 绑定消息内容、附件 content hash 与 schema
-   identity，不绑定附件路径或 transport 层 base64。当前仍是 `prompt_resolution_schema=1`，但
-   schema-1 有两条明确的持久化轨道：没有任何 `messages`、`attachments`、`response_spec` 字段的
-   历史 legacy record 使用旧 body digest 校验；新写入的 managed record 必须同时包含这三个字段，
-   并使用包含消息、附件内容摘要和 `ResponseSpec` 的 managed request digest。只出现其中一部分字段
-   的 record 不属于兼容形态，必须 fail closed；不能把它当作普通 cache miss，也不能猜测缺失字段。
+   identity，不绑定附件路径或 transport 层 base64。`prompt_resolution_schema=1` 只有一条
+   managed 持久化轨道：record 必须同时包含 `messages`、`attachments`、`response_spec` 以及
+   其他 canonical 字段，并使用包含消息、附件内容摘要和 `ResponseSpec` 的 managed request digest。
+   缺少字段、字段类型错误或摘要不一致都必须 fail closed；旧 legacy body 不属于可接受形态，不能
+   把它当作普通 cache miss，也不能猜测缺失字段。
 10. `preflight()` 在缓存查找和 provider 请求前检查估算 token、附件数量和总字节数；违规抛
     `RequestTooLarge`，不得静默调用 `clip()`。
 11. `ctx.resolve_prompt()` 只返回预解析对象；只有 `ctx.call(resolved)` 或把该对象直接作为

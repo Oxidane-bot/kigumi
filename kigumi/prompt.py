@@ -539,86 +539,133 @@ def _thaw_value(value: Any) -> Any:
 
 def validate_prompt_resolution_record(value: Any) -> None:
     """Validate one persisted schema-1 resolution without reconstructing Prompt text."""
-    if not isinstance(value, Mapping) or value.get("prompt_resolution_schema") != 1:
+    if not isinstance(value, Mapping):
         raise PromptResolutionError("persisted Prompt resolution has invalid schema")
-    extension_keys = {"messages", "attachments", "response_spec"}
-    present_extension_keys = extension_keys & set(value)
-    if not present_extension_keys:
-        digest = value.get("resolution_digest")
-        if not isinstance(digest, str):
-            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-        # Accept schema-1 records written before managed request fields existed. They
-        # remain subject to the old digest check, while every newly written record
-        # uses the content-addressed request digest below.
-        legacy_keys = (
-            "prompt_resolution_schema",
-            "spec",
-            "structure_digest",
-            "base",
-            "layers",
-            "axes",
-            "materials",
-            "rendered",
+    try:
+        schema = value["prompt_resolution_schema"]
+    except (KeyError, TypeError) as error:
+        raise PromptResolutionError("persisted Prompt resolution has invalid schema") from error
+    if (
+        isinstance(schema, bool)
+        or not isinstance(schema, int)
+        or schema != PROMPT_RESOLUTION_SCHEMA
+    ):
+        raise PromptResolutionError("persisted Prompt resolution has invalid schema")
+    required_fields = {
+        "prompt_resolution_schema",
+        "spec",
+        "structure_digest",
+        "base",
+        "layers",
+        "axes",
+        "materials",
+        "rendered",
+        "messages",
+        "attachments",
+        "response_spec",
+        "resolution_digest",
+    }
+    missing_fields = required_fields - set(value)
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise PromptResolutionError(
+            f"persisted Prompt resolution has incomplete managed request fields; missing: {missing}"
         )
-        legacy_body = {key: _thaw_value(value.get(key)) for key in legacy_keys}
-        if digest != sha(legacy_body):
+
+    try:
+        digest = value["resolution_digest"]
+        if not isinstance(digest, str) or not digest:
             raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-    else:
-        missing_extension_keys = extension_keys - present_extension_keys
-        if missing_extension_keys:
-            missing = ", ".join(sorted(missing_extension_keys))
-            raise PromptResolutionError(
-                "persisted Prompt resolution has incomplete managed request fields; "
-                f"missing: {missing}"
-            )
-        digest = value.get("resolution_digest")
-        if not isinstance(digest, str):
-            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-        try:
-            messages = [
-                Message(
-                    role=record["role"],
-                    parts=list(record["parts"]),
-                )
-                for record in value["messages"]
-            ]
-            attachments = [
+
+        spec_name = value["spec"]
+        structure_digest = value["structure_digest"]
+        base = value["base"]
+        layers = value["layers"]
+        axes = value["axes"]
+        materials = value["materials"]
+        rendered = value["rendered"]
+        messages_value = value["messages"]
+        attachments_value = value["attachments"]
+        response_spec_value = value["response_spec"]
+
+        if not isinstance(spec_name, str) or not spec_name:
+            raise TypeError("spec must be a non-empty string")
+        if not isinstance(structure_digest, str) or not structure_digest:
+            raise TypeError("structure_digest must be a non-empty string")
+        if not isinstance(base, Mapping):
+            raise TypeError("base must be a mapping")
+        if not all(
+            isinstance(records, list) and all(isinstance(record, Mapping) for record in records)
+            for records in (layers, axes, materials)
+        ):
+            raise TypeError("layer, axis, and material records must be lists of mappings")
+        if not isinstance(rendered, Mapping):
+            raise TypeError("rendered must be a mapping")
+        rendered_sha256 = rendered["sha256"]
+        rendered_bytes = rendered["bytes"]
+        if not isinstance(rendered_sha256, str) or not rendered_sha256:
+            raise TypeError("rendered sha256 must be a non-empty string")
+        if isinstance(rendered_bytes, bool) or not isinstance(rendered_bytes, int):
+            raise TypeError("rendered bytes must be an integer")
+        if rendered_bytes < 0:
+            raise ValueError("rendered bytes must be non-negative")
+        if not isinstance(messages_value, list):
+            raise TypeError("messages must be a list")
+        messages = []
+        for record in messages_value:
+            if not isinstance(record, Mapping) or set(record) != {"role", "parts"}:
+                raise TypeError("message records must contain role and parts")
+            messages.append(Message(role=record["role"], parts=record["parts"]))
+        if not isinstance(attachments_value, list):
+            raise TypeError("attachments must be a list")
+        attachments = []
+        for record in attachments_value:
+            if not isinstance(record, Mapping) or set(record) != {
+                "path",
+                "content_hash",
+                "mime_type",
+                "size_bytes",
+            }:
+                raise TypeError("attachment records are incomplete")
+            attachments.append(
                 Attachment(
                     path=record["path"],
                     content_hash=record["content_hash"],
                     mime_type=record["mime_type"],
                     size_bytes=record["size_bytes"],
                 )
-                for record in value["attachments"]
-            ]
-            response_spec_value = value["response_spec"]
-            if not isinstance(response_spec_value, Mapping):
-                raise TypeError("response_spec must be a mapping")
-            response_spec = ResponseSpec(
-                schema_sha256=response_spec_value.get("schema_sha256"),
-                format=response_spec_value.get("format", "text"),
             )
-            resolution = PromptResolution(
-                spec_name=value["spec"],
-                structure_digest=value["structure_digest"],
-                base=value["base"],
-                layers=tuple(value["layers"]),
-                axes=tuple(value["axes"]),
-                materials=tuple(value["materials"]),
-                rendered_sha256=value["rendered"]["sha256"],
-                rendered_bytes=value["rendered"]["bytes"],
-                schema=value["prompt_resolution_schema"],
-                messages=messages,
-                attachments=attachments,
-                response_spec=response_spec,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise PromptResolutionError(
-                "persisted Prompt resolution has invalid managed request fields"
-            ) from error
-        if digest != resolution.digest:
-            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-    if value.get("base_resolution_digest", digest) != digest:
+        if not isinstance(response_spec_value, Mapping) or set(response_spec_value) != {
+            "schema_sha256",
+            "format",
+        }:
+            raise TypeError("response_spec is incomplete")
+        response_spec = ResponseSpec(
+            schema_sha256=response_spec_value["schema_sha256"],
+            format=response_spec_value["format"],
+        )
+        resolution = PromptResolution(
+            spec_name=spec_name,
+            structure_digest=structure_digest,
+            base=base,
+            layers=tuple(layers),
+            axes=tuple(axes),
+            materials=tuple(materials),
+            rendered_sha256=rendered_sha256,
+            rendered_bytes=rendered_bytes,
+            schema=schema,
+            messages=messages,
+            attachments=attachments,
+            response_spec=response_spec,
+        )
+        actual_digest = resolution.digest
+    except (KeyError, TypeError, ValueError) as error:
+        raise PromptResolutionError(
+            "persisted Prompt resolution has invalid managed request fields"
+        ) from error
+    if digest != actual_digest:
+        raise PromptResolutionError("persisted Prompt resolution failed digest validation")
+    if "base_resolution_digest" in value and value["base_resolution_digest"] != digest:
         raise PromptResolutionError("persisted Prompt resolution has a mismatched base resolution")
 
 
