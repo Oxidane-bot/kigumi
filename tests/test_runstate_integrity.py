@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+import kigumi._runstate as runstate_module
 from kigumi._runstate import AttemptStore, RunManifestError, StateIntegrityError
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.failures import ProviderFailure, ProviderFailureKind, ProviderFailureStage
@@ -167,6 +168,95 @@ def test_durable_json_read_rejects_symlinked_parent_final_file_and_fifo(
     value, corrupted = AttemptStore._read_json_safe(parent_alias / "state.json")
     assert value is None
     assert corrupted is True
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_run_lock_rejects_symlink_or_fifo_without_touching_external_target(
+    tmp_path: Path, kind: str
+) -> None:
+    store = _store(tmp_path)
+    lock_path = store._run_lock_path
+    lock_path.unlink()
+    external = tmp_path / "external-lock"
+    external.write_text("sentinel", encoding="utf-8")
+    if kind == "symlink":
+        lock_path.symlink_to(external)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("mkfifo is unavailable")
+        os.mkfifo(lock_path)
+
+    with pytest.raises(RunManifestError, match="regular file|symlink"):
+        store.update_manifest("running")
+
+    assert external.read_text(encoding="utf-8") == "sentinel"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_target_lease_rejects_symlink_or_fifo_without_touching_external_target(
+    tmp_path: Path, kind: str
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    store = AttemptStore(run_root, {})
+    store.initialize()
+    lock_path = store._target_lock_path("work")
+    external = tmp_path / "external-target-lock"
+    external.write_text("sentinel", encoding="utf-8")
+    if kind == "symlink":
+        lock_path.symlink_to(external)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("mkfifo is unavailable")
+        os.mkfifo(lock_path)
+
+    with pytest.raises(RunManifestError, match="regular file|symlink|lease"):
+        store.prepare("work", policy=None, declaration_digest="decl")
+
+    assert external.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_recovery_receipt_rejects_run_root_swap_without_external_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    external = tmp_path / "external-recovery"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    moved = tmp_path / "moved-run"
+    original_validate = runstate_module.validate_run_path
+    swapped = False
+
+    def swap_after_validation(path: Path) -> Path:
+        nonlocal swapped
+        result = original_validate(path)
+        if Path(path) == store.run_root and not swapped:
+            store.run_root.rename(moved)
+            store.run_root.symlink_to(external, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(runstate_module, "validate_run_path", swap_after_validation)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    try:
+        with pytest.raises((RunManifestError, ValueError), match="symlink|owned|safe"):
+            store.write_recovery_receipt(payload)
+    finally:
+        if store.run_root.is_symlink():
+            store.run_root.unlink()
+        moved.rename(store.run_root)
+
+    assert not list(external.glob("recovery-*.json"))
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
 
 
 def test_missing_attempt_receipt_is_not_started_case(tmp_path: Path) -> None:

@@ -53,7 +53,7 @@ from ._runstate import (
     RunManifestError,
     validate_run_path,
 )
-from ._safe_io import digest_open_file, open_regular_file
+from ._safe_io import SecureDirectory, digest_open_file, open_regular_file
 from .agents import (
     AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
@@ -1364,10 +1364,9 @@ class Dag:
         dynamic_files_ledger: dict[str, dict[str, list[dict[str, str]]]] = {}
         if run_id is not None:
             manifest_path = store.run_directory(self.config.artifacts_path, run_id) / "_run.json"
-            try:
-                candidate_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, OSError, json.JSONDecodeError):
-                candidate_manifest = None
+            candidate_manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+            if manifest_corrupted:
+                raise RunManifestError(f"Run {run_id!r} has no valid schema-2 run manifest")
             if isinstance(candidate_manifest, dict):
                 if candidate_manifest.get("run_manifest_schema") == RUN_MANIFEST_SCHEMA:
                     self._validate_execution_manifest_profile(run_id, candidate_manifest)
@@ -2135,12 +2134,11 @@ class Dag:
     ) -> RunResult:
         """Resume one schema-2 run under its originally bound declaration."""
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
-        try:
-            manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        manifest, manifest_corrupted = AttemptStore._read_json_safe(run_dir / "_run.json")
+        if manifest_corrupted or manifest is None:
             raise RunManifestError(
                 f"Run {run_id!r} has no valid schema-2 run manifest and cannot be resumed"
-            ) from error
+            )
         if (
             not isinstance(manifest, dict)
             or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
@@ -2199,12 +2197,9 @@ class Dag:
 
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
         manifest_path = run_dir / "_run.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Run {run_id!r} was not found or has no valid manifest") from error
-        if not isinstance(manifest, dict):
-            raise ValueError(f"Run {run_id!r} has an invalid manifest")
+        manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+        if manifest_corrupted or manifest is None:
+            raise ValueError(f"Run {run_id!r} was not found or has no valid manifest")
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
         self._validate_execution_manifest_profile(run_id, manifest)
@@ -2372,10 +2367,9 @@ class Dag:
             raise ValueError("retry resolution action must be 'retry' or 'fail'")
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
         manifest_path = run_dir / "_run.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
-            raise RunManifestError(f"Run {run_id!r} has no valid manifest") from error
+        manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+        if manifest_corrupted or manifest is None:
+            raise RunManifestError(f"Run {run_id!r} has no valid manifest")
         if (
             not isinstance(manifest, dict)
             or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
@@ -3616,14 +3610,38 @@ class Dag:
             )
         }
         attempt_states: dict[str, list[dict[str, Any]]] = {}
-        for state_path in sorted((run_directory / "attempts").glob("*/state.json")):
+        attempts_directory = run_directory / "attempts"
+        try:
+            with SecureDirectory(attempts_directory, create=False) as attempts:
+                attempt_names = sorted(attempts.names())
+        except FileNotFoundError:
+            attempt_names = []
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Run {run_id!r} has an unowned attempts directory") from error
+
+        for attempt_name in attempt_names:
+            target_directory = attempts_directory / attempt_name
+            try:
+                with SecureDirectory(target_directory, create=False) as target:
+                    target_names = set(target.names())
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"Run {run_id!r} has an invalid attempt directory {attempt_name!r}"
+                ) from error
+            if "state.json" not in target_names:
+                continue
+            state_path = target_directory / "state.json"
             state, corrupted = AttemptStore._read_json_safe(state_path)
             if corrupted:
+                raise ValueError(
+                    f"Run {run_id!r} has an unsafe or corrupt attempt state {attempt_name!r}"
+                )
+            if state is None:
                 continue
-            target = state.get("target") if state is not None else None
-            if not isinstance(target, str):
+            target_name = state.get("target")
+            if not isinstance(target_name, str):
                 continue
-            node_name = target.partition("@")[0]
+            node_name = target_name.partition("@")[0]
             attempt_states.setdefault(node_name, []).append(state)
         retry_nodes = {
             name
@@ -3680,9 +3698,13 @@ class Dag:
         """Print static declaration and source-guard findings without running nodes."""
         del args
         guard_findings: list[Any] = []
+        guard_error: BaseException | None = None
         if self.config.source_dirs:
-            guard_findings.extend(check_paths(self.config.source_paths))
-            guard_findings.extend(check_raw_io_node_paths(self.config.source_paths))
+            try:
+                guard_findings.extend(check_paths(self.config.source_paths))
+                guard_findings.extend(check_raw_io_node_paths(self.config.source_paths))
+            except (OSError, UnicodeError, SyntaxError, ValueError) as error:
+                guard_error = error
         guard_violations = [finding for finding in guard_findings if not finding.waived]
         guard_waivers = [finding for finding in guard_findings if finding.waived]
 
@@ -3697,6 +3719,8 @@ class Dag:
             for declared_path in node.files:
                 if not self.config.resolve(declared_path).is_file():
                     errors.append(f"{name}: missing declared file {declared_path}")
+        if guard_error is not None:
+            errors.append(f"source: {guard_error}")
         try:
             self._topological_order(tuple(self._nodes))
         except ValueError as error:

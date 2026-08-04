@@ -125,6 +125,46 @@ def test_retry_is_durable_pending_and_resume_runs_only_when_due(tmp_path: Path) 
     assert json.loads((target / "attempt-0002.json").read_text())["status"] == "completed"
 
 
+def test_dag_manifest_prechecks_reject_external_manifest_symlink(tmp_path: Path) -> None:
+    transport = _SequenceTransport([Response("done", {"total_tokens": 1}, "stop")])
+    dag = _retry_dag(
+        tmp_path,
+        transport,
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    dag.run(run_id="manifest-precheck")
+    run_dir = tmp_path / "artifacts" / "runs" / "manifest-precheck"
+    manifest_path = run_dir / "_run.json"
+    original = manifest_path.read_bytes()
+    external = tmp_path / "external-manifest.json"
+    external.write_bytes(original)
+    manifest_path.unlink()
+    manifest_path.symlink_to(external)
+
+    with pytest.raises(RunManifestError):
+        dag.run(run_id="manifest-precheck")
+    with pytest.raises(RunManifestError):
+        dag.resume("manifest-precheck")
+    with pytest.raises(ValueError):
+        dag.recover(
+            "manifest-precheck",
+            "ask",
+            from_attempt=1,
+            decision="fail",
+            reason="manifest must be read without following links",
+        )
+    with pytest.raises(RunManifestError):
+        dag.retry_resolve(
+            "manifest-precheck",
+            "ask",
+            attempt=1,
+            action="fail",
+            reason="manifest must be read without following links",
+        )
+
+    assert external.read_bytes() == original
+
+
 def test_resume_before_retry_due_does_not_sleep_or_request_provider(
     tmp_path: Path,
 ) -> None:

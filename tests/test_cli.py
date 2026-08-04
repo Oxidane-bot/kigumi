@@ -965,6 +965,20 @@ def test_cli_check_reports_guard_violation(tmp_path: Path, capsys) -> None:
     assert "violation" in capsys.readouterr().out
 
 
+def test_cli_check_reports_source_syntax_error_as_nonzero_diagnostic(
+    tmp_path: Path, capsys
+) -> None:
+    nodes = tmp_path / "nodes"
+    nodes.mkdir()
+    (nodes / "broken.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+    dag = _cli_dag(tmp_path, source_dirs=["nodes"])
+
+    assert _run_dag_cli(dag, ["check"]) == 1
+    output = capsys.readouterr().out
+    assert "source:" in output
+    assert "invalid syntax" in output or "SyntaxError" in output
+
+
 def test_cli_check_raw_io_filters_to_decorated_node_bodies(tmp_path: Path, capsys) -> None:
     """教训 raw_io_cli_check: 图检查不得因 source_dirs 的 helper 产生误报。"""
     nodes = tmp_path / "nodes"

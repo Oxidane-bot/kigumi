@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -60,6 +61,47 @@ _MANIFEST_GENERATION_FIELD = "manifest_generation"
 _SIDECAR_DIGEST_FIELD = "sidecar_sha256"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
 _PROCESS_TARGET_LEASES_LOCK = threading.RLock()
+
+
+def _open_lock_file(path: Path, label: str) -> Any:
+    """Open one lock file without following its parent or final entry."""
+    path = Path(path)
+    try:
+        with SecureDirectory(path.parent, create=True) as directory:
+            try:
+                existing = directory.stat(path.name)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and stat.S_ISLNK(existing.st_mode):
+                raise RunManifestError(f"{label} must not be a symlink: {path}")
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise RunManifestError(f"{label} must reference a regular file: {path}")
+
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                descriptor = os.open(path.name, flags, 0o600, dir_fd=directory.fd)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    raise RunManifestError(f"{label} must not be a symlink: {path}") from error
+                raise RunManifestError(f"{label} could not be opened safely: {path}") from error
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise RunManifestError(f"{label} must reference a regular file: {path}")
+                return os.fdopen(descriptor, "r+b", closefd=True)
+            except BaseException:
+                os.close(descriptor)
+                raise
+    except RunManifestError:
+        raise
+    except (OSError, ValueError) as error:
+        raise RunManifestError(f"{label} could not be opened safely: {path}") from error
 
 
 @dataclass(frozen=True)
@@ -141,9 +183,9 @@ class AttemptStore:
         self.identity = json.loads(canonical_json(manifest_identity))
         self._receipt_chain_lock = threading.RLock()
         self._run_lock_local = threading.local()
-        resolved_root = run_root.resolve()
-        lock_name = f".kigumi-run-{sha(str(resolved_root))}.lock"
-        self._run_lock_path = resolved_root.parent / lock_name
+        absolute_root = Path(os.path.abspath(self.run_root))
+        lock_name = f".kigumi-run-{sha(str(absolute_root))}.lock"
+        self._run_lock_path = absolute_root.parent / lock_name
         self._target_leases: dict[str, tuple[str, Any]] = {}
         self._manifest_generation: int | None = None
         self._fence_manifest_generation = False
@@ -176,8 +218,7 @@ class AttemptStore:
                     self._run_lock_local.depth = depth
                 return
 
-            self._run_lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._run_lock_path.open("a+", encoding="utf-8") as handle:
+            with _open_lock_file(self._run_lock_path, "Run lock") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 self._run_lock_local.depth = 1
                 try:
@@ -224,7 +265,6 @@ class AttemptStore:
             )
         token = uuid.uuid4().hex
         path = self._target_lock_path(target)
-        path.parent.mkdir(parents=True, exist_ok=True)
         with _PROCESS_TARGET_LEASES_LOCK:
             process_lease = _PROCESS_TARGET_LEASES.get(path)
             if process_lease is not None and allow_same_process_fence:
@@ -233,7 +273,7 @@ class AttemptStore:
                 if not old_handle.closed:
                     fcntl.flock(old_handle.fileno(), fcntl.LOCK_UN)
                     old_handle.close()
-            handle = path.open("a+", encoding="utf-8")
+            handle = _open_lock_file(path, f"Target {target!r} lease")
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
@@ -2008,21 +2048,39 @@ class AttemptStore:
             or "\\" in recovery_time
         ):
             raise RunManifestError("recovery receipt must contain a recovery_time")
-        self.run_root.mkdir(parents=True, exist_ok=True)
         stem = f"recovery-{recovery_time}"
         suffix = 0
-        while True:
-            suffix_text = "" if suffix == 0 else f"-{suffix}"
-            path = self.run_root / f"{stem}{suffix_text}.json"
-            try:
-                with path.open("x", encoding="utf-8") as handle:
-                    handle.write(canonical_json(payload))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except FileExistsError:
-                suffix += 1
-                continue
-            return path
+        with SecureDirectory(self.run_root, create=False) as directory:
+            while True:
+                suffix_text = "" if suffix == 0 else f"-{suffix}"
+                name = f"{stem}{suffix_text}.json"
+                descriptor, temporary_name = directory.temporary(f".{name}.")
+                try:
+                    try:
+                        with os.fdopen(
+                            descriptor,
+                            "w",
+                            encoding="utf-8",
+                            closefd=True,
+                        ) as handle:
+                            descriptor = -1
+                            handle.write(canonical_json(payload))
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    finally:
+                        if descriptor >= 0:
+                            with suppress(OSError):
+                                os.close(descriptor)
+
+                    try:
+                        directory.link(temporary_name, name)
+                    except FileExistsError:
+                        suffix += 1
+                        continue
+                    return self.run_root / name
+                finally:
+                    with suppress(OSError, ValueError):
+                        directory.unlink(temporary_name, missing_ok=True)
 
     def _validate_attempt_receipts(self, target: str) -> None:
         """Reject a present torn receipt while allowing an absent receipt."""
