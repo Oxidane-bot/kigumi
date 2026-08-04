@@ -314,8 +314,9 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
     lines = text.splitlines()
     comments = _source_comments(text)
     tree = ast.parse(text, filename=str(path))
+    module_facts = _collect_scope_facts(tree.body)
     module_aliases = _collect_callable_aliases(
-        _collect_scope_facts(tree.body),
+        module_facts,
         context_name=None,
         inherited_raw_aliases=None,
         inherited_dynamic_aliases=None,
@@ -338,6 +339,9 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
         visitor.visit_function_body(
             statement,
             state=_ScopeState(
+                functions=module_facts.functions,
+                classes=module_facts.classes,
+                lambdas=module_facts.lambdas,
                 raw_aliases=module_aliases.raw,
                 dynamic_aliases=module_aliases.dynamic,
                 higher_order_aliases=module_aliases.higher_order,
@@ -436,20 +440,27 @@ class _LoopScope:
             )
             if dynamic_kind is not None:
                 return dynamic_kind
-            element = _resolve_static_container_element(expression, self.sequence_aliases)
-            if element is not None:
-                return self.classify(element)
-            return _LoopCallableKind.UNKNOWN
+            candidates = _resolve_loop_callable_candidates(expression, self)
+            if candidates:
+                return _join_loop_callable_kinds(
+                    [self.classify(candidate) for candidate in candidates]
+                )
+            return _LoopCallableKind.OPAQUE
         if isinstance(expression, ast.Call):
-            if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
-                return _LoopCallableKind.MODEL
             dynamic_kind = _classify_dynamic_builtin_lookup(
                 expression,
                 self.builtin_module_aliases,
             )
             if dynamic_kind is not None:
                 return dynamic_kind
-            return _LoopCallableKind.UNKNOWN
+            candidates = _resolve_loop_callable_candidates(expression, self)
+            if candidates:
+                return _join_loop_callable_kinds(
+                    [self.classify(candidate) for candidate in candidates]
+                )
+            if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
+                return _LoopCallableKind.OPAQUE
+            return _LoopCallableKind.OPAQUE
         if not isinstance(expression, ast.Name):
             return _LoopCallableKind.UNKNOWN
         if expression.id in self.model_aliases:
@@ -593,6 +604,8 @@ def _classify_dynamic_builtin_lookup(
     path. This is deliberately syntactic; it does not evaluate arbitrary
     Python expressions.
     """
+    if _is_static_loop_higher_order_lookup(expression):
+        return _LoopCallableKind.HIGHER_ORDER
     lookup = _dynamic_builtin_lookup_key(expression, builtin_module_aliases)
     if lookup is None:
         return None
@@ -600,6 +613,29 @@ def _classify_dynamic_builtin_lookup(
     if is_static and key in _LOOP_HIGHER_ORDER_NAMES:
         return _LoopCallableKind.HIGHER_ORDER
     return _LoopCallableKind.OPAQUE
+
+
+def _is_static_loop_higher_order_lookup(expression: ast.AST) -> bool:
+    """Recognize map/filter keys without tracing arbitrary namespace aliases."""
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Subscript):
+        is_static, key = _static_subscript_key(expression.slice)
+        return is_static and key in _LOOP_HIGHER_ORDER_NAMES
+    if not isinstance(expression, ast.Call):
+        return False
+    if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
+        if len(expression.args) < 2:
+            return False
+        is_static, key = _static_subscript_key(expression.args[1])
+        return is_static and key in _LOOP_HIGHER_ORDER_NAMES
+    if (
+        isinstance(expression.func, ast.Attribute)
+        and expression.func.attr in {"get", "__getitem__"}
+        and expression.args
+    ):
+        is_static, key = _static_subscript_key(_unwrap_starred(expression.args[0]))
+        return is_static and key in _LOOP_HIGHER_ORDER_NAMES
+    return False
 
 
 def _dynamic_builtin_lookup_key(
@@ -643,6 +679,67 @@ def _is_loop_builtin_dict_value(
         and expression.func.attr == "copy"
         and _is_loop_builtin_dict_value(expression.func.value, builtin_module_aliases)
     )
+
+
+def _resolve_loop_container_options(
+    expression: ast.AST,
+    scope: _LoopScope,
+) -> list[_StaticContainer] | None:
+    """Return statically possible sequence/dict containers for one expression."""
+    expression = _unwrap_named_expr(expression)
+    container = _resolve_static_container(expression, scope.sequence_aliases)
+    if container is not None:
+        return [container]
+    if isinstance(expression, ast.BoolOp):
+        options: list[_StaticContainer] = []
+        for candidate in expression.values:
+            candidate_options = _resolve_loop_container_options(candidate, scope)
+            if candidate_options is None:
+                return None
+            options.extend(candidate_options)
+        return options
+    return None
+
+
+def _resolve_loop_callable_candidates(
+    expression: ast.AST,
+    scope: _LoopScope,
+) -> list[ast.expr]:
+    """Resolve subscript/pop callback shapes inside the finite proof boundary."""
+    expression = _unwrap_starred(_unwrap_named_expr(expression))
+    if isinstance(expression, ast.Subscript):
+        options = _resolve_loop_container_options(expression.value, scope)
+        if options is None:
+            return []
+        is_static, key = _static_subscript_key(expression.slice)
+        if not is_static:
+            return [value for container in options for value in _container_values(container)]
+        candidates: list[ast.expr] = []
+        for container in options:
+            if isinstance(container, tuple):
+                if (
+                    isinstance(key, int)
+                    and not isinstance(key, bool)
+                    and -len(container) <= key < len(container)
+                ):
+                    candidates.append(container[key])
+            elif isinstance(container, dict):
+                value = container.get(key)
+                if value is not None:
+                    candidates.append(value)
+        return candidates
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "pop"
+    ):
+        options = _resolve_loop_container_options(expression.func.value, scope) or []
+        return [value for container in options for value in _container_values(container)]
+    return []
+
+
+def _container_values(container: _StaticContainer) -> list[ast.expr]:
+    return list(container) if isinstance(container, tuple) else list(container.values())
 
 
 class _LoopCallVisitor(ast.NodeVisitor):
@@ -788,13 +885,17 @@ class _LoopCallVisitor(ast.NodeVisitor):
     def _is_model_call(self, node: ast.Call, scope: _LoopScope | None = None) -> bool:
         current_scope = scope or self.scope
         kind = current_scope.classify(node.func)
-        if kind is _LoopCallableKind.UNKNOWN and isinstance(node.func, ast.Name):
-            function = current_scope.functions.get(node.func.id)
-            if function is not None:
-                return self._contains_loop_risk(
-                    function.body,
-                    self._scope_for(function, current_scope),
-                )
+        if kind is _LoopCallableKind.UNKNOWN:
+            for candidate in _resolve_loop_callable_candidates(node.func, current_scope):
+                if self._callable_has_risk(candidate, current_scope):
+                    return True
+            if isinstance(node.func, ast.Name):
+                function = current_scope.functions.get(node.func.id)
+                if function is not None:
+                    return self._contains_loop_risk(
+                        function.body,
+                        self._scope_for(function, current_scope),
+                    )
         return kind in {_LoopCallableKind.MODEL, _LoopCallableKind.OPAQUE}
 
     def _is_model_higher_order_callback(
@@ -803,13 +904,64 @@ class _LoopCallVisitor(ast.NodeVisitor):
         scope: _LoopScope | None = None,
     ) -> bool:
         current_scope = scope or self.scope
-        if current_scope.classify(node.func) is not _LoopCallableKind.HIGHER_ORDER:
+        kind = current_scope.classify(node.func)
+        if kind is _LoopCallableKind.OPAQUE:
+            callback = _first_loop_callback_argument(node.args)
+            return (
+                callback is not None
+                and self._looks_like_callback(callback, current_scope)
+                and self._callback_has_risk(callback, current_scope)
+            )
+        if kind is not _LoopCallableKind.HIGHER_ORDER:
             return False
         callback = _first_loop_callback_argument(node.args)
         return callback is not None and self._callback_has_risk(callback, current_scope)
 
     def _callback_has_risk(self, expression: ast.expr, scope: _LoopScope) -> bool:
         expression = expression.value if isinstance(expression, ast.Starred) else expression
+        kind = scope.classify(expression)
+        if kind in {
+            _LoopCallableKind.MODEL,
+            _LoopCallableKind.HIGHER_ORDER,
+            _LoopCallableKind.OPAQUE,
+        }:
+            return True
+        if kind is _LoopCallableKind.SAFE:
+            return False
+        candidates = _resolve_loop_callable_candidates(expression, scope)
+        if candidates:
+            return any(self._callable_has_risk(candidate, scope) for candidate in candidates)
+        if isinstance(expression, ast.Lambda):
+            return self._contains_loop_risk(
+                expression.body,
+                self._scope_for(expression, scope),
+            )
+        if isinstance(expression, ast.Name):
+            function = scope.functions.get(expression.id)
+            if function is not None:
+                return self._contains_loop_risk(
+                    function.body,
+                    self._scope_for(function, scope),
+                )
+            return True
+        return isinstance(expression, (ast.Attribute, ast.Call, ast.Subscript))
+
+    def _looks_like_callback(self, expression: ast.expr, scope: _LoopScope) -> bool:
+        expression = expression.value if isinstance(expression, ast.Starred) else expression
+        if isinstance(expression, (ast.Attribute, ast.Call, ast.Lambda, ast.Subscript)):
+            return True
+        return isinstance(expression, ast.Name) and (
+            expression.id in scope.functions
+            or scope.classify(expression)
+            in {
+                _LoopCallableKind.MODEL,
+                _LoopCallableKind.HIGHER_ORDER,
+                _LoopCallableKind.OPAQUE,
+                _LoopCallableKind.SAFE,
+            }
+        )
+
+    def _callable_has_risk(self, expression: ast.expr, scope: _LoopScope) -> bool:
         kind = scope.classify(expression)
         if kind in {
             _LoopCallableKind.MODEL,
@@ -831,8 +983,9 @@ class _LoopCallVisitor(ast.NodeVisitor):
                     function.body,
                     self._scope_for(function, scope),
                 )
-            return True
-        return isinstance(expression, (ast.Attribute, ast.Call, ast.Subscript))
+        # A statically selected but otherwise unknown callable is precisely the
+        # finite boundary: it may be a model callback and needs review.
+        return True
 
     def _contains_loop_risk(
         self,
@@ -952,8 +1105,9 @@ class _RawIOVisitor(ast.NodeVisitor):
         self.visit_function_body(node)
 
     def visit_Module(self, node: ast.Module) -> None:  # noqa: N802 -- ast protocol.
+        module_facts = _collect_scope_facts(node.body)
         aliases = _collect_callable_aliases(
-            _collect_scope_facts(node.body),
+            module_facts,
             context_name=self.context_name,
             inherited_raw_aliases=None,
             inherited_dynamic_aliases=None,
@@ -966,6 +1120,9 @@ class _RawIOVisitor(ast.NodeVisitor):
                 self._scan_function(
                     statement,
                     state=_ScopeState(
+                        functions=module_facts.functions,
+                        classes=module_facts.classes,
+                        lambdas=module_facts.lambdas,
                         raw_aliases=aliases.raw,
                         dynamic_aliases=aliases.dynamic,
                         higher_order_aliases=aliases.higher_order,
@@ -1522,6 +1679,11 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
                     dynamic_aliases=self.dynamic_aliases,
                     builtin_module_aliases=self.builtin_module_aliases,
                 )
+                and not _is_dynamic_builtin_namespace_reconstruction(
+                    node.value,
+                    dynamic_aliases=self.dynamic_aliases,
+                    builtin_module_aliases=self.builtin_module_aliases,
+                )
             )
         ):
             self._append_structural_finding(node)
@@ -1937,6 +2099,15 @@ def _collect_callable_aliases(
     while changed:
         changed = False
         for name, expression in assignments:
+            if _is_higher_order_callable_expression(
+                expression,
+                higher_order_aliases=higher_order,
+                builtin_module_aliases=builtin_modules,
+            ):
+                if name not in higher_order:
+                    higher_order.add(name)
+                    changed = True
+                continue
             callable_kind = _classify_callable_expression(
                 expression,
                 context_name=effective_context_name,
@@ -2224,7 +2395,11 @@ def _classify_callable_expression(
         return _CallableKind.UNKNOWN
 
     if isinstance(expression, ast.Subscript):
-        if _is_dynamic_builtin_namespace_subscript(expression):
+        if _is_dynamic_lookup_expression(
+            expression,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        ):
             return _CallableKind.OPAQUE
         element = _resolve_static_container_element(expression, sequence_aliases)
         if element is not None:
@@ -2306,6 +2481,24 @@ def _classify_callable_expression(
     return _CallableKind.UNKNOWN
 
 
+def _is_higher_order_callable_expression(
+    expression: ast.AST,
+    *,
+    higher_order_aliases: set[str],
+    builtin_module_aliases: set[str],
+) -> bool:
+    """Recognize the finite map/filter alias forms used by raw-I/O callbacks."""
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Name):
+        return expression.id in _LOOP_HIGHER_ORDER_NAMES or expression.id in higher_order_aliases
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr in _LOOP_HIGHER_ORDER_NAMES
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in builtin_module_aliases
+    )
+
+
 def _is_hard_dynamic_kind(callable_kind: _CallableKind) -> bool:
     return callable_kind in {_CallableKind.DYNAMIC, _CallableKind.OPAQUE}
 
@@ -2316,6 +2509,12 @@ def _is_dynamic_lookup_expression(
     dynamic_aliases: set[str],
     builtin_module_aliases: set[str],
 ) -> bool:
+    if _is_dynamic_builtin_namespace_reconstruction(
+        expression,
+        dynamic_aliases=dynamic_aliases,
+        builtin_module_aliases=builtin_module_aliases,
+    ):
+        return True
     if isinstance(expression, ast.Subscript):
         if _is_dynamic_builtin_namespace_subscript(expression):
             return True
@@ -2347,6 +2546,12 @@ def _is_dynamic_lookup_call(
 ) -> bool:
     """Recognize dynamic lookup producers without banning ordinary data reads."""
     expression = _unwrap_named_expr(expression)
+    if _is_dynamic_builtin_namespace_reconstruction(
+        expression,
+        dynamic_aliases=dynamic_aliases,
+        builtin_module_aliases=builtin_module_aliases,
+    ):
+        return True
     if _is_dynamic_dict_lookup_attribute(
         expression,
         dynamic_aliases=dynamic_aliases,
@@ -2388,6 +2593,79 @@ def _is_dynamic_lookup_call(
     if _is_dynamic_import_attribute(expression.func, dynamic_aliases):
         return True
     return _is_dynamic_builtin_attribute(expression.func, builtin_module_aliases)
+
+
+def _is_dynamic_builtin_namespace_reconstruction(
+    expression: ast.AST,
+    *,
+    dynamic_aliases: set[str],
+    builtin_module_aliases: set[str],
+) -> bool:
+    """Recognize finite dictionary rebuilds rooted in the builtin namespace."""
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Call):
+        if isinstance(expression.func, ast.Name) and expression.func.id in {"dict", "vars"}:
+            return any(
+                _is_dynamic_builtin_namespace_source(
+                    argument,
+                    dynamic_aliases=dynamic_aliases,
+                    builtin_module_aliases=builtin_module_aliases,
+                )
+                for argument in [
+                    *expression.args,
+                    *(keyword.value for keyword in expression.keywords),
+                ]
+            )
+        return False
+    if isinstance(expression, ast.Dict):
+        return any(
+            key is None
+            and _is_dynamic_builtin_namespace_source(
+                value,
+                dynamic_aliases=dynamic_aliases,
+                builtin_module_aliases=builtin_module_aliases,
+            )
+            for key, value in zip(expression.keys, expression.values, strict=True)
+        )
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.BitOr):
+        return _is_dynamic_builtin_namespace_source(
+            expression.left,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        ) or _is_dynamic_builtin_namespace_source(
+            expression.right,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        )
+    return False
+
+
+def _is_dynamic_builtin_namespace_source(
+    expression: ast.AST,
+    *,
+    dynamic_aliases: set[str],
+    builtin_module_aliases: set[str],
+) -> bool:
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Name):
+        return expression.id in dynamic_aliases or expression.id in builtin_module_aliases
+    if _is_builtin_dict_attribute(expression, builtin_module_aliases):
+        return True
+    if isinstance(expression, ast.Attribute) and expression.attr == "__dict__":
+        return _is_dynamic_value_expression(
+            expression.value,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        )
+    return (
+        _is_dynamic_lookup_expression(
+            expression,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        )
+        if isinstance(expression, ast.Call | ast.Subscript)
+        else False
+    )
 
 
 def _is_dynamic_value_expression(

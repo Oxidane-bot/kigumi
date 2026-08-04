@@ -1253,6 +1253,81 @@ def node(inputs, ctx):
     assert all(not finding.waived for finding in findings)
 
 
+def test_raw_io_rejects_reconstructed_builtin_dict_open_lookups() -> None:
+    """普通 dict 重建不能把 builtin open 变成不可见的普通下标。"""
+    source = """
+import builtins
+
+def node(inputs, ctx):
+    first = dict(builtins.__dict__)["open"]
+    second = {**builtins.__dict__}["open"]
+    third = (builtins.__dict__ | {})["open"]
+    return (
+        first("first-secret.txt").read(),
+        second("second-secret.txt").read(),
+        third("third-secret.txt").read(),
+    )
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/rebuilt-builtin-dict.py"))
+    snippets = {finding.snippet for finding in findings}
+
+    assert {
+        'first = dict(builtins.__dict__)["open"]',
+        'second = {**builtins.__dict__}["open"]',
+        'third = (builtins.__dict__ | {})["open"]',
+        'first("first-secret.txt").read(),',
+        'second("second-secret.txt").read(),',
+        'third("third-secret.txt").read(),',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_rejects_assigned_map_and_filter_callback_aliases() -> None:
+    """mapper = map 与 select = filter 仍保留 higher-order callback 边界。"""
+    source = """
+def node(inputs, ctx):
+    mapper = map
+    select = filter
+    mapped = [item.read() for item in mapper(open, inputs)]
+    selected = [item.read() for item in select(open, inputs)]
+    return mapped, selected
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/assigned-higher-order.py"))
+
+    assert "mapped = [item.read() for item in mapper(open, inputs)]" in {
+        finding.snippet for finding in findings
+    }
+    assert "selected = [item.read() for item in select(open, inputs)]" in {
+        finding.snippet for finding in findings
+    }
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_node_guard_reaches_top_level_transitive_open_callbacks() -> None:
+    """装饰节点调用的顶层 helper/递归 helper 不能隐藏传递的 open。"""
+    source = """
+def relay(reader, values):
+    if values:
+        return relay(reader, values[1:])
+    return [item.read() for item in map(reader, values)]
+
+def apply(reader, values):
+    return relay(reader, values)
+
+@dag.node("transitive")
+def node(inputs, ctx):
+    return apply(open, inputs)
+"""
+
+    findings = check_raw_io_node_source(source, Path("nodes/top-level-transitive.py"))
+    snippets = {finding.snippet for finding in findings}
+
+    assert "return [item.read() for item in map(reader, values)]" in snippets
+    assert all(not finding.waived for finding in findings)
+
+
 def test_raw_io_rejects_imported_map_alias_open_callback() -> None:
     """from builtins import map as mapper 仍须检查 raw open callback。"""
     source = """
@@ -1370,6 +1445,89 @@ def node(items, ctx):
         'list(builtins.__dict__["map"](ctx.call, items))',
         'list(builtins.__dict__.copy()["map"](ctx.call, items))',
     ]
+    assert all(not finding.waived for finding in findings)
+
+
+def test_loop_guard_rejects_static_container_callable_shapes() -> None:
+    """helper/lambda、subscript、pop 与短路容器都必须进入有限证明边界。"""
+    source = """
+def helper(item, ctx):
+    return ctx.call(item)
+
+def safe(item):
+    return item + 1
+
+def node(items, ctx):
+    helper_callbacks = [helper]
+    lambda_callbacks = [lambda item: ctx.llm(item)]
+    for item in items:
+        helper_callbacks[0](item)
+        lambda_callbacks.pop(0)(item)
+        ([ctx.call] or [safe])[0](item)
+    list(map((lambda_callbacks or [ctx.call])[0], items))
+"""
+
+    findings = check_source(source, Path("nodes/static-container-loop-callbacks.py"))
+    snippets = {finding.snippet for finding in findings}
+
+    assert "helper_callbacks[0](item)" in snippets
+    assert "lambda_callbacks.pop(0)(item)" in snippets
+    assert "([ctx.call] or [safe])[0](item)" in snippets
+    assert "list(map((lambda_callbacks or [ctx.call])[0], items))" in snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_loop_guard_keeps_static_safe_container_callbacks_allowed() -> None:
+    """能证明 callback 安全时，静态容器解析不能制造误报。"""
+    source = """
+def safe(item):
+    return item + 1
+
+def node(items, ctx):
+    callbacks = [safe]
+    for item in items:
+        callbacks[0](item)
+        (callbacks or [safe])[0](item)
+    list(map(callbacks[0], items))
+"""
+
+    assert check_source(source, Path("nodes/static-safe-container-callbacks.py")) == []
+
+
+def test_loop_guard_rejects_indirect_builtin_map_sources() -> None:
+    """importlib/vars/sys.modules/getattr/namespace 链不能绕过 map guard。"""
+    source = """
+import builtins
+import importlib
+import sys
+
+def node(items, ctx):
+    namespace = builtins.__dict__
+    imported = importlib.import_module("builtins")
+    imported_namespace = imported.__dict__
+    vars_namespace = vars(builtins)
+    system_module = sys.modules["builtins"]
+    attribute_map = getattr(builtins, "map")
+    list(namespace["map"](ctx.call, items))
+    for item in items:
+        list(imported_namespace["map"](ctx.call, items))
+        list(vars_namespace["map"](ctx.call, items))
+        list(system_module.__dict__["map"](ctx.call, items))
+        list(attribute_map(ctx.call, items))
+        list(importlib.import_module("builtins").__dict__["map"](ctx.call, items))
+"""
+
+    findings = check_source(source, Path("nodes/indirect-builtin-map-sources.py"))
+    snippets = {finding.snippet for finding in findings}
+
+    assert {
+        'list(namespace["map"](ctx.call, items))',
+        'list(imported_namespace["map"](ctx.call, items))',
+        'list(vars_namespace["map"](ctx.call, items))',
+        'list(system_module.__dict__["map"](ctx.call, items))',
+        "list(attribute_map(ctx.call, items))",
+        'list(importlib.import_module("builtins").__dict__["map"](ctx.call, items))',
+    } <= snippets
     assert all(not finding.waived for finding in findings)
 
 
