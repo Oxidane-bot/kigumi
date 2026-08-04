@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ def test_multiple_processes_leave_a_valid_shared_cache(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     processes = [
         subprocess.Popen(
-            ["uv", "run", "python", str(script), str(cache_dir)],
+            [sys.executable, str(script), str(cache_dir)],
             cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
