@@ -52,6 +52,7 @@ from ._runstate import (
     AttemptStore,
     RunManifestError,
 )
+from ._safe_io import digest_open_file, open_regular_file
 from .agents import (
     AGENT_EXECUTOR_SCHEMA,
     AgentAdapter,
@@ -105,6 +106,8 @@ AggregateFunction = Callable[[dict[str, dict[str, Any]], list[str]], dict[str, A
 PostNodeHook = Callable[[str, dict[str, Any], bool], None]
 _NO_CARRY = object()
 _NO_ITEM = object()
+_DYNAMIC_FILES_LEDGER_FIELD = "dynamic_files_ledger"
+_DYNAMIC_FILES_LEDGER_DIGEST_FIELD = "dynamic_files_ledger_sha256"
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
 CACHE_SCHEMA = 7
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
@@ -193,6 +196,47 @@ def _kigumi_key_inputs() -> dict[str, Any]:
         "schema": CACHE_SCHEMA,
         "pydantic": pydantic.__version__,
     }
+
+
+def _dag_file_error(message: str, path: Path) -> ValueError:
+    """Describe a declared DAG input rejected by the regular-file boundary."""
+    return ValueError(f"DAG declared file {message}: {path}")
+
+
+def _dag_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Return descriptor metadata used to detect a file changing mid-snapshot."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_snapshot_file(path: Path) -> bytes:
+    """Read one declared input from a descriptor-bound regular file."""
+    with open_regular_file(
+        path,
+        identity=_dag_file_identity,
+        expected_identity=None,
+        phase="before snapshot",
+        error=_dag_file_error,
+    ) as handle:
+        _digest, _size, data = digest_open_file(
+            handle,
+            path,
+            identity=_dag_file_identity,
+            expected_identity=None,
+            before_phase="before snapshot",
+            during_phase="during snapshot",
+            chunk_size=1024 * 1024,
+            error=_dag_file_error,
+            collect=True,
+        )
+    if data is None:
+        raise _dag_file_error("returned no bytes", path)
+    return data
 
 
 class CheckpointPending(RuntimeError):
@@ -387,10 +431,12 @@ class _FileSnapshot:
         for raw_path in paths:
             declared = Path(raw_path)
             resolved = resolve(declared)
-            data = resolved_contents.get(resolved)
-            if data is None:
-                data = resolved.read_bytes()
-                resolved_contents[resolved] = data
+            # ``KigumiConfig.resolve`` is a logical project-boundary helper and
+            # intentionally follows symlinks.  It is not a safe input read.  Open
+            # the lexical path through the shared descriptor boundary so the
+            # declaration itself cannot turn into a symlink or special file.
+            data = _read_snapshot_file(self._lexical_absolute(declared))
+            resolved_contents[resolved] = data
             aliases = self._aliases(declared, resolved)
             declared_aliases.setdefault(str(declared), aliases)
             for alias in aliases:
@@ -1309,6 +1355,7 @@ class Dag:
             raise ValueError("workers must be a positive integer")
         requested_force = tuple(force)
         existing_manifest: dict[str, Any] | None = None
+        dynamic_files_ledger: dict[str, dict[str, list[dict[str, str]]]] = {}
         if run_id is not None:
             manifest_path = store.run_directory(self.config.artifacts_path, run_id) / "_run.json"
             try:
@@ -1318,6 +1365,9 @@ class Dag:
             if isinstance(candidate_manifest, dict):
                 if candidate_manifest.get("run_manifest_schema") == RUN_MANIFEST_SCHEMA:
                     self._validate_execution_manifest_profile(run_id, candidate_manifest)
+                    dynamic_files_ledger = self._validate_dynamic_files_ledger(
+                        run_id, candidate_manifest
+                    )
                 existing_manifest = candidate_manifest
         selected = (
             tuple(existing_manifest.get("targets", ()))
@@ -1376,6 +1426,7 @@ class Dag:
                 libs_hashes,
                 prompt_snapshot,
                 file_snapshot,
+                dynamic_files_ledger,
             ),
         )
         attempt_store.initialize()
@@ -1450,33 +1501,64 @@ class Dag:
                 )
                 run_artifact = run_dir / f"{node.name}.json"
                 run_sidecar = run_dir / f"{node.name}.json.meta.json"
-                if (
-                    existing_manifest is not None
-                    and run_artifact.is_file()
-                    and run_sidecar.is_file()
-                ):
-                    artifact, prior_metadata = self._resume_completed_artifact(
-                        run_dir,
-                        node.name,
-                        key_components,
-                        cache_key,
-                        validate_agent=node.executor == "agent",
-                        prompt_resolutions=prompt_resolution_records,
-                    )
-                    origin = prior_metadata.get("origin_provenance")
-                    if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
-                        agent_provenance = copy.deepcopy(origin["agent"])
-                    cache_hit = prior_metadata.get("cache") == "hit"
-                    resumed_completed = True
+                has_artifact = run_artifact.is_file()
+                has_sidecar = run_sidecar.is_file()
+                if existing_manifest is not None and (has_artifact or has_sidecar):
+                    if not (has_artifact and has_sidecar):
+                        raise RunManifestError(
+                            f"Target {node.name!r} has an incomplete run artifact pair"
+                        )
+                    if prior_state is None:
+                        raise RunManifestError(
+                            f"Target {node.name!r} has no durable state/candidate ownership"
+                        )
+                    if prior_state.get("status") == "completed":
+                        artifact, prior_metadata = self._resume_completed_artifact(
+                            run_dir,
+                            node.name,
+                            key_components,
+                            cache_key,
+                            state=prior_state,
+                            validate_agent=node.executor == "agent",
+                            prompt_resolutions=prompt_resolution_records,
+                        )
+                        origin = prior_metadata.get("origin_provenance")
+                        if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                            agent_provenance = copy.deepcopy(origin["agent"])
+                        cache_hit = prior_metadata.get("cache") == "hit"
+                        resumed_completed = True
+                    elif prior_state.get("status") == "success_candidate":
+                        artifact, cache_hit = None, False
+                    else:
+                        raise RunManifestError(
+                            f"Target {node.name!r} run artifact pair is not owned by a "
+                            "completed state/candidate"
+                        )
                 elif prior_state is not None:
                     artifact, cache_hit = None, False
                 else:
-                    cache_entry = self._cache_entry_for_lookup(
-                        cache_key,
-                        forced=node.name in forced_nodes,
-                        cache_policy=(node.cache if libs_cache_reusable else "off"),
-                        evidence_policy=evidence_policy,
-                    )
+                    try:
+                        cache_entry = self._cache_entry_for_lookup(
+                            cache_key,
+                            forced=node.name in forced_nodes,
+                            cache_policy=(node.cache if libs_cache_reusable else "off"),
+                            evidence_policy=evidence_policy,
+                        )
+                    except CacheIntegrityError as error:
+                        assert key_components is not None
+                        self._record_cache_lookup_failure(
+                            attempt_store,
+                            node.name,
+                            error,
+                            policy=node.retry,
+                            declaration_digest=self._attempt_declaration_digest(
+                                node,
+                                key_components,
+                                evidence_policy,
+                            ),
+                            prompt_resolutions=prompt_resolution_records,
+                        )
+                        raise
                     artifact = cache_entry.artifact if cache_entry is not None else None
                     cache_hit = cache_entry is not None
             else:
@@ -1524,6 +1606,7 @@ class Dag:
                             prompt_snapshot=prompt_snapshot,
                             budget_abort=budget_abort,
                             file_snapshot=file_snapshot,
+                            allow_new_dynamic_files_ledger=existing_manifest is None,
                         )
                         cache_key = item_cache_keys
                         with state_lock:
@@ -1558,6 +1641,7 @@ class Dag:
                                 node.name,
                                 key_components,
                                 cache_key,
+                                state=prepared["state"],
                                 validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
                             )
@@ -1769,66 +1853,109 @@ class Dag:
                                     "prompt_resolutions": prompt_resolution_records,
                                 },
                             )
-                        if node.items_from is None:
-                            effective_cache_policy = (
-                                "off" if checkpoint_used or not libs_cache_reusable else node.cache
-                            )
-                        if not resumed_completed:
-                            # miss 路径喂下游的必须与命中路径同形态:命中读的是
-                            # 排序后的磁盘 JSON,活字典键序不能让下游 prompt 漂移。
-                            artifact = envelope.seal(
-                                artifact,
-                                cache_key,
-                                label=f"Node {node.name!r}",
-                                calls=calls,
-                                cache_policy=effective_cache_policy,
-                                evidence_policy=evidence_policy,
-                                agent_provenance=agent_provenance,
-                                prompt_resolutions=prompt_resolution_records,
-                            )
-                    if node.executor == "agent" and node.items_from is None:
-                        validate_agent_artifact(artifact, self.blob_store)
-                        if isinstance(agent_provenance, dict):
-                            validate_agent_provenance(
-                                agent_provenance,
-                                self.blob_store,
-                            )
-                    elapsed = time.monotonic() - started
-                    with state_lock:
-                        if cache_hit:
-                            cache_hits.append(node.name)
-                        outputs = envelope.materialize(
+                if (
+                    node.items_from is None
+                    and artifact is not None
+                    and cache_hit
+                    and not resumed_completed
+                ):
+                    assert key_components is not None
+                    declaration_digest = self._attempt_declaration_digest(
+                        node,
+                        key_components,
+                        evidence_policy,
+                    )
+                    prepared = attempt_store.prepare(
+                        node.name,
+                        policy=node.retry,
+                        declaration_digest=declaration_digest,
+                        prompt_resolutions=prompt_resolution_records,
+                    )
+                    if prepared["action"] != "run":
+                        raise RunManifestError(
+                            f"Cache hit for {node.name!r} has an unexpected durable state"
+                        )
+                    attempt_store.save_candidate(
+                        node.name,
+                        {
+                            "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
+                            "artifact": artifact,
+                            "cache_key": cache_key,
+                            "key_components": key_components,
+                            "calls": copy.deepcopy(calls),
+                            "agent_provenance": copy.deepcopy(agent_provenance),
+                            "seconds": time.monotonic() - started,
+                            "checkpoint_used": False,
+                            "prompt_resolutions": prompt_resolution_records,
+                        },
+                    )
+                if node.items_from is None:
+                    effective_cache_policy = (
+                        "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                    )
+                if node.items_from is None and not resumed_completed and not cache_hit:
+                    # miss 路径喂下游的必须与命中路径同形态:命中读的是
+                    # 排序后的磁盘 JSON,活字典键序不能让下游 prompt 漂移。
+                    artifact = envelope.seal(
+                        artifact,
+                        cache_key,
+                        label=f"Node {node.name!r}",
+                        calls=calls,
+                        cache_policy=effective_cache_policy,
+                        evidence_policy=evidence_policy,
+                        agent_provenance=agent_provenance,
+                        prompt_resolutions=prompt_resolution_records,
+                    )
+                if node.executor == "agent" and node.items_from is None:
+                    validate_agent_artifact(artifact, self.blob_store)
+                    if isinstance(agent_provenance, dict):
+                        validate_agent_provenance(
+                            agent_provenance,
+                            self.blob_store,
+                        )
+                elapsed = time.monotonic() - started
+                with state_lock:
+                    if cache_hit:
+                        cache_hits.append(node.name)
+                    outputs = envelope.materialize(
+                        node.name,
+                        artifact,
+                        allow_item_owners=node.items_from is not None,
+                    )
+                    if self.post_node is not None and not resumed_completed:
+                        self.post_node(node.name, artifact, cache_hit)
+                    artifacts[node.name] = artifact
+                    artifact_sha256 = sha(artifact)
+                    artifact_shas[node.name] = artifact_sha256
+                    if not resumed_completed:
+                        envelope.write_sidecar(
                             node.name,
                             artifact,
-                            allow_item_owners=node.items_from is not None,
+                            cache_key,
+                            # The dynamic aggregate is a derived view of
+                            # item materializations, not an independently
+                            # resumable attempt.  Its sidecar therefore
+                            # has no node state/candidate ownership; mark
+                            # it as the framework's state-less cache-hit
+                            # shape while preserving the real item cache
+                            # statuses in the result and item sidecars.
+                            cache_hit=(cache_hit or node.items_from is not None),
+                            cache_entry=cache_entry,
+                            seconds=elapsed,
+                            calls=calls,
+                            key_components=key_components,
+                            outputs=outputs,
+                            cache_policy=effective_cache_policy,
+                            evidence_policy=evidence_policy,
+                            agent_provenance=agent_provenance,
+                            prompt_resolutions=prompt_resolution_records,
                         )
-                        if self.post_node is not None and not resumed_completed:
-                            self.post_node(node.name, artifact, cache_hit)
-                        artifacts[node.name] = artifact
-                        artifact_sha256 = sha(artifact)
-                        artifact_shas[node.name] = artifact_sha256
-                        if not resumed_completed:
-                            envelope.write_sidecar(
-                                node.name,
-                                artifact,
-                                cache_key,
-                                cache_hit=cache_hit,
-                                cache_entry=cache_entry,
-                                seconds=elapsed,
-                                calls=calls,
-                                key_components=key_components,
-                                outputs=outputs,
-                                cache_policy=effective_cache_policy,
-                                evidence_policy=evidence_policy,
-                                agent_provenance=agent_provenance,
-                                prompt_resolutions=prompt_resolution_records,
-                            )
-                        if node.items_from is None and artifact is not None and not cache_hit:
-                            attempt_store.mark_completed(
-                                node.name,
-                                artifact_sha256=artifact_sha256,
-                            )
-                    return node_name, "success"
+                    if node.items_from is None and artifact is not None and not resumed_completed:
+                        attempt_store.mark_completed(
+                            node.name,
+                            artifact_sha256=artifact_sha256,
+                        )
+                return node_name, "success"
             except BudgetExceeded:
                 budget_abort.set()
                 raise
@@ -2075,6 +2202,7 @@ class Dag:
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
         self._validate_execution_manifest_profile(run_id, manifest)
+        dynamic_files_ledger = self._validate_dynamic_files_ledger(run_id, manifest)
         if manifest.get("status") != "failed":
             raise ValueError(f"Run {run_id!r} is not in terminal failed state")
 
@@ -2110,6 +2238,7 @@ class Dag:
                     libs_hashes,
                     prompt_snapshot,
                     file_snapshot,
+                    dynamic_files_ledger,
                 ),
             )
             attempts.initialize()
@@ -2276,6 +2405,113 @@ class Dag:
         if manifest.get("workflow_profile_digest") != sha(profile):
             raise RunManifestError(f"Run {run_id!r} workflow_profile digest validation failed")
 
+    @staticmethod
+    def _validate_dynamic_files_ledger(
+        run_id: str,
+        manifest: Mapping[str, Any],
+    ) -> dict[str, dict[str, list[dict[str, str]]]]:
+        """Validate the immutable path/digest ledger owned by a run manifest."""
+        ledger = manifest.get(_DYNAMIC_FILES_LEDGER_FIELD)
+        digest = manifest.get(_DYNAMIC_FILES_LEDGER_DIGEST_FIELD)
+        if not isinstance(ledger, dict) or digest != sha(ledger):
+            raise RunManifestError(f"Run {run_id!r} has an invalid dynamic files snapshot ledger")
+        for node_name, items in ledger.items():
+            if not isinstance(node_name, str) or not isinstance(items, dict):
+                raise RunManifestError(
+                    f"Run {run_id!r} has an invalid dynamic files snapshot ledger"
+                )
+            for item_id, entries in items.items():
+                if not isinstance(item_id, str) or not isinstance(entries, list):
+                    raise RunManifestError(
+                        f"Run {run_id!r} has an invalid dynamic files snapshot ledger"
+                    )
+                for entry in entries:
+                    if (
+                        not isinstance(entry, dict)
+                        or set(entry) != {"path", "sha256"}
+                        or not isinstance(entry.get("path"), str)
+                        or not entry["path"]
+                        or not isinstance(entry.get("sha256"), str)
+                        or len(entry["sha256"]) != 64
+                        or entry["sha256"] != entry["sha256"].lower()
+                        or any(character not in "0123456789abcdef" for character in entry["sha256"])
+                    ):
+                        raise RunManifestError(
+                            f"Run {run_id!r} has an invalid dynamic files snapshot ledger"
+                        )
+        return copy.deepcopy(ledger)
+
+    @staticmethod
+    def _dynamic_files_observation(
+        node: _Node,
+        item_files_by_id: Mapping[str, tuple[Path, ...]],
+        file_snapshot: _FileSnapshot,
+    ) -> dict[str, dict[str, list[dict[str, str]]]]:
+        return {
+            node.name: {
+                item_id: [
+                    {"path": str(path), "sha256": _bytes_hash(file_snapshot.read(path))}
+                    for path in item_files
+                ]
+                for item_id, item_files in item_files_by_id.items()
+            }
+        }
+
+    def _bind_dynamic_files_ledger(
+        self,
+        attempt_store: AttemptStore,
+        run_id: str,
+        node: _Node,
+        observed: dict[str, dict[str, list[dict[str, str]]]],
+        *,
+        allow_new: bool,
+    ) -> None:
+        """Bind one dynamic node's complete files_fn result before any item runs."""
+        with attempt_store._run_locked():  # noqa: SLF001 - manifest binding is DAG-owned
+            manifest = attempt_store._required_manifest()  # noqa: SLF001
+            ledger = self._validate_dynamic_files_ledger(run_id, manifest)
+            current = observed[node.name]
+            if node.name in ledger:
+                if ledger[node.name] != current:
+                    raise RunManifestError(
+                        f"Run {run_id!r} dynamic files snapshot changed for node {node.name!r}"
+                    )
+                return
+            if not allow_new and (
+                manifest.get("status") == "completed"
+                or self._dynamic_node_has_durable_evidence(attempt_store, node.name)
+            ):
+                raise RunManifestError(
+                    f"Run {run_id!r} dynamic files snapshot ledger has no node {node.name!r}"
+                )
+            updated = copy.deepcopy(ledger)
+            updated[node.name] = copy.deepcopy(current)
+            updated_digest = sha(updated)
+            manifest[_DYNAMIC_FILES_LEDGER_FIELD] = updated
+            manifest[_DYNAMIC_FILES_LEDGER_DIGEST_FIELD] = updated_digest
+            attempt_store.identity[_DYNAMIC_FILES_LEDGER_FIELD] = copy.deepcopy(updated)
+            attempt_store.identity[_DYNAMIC_FILES_LEDGER_DIGEST_FIELD] = updated_digest
+            attempt_store._commit_manifest(manifest)  # noqa: SLF001
+
+    @staticmethod
+    def _dynamic_node_has_durable_evidence(
+        attempt_store: AttemptStore,
+        node_name: str,
+    ) -> bool:
+        """Detect a previously started dynamic node before permitting first bind."""
+        states = attempt_store._validate_all_attempt_receipts()  # noqa: SLF001
+        if any(
+            target == node_name or target.startswith(f"{node_name}@")
+            for target in (state.get("target") for state in states)
+        ):
+            return True
+        run_root = attempt_store.run_root
+        if (run_root / f"{node_name}.json").exists() or (
+            run_root / f"{node_name}.json.meta.json"
+        ).exists():
+            return True
+        return any(run_root.glob(f"{node_name}@*.json"))
+
     def _run_manifest_identity(
         self,
         run_id: str,
@@ -2285,6 +2521,7 @@ class Dag:
         libs_hashes: Mapping[str, str],
         prompt_snapshot: PromptCatalogSnapshot,
         file_snapshot: _FileSnapshot,
+        dynamic_files_ledger: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         declarations: dict[str, Any] = {}
         retry_digests: dict[str, str | None] = {}
@@ -2325,6 +2562,7 @@ class Dag:
         source_digest = sha(declarations)
         static_profile = self._static_workflow_profile(prompt_snapshot)
         libs_digest = sha(libs_hashes)
+        dynamic_ledger = copy.deepcopy(dynamic_files_ledger or {})
         return {
             "run_id": run_id,
             "graph_identity": sha(
@@ -2341,6 +2579,8 @@ class Dag:
             "libs_digest": libs_digest,
             "retry_policy_digests": retry_digests,
             "evidence_policy_digests": evidence_digests,
+            _DYNAMIC_FILES_LEDGER_FIELD: dynamic_ledger,
+            _DYNAMIC_FILES_LEDGER_DIGEST_FIELD: sha(dynamic_ledger),
             "workflow_profile": static_profile,
             "workflow_profile_digest": sha(static_profile),
         }
@@ -2367,6 +2607,7 @@ class Dag:
         key_components: dict[str, str],
         cache_key: str,
         *,
+        state: Mapping[str, Any] | None = None,
         validate_agent: bool = False,
         prompt_resolutions: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2382,6 +2623,44 @@ class Dag:
         if not isinstance(artifact, dict) or not isinstance(metadata, dict):
             raise RunManifestError(f"Completed target {label!r} has invalid run artifacts")
         artifact_digest = sha(artifact)
+        if state is None or state.get("status") != "completed":
+            raise RunManifestError(
+                f"Completed target {label!r} has no durable state/candidate ownership"
+            )
+        if state.get("artifact_sha256") != artifact_digest:
+            raise RunManifestError(
+                f"Completed target {label!r} state does not own the run artifact"
+            )
+        candidate_file = state.get("candidate_file")
+        if (
+            not isinstance(candidate_file, str)
+            or Path(candidate_file).is_absolute()
+            or Path(candidate_file).parent != Path(".")
+            or candidate_file != f"candidate-{state.get('attempt', 0):04d}.json"
+        ):
+            raise RunManifestError(
+                f"Completed target {label!r} has no valid success candidate ownership"
+            )
+        candidate_path = run_dir / "attempts" / sha(label) / candidate_file
+        try:
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+            raise RunManifestError(
+                f"Completed target {label!r} has a missing or invalid success candidate"
+            ) from error
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
+            or state.get("candidate_sha256") != sha(candidate)
+            or not isinstance(candidate.get("artifact"), dict)
+            or sha(candidate["artifact"]) != artifact_digest
+            or candidate.get("cache_key") != cache_key
+            or candidate.get("key_components") != key_components
+            or candidate.get("prompt_resolutions") != dict(prompt_resolutions or {})
+        ):
+            raise RunManifestError(
+                f"Completed target {label!r} success candidate ownership validation failed"
+            )
         origin = metadata.get("origin_provenance")
         if (
             metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
@@ -2404,7 +2683,101 @@ class Dag:
         if validate_agent:
             validate_agent_artifact(artifact, self.blob_store)
         _validate_persisted_prompt_lineage(metadata, label)
+        self._validate_materialized_outputs(label, artifact, metadata)
         return artifact, metadata
+
+    def _validate_materialized_outputs(
+        self,
+        label: str,
+        artifact: dict[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Check completed output bytes before resume is allowed to rematerialize them."""
+        expected: dict[str, bytes] = {}
+        files = artifact.get("files")
+        if files is not None:
+            if not isinstance(files, dict):
+                raise RunManifestError(f"Completed target {label!r} has invalid materialized files")
+            for relative_name, contents in files.items():
+                if not isinstance(relative_name, str) or not isinstance(contents, str):
+                    raise RunManifestError(
+                        f"Completed target {label!r} has invalid materialized files"
+                    )
+                try:
+                    relative_path = store.project_relative_path(relative_name)
+                except (TypeError, ValueError) as error:
+                    raise RunManifestError(
+                        f"Completed target {label!r} has an invalid materialized output path"
+                    ) from error
+                output_name = relative_path.as_posix()
+                if output_name in expected:
+                    raise RunManifestError(
+                        f"Completed target {label!r} has duplicate materialized output "
+                        f"{output_name!r}"
+                    )
+                expected[output_name] = contents.encode("utf-8")
+
+        def blob_references(value: Any) -> Iterable[dict[str, Any]]:
+            if isinstance(value, dict):
+                if "kigumi_blob" in value:
+                    yield value
+                for child in value.values():
+                    yield from blob_references(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from blob_references(child)
+
+        for reference in blob_references(artifact):
+            digest = reference.get("kigumi_blob")
+            relative_name = reference.get("path")
+            if not isinstance(digest, str) or not isinstance(relative_name, str):
+                raise RunManifestError(
+                    f"Completed target {label!r} has an invalid blob materialization"
+                )
+            try:
+                relative_path = store.project_relative_path(relative_name)
+                expected_bytes = self.blob_store.read_verified(digest)
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                raise RunManifestError(
+                    f"Completed target {label!r} has an invalid blob materialization"
+                ) from error
+            output_name = relative_path.as_posix()
+            if output_name in expected:
+                raise RunManifestError(
+                    f"Completed target {label!r} has duplicate materialized output {output_name!r}"
+                )
+            expected[output_name] = expected_bytes
+
+        recorded = metadata.get("outputs")
+        if (
+            not isinstance(recorded, list)
+            or not all(isinstance(value, str) for value in recorded)
+            or len(recorded) != len(set(recorded))
+            or sorted(recorded) != sorted(expected)
+        ):
+            raise RunManifestError(
+                f"Completed target {label!r} materialized output ledger is invalid"
+            )
+
+        project_root = self.config.project_root.resolve()
+        for output_name, expected_bytes in expected.items():
+            relative_path = Path(output_name)
+            destination = project_root / relative_path
+            try:
+                resolved = self.config.resolve(relative_path)
+                resolved.relative_to(project_root)
+                actual = _read_snapshot_file(destination)
+            except (OSError, ValueError) as error:
+                raise RunManifestError(
+                    f"Completed target {label!r} materialized output {output_name!r} "
+                    "cannot be safely read"
+                ) from error
+            if actual != expected_bytes:
+                raise RunManifestError(
+                    f"Completed target {label!r} materialized output {output_name!r} "
+                    f"digest mismatch (expected {_bytes_hash(expected_bytes)}, "
+                    f"got {_bytes_hash(actual)})"
+                )
 
     def _cache_entry_for_lookup(
         self,
@@ -2431,6 +2804,39 @@ class Dag:
         ):
             return None
         return entry
+
+    @staticmethod
+    def _record_cache_lookup_failure(
+        attempt_store: AttemptStore,
+        target: str,
+        error: CacheIntegrityError,
+        *,
+        policy: RetryPolicy | None,
+        declaration_digest: str,
+        prompt_resolutions: Mapping[str, Any],
+        calls: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Bind a cache read failure to durable target state before re-raising it.
+
+        A corrupt cache can be discovered before normal attempt admission.  The
+        run still needs a durable failed target when other cache hits have
+        already completed; otherwise strict manifest publication quite rightly
+        rejects a terminal failure with only completed states.
+        """
+        prepared = attempt_store.prepare(
+            target,
+            policy=policy,
+            declaration_digest=declaration_digest,
+            prompt_resolutions=dict(prompt_resolutions),
+        )
+        if prepared["action"] != "run":
+            raise RunManifestError(f"Cache lookup for {target!r} has an unexpected durable state")
+        attempt_store.record_failure(
+            target,
+            error,
+            policy=policy,
+            calls=calls,
+        )
 
     def _lookup_cache(
         self,
@@ -3593,6 +3999,7 @@ class Dag:
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
         file_snapshot: _FileSnapshot,
+        allow_new_dynamic_files_ledger: bool,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
@@ -3611,6 +4018,13 @@ class Dag:
         file_snapshot = file_snapshot.extend(
             (path for item_files in item_files_by_id.values() for path in item_files),
             self.config.resolve,
+        )
+        self._bind_dynamic_files_ledger(
+            attempt_store,
+            run_id,
+            node,
+            self._dynamic_files_observation(node, item_files_by_id, file_snapshot),
+            allow_new=allow_new_dynamic_files_ledger,
         )
 
         shared_inputs = self._function_inputs(
@@ -3666,31 +4080,63 @@ class Dag:
                     cache_entry: store.CacheEntry | None = None
                     resumed_completed = False
                     run_root = envelope.artifacts_path / "runs" / run_id
-                    if (run_root / f"{target}.json").is_file() and (
-                        run_root / f"{target}.json.meta.json"
-                    ).is_file():
-                        artifact, prior_metadata = self._resume_completed_artifact(
-                            run_root,
-                            target,
-                            key_components,
-                            cache_key,
-                            prompt_resolutions=prompt_resolution_records,
-                        )
-                        cache_hit = prior_metadata.get("cache") == "hit"
-                        if prior_metadata.get("cache_policy") == "off":
-                            checkpoint_used = True
-                        resumed_completed = True
-                    elif attempt_store.state_for(target) is not None:
+                    prior_state = attempt_store.state_for(target)
+                    run_artifact = run_root / f"{target}.json"
+                    run_sidecar = run_root / f"{target}.json.meta.json"
+                    has_artifact = run_artifact.is_file()
+                    has_sidecar = run_sidecar.is_file()
+                    if has_artifact or has_sidecar:
+                        if not (has_artifact and has_sidecar):
+                            raise RunManifestError(
+                                f"Target {target!r} has an incomplete run artifact pair"
+                            )
+                        if prior_state is None:
+                            raise RunManifestError(
+                                f"Target {target!r} has no durable state/candidate ownership"
+                            )
+                        if prior_state.get("status") == "completed":
+                            artifact, prior_metadata = self._resume_completed_artifact(
+                                run_root,
+                                target,
+                                key_components,
+                                cache_key,
+                                state=prior_state,
+                                prompt_resolutions=prompt_resolution_records,
+                            )
+                            cache_hit = prior_metadata.get("cache") == "hit"
+                            if prior_metadata.get("cache_policy") == "off":
+                                checkpoint_used = True
+                            resumed_completed = True
+                        elif prior_state.get("status") == "success_candidate":
+                            artifact, cache_hit = None, False
+                        else:
+                            raise RunManifestError(
+                                f"Target {target!r} run artifact pair is not owned by a "
+                                "completed state/candidate"
+                            )
+                    elif prior_state is not None:
                         artifact, cache_hit = None, False
                     else:
-                        cache_entry = self._cache_entry_for_lookup(
-                            cache_key,
-                            forced=forced_all or item_id in forced_items,
-                            cache_policy=(node.cache if libs_cache_reusable else "off"),
-                            evidence_policy=(
-                                node.evidence_policy or self._caller_evidence_policy()
-                            ),
-                        )
+                        try:
+                            cache_entry = self._cache_entry_for_lookup(
+                                cache_key,
+                                forced=forced_all or item_id in forced_items,
+                                cache_policy=(node.cache if libs_cache_reusable else "off"),
+                                evidence_policy=(
+                                    node.evidence_policy or self._caller_evidence_policy()
+                                ),
+                            )
+                        except CacheIntegrityError as error:
+                            self._record_cache_lookup_failure(
+                                attempt_store,
+                                target,
+                                error,
+                                policy=node.retry,
+                                declaration_digest=declaration_digest,
+                                prompt_resolutions=prompt_resolution_records,
+                                calls=calls,
+                            )
+                            raise
                         artifact = cache_entry.artifact if cache_entry is not None else None
                         cache_hit = cache_entry is not None
                     if artifact is None:
@@ -3722,6 +4168,7 @@ class Dag:
                                 target,
                                 key_components,
                                 cache_key,
+                                state=prepared["state"],
                                 prompt_resolutions=prompt_resolution_records,
                             )
                             resumed_completed = True
@@ -3838,6 +4285,31 @@ class Dag:
                                 evidence_policy=self._caller_evidence_policy(),
                                 prompt_resolutions=prompt_resolution_records,
                             )
+                    if artifact is not None and cache_hit and not resumed_completed:
+                        prepared = attempt_store.prepare(
+                            target,
+                            policy=node.retry,
+                            declaration_digest=declaration_digest,
+                            prompt_resolutions=prompt_resolution_records,
+                        )
+                        if prepared["action"] != "run":
+                            raise RunManifestError(
+                                f"Cache hit for {target!r} has an unexpected durable state"
+                            )
+                        attempt_store.save_candidate(
+                            target,
+                            {
+                                "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
+                                "artifact": artifact,
+                                "cache_key": cache_key,
+                                "key_components": key_components,
+                                "calls": copy.deepcopy(calls),
+                                "agent_provenance": None,
+                                "seconds": time.monotonic() - started,
+                                "checkpoint_used": False,
+                                "prompt_resolutions": prompt_resolution_records,
+                            },
+                        )
                     return {
                         "id": item_id,
                         "status": "success",
@@ -3926,7 +4398,7 @@ class Dag:
                         evidence_policy=self._caller_evidence_policy(),
                         prompt_resolutions=outcome["prompt_resolutions"],
                     )
-                if outcome["cache"] != "hit" and not outcome["resumed_completed"]:
+                if not outcome["resumed_completed"]:
                     attempt_store.mark_completed(
                         outcome["target"],
                         artifact_sha256=sha(artifact),
@@ -4027,6 +4499,7 @@ class Dag:
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
         file_snapshot: _FileSnapshot,
+        allow_new_dynamic_files_ledger: bool,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
@@ -4046,6 +4519,13 @@ class Dag:
         file_snapshot = file_snapshot.extend(
             (path for item_files in item_files_by_id.values() for path in item_files),
             self.config.resolve,
+        )
+        self._bind_dynamic_files_ledger(
+            attempt_store,
+            run_id,
+            node,
+            self._dynamic_files_observation(node, item_files_by_id, file_snapshot),
+            allow_new=allow_new_dynamic_files_ledger,
         )
 
         omitted_local = {node.local_items_source or source_name}
@@ -4120,33 +4600,65 @@ class Dag:
                     cache_entry: store.CacheEntry | None = None
                     resumed_completed = False
                     run_root = envelope.artifacts_path / "runs" / run_id
-                    if (run_root / f"{target}.json").is_file() and (
-                        run_root / f"{target}.json.meta.json"
-                    ).is_file():
-                        artifact, prior_metadata = self._resume_completed_artifact(
-                            run_root,
-                            target,
-                            key_components,
-                            cache_key,
-                            validate_agent=node.executor == "agent",
-                            prompt_resolutions=prompt_resolution_records,
-                        )
-                        origin = prior_metadata.get("origin_provenance")
-                        if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
-                            agent_provenance = copy.deepcopy(origin["agent"])
-                        cache_hit = prior_metadata.get("cache") == "hit"
-                        if prior_metadata.get("cache_policy") == "off":
-                            effective_cache_policy = "off"
-                        resumed_completed = True
-                    elif attempt_store.state_for(target) is not None:
+                    prior_state = attempt_store.state_for(target)
+                    run_artifact = run_root / f"{target}.json"
+                    run_sidecar = run_root / f"{target}.json.meta.json"
+                    has_artifact = run_artifact.is_file()
+                    has_sidecar = run_sidecar.is_file()
+                    if has_artifact or has_sidecar:
+                        if not (has_artifact and has_sidecar):
+                            raise RunManifestError(
+                                f"Target {target!r} has an incomplete run artifact pair"
+                            )
+                        if prior_state is None:
+                            raise RunManifestError(
+                                f"Target {target!r} has no durable state/candidate ownership"
+                            )
+                        if prior_state.get("status") == "completed":
+                            artifact, prior_metadata = self._resume_completed_artifact(
+                                run_root,
+                                target,
+                                key_components,
+                                cache_key,
+                                state=prior_state,
+                                validate_agent=node.executor == "agent",
+                                prompt_resolutions=prompt_resolution_records,
+                            )
+                            origin = prior_metadata.get("origin_provenance")
+                            if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
+                                agent_provenance = copy.deepcopy(origin["agent"])
+                            cache_hit = prior_metadata.get("cache") == "hit"
+                            if prior_metadata.get("cache_policy") == "off":
+                                effective_cache_policy = "off"
+                            resumed_completed = True
+                        elif prior_state.get("status") == "success_candidate":
+                            artifact, cache_hit = None, False
+                        else:
+                            raise RunManifestError(
+                                f"Target {target!r} run artifact pair is not owned by a "
+                                "completed state/candidate"
+                            )
+                    elif prior_state is not None:
                         artifact, cache_hit = None, False
                     else:
-                        cache_entry = self._cache_entry_for_lookup(
-                            cache_key,
-                            forced=forced_all or item_id in forced_items,
-                            cache_policy=(node.cache if libs_cache_reusable else "off"),
-                            evidence_policy=evidence_policy,
-                        )
+                        try:
+                            cache_entry = self._cache_entry_for_lookup(
+                                cache_key,
+                                forced=forced_all or item_id in forced_items,
+                                cache_policy=(node.cache if libs_cache_reusable else "off"),
+                                evidence_policy=evidence_policy,
+                            )
+                        except CacheIntegrityError as error:
+                            self._record_cache_lookup_failure(
+                                attempt_store,
+                                target,
+                                error,
+                                policy=node.retry,
+                                declaration_digest=declaration_digest,
+                                prompt_resolutions=prompt_resolution_records,
+                                calls=calls,
+                            )
+                            raise
                         artifact = cache_entry.artifact if cache_entry is not None else None
                         cache_hit = cache_entry is not None
                     if artifact is None:
@@ -4169,6 +4681,7 @@ class Dag:
                                 target,
                                 key_components,
                                 cache_key,
+                                state=prepared["state"],
                                 validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
                             )
@@ -4391,6 +4904,31 @@ class Dag:
                                 agent_provenance=agent_provenance,
                                 prompt_resolutions=prompt_resolution_records,
                             )
+                    if artifact is not None and cache_hit and not resumed_completed:
+                        prepared = attempt_store.prepare(
+                            target,
+                            policy=node.retry,
+                            declaration_digest=declaration_digest,
+                            prompt_resolutions=prompt_resolution_records,
+                        )
+                        if prepared["action"] != "run":
+                            raise RunManifestError(
+                                f"Cache hit for {target!r} has an unexpected durable state"
+                            )
+                        attempt_store.save_candidate(
+                            target,
+                            {
+                                "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
+                                "artifact": artifact,
+                                "cache_key": cache_key,
+                                "key_components": key_components,
+                                "calls": copy.deepcopy(calls),
+                                "agent_provenance": copy.deepcopy(agent_provenance),
+                                "seconds": time.monotonic() - started,
+                                "checkpoint_used": False,
+                                "prompt_resolutions": prompt_resolution_records,
+                            },
+                        )
                     if node.executor == "agent":
                         validate_agent_artifact(artifact, self.blob_store)
                         if isinstance(agent_provenance, dict):
@@ -4420,7 +4958,7 @@ class Dag:
                             agent_provenance=agent_provenance,
                             prompt_resolutions=prompt_resolution_records,
                         )
-                    if not cache_hit and not resumed_completed:
+                    if not resumed_completed:
                         attempt_store.mark_completed(
                             target,
                             artifact_sha256=sha(artifact),
