@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -26,6 +27,10 @@ _RECEIPT_SEQUENCE_FIELD = "receipt_sequence"
 _PREVIOUS_RECEIPT_DIGEST_FIELD = "previous_receipt_sha256"
 _RECEIPT_CHAIN_FIELD = "attempt_receipt_chains"
 _TARGET_OWNER_FIELD = "target_owner_token"
+_RECOVERY_RECEIPT_FILE_FIELD = "recovery_receipt_file"
+_RECOVERY_RECEIPT_DIGEST_FIELD = "recovery_receipt_sha256"
+_PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
+_PROCESS_TARGET_LEASES_LOCK = threading.RLock()
 
 
 def utc_now() -> datetime:
@@ -73,6 +78,12 @@ class AttemptStore:
         self._run_lock_path = resolved_root.parent / lock_name
         self._target_leases: dict[str, tuple[str, Any]] = {}
 
+    def __del__(self) -> None:
+        """Release process-local target descriptors when a store is discarded."""
+        for target in tuple(getattr(self, "_target_leases", {})):
+            with suppress(BaseException):
+                self._release_target_lease(target)
+
     @contextmanager
     def _run_locked(self) -> Iterator[None]:
         """Serialize one run's durable read-modify-write transactions.
@@ -102,34 +113,86 @@ class AttemptStore:
                     self._run_lock_local.depth = 0
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def _target_lock_path(self, target: str, owner_token: str) -> Path:
+    def _target_lock_path(self, target: str) -> Path:
         return self._run_lock_path.with_name(
-            f"{self._run_lock_path.name}.target-{sha(target)}-{owner_token}.lock"
+            f"{self._run_lock_path.name}.target-{sha(target)}.lock"
         )
 
-    def _acquire_target_lease(self, target: str, owner_token: str | None = None) -> bool:
+    def _acquire_target_lease(
+        self,
+        target: str,
+        expected_owner_token: str | None = None,
+        *,
+        allow_same_process_fence: bool = False,
+    ) -> bool:
         """Claim an active target attempt until it leaves execution.
 
         The descriptor-backed flock is released by the operating system if the
         owning process dies.  A second live executor therefore gets an explicit
         busy error instead of restarting the same attempt and potentially
-        crossing the external side-effect boundary twice.
+        crossing the external side-effect boundary twice.  The path is stable;
+        the token is a fencing token stored in the durable state, not part of
+        the lock filename.
         """
-        if target in self._target_leases:
+        existing = self._target_leases.get(target)
+        if existing is not None:
+            current_token = existing[0]
+            if expected_owner_token != current_token:
+                raise RunManifestError(
+                    f"Target {target!r} busy or stale: local lease does not match "
+                    "the durable owner token"
+                )
             return False
-        token = owner_token or uuid.uuid4().hex
-        path = self._target_lock_path(target, token)
+        if expected_owner_token is not None and not self._is_owner_token(expected_owner_token):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "active state has an invalid target owner token",
+            )
+        token = uuid.uuid4().hex
+        path = self._target_lock_path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            handle.close()
-            raise RunManifestError(
-                f"Target {target!r} busy: another executor owns its active attempt"
-            ) from error
+        with _PROCESS_TARGET_LEASES_LOCK:
+            process_lease = _PROCESS_TARGET_LEASES.get(path)
+            if process_lease is not None and allow_same_process_fence:
+                _, old_handle = process_lease
+                _PROCESS_TARGET_LEASES.pop(path, None)
+                if not old_handle.closed:
+                    fcntl.flock(old_handle.fileno(), fcntl.LOCK_UN)
+                    old_handle.close()
+            handle = path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                handle.close()
+                raise RunManifestError(
+                    f"Target {target!r} busy: another executor owns its active attempt"
+                ) from error
+            _PROCESS_TARGET_LEASES[path] = (token, handle)
         self._target_leases[target] = (token, handle)
         return True
+
+    def _require_target_lease(self, target: str, state: dict[str, Any]) -> str:
+        """Require this instance's lease and the state-backed fencing token."""
+        expected = state.get(_TARGET_OWNER_FIELD)
+        if not self._is_owner_token(expected):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "active state is missing or has an invalid target owner token",
+            )
+        lease = self._target_leases.get(target)
+        if lease is None:
+            raise RunManifestError(
+                f"Target {target!r} busy or stale: this executor does not hold its lease"
+            )
+        current, handle = lease
+        if handle.closed or current != expected:
+            raise RunManifestError(
+                f"Target {target!r} busy or stale: local lease does not match "
+                "the durable owner token"
+            )
+        return current
 
     def _target_owner_token(self, target: str) -> str:
         lease = self._target_leases.get(target)
@@ -142,10 +205,17 @@ class AttemptStore:
         if lease is None:
             return
         _, handle = lease
+        path = self._target_lock_path(target)
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            with _PROCESS_TARGET_LEASES_LOCK:
+                process_lease = _PROCESS_TARGET_LEASES.get(path)
+                if process_lease is not None and process_lease[1] is handle:
+                    _PROCESS_TARGET_LEASES.pop(path, None)
+                if not handle.closed:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            handle.close()
+            if not handle.closed:
+                handle.close()
 
     def _clear_target_owner(self, target: str, state: dict[str, Any]) -> None:
         state.pop(_TARGET_OWNER_FIELD, None)
@@ -287,6 +357,12 @@ class AttemptStore:
             if status == "running":
                 attempt = int(state["attempt"])
                 if state.get("side_effect_started") is True:
+                    self._acquire_target_lease(
+                        target,
+                        state.get(_TARGET_OWNER_FIELD),
+                        allow_same_process_fence=True,
+                    )
+                    state[_TARGET_OWNER_FIELD] = self._target_owner_token(target)
                     state["status"] = "ambiguous"
                     state["updated_at"] = iso_now()
                     self._clear_target_owner(target, state)
@@ -363,8 +439,15 @@ class AttemptStore:
         to_attempt: int,
         recovery: dict[str, Any],
         inherited_nodes: dict[str, Any],
+        recovery_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Queue a new manual recovery attempt without touching the failed receipt."""
+        """Queue a recovery attempt and optionally bind its receipt atomically.
+
+        ``recovery_receipt`` is written under the same run lock before the new
+        state snapshot is committed.  The state records its relative filename
+        and canonical digest, so a missing or modified recovery record fails
+        closed on the next durable read.
+        """
         with self._run_locked():
             state_path = self._state_path(target)
             state = self._required_json(state_path)
@@ -382,6 +465,16 @@ class AttemptStore:
                 )
             canonical_recovery = json.loads(canonical_json(recovery))
             canonical_inherited = json.loads(canonical_json(inherited_nodes))
+            recovery_receipt_path: Path | None = None
+            canonical_recovery_receipt: dict[str, Any] | None = None
+            if recovery_receipt is not None:
+                canonical_recovery_receipt = self._canonical_object(
+                    recovery_receipt,
+                    label="recovery receipt",
+                )
+                recovery_receipt_path = self._write_recovery_receipt_locked(
+                    canonical_recovery_receipt
+                )
             now = iso_now()
             state.update(
                 {
@@ -395,9 +488,27 @@ class AttemptStore:
                     "updated_at": now,
                 }
             )
+            if recovery_receipt_path is not None and canonical_recovery_receipt is not None:
+                state[_RECOVERY_RECEIPT_FILE_FIELD] = recovery_receipt_path.relative_to(
+                    self.run_root
+                ).as_posix()
+                state[_RECOVERY_RECEIPT_DIGEST_FIELD] = sha(canonical_recovery_receipt)
             self._clear_target_owner(target, state)
             self._write_state(target, state)
             return state
+
+    def write_recovery_receipt(self, payload: dict[str, Any]) -> Path:
+        """Write a fail-decision recovery receipt under the run lock.
+
+        The method uses exclusive creation and never replaces an existing
+        receipt, even when two decisions share the same recovery timestamp.
+        Retry scheduling should use ``schedule_recovery(...,
+        recovery_receipt=payload)`` so the state also stores the file binding.
+        """
+        with self._run_locked():
+            return self._write_recovery_receipt_locked(
+                self._canonical_object(payload, label="recovery receipt")
+            )
 
     def mark_side_effect(
         self,
@@ -411,8 +522,7 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Cannot mark side effect for {target!r} in non-running state"
                 )
-            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
-            state[_TARGET_OWNER_FIELD] = self._target_owner_token(target)
+            self._require_target_lease(target, state)
             if active_effect is not None:
                 canonical = json.loads(canonical_json(active_effect))
                 if not isinstance(canonical, dict):
@@ -426,7 +536,11 @@ class AttemptStore:
     def mark_checkpoint(self, target: str, checkpoint: str) -> None:
         with self._run_locked():
             state = self._required_json(self._state_path(target))
-            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            if state.get("status") != "running":
+                raise RunManifestError(
+                    f"Cannot mark checkpoint for {target!r} in non-running state"
+                )
+            self._require_target_lease(target, state)
             state.update(
                 {
                     "status": "checkpoint_pending",
@@ -443,7 +557,7 @@ class AttemptStore:
             state = self._required_json(self._state_path(target))
             if state.get("status") != "running":
                 raise RunManifestError(f"Cannot save candidate for {target!r} in non-running state")
-            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            self._require_target_lease(target, state)
             canonical = json.loads(canonical_json(candidate))
             attempt = int(state["attempt"])
             filename = f"candidate-{attempt:04d}.json"
@@ -464,7 +578,25 @@ class AttemptStore:
     def mark_completed(self, target: str, *, artifact_sha256: str) -> None:
         with self._run_locked():
             state = self._required_json(self._state_path(target))
-            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            if state.get("status") == "completed":
+                if state.get("artifact_sha256") != artifact_sha256:
+                    raise RunManifestError(
+                        f"Completed artifact for {target!r} does not match the durable state"
+                    )
+                return
+            if state.get("status") == "running":
+                self._require_target_lease(target, state)
+            elif state.get("status") == "success_candidate":
+                self._acquire_target_lease(
+                    target,
+                    state.get(_TARGET_OWNER_FIELD),
+                    allow_same_process_fence=True,
+                )
+                state[_TARGET_OWNER_FIELD] = self._target_owner_token(target)
+            else:
+                raise RunManifestError(
+                    f"Cannot complete {target!r} in state {state.get('status')!r}"
+                )
             state.update(
                 {
                     "status": "completed",
@@ -489,7 +621,9 @@ class AttemptStore:
 
         with self._run_locked():
             state = self._required_json(self._state_path(target))
-            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            if state.get("status") != "running":
+                raise RunManifestError(f"Cannot record failure for {target!r} in non-running state")
+            self._require_target_lease(target, state)
             attempt = int(state["attempt"])
             failure = canonical_failure(error)
             retryable = (
@@ -543,20 +677,39 @@ class AttemptStore:
         with self._run_locked():
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError("retry resolution reason must be non-empty")
+            if action not in {"retry", "fail"}:
+                raise ValueError("retry resolution action must be 'retry' or 'fail'")
             state = self._required_json(self._state_path(target))
             if (
                 state.get("status") == "running"
                 and state.get("side_effect_started") is True
                 and state.get("attempt") == attempt
             ):
+                self._acquire_target_lease(
+                    target,
+                    state.get(_TARGET_OWNER_FIELD),
+                    allow_same_process_fence=True,
+                )
+                state[_TARGET_OWNER_FIELD] = self._target_owner_token(target)
                 state["status"] = "ambiguous"
                 state["updated_at"] = iso_now()
-                self._clear_target_owner(target, state)
                 self._write_state(target, state)
+            elif state.get("status") == "ambiguous" and state.get("attempt") == attempt:
+                self._acquire_target_lease(
+                    target,
+                    state.get(_TARGET_OWNER_FIELD),
+                    allow_same_process_fence=True,
+                )
+                current_token = self._target_owner_token(target)
+                if state.get(_TARGET_OWNER_FIELD) != current_token:
+                    state[_TARGET_OWNER_FIELD] = current_token
+                    state["updated_at"] = iso_now()
+                    self._write_state(target, state)
             if state.get("status") != "ambiguous" or state.get("attempt") != attempt:
                 raise ValueError(
                     f"Target {target!r} attempt {attempt} is not the active ambiguous attempt"
                 )
+            self._require_target_lease(target, state)
             resolution = {
                 "attempt_receipt_schema": ATTEMPT_RECEIPT_SCHEMA,
                 "target": target,
@@ -868,6 +1021,14 @@ class AttemptStore:
         attempt = state.get("attempt")
         if type(attempt) is not int or attempt < 1:
             raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "attempt binding is invalid")
+        if state.get("status") == "running" and not self._is_owner_token(
+            state.get(_TARGET_OWNER_FIELD)
+        ):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "active state is missing or has an invalid target owner token",
+            )
         if state.get(_STATE_DIGEST_FIELD) != self._state_digest(state):
             raise StateIntegrityError(
                 path,
@@ -897,7 +1058,14 @@ class AttemptStore:
         receipt, corrupted = self._read_json_safe(receipt_path)
         if corrupted:
             raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+        self._validate_recovery_receipt_binding(state, path)
         if receipt is None:
+            if state.get("side_effect_started") is True:
+                raise AmbiguousAttemptError(
+                    self.run_root.name,
+                    target,
+                    attempt,
+                )
             return
         self._validate_receipt_record(receipt_path, receipt, target, attempt)
         if receipt != state:
@@ -937,6 +1105,87 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "receipt content digest does not match the receipt payload",
             )
+
+    @staticmethod
+    def _is_owner_token(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _canonical_object(value: Any, *, label: str) -> dict[str, Any]:
+        canonical = json.loads(canonical_json(value))
+        if not isinstance(canonical, dict):
+            raise RunManifestError(f"{label} must be a canonical object")
+        return canonical
+
+    def _validate_recovery_receipt_binding(
+        self,
+        state: dict[str, Any],
+        state_path: Path,
+    ) -> None:
+        file_name = state.get(_RECOVERY_RECEIPT_FILE_FIELD)
+        digest = state.get(_RECOVERY_RECEIPT_DIGEST_FIELD)
+        if file_name is None and digest is None:
+            return
+        if not isinstance(file_name, str) or not file_name or not self._is_sha256(digest):
+            raise StateIntegrityError(
+                state_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "recovery receipt binding is incomplete or invalid",
+            )
+        relative = Path(file_name)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parent != Path(".")
+            or not relative.name.startswith("recovery-")
+            or relative.suffix != ".json"
+        ):
+            raise StateIntegrityError(
+                state_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "recovery receipt path escapes the run directory",
+            )
+        receipt_path = self.run_root / relative
+        receipt, corrupted = self._read_json_safe(receipt_path)
+        if corrupted:
+            raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+        if receipt is None:
+            raise StateIntegrityError(
+                receipt_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "bound recovery receipt is missing",
+            )
+        if sha(receipt) != digest:
+            raise StateIntegrityError(
+                receipt_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "bound recovery receipt digest does not match the state",
+            )
+
+    def _write_recovery_receipt_locked(self, payload: dict[str, Any]) -> Path:
+        recovery_time = payload.get("recovery_time")
+        if (
+            not isinstance(recovery_time, str)
+            or not recovery_time
+            or "/" in recovery_time
+            or "\\" in recovery_time
+        ):
+            raise RunManifestError("recovery receipt must contain a recovery_time")
+        self.run_root.mkdir(parents=True, exist_ok=True)
+        stem = f"recovery-{recovery_time}"
+        suffix = 0
+        while True:
+            suffix_text = "" if suffix == 0 else f"-{suffix}"
+            path = self.run_root / f"{stem}{suffix_text}.json"
+            try:
+                with path.open("x", encoding="utf-8") as handle:
+                    handle.write(canonical_json(payload))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                suffix += 1
+                continue
+            return path
 
     def _validate_attempt_receipts(self, target: str) -> None:
         """Reject a present torn receipt while allowing an absent receipt."""

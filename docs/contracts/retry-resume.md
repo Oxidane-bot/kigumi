@@ -12,6 +12,11 @@ Status: Active (0.13.0)
 dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 ```
 
+底层 `AttemptStore` 为需要原子记录恢复决定的调用方提供
+`schedule_recovery(..., recovery_receipt=payload)` 与
+`write_recovery_receipt(payload)`；前者在同一 run lock 内排他创建
+`recovery-*.json`，并把相对文件名及 canonical digest 绑定到新的 state。
+
 终态 `failed` run 使用 `Dag.recover()` 记录显式 decision、reason 与 evidence，再由
 `Dag.resume()` 执行新 attempt；恢复不删除 run 目录，也不改动缓存键族。
 
@@ -38,9 +43,12 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
    存在、断裂、回退、分叉或只更新了其中一份 durable record 都必须 fail closed。
    active 的 target state 还带一个不参与缓存键或 run identity 的
    `target_owner_token`。`AttemptStore` 用 run 目录外的稳定 advisory lock 串行化
-   state/receipt/manifest 的 durable read-modify-write，并用 descriptor-backed target lease
-   阻止两个 live executor 同时接管同一未跨副作用边界的 attempt；进程退出后由操作系统
-   释放 lease。lease 只表达本地执行所有权，不承诺外部副作用 exactly-once。
+   state/receipt/manifest 的 durable read-modify-write，并用每个 target 唯一且稳定的
+   descriptor-backed lock path 阻止两个 live executor 同时接管同一 attempt；token 是
+   durable owner 的 fencing token，不能编码进 lock 文件名。所有执行态 mutation 都必须
+   同时持有本实例 lease 且匹配磁盘 owner token；active state 缺失 token、token 不匹配或
+   lease 已被新 owner/人工裁决取代时必须 fail closed。进程退出后由操作系统释放 lease。
+   lease 只表达本地执行所有权，不承诺外部副作用 exactly-once。
 6. crash-after-success 可提交 candidate 而不重做 side effect。crash 且 side effect 未开始可
    恢复同 attempt；已开始但无 terminal receipt 必须 ambiguous，未经带 reason 的人工裁决
    不得重试。
@@ -56,8 +64,10 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 11. 已存在但 JSON、schema 或 digest 不可信的 durable manifest、attempt receipt、candidate、
     artifact 或 Prompt lineage 是完整性错误，不是缺失状态；`StateIntegrityError` 或
     `RunManifestError` 必须 fail closed，不能把它当成未开始 attempt 创建新执行。只有真正缺失
-    的当前 receipt 才能按未开始处理；若已记录 side effect boundary，则仍必须进入
-    `ambiguous`，不能因为 receipt 缺失而重放。
+    的当前 receipt 才能按未开始处理；若已记录 side effect boundary，则
+    `state_for`、`pending_retries`、`ambiguous_attempts` 等读取也必须抛出明确的
+    `AmbiguousAttemptError` 或完整性错误，不能返回可信的 running 状态或因为 receipt
+    缺失而重放。
 
 12. receipt-chain 是 Greenfield 的硬切格式。没有 manifest 链锚或没有上述 chain fields 的
     旧 attempt state 不可 resume；这不是缓存键变更，也不改变默认 Agent/agent-scan 的

@@ -5,11 +5,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from kigumi._runstate import AttemptStore, RunManifestError, StateIntegrityError
 from kigumi.artifacts import sha
+from kigumi.retry import AmbiguousAttemptError
 
 
 def _store(tmp_path: Path) -> AttemptStore:
@@ -200,6 +202,206 @@ while not release.exists():
         release.touch()
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, (stdout, stderr)
+
+
+def test_target_lease_uses_one_stable_path_and_requires_active_owner_token(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    prepared = store.prepare("work", policy=None, declaration_digest="decl")
+
+    owner_token = prepared["state"]["target_owner_token"]
+    lock_path = store._target_lock_path("work")
+    assert lock_path.name == f"{store._run_lock_path.name}.target-{sha('work')}.lock"
+    assert owner_token not in lock_path.name
+
+    state_path = _state_path(tmp_path)
+    receipt_path = _receipt_path(tmp_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("target_owner_token")
+    state.pop("state_sha256")
+    state["state_sha256"] = sha(state)
+    receipt_path.write_text(json.dumps(state), encoding="utf-8")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    manifest_path = tmp_path / "run" / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["attempt_receipt_chains"][sha("work")][-1]["state_sha256"] = state["state_sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(StateIntegrityError, match="owner token"):
+        store.prepare("work", policy=None, declaration_digest="decl")
+
+
+def test_stale_executor_is_fenced_after_new_owner_and_manual_resolution(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path)
+    first.prepare("work", policy=None, declaration_digest="decl")
+    first.mark_side_effect("work", {"kind": "provider"})
+    first._release_target_lease("work")
+
+    second = AttemptStore(tmp_path / "run", {})
+    second.initialize()
+    second.resolve(
+        "work",
+        attempt=1,
+        action="retry",
+        reason="operator confirmed the effect did not complete",
+    )
+
+    with pytest.raises(RunManifestError, match="lease|owner|state"):
+        first.mark_completed("work", artifact_sha256="a" * 64)
+
+
+def test_missing_current_receipt_after_side_effect_is_not_trusted_by_readers(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.mark_side_effect("work", {"kind": "provider"})
+    _receipt_path(tmp_path).unlink()
+
+    with pytest.raises(AmbiguousAttemptError):
+        store.state_for("work")
+    with pytest.raises(AmbiguousAttemptError):
+        store.pending_retries()
+    with pytest.raises(AmbiguousAttemptError):
+        store.ambiguous_attempts()
+
+
+def test_recovery_receipt_is_bound_inside_schedule_recovery_transaction(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 2,
+        "decision": "retry_not_started",
+        "reason": "the side effect never started",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+
+    state = store.schedule_recovery(
+        "work",
+        from_attempt=1,
+        to_attempt=2,
+        recovery=payload,
+        recovery_receipt=payload,
+        inherited_nodes={},
+    )
+
+    receipt_path = tmp_path / "run" / state["recovery_receipt_file"]
+    assert receipt_path.is_file()
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == payload
+    assert state["recovery_receipt_sha256"] == sha(payload)
+    assert state["status"] == "retry_scheduled"
+    receipt_path.unlink()
+    with pytest.raises(StateIntegrityError, match="recovery receipt"):
+        store.state_for("work")
+
+
+def test_recovery_receipt_writer_is_exclusive_and_preserves_collisions(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+
+    first = store.write_recovery_receipt(payload)
+    second = store.write_recovery_receipt(payload)
+
+    assert first != second
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+
+
+def test_recovery_receipt_writer_is_exclusive_across_processes(tmp_path: Path) -> None:
+    _store(tmp_path)
+    worker = tmp_path / "recovery_receipt_worker.py"
+    worker.write_text(
+        """
+import sys
+from pathlib import Path
+
+from kigumi._runstate import AttemptStore
+
+payload = {
+    "recovery_time": "2026-08-04T12:00:00.000000Z",
+    "from_attempt": 1,
+    "to_attempt": 1,
+    "decision": "fail",
+    "reason": "operator rejected retry",
+    "evidence_refs": [],
+    "recovered_by": "worker",
+}
+AttemptStore(Path(sys.argv[1]), {}).write_recovery_receipt(payload)
+""",
+        encoding="utf-8",
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(worker), str(tmp_path / "run")],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    results = [process.communicate(timeout=30) for process in processes]
+
+    assert all(process.returncode == 0 for process in processes), results
+    receipts = sorted((tmp_path / "run").glob("recovery-*.json"))
+    assert len(receipts) == 4
+    assert len({receipt.name for receipt in receipts}) == 4
+
+
+def test_schedule_recovery_receipt_is_not_claimed_if_state_commit_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 2,
+        "decision": "retry_not_started",
+        "reason": "the side effect never started",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+
+    def crash(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise OSError("crash while committing recovery state")
+
+    monkeypatch.setattr(store, "_write_state", crash)
+    with pytest.raises(OSError, match="committing recovery state"):
+        store.schedule_recovery(
+            "work",
+            from_attempt=1,
+            to_attempt=2,
+            recovery=payload,
+            recovery_receipt=payload,
+            inherited_nodes={},
+        )
+
+    assert len(list((tmp_path / "run").glob("recovery-*.json"))) == 1
+    assert not (tmp_path / "run" / "attempts" / sha("work") / "attempt-0002.json").exists()
+    state = json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
 
 
 def test_receipt_chain_is_monotonic_and_manifest_anchored(tmp_path: Path) -> None:
