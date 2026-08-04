@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kigumi.config import find_project_root, load_config, load_env
+from kigumi.config import KigumiConfig, find_project_root, load_config, load_env
 
 
 def test_load_config_returns_none_without_kigumi_table(tmp_path: Path) -> None:
@@ -57,6 +57,23 @@ agent_slot_timeout_seconds = 12
     assert config.agent_slots == 4
     assert config.agent_lock_path == (tmp_path / "machine-locks").resolve()
     assert config.agent_slot_timeout_seconds == 3.5
+
+
+def test_configured_paths_reject_user_symlink_components(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "prompts-link"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"target filesystem does not support directory symlinks: {error}")
+
+    config = KigumiConfig(
+        project_root=tmp_path,
+        prompts_dir="prompts-link",
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        _ = config.prompts_path
 
 
 def test_unknown_config_key_fails_loudly(tmp_path: Path) -> None:

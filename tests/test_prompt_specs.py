@@ -562,6 +562,33 @@ def test_prompt_snapshot_rejects_fifo_without_blocking(tmp_path: Path) -> None:
         PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
 
 
+@pytest.mark.parametrize("link_root", ["root", "parent"])
+def test_prompt_snapshot_rejects_symlinked_catalog_root(tmp_path: Path, link_root: str) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "base.md").write_text("must not be read", encoding="utf-8")
+    if link_root == "root":
+        prompts = tmp_path / "prompts-link"
+        try:
+            prompts.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"target filesystem does not support directory symlinks: {error}")
+    else:
+        real_parent = tmp_path / "real-parent"
+        real_parent.mkdir()
+        prompts = tmp_path / "parent-link" / "prompts"
+        try:
+            prompts.parent.symlink_to(real_parent, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"target filesystem does not support directory symlinks: {error}")
+        (real_parent / "prompts").mkdir()
+        (real_parent / "prompts" / "base.md").write_text("must not be read", encoding="utf-8")
+
+    spec = PromptSpec("managed", PromptRef("base"))
+    with pytest.raises(PromptDefinitionError, match="symlink"):
+        PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
+
+
 def test_prompt_snapshot_rejects_symlink_installed_at_descriptor_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

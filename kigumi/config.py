@@ -3,9 +3,40 @@
 from __future__ import annotations
 
 import os
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ._safe_io import _secure_directory_absolute
+
+
+def _safe_configured_path(path: str | Path) -> Path:
+    """Return an absolute configured path without following user symlinks.
+
+    Configuration paths are often handed to a later descriptor-relative reader.
+    Resolving them here would erase a user-controlled symlink before that reader
+    can reject it.  Keep the path lexical, normalize only the explicitly trusted
+    macOS system aliases, and reject every existing symlink component.
+    """
+    absolute = _secure_directory_absolute(Path(path))
+    probe = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        if component in {"", "."}:
+            continue
+        probe /= component
+        try:
+            info = probe.lstat()
+        except FileNotFoundError:
+            # Once a component is absent, lower components cannot already be
+            # present in the same path.  The eventual secure creator/reader
+            # remains responsible for races while those components are made.
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"Configured path must not contain a symlink: {probe}")
+        if probe != absolute and not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"Configured path component must be a directory: {probe}")
+    return absolute
 
 
 @dataclass
@@ -86,8 +117,11 @@ class KigumiConfig:
 
     @property
     def prompts_path(self) -> Path:
-        """The resolved prompt directory."""
-        return self.resolve(self.prompts_dir)
+        """The prompt directory, retaining and rejecting user symlinks."""
+        candidate = Path(self.prompts_dir)
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        return _safe_configured_path(candidate)
 
     @property
     def artifacts_path(self) -> Path:

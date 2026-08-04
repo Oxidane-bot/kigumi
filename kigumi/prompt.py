@@ -20,7 +20,9 @@ from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel
 
+from ._safe_io import SecureDirectory
 from .artifacts import canonical_json, sha
+from .config import _safe_configured_path
 
 TITLE_DELIMITER = "## {title}\n\n"
 WORDING_CLIPPED = "(已截断：原文 {original_chars} 字，保留 {kept_chars} 字)"
@@ -1161,7 +1163,35 @@ class PromptCatalogSnapshot:
         *,
         prompt_specs: tuple[PromptSpec, ...] = (),
     ) -> PromptCatalogSnapshot:
-        resolved_root = root.resolve()
+        try:
+            resolved_root = _safe_configured_path(root)
+        except (OSError, ValueError) as error:
+            raise PromptDefinitionError(
+                f"Prompt catalog root must not contain a user symlink: {root}"
+            ) from error
+        try:
+            root_info = resolved_root.lstat()
+        except FileNotFoundError:
+            root_info = None
+        except OSError as error:
+            raise PromptDefinitionError(
+                f"Prompt catalog root is not safely readable: {root}"
+            ) from error
+        if root_info is not None:
+            if not stat.S_ISDIR(root_info.st_mode):
+                raise PromptDefinitionError(
+                    f"Prompt catalog root must be a regular directory: {resolved_root}"
+                )
+            try:
+                # Bind the existing root once before reading entries.  The
+                # per-file reader below still performs its own descriptor-
+                # relative no-follow open and race check.
+                with SecureDirectory(resolved_root, create=False):
+                    pass
+            except (OSError, ValueError) as error:
+                raise PromptDefinitionError(
+                    f"Prompt catalog root must not contain a user symlink: {root}"
+                ) from error
         names: set[str] = set()
         for spec in prompt_specs:
             names.update(reference.name for reference in spec.references())
