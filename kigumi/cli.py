@@ -42,6 +42,16 @@ from .store import approve_checkpoint, diff_runs, gc_artifacts, run_directory, r
 DAG_ENTRY_MODULE = "nodes.graph"
 """Module `kigumi init` scaffolds, matching the default ``source_dirs`` entry."""
 
+_HOOK_MODE = (
+    stat.S_IRUSR
+    | stat.S_IWUSR
+    | stat.S_IXUSR
+    | stat.S_IRGRP
+    | stat.S_IXGRP
+    | stat.S_IROTH
+    | stat.S_IXOTH
+)
+
 DAG_ENTRY_TEMPLATE = '''"""Build this project's DAG.
 
 `build_dag()` is the single place that constructs the graph. Both entry points call
@@ -744,7 +754,7 @@ def _init(root: Path, *, hooks: bool) -> int:
         for path, text in plan.writes:
             transaction.write_text(path, text)
         if plan.hook_path is not None:
-            transaction.chmod(plan.hook_path, 0o755)
+            transaction.chmod(plan.hook_path, _HOOK_MODE)
     except Exception as error:
         rollback_errors = transaction.rollback()
         detail = f"; rollback incomplete: {', '.join(rollback_errors)}" if rollback_errors else ""
