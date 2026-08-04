@@ -2888,11 +2888,6 @@ def test_libs_hash_falls_back_for_loaded_runtime_module_mismatch(
             'import sys\nname = "__" + "import__"\nload = sys.modules["builtins"].__dict__[name]\n',
             "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
         ),
-        (
-            "walrus_target",
-            "",
-            '    helper = (load := __import__)("{package_name}.helper", fromlist=["VALUE"])\n',
-        ),
     ],
 )
 def test_libs_hash_falls_back_for_aliased_dynamic_imports(
@@ -2967,6 +2962,12 @@ def test_libs_hash_falls_back_for_aliased_dynamic_imports(
             '    loaders["x"] = __import__\n'
             '    helper = loaders["x"]("{package_name}.helper", fromlist=["VALUE"])\n',
             id="container-target",
+        ),
+        pytest.param(
+            "walrus_target",
+            "",
+            '    helper = (load := __import__)("{package_name}.helper", fromlist=["VALUE"])\n',
+            id="walrus-target",
         ),
     ],
 )
