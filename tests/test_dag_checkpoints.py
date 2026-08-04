@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kigumi._runstate import RunManifestError
+from kigumi.artifacts import sha
 from kigumi.dag import CheckpointPending, Dag
 from tests._dag_helpers import _make_dag
 
@@ -67,6 +70,75 @@ def test_checkpoint_pending_approval_and_resume(tmp_path: Path) -> None:
     assert fresh.pending_checkpoints == ["editor"]
     assert "review" not in fresh.cache_hits
     assert fresh.skipped == ["publish"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_checkpoint_approval_file_is_no_follow_and_nonblocking(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """An approval file outside the owned run must never be accepted or read."""
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+
+    dag = _make_dag(tmp_path)
+
+    @dag.node("review")
+    def review(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        return {"approval": ctx.checkpoint("editor", {"question": "approve?"})}
+
+    first = dag.run(run_id="unsafe-approval")
+    assert first.pending_checkpoints == ["editor"]
+    approval_path = (
+        tmp_path / "artifacts" / "runs" / "unsafe-approval" / "approvals" / "editor.json"
+    )
+    if kind == "symlink":
+        outside = tmp_path / "outside-approval.json"
+        outside.write_text(
+            json.dumps({"payload_sha": sha({"question": "approve?"}), "data": {"ok": True}}),
+            encoding="utf-8",
+        )
+        approval_path.symlink_to(outside)
+    else:
+        os.mkfifo(approval_path)
+
+    with pytest.raises(RunManifestError, match="approval"):
+        dag.run(run_id="unsafe-approval")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_dag_approve_rejects_unowned_or_special_pending_file(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """The operator approval path must validate the pending file before writing."""
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+
+    dag = _make_dag(tmp_path)
+
+    @dag.node("review")
+    def review(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        return {"approval": ctx.checkpoint("editor", {"question": "approve?"})}
+
+    dag.run(run_id="unsafe-pending")
+    pending_path = (
+        tmp_path / "artifacts" / "runs" / "unsafe-pending" / "approvals" / "editor.pending.json"
+    )
+    if kind == "symlink":
+        outside = tmp_path / "outside-pending.json"
+        outside.write_text(pending_path.read_text(encoding="utf-8"), encoding="utf-8")
+        pending_path.unlink()
+        pending_path.symlink_to(outside)
+    else:
+        pending_path.unlink()
+        os.mkfifo(pending_path)
+
+    with pytest.raises(ValueError, match="unsafe or corrupt"):
+        dag.approve("unsafe-pending", "editor", {"ok": True})
+    assert not (pending_path.parent / "editor.json").exists()
 
 
 def test_checkpoint_exception_exposes_name_and_payload() -> None:

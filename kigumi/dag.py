@@ -51,6 +51,7 @@ from ._runstate import (
     SUCCESS_CANDIDATE_SCHEMA,
     AttemptStore,
     RunManifestError,
+    validate_run_path,
 )
 from ._safe_io import digest_open_file, open_regular_file
 from .agents import (
@@ -612,12 +613,15 @@ class NodeContext:
         if qualifiers:
             name = "@".join((name, *qualifiers))
         approval_path = self._dag._approval_path(self._run_id, name)
-        if approval_path.is_file():
-            with approval_path.open(encoding="utf-8") as handle:
-                record = json.load(handle)
-            if isinstance(record, dict) and record.get("payload_sha") == sha(payload):
-                return record["data"]
-            # 审批绑定批准时的 payload 内容;内容变了旧批作废,重新挂起。
+        record, corrupted = AttemptStore._read_json_safe(approval_path)
+        if corrupted:
+            raise RunManifestError(
+                f"Checkpoint approval {name!r} in run {self._run_id!r} "
+                "is missing, unsafe, or corrupt"
+            )
+        if record is not None and record.get("payload_sha") == sha(payload):
+            return record["data"]
+        # 审批绑定批准时的 payload 内容;内容变了旧批作废,重新挂起。
         raise CheckpointPending(name, payload)
 
     def emit_file(self, relative_path: str, data: bytes) -> dict[str, Any]:
@@ -3584,15 +3588,24 @@ class Dag:
         if run_id is None:
             return None
         run_directory = store.run_directory(self.config.artifacts_path, run_id)
+        try:
+            validate_run_path(run_directory)
+        except RunManifestError as error:
+            raise ValueError(f"Run {run_id!r} does not have an owned durable path") from error
         if not run_directory.is_dir():
             raise ValueError(f"Run {run_id!r} does not exist")
         metadata = _read_run_metadata(run_directory)
         approvals = run_directory / "approvals"
-        pending_names = (
-            {path.name[: -len(".pending.json")] for path in approvals.glob("*.pending.json")}
-            if approvals.is_dir()
-            else set()
-        )
+        try:
+            validate_run_path(approvals)
+        except RunManifestError as error:
+            raise ValueError(f"Run {run_id!r} has an unowned approvals directory") from error
+        pending_names: set[str] = set()
+        if approvals.is_dir():
+            for path in approvals.glob("*.pending.json"):
+                _pending, corrupted = AttemptStore._read_json_safe(path)
+                if not corrupted:
+                    pending_names.add(path.name[: -len(".pending.json")])
         pending_nodes = {
             name
             for name, node in self._nodes.items()
@@ -3604,11 +3617,10 @@ class Dag:
         }
         attempt_states: dict[str, list[dict[str, Any]]] = {}
         for state_path in sorted((run_directory / "attempts").glob("*/state.json")):
-            try:
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            state, corrupted = AttemptStore._read_json_safe(state_path)
+            if corrupted:
                 continue
-            target = state.get("target") if isinstance(state, dict) else None
+            target = state.get("target") if state is not None else None
             if not isinstance(target, str):
                 continue
             node_name = target.partition("@")[0]
@@ -3685,6 +3697,14 @@ class Dag:
             for declared_path in node.files:
                 if not self.config.resolve(declared_path).is_file():
                     errors.append(f"{name}: missing declared file {declared_path}")
+        try:
+            self._topological_order(tuple(self._nodes))
+        except ValueError as error:
+            errors.append(f"topology: {error}")
+        try:
+            self._prompt_snapshot()
+        except (OSError, UnicodeError, ValueError) as error:
+            errors.append(f"prompts: {error}")
 
         warnings = [
             f"{name}: missing docstring"
@@ -3727,7 +3747,11 @@ class Dag:
             if args.targets is not None
             else None
         )
-        forecast = self.plan(targets=targets)
+        try:
+            forecast = self.plan(targets=targets)
+        except (OSError, UnicodeError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
         hits = [name for name, status in forecast.nodes.items() if status == "hit"]
         print(
             f"plan: {len(forecast.nodes)} nodes, {len(forecast.certain)} certain, "
@@ -3830,7 +3854,18 @@ class Dag:
 
     def approve(self, run_id: str, name: str, data: Any) -> None:
         """Record approval bound to the pending payload; content changes void it."""
-        store.approve_checkpoint(self.config.artifacts_path / "runs", run_id, name, data)
+        approval_path = self._approval_path(run_id, name)
+        pending_path = approval_path.with_suffix(".pending.json")
+        payload, corrupted = AttemptStore._read_json_safe(pending_path)
+        if corrupted:
+            raise ValueError(f"Pending checkpoint {name!r} in run {run_id!r} is unsafe or corrupt")
+        if payload is None:
+            raise ValueError(f"No pending checkpoint {name!r} in run {run_id!r}")
+        atomic_write_json(approval_path, {"payload_sha": sha(payload), "data": data})
+        from ._safe_io import SecureDirectory
+
+        with SecureDirectory(pending_path.parent, create=False) as directory:
+            directory.unlink(pending_path.name)
 
     def diff(self, run_a: str, run_b: str) -> dict[str, list[str]]:
         """Compare persisted node artifacts by canonical content hash."""
@@ -5377,12 +5412,10 @@ def _read_run_metadata(run_directory: Path) -> dict[str, dict[str, Any]]:
     """读取可用 sidecar；损坏 sidecar 不足以让纯渲染失败。"""
     metadata: dict[str, dict[str, Any]] = {}
     for sidecar in run_directory.glob("*.json.meta.json"):
-        try:
-            with sidecar.open(encoding="utf-8") as handle:
-                candidate = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        candidate, corrupted = AttemptStore._read_json_safe(sidecar)
+        if corrupted:
             continue
-        if isinstance(candidate, dict) and isinstance(candidate.get("node"), str):
+        if candidate is not None and isinstance(candidate.get("node"), str):
             metadata[candidate["node"]] = candidate
     return metadata
 

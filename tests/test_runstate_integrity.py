@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -133,6 +134,39 @@ def test_attempt_store_rejects_symlinked_run_root_and_runs_root(tmp_path: Path) 
 
     with pytest.raises(RunManifestError, match="symlink"):
         AttemptStore(linked_artifacts / "runs" / "run", {}).initialize()
+
+
+def test_durable_json_read_rejects_symlinked_parent_final_file_and_fifo(
+    tmp_path: Path,
+) -> None:
+    """Durable reads must bind the parent and never block on a special file."""
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    state_path = _state_path(tmp_path)
+
+    external = tmp_path / "external.json"
+    external.write_text('{"target": "work"}', encoding="utf-8")
+    state_path.unlink()
+    state_path.symlink_to(external)
+    value, corrupted = AttemptStore._read_json_safe(state_path)
+    assert value is None
+    assert corrupted is True
+
+    state_path.unlink()
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(state_path)
+        value, corrupted = AttemptStore._read_json_safe(state_path)
+        assert value is None
+        assert corrupted is True
+
+    parent_alias = tmp_path / "attempt-alias"
+    real_parent = tmp_path / "external-attempt"
+    real_parent.mkdir()
+    (real_parent / "state.json").write_text('{"target": "work"}', encoding="utf-8")
+    parent_alias.symlink_to(real_parent, target_is_directory=True)
+    value, corrupted = AttemptStore._read_json_safe(parent_alias / "state.json")
+    assert value is None
+    assert corrupted is True
 
 
 def test_missing_attempt_receipt_is_not_started_case(tmp_path: Path) -> None:

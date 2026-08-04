@@ -263,6 +263,24 @@ def test_render_mermaid_uses_run_sidecars_for_item_counts(tmp_path: Path) -> Non
         dag.render_mermaid("missing")
 
 
+def test_render_mermaid_rejects_a_symlinked_run_root(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    result = dag.run(run_id="owned-run")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    external = tmp_path / "external-run"
+    run_path.rename(external)
+    run_path.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="owned durable path"):
+        dag.render_mermaid(result.run_id)
+
+
 def test_render_mermaid_marks_pending_checkpoint_and_skipped_descendants(tmp_path: Path) -> None:
     """教训 graph_pending: 挂起与被跳过节点也必须在运行图中可见。"""
     dag = _make_dag(tmp_path)

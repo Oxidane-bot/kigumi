@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from ._safe_io import SecureDirectory, _open_regular_file_at
 from .artifacts import atomic_write_json, canonical_json, sha
 from .failures import canonical_failure
 from .retry import AmbiguousAttemptError, RetryPolicy
@@ -2489,40 +2490,61 @@ class AttemptStore:
             resolution(agent.get("prompt_resolution"), "origin Agent Prompt resolution")
 
     @staticmethod
-    def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    def _read_json_bytes_safe(path: Path) -> tuple[bytes | None, BaseException | None]:
+        """Read durable JSON through a bound parent descriptor.
+
+        A lexical ``lstat`` followed by ``Path.read_text`` leaves both the
+        final file and every parent directory replaceable between the check and
+        the read.  Durable run paths are ownership boundaries, so bind the
+        complete parent path with the existing no-follow directory primitive
+        and open the final file relative to that descriptor.  The final open is
+        non-blocking and rejects symlinks and special files before any bytes are
+        consumed.
+
+        ``(None, None)`` is a genuine missing file.  A non-``None`` exception is
+        an integrity failure, including a symlinked parent or final entry.
+        """
+        try:
+            with SecureDirectory(Path(path).parent, create=False) as directory:
+                try:
+                    with _open_regular_file_at(
+                        directory,
+                        Path(path).name,
+                        phase="before reading durable JSON",
+                    ) as handle:
+                        return handle.read(), None
+                except FileNotFoundError:
+                    return None, None
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError) as error:
+            return None, error
+
+    @classmethod
+    def _read_json_safe(cls, path: Path) -> tuple[dict[str, Any] | None, bool]:
         """Return ``(data, corrupted)`` while keeping missing distinct from torn JSON."""
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
+        raw, read_error = cls._read_json_bytes_safe(path)
+        if read_error is not None:
+            return None, True
+        if raw is None:
             return None, False
-        except OSError:
-            return None, True
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            return None, True
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None, True
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return None, True
         return (value, False) if isinstance(value, dict) else (None, True)
 
     @staticmethod
     def _parse_error(path: Path) -> BaseException | str:
         """Recover a useful parse explanation for a failed safe read."""
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
+        raw, read_error = AttemptStore._read_json_bytes_safe(path)
+        if read_error is not None:
+            return read_error
+        if raw is None:
             return FileNotFoundError(str(path))
-        except OSError as error:
-            return error
-        if stat.S_ISLNK(info.st_mode):
-            return ValueError("durable JSON path must not be a symlink")
-        if not stat.S_ISREG(info.st_mode):
-            return ValueError("durable JSON path must be a regular file")
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             return error
         return TypeError(f"expected a JSON object, got {type(value).__name__}")
 
