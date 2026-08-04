@@ -1,4 +1,11 @@
-"""Pure AST checks for unsafe raw calls made inside node functions."""
+"""Pure AST checks for unsafe raw calls made inside node functions.
+
+The loop guard deliberately has a finite proof boundary.  It proves direct
+model-method calls and a small set of local aliases; opaque aliases and
+higher-order ``map``/``filter`` callbacks require an explicit waiver.  It is
+not a Python interpreter, and its facts are lexical-scope local so a binding
+from one unrelated function cannot affect another function.
+"""
 
 from __future__ import annotations
 
@@ -219,6 +226,10 @@ class _ScopeFacts(ast.NodeVisitor):
             self.bound_names.add(local_name)
             if node.module == "builtins" and alias.name == "open":
                 self.imported_raw_aliases.add(local_name)
+            elif node.module == "builtins" and alias.name == "__dict__":
+                # ``from builtins import __dict__ as namespace`` is the same
+                # opaque dictionary boundary as ``builtins.__dict__``.
+                self.imported_dynamic_aliases.add(local_name)
             elif node.module == "builtins" and alias.name in _DYNAMIC_CALLABLE_NAMES:
                 self.imported_dynamic_aliases.add(local_name)
                 if alias.name == "__import__":
@@ -350,6 +361,171 @@ def check_raw_io_source(
     return visitor.findings
 
 
+_LOOP_SAFE_CALLBACK_NAMES = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "float",
+        "int",
+        "len",
+        "max",
+        "min",
+        "open",
+        "repr",
+        "round",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+    }
+)
+
+
+class _LoopCallableKind(Enum):
+    UNKNOWN = "unknown"
+    MODEL = "model"
+    HIGHER_ORDER = "higher_order"
+    OPAQUE = "opaque"
+    SAFE = "safe"
+
+
+@dataclass
+class _LoopScope:
+    """Finite callable facts for one lexical scope."""
+
+    model_aliases: frozenset[str]
+    higher_order_aliases: frozenset[str]
+    opaque_aliases: frozenset[str]
+    safe_aliases: frozenset[str]
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+
+    def classify(self, expression: ast.AST) -> _LoopCallableKind:
+        if isinstance(expression, ast.NamedExpr):
+            kind = self.classify(expression.value)
+            if kind is _LoopCallableKind.UNKNOWN:
+                names = _target_names(expression.target)
+                if names & self.opaque_aliases:
+                    return _LoopCallableKind.OPAQUE
+            return kind
+        if isinstance(expression, ast.Starred):
+            return self.classify(expression.value)
+        if isinstance(expression, ast.Attribute):
+            return (
+                _LoopCallableKind.MODEL
+                if expression.attr in _LOOP_MODEL_METHOD_NAMES
+                else _LoopCallableKind.UNKNOWN
+            )
+        if isinstance(expression, ast.Call):
+            if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
+                return _LoopCallableKind.MODEL
+            return _LoopCallableKind.UNKNOWN
+        if not isinstance(expression, ast.Name):
+            return _LoopCallableKind.UNKNOWN
+        if expression.id in self.model_aliases:
+            return _LoopCallableKind.MODEL
+        if expression.id in self.higher_order_aliases:
+            return _LoopCallableKind.HIGHER_ORDER
+        if expression.id in self.opaque_aliases:
+            return _LoopCallableKind.OPAQUE
+        if expression.id in self.safe_aliases or expression.id in _LOOP_SAFE_CALLBACK_NAMES:
+            return _LoopCallableKind.SAFE
+        if expression.id in {"map", "filter"}:
+            return _LoopCallableKind.HIGHER_ORDER
+        return _LoopCallableKind.UNKNOWN
+
+
+def _join_loop_callable_kinds(kinds: list[_LoopCallableKind]) -> _LoopCallableKind:
+    concrete = {kind for kind in kinds if kind is not _LoopCallableKind.UNKNOWN}
+    if not concrete:
+        return _LoopCallableKind.UNKNOWN
+    if any(kind is _LoopCallableKind.UNKNOWN for kind in kinds):
+        return _LoopCallableKind.OPAQUE
+    return next(iter(concrete)) if len(concrete) == 1 else _LoopCallableKind.OPAQUE
+
+
+def _build_loop_scope(
+    body: list[ast.stmt] | list[ast.expr],
+    *,
+    parent: _LoopScope | None = None,
+    parameter_names: set[str] | None = None,
+) -> _LoopScope:
+    facts = _collect_scope_facts(body)
+    local_names = set(facts.bound_names) | set(parameter_names or ())
+    inherited_model = set(parent.model_aliases if parent else ()) - local_names
+    inherited_higher = set(parent.higher_order_aliases if parent else ()) - local_names
+    inherited_opaque = set(parent.opaque_aliases if parent else ()) - local_names
+    inherited_safe = set(parent.safe_aliases if parent else ()) - local_names
+    functions = dict(parent.functions if parent else {})
+    for name in local_names:
+        functions.pop(name, None)
+    functions.update(facts.functions)
+    bindings: dict[str, list[ast.expr]] = {}
+    for name, expression in facts.assignments:
+        bindings.setdefault(name, []).append(expression)
+
+    local_kinds = {name: _LoopCallableKind.UNKNOWN for name in bindings}
+    for _ in range(max(1, len(bindings) + 1)):
+        changed = False
+        provisional = _LoopScope(
+            model_aliases=frozenset(
+                inherited_model
+                | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.MODEL}
+            ),
+            higher_order_aliases=frozenset(
+                inherited_higher
+                | {
+                    name
+                    for name, kind in local_kinds.items()
+                    if kind is _LoopCallableKind.HIGHER_ORDER
+                }
+            ),
+            opaque_aliases=frozenset(
+                inherited_opaque
+                | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.OPAQUE}
+            ),
+            safe_aliases=frozenset(
+                inherited_safe
+                | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.SAFE}
+            ),
+            functions=functions,
+        )
+        for name, expressions in bindings.items():
+            kind = _join_loop_callable_kinds([provisional.classify(expr) for expr in expressions])
+            if kind is not local_kinds[name]:
+                local_kinds[name] = kind
+                changed = True
+        if not changed:
+            break
+
+    # Any binding that could not be proved model/higher-order/safe is opaque.
+    # This is the finite boundary: aliases are either proven or require a
+    # waiver; the guard does not attempt arbitrary callable evaluation.
+    for name, kind in list(local_kinds.items()):
+        if kind is _LoopCallableKind.UNKNOWN:
+            local_kinds[name] = _LoopCallableKind.OPAQUE
+    return _LoopScope(
+        model_aliases=frozenset(
+            inherited_model
+            | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.MODEL}
+        ),
+        higher_order_aliases=frozenset(
+            inherited_higher
+            | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.HIGHER_ORDER}
+        ),
+        opaque_aliases=frozenset(
+            inherited_opaque
+            | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.OPAQUE}
+        ),
+        safe_aliases=frozenset(
+            inherited_safe
+            | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.SAFE}
+        ),
+        functions=functions,
+    )
+
+
 class _LoopCallVisitor(ast.NodeVisitor):
     def __init__(
         self,
@@ -364,10 +540,38 @@ class _LoopCallVisitor(ast.NodeVisitor):
         self.loop_depth = 0
         self.callback_depth = 0
         self.findings: list[Finding] = []
-        (
-            self.model_aliases,
-            self.model_callback_names,
-        ) = _collect_loop_model_facts(tree)
+        self.scope_stack: list[_LoopScope] = []
+        self.scope_cache: dict[int, _LoopScope] = {
+            id(tree): _build_loop_scope(tree.body),
+        }
+        self.risk_stack: set[int] = set()
+
+    @property
+    def scope(self) -> _LoopScope:
+        return self.scope_stack[-1]
+
+    def visit_Module(self, node: ast.Module) -> None:  # noqa: N802 -- ast visitor protocol.
+        self._visit_scoped(node, node.body, self.scope_cache[id(node)])
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 -- ast protocol.
+        self._visit_defaults(node.args)
+        self._visit_scoped(node, [node.body], self._scope_for(node, self.scope))
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 -- ast protocol.
+        expressions = [
+            *node.decorator_list,
+            *node.bases,
+            *(item.value for item in node.keywords),
+        ]
+        for expression in expressions:
+            self.visit(expression)
+        self._visit_scoped(node, node.body, self._scope_for(node, self.scope))
 
     def visit_For(self, node: ast.For) -> None:  # noqa: N802 -- ast visitor protocol.
         self._visit_loop(node)
@@ -405,24 +609,121 @@ class _LoopCallVisitor(ast.NodeVisitor):
         finally:
             self.callback_depth = previous_callback_depth
 
-    def _is_model_call(self, node: ast.Call) -> bool:
-        return _is_loop_model_callable(node.func, self.model_aliases)
+    def _visit_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
+        for expression in node.decorator_list:
+            self.visit(expression)
+        self._visit_defaults(node.args)
+        for argument in [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+            *([node.args.vararg] if node.args.vararg is not None else []),
+            *([node.args.kwarg] if node.args.kwarg is not None else []),
+        ]:
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.returns is not None:
+            self.visit(node.returns)
+        self._visit_scoped(node, node.body, self._scope_for(node, self.scope))
 
-    def _is_model_higher_order_callback(self, node: ast.Call) -> bool:
-        if not (isinstance(node.func, ast.Name) and node.func.id in _LOOP_HIGHER_ORDER_NAMES):
+    def _visit_defaults(self, arguments: ast.arguments) -> None:
+        for default in [*arguments.defaults, *(item for item in arguments.kw_defaults if item)]:
+            self.visit(default)
+
+    def _visit_scoped(
+        self,
+        node: ast.AST,
+        body: list[ast.stmt] | list[ast.expr],
+        scope: _LoopScope,
+    ) -> None:
+        del node
+        self.scope_stack.append(scope)
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self.scope_stack.pop()
+
+    def _scope_for(self, node: ast.AST, parent: _LoopScope) -> _LoopScope:
+        cached = self.scope_cache.get(id(node))
+        if cached is not None:
+            return cached
+        if isinstance(node, ast.Lambda):
+            body: list[ast.stmt] | list[ast.expr] = [node.body]
+            parameters = _parameter_names(node.args)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            body = node.body
+            parameters = _parameter_names(node.args)
+        elif isinstance(node, ast.ClassDef):
+            body = node.body
+            parameters = set()
+        else:
+            raise TypeError(f"Unsupported loop scope node: {type(node).__name__}")
+        scope = _build_loop_scope(body, parent=parent, parameter_names=parameters)
+        self.scope_cache[id(node)] = scope
+        return scope
+
+    def _is_model_call(self, node: ast.Call, scope: _LoopScope | None = None) -> bool:
+        kind = (scope or self.scope).classify(node.func)
+        return kind in {_LoopCallableKind.MODEL, _LoopCallableKind.OPAQUE}
+
+    def _is_model_higher_order_callback(
+        self,
+        node: ast.Call,
+        scope: _LoopScope | None = None,
+    ) -> bool:
+        current_scope = scope or self.scope
+        if current_scope.classify(node.func) is not _LoopCallableKind.HIGHER_ORDER:
             return False
         callback = _first_loop_callback_argument(node.args)
-        if callback is None:
+        return callback is not None and self._callback_has_risk(callback, current_scope)
+
+    def _callback_has_risk(self, expression: ast.expr, scope: _LoopScope) -> bool:
+        expression = expression.value if isinstance(expression, ast.Starred) else expression
+        kind = scope.classify(expression)
+        if kind in {
+            _LoopCallableKind.MODEL,
+            _LoopCallableKind.HIGHER_ORDER,
+            _LoopCallableKind.OPAQUE,
+        }:
+            return True
+        if kind is _LoopCallableKind.SAFE:
             return False
-        if isinstance(callback, ast.Lambda):
-            return _contains_loop_model_call(
-                callback.body,
-                self.model_aliases,
-                self.model_callback_names,
+        if isinstance(expression, ast.Lambda):
+            return self._contains_loop_risk(
+                expression.body,
+                self._scope_for(expression, scope),
             )
-        return _is_loop_model_callable(callback, self.model_aliases) or (
-            isinstance(callback, ast.Name) and callback.id in self.model_callback_names
-        )
+        if isinstance(expression, ast.Name):
+            function = scope.functions.get(expression.id)
+            if function is not None:
+                return self._contains_loop_risk(
+                    function.body,
+                    self._scope_for(function, scope),
+                )
+            return True
+        return isinstance(expression, (ast.Attribute, ast.Call, ast.Subscript))
+
+    def _contains_loop_risk(
+        self,
+        node: ast.AST | list[ast.AST],
+        scope: _LoopScope,
+    ) -> bool:
+        roots = node if isinstance(node, list) else [node]
+        identity = id(node)
+        if identity in self.risk_stack:
+            return True
+        self.risk_stack.add(identity)
+        visitor = _LoopRiskVisitor(self, scope)
+        try:
+            for root in roots:
+                visitor.visit(root)
+            return visitor.risk
+        finally:
+            self.risk_stack.remove(identity)
 
     def _append_finding(self, node: ast.AST) -> None:
         snippet = self.lines[node.lineno - 1].strip()
@@ -445,99 +746,37 @@ class _LoopCallVisitor(ast.NodeVisitor):
         self.loop_depth -= 1
 
 
-def _collect_loop_model_facts(tree: ast.AST) -> tuple[set[str], set[str]]:
-    """Collect the small, syntactic model-call facts used by the loop guard.
+class _LoopRiskVisitor(ast.NodeVisitor):
+    """Find callable risk inside one callback without crossing nested scopes."""
 
-    This intentionally proves only direct ``.call``/``.llm`` aliases, dynamic
-    ``getattr`` aliases, and named callbacks whose bodies contain one of those
-    calls.  It is a finite AST boundary, not an attempt to evaluate arbitrary
-    Python callables.
-    """
-    assignments = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
-    ]
-    aliases: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for node in assignments:
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-                value = node.value
-            else:
-                targets = [node.target]
-                value = node.value
-            if value is None or not _is_loop_model_callable(value, aliases):
-                continue
-            for target in targets:
-                for name in _target_names(target):
-                    if name not in aliases:
-                        aliases.add(name)
-                        changed = True
+    def __init__(self, owner: _LoopCallVisitor, scope: _LoopScope) -> None:
+        self.owner = owner
+        self.scope = scope
+        self.risk = False
 
-    callback_names: set[str] = set()
-    callback_bindings = [
-        node for node in assignments if isinstance(node, ast.Assign | ast.AnnAssign)
-    ]
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and _contains_loop_model_call(node.body, aliases, callback_names)
-                and node.name not in callback_names
-            ):
-                callback_names.add(node.name)
-                changed = True
-        for node in callback_bindings:
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-                value = node.value
-            else:
-                targets = [node.target]
-                value = node.value
-            if not _contains_loop_model_call(value, aliases, callback_names):
-                continue
-            for target in targets:
-                for name in _target_names(target):
-                    if name not in callback_names:
-                        callback_names.add(name)
-                        changed = True
-    return aliases, callback_names
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        del node
 
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        del node
 
-def _contains_loop_model_call(
-    node: ast.AST | list[ast.AST] | None,
-    aliases: set[str],
-    callback_names: set[str],
-) -> bool:
-    if node is None:
-        return False
-    roots = node if isinstance(node, list) else [node]
-    return any(
-        isinstance(candidate, ast.Call)
-        and (
-            _is_loop_model_callable(candidate.func, aliases)
-            or (isinstance(candidate.func, ast.Name) and candidate.func.id in callback_names)
-        )
-        for root in roots
-        for candidate in ast.walk(root)
-    )
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 -- ast protocol.
+        del node
 
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 -- ast protocol.
+        del node
 
-def _is_loop_model_callable(expression: ast.AST, aliases: set[str]) -> bool:
-    if isinstance(expression, ast.Attribute):
-        return expression.attr in _LOOP_MODEL_METHOD_NAMES
-    if isinstance(expression, ast.Name):
-        return expression.id in aliases
-    return (
-        isinstance(expression, ast.Call)
-        and isinstance(expression.func, ast.Name)
-        and expression.func.id == "getattr"
-    )
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 -- ast protocol.
+        if self.owner._is_model_call(node, self.scope):
+            self.risk = True
+            return
+        if self.owner._is_model_higher_order_callback(node, self.scope):
+            self.risk = True
+            return
+        if self.owner._callback_has_risk(node.func, self.scope):
+            self.risk = True
+            return
+        self.generic_visit(node)
 
 
 def _first_loop_callback_argument(arguments: list[ast.expr]) -> ast.expr | None:
@@ -1925,7 +2164,10 @@ def _is_dynamic_lookup_expression(
         if _is_dynamic_builtin_namespace_subscript(expression):
             return True
         if _is_builtin_dict_subscript(expression, builtin_module_aliases):
-            return _is_builtin_dict_lookup(expression, builtin_module_aliases)
+            # A key that is not a literal is still an opaque callable lookup;
+            # refusing only known names leaves ``builtins.__dict__[key]`` as a
+            # straightforward raw-I/O bypass.
+            return True
         if isinstance(expression.value, ast.Name) and expression.value.id in dynamic_aliases:
             return True
         return _is_dynamic_lookup_call(

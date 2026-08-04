@@ -1181,3 +1181,83 @@ def node(inputs, ctx):
         'after = ctx.read_text("after-match-secret.txt")',
     ]
     assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_hard_cuts_dynamic_builtin_dict_keys_and_imported_dict() -> None:
+    """动态 builtin namespace lookup is opaque even when the key is not literal."""
+    source = """
+import builtins
+from builtins import __dict__ as namespace
+
+def node(inputs, ctx):
+    first = builtins.__dict__[key]
+    second = namespace[key]
+    return first("one.txt"), second("two.txt")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/dynamic-builtin-dict.py"))
+
+    assert [(finding.lineno, finding.snippet, finding.waived) for finding in findings] == [
+        (6, "first = builtins.__dict__[key]", False),
+        (7, "second = namespace[key]", False),
+        (8, 'return first("one.txt"), second("two.txt")', False),
+        (8, 'return first("one.txt"), second("two.txt")', False),
+    ]
+
+
+def test_loop_guard_uses_scope_local_facts_and_finite_opaque_boundaries() -> None:
+    """Aliases are local; unknown aliases and higher-order callbacks need review."""
+    source = """
+def helper(item):
+    return item
+
+def first(items, ctx):
+    call = ctx.call
+    for item in items:
+        call(item)
+
+def second(items, ctx):
+    for item in items:
+        call(item)
+    mapper = map
+    predicate = filter
+    callback = helper
+    list(mapper(lambda value: ctx.call(value), items))  # kigumi: raw-llm-ok alias fixture
+    list(predicate(lambda value: ctx.llm(value), items))
+    list(mapper(callback, items))
+    values = [(named := ctx.call)(item) for item in items]
+"""
+
+    findings = check_source(source, Path("nodes/finite-loop-boundary.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "call(item)",
+        "list(mapper(lambda value: ctx.call(value), items))  # kigumi: raw-llm-ok alias fixture",
+        "list(predicate(lambda value: ctx.llm(value), items))",
+        "list(mapper(callback, items))",
+        "values = [(named := ctx.call)(item) for item in items]",
+    ]
+    assert [(finding.waived, finding.waiver_reason) for finding in findings] == [
+        (False, None),
+        (True, "alias fixture"),
+        (False, None),
+        (False, None),
+        (False, None),
+    ]
+
+
+def test_loop_guard_keeps_safe_direct_and_proven_simple_callbacks_allowed() -> None:
+    """The finite boundary does not turn ordinary direct code into findings."""
+    source = """
+def increment(item):
+    return item + 1
+
+def node(items, ctx):
+    for item in items:
+        print(item)
+    list(map(increment, items))
+    list(map(str, items))
+    return ctx.call(items[0])
+"""
+
+    assert check_source(source, Path("nodes/safe-loop-code.py")) == []
