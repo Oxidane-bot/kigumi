@@ -805,7 +805,9 @@ replaced = False
 
 def open_race(path, flags, mode=0o777, *, dir_fd=None):
     global replaced
-    if Path(path) == source and not replaced:
+    # File reads now bind the parent directory and open the final name
+    # relative to its descriptor; race the descriptor-relative final open.
+    if dir_fd is not None and str(path) == source.name and not replaced:
         replaced = True
         source.unlink()
         os.mkfifo(source)

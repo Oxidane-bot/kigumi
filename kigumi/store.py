@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 import re
@@ -14,7 +13,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -22,13 +21,15 @@ from ._safe_io import (
     SecureDirectory as _SecureDirectory,
 )
 from ._safe_io import (
-    atomic_write_json,
-    atomic_write_text,
-    install_safe_artifact_writes,
-    install_secure_blob_store_writes,
+    _open_regular_file_at,
+    lstat_regular_file,
+    read_regular_bytes,
 )
-from .artifacts import canonical_json, sha, write_artifact
-from .blobs import BlobStore, _rename_at
+from ._safe_io import (
+    rename_at as _rename_at,
+)
+from .artifacts import atomic_write_json, atomic_write_text, canonical_json, sha, write_artifact
+from .blobs import BlobStore
 from .errors import OutputOwnershipError
 
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
@@ -52,8 +53,14 @@ _ORIGIN_PROVENANCE_FIELDS = (
 _ORIGIN_KINDS = frozenset(("call", "agent", "code"))
 _EVIDENCE_MODES = frozenset(("full", "redacted", "hash_only"))
 
-install_safe_artifact_writes()
-install_secure_blob_store_writes(BlobStore)
+
+def _storage_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _storage_file_error(message: str, path: Path) -> ValueError:
+    return ValueError(f"Storage file {message}: {path}")
+
 
 CacheState = Literal["MISSING", "VALID", "CORRUPT"]
 
@@ -225,69 +232,32 @@ def _read_node_cache_envelope(
     cache_key: str,
 ) -> CacheLookup:
     path = node_cache_path(artifacts_path, cache_key)
+
+    def file_identity(info: os.stat_result) -> tuple[int, int]:
+        return info.st_dev, info.st_ino
+
+    def file_error(message: str, target: Path) -> ValueError:
+        return ValueError(f"node cache file {message}: {target}")
+
     try:
-        info = path.lstat()
+        info = lstat_regular_file(path, error=file_error)
     except FileNotFoundError:
         return CacheLookup("MISSING", None, None, None, "node cache file is missing")
-    except OSError as error:
+    except (OSError, ValueError) as error:
         return CacheLookup("CORRUPT", None, None, None, f"node cache file stat failed: {error}")
-    if stat.S_ISLNK(info.st_mode):
-        return CacheLookup("CORRUPT", None, None, None, "node cache file is a symlink")
-    if not stat.S_ISREG(info.st_mode):
-        return CacheLookup(
-            "CORRUPT", None, None, None, "node cache file must reference a regular file"
-        )
-
     try:
-        nofollow = os.O_NOFOLLOW
-    except AttributeError:
-        return CacheLookup(
-            "CORRUPT", None, None, None, "node cache requires no-follow descriptor I/O"
+        raw = read_regular_bytes(
+            path,
+            identity=file_identity,
+            expected_identity=file_identity(info),
+            phase="reading node cache",
+            error=file_error,
         )
-
-    descriptor = -1
-    try:
-        with _SecureDirectory(path.parent, create=False) as cache_directory:
-            cache_directory.verify_bound()
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_CLOEXEC", 0)
-                | nofollow
-                | getattr(os, "O_NONBLOCK", 0)
-            )
-            try:
-                descriptor = os.open(path.name, flags, dir_fd=cache_directory.fd)
-            except FileNotFoundError:
-                return CacheLookup(
-                    "CORRUPT", None, None, None, "node cache file changed during read"
-                )
-            except OSError as error:
-                if error.errno == errno.ELOOP:
-                    return CacheLookup("CORRUPT", None, None, None, "node cache file is a symlink")
-                return CacheLookup(
-                    "CORRUPT", None, None, None, f"node cache file open failed: {error}"
-                )
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                return CacheLookup(
-                    "CORRUPT", None, None, None, "node cache file must reference a regular file"
-                )
-            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-                return CacheLookup(
-                    "CORRUPT", None, None, None, "node cache file changed during read"
-                )
-            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
-                descriptor = -1
-                payload = json.load(handle)
+        payload = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         return CacheLookup("CORRUPT", None, None, None, "node cache file changed during read")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         return CacheLookup("CORRUPT", None, None, None, f"node cache JSON read failed: {error}")
-    finally:
-        if descriptor >= 0:
-            with suppress(OSError):
-                os.close(descriptor)
     if not isinstance(payload, dict):
         return CacheLookup("CORRUPT", None, None, None, "node cache JSON is not an object")
     if payload.get("cache_schema") != _NODE_CACHE_ENVELOPE_SCHEMA:
@@ -359,22 +329,28 @@ def write_node_cache(
 def allocate_run_id(artifacts_path: Path) -> str:
     """Allocate and create the next ``run-NNNN`` directory atomically."""
     root = runs_root(artifacts_path)
-    root.mkdir(parents=True, exist_ok=True)
-    sequence = [
-        int(match.group(1))
-        for path in root.iterdir()
-        if path.is_dir() and (match := _RUN_ID_PATTERN.fullmatch(path.name))
-    ]
-    candidate = max(sequence, default=0) + 1
-    # 扫描到分配之间另一进程可能占走同号;mkdir 是原子的,占不到就顺延。
-    while True:
-        run_id = f"run-{candidate:04d}"
-        try:
-            (root / run_id).mkdir()
-        except FileExistsError:
-            candidate += 1
-        else:
-            return run_id
+    with _SecureDirectory(root, create=True) as directory:
+        sequence = []
+        for name in directory.names():
+            match = _RUN_ID_PATTERN.fullmatch(name)
+            if match is None:
+                continue
+            try:
+                info = directory.stat(name)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                sequence.append(int(match.group(1)))
+        candidate = max(sequence, default=0) + 1
+        # 扫描到分配之间另一进程可能占走同号;mkdir 是原子的,占不到就顺延。
+        while True:
+            run_id = f"run-{candidate:04d}"
+            try:
+                directory.mkdir(run_id)
+            except FileExistsError:
+                candidate += 1
+            else:
+                return run_id
 
 
 def run_sort_key(path: Path) -> tuple[int, int | str]:
@@ -399,15 +375,20 @@ def write_run_artifact(
 
 def next_history_id(history_root: Path) -> str:
     """Return the next four-digit history directory name without creating it."""
-    sequence = (
-        [
-            int(path.name)
-            for path in history_root.iterdir()
-            if path.is_dir() and _HISTORY_ID_PATTERN.fullmatch(path.name)
-        ]
-        if history_root.is_dir()
-        else []
-    )
+    try:
+        with _SecureDirectory(history_root, create=False) as directory:
+            sequence = []
+            for name in directory.names():
+                if _HISTORY_ID_PATTERN.fullmatch(name) is None:
+                    continue
+                try:
+                    info = directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    sequence.append(int(name))
+    except FileNotFoundError:
+        sequence = []
     return f"{max(sequence, default=0) + 1:04d}"
 
 
@@ -684,12 +665,25 @@ def approve_checkpoint(runs_root: Path, run_id: str, name: str, data: Any) -> No
     approval_path = checkpoint_path(runs_root, run_id, name)
     pending_path = approval_path.with_suffix(".pending.json")
     try:
-        with pending_path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
+        with _SecureDirectory(approval_path.parent, create=False) as approval_directory:
+            pending_info = approval_directory.stat(pending_path.name)
+            if not stat.S_ISREG(pending_info.st_mode):
+                raise ValueError(f"Pending checkpoint must be a regular file: {pending_path}")
+            with _open_regular_file_at(
+                approval_directory,
+                pending_path.name,
+                identity=_storage_file_identity,
+                expected_identity=_storage_file_identity(pending_info),
+                phase="reading pending checkpoint",
+                error=_storage_file_error,
+            ) as handle:
+                payload = json.loads(handle.read().decode("utf-8"))
+            atomic_write_json(approval_path, {"payload_sha": sha(payload), "data": data})
+            approval_directory.unlink(pending_path.name)
     except FileNotFoundError as error:
         raise ValueError(f"No pending checkpoint {name!r} in run {run_id!r}") from error
-    atomic_write_json(approval_path, {"payload_sha": sha(payload), "data": data})
-    pending_path.unlink()
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Pending checkpoint {name!r} is not valid JSON") from error
 
 
 def checkpoint_path(runs_root: Path, run_id: str, name: str) -> Path:
@@ -718,34 +712,77 @@ def gc_cache(cache_root: Path, runs_root: Path, keep_last: int) -> int:
     """Delete cache files not referenced by the latest retained run directories."""
     if keep_last < 0:
         raise ValueError("keep_last must be non-negative")
-    if not runs_root.is_dir():
+    try:
+        with _SecureDirectory(runs_root, create=False) as runs_directory:
+            run_names = []
+            for name in runs_directory.names():
+                try:
+                    info = runs_directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    run_names.append(name)
+    except FileNotFoundError:
         return 0
-    runs = sorted((path for path in runs_root.iterdir() if path.is_dir()), key=run_sort_key)
-    retained = runs[-keep_last:] if keep_last else []
+    ordered_runs = sorted((Path(name) for name in run_names), key=run_sort_key)
+    retained = ordered_runs[-keep_last:] if keep_last else []
     referenced: set[str] = set()
-    for run in retained:
-        for sidecar in run.glob("*.json.meta.json"):
-            try:
-                with sidecar.open(encoding="utf-8") as handle:
-                    metadata = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(metadata, dict):
-                continue
-            cache_key = metadata.get("cache_key")
-            if isinstance(cache_key, str):
-                referenced.add(cache_key)
-            elif isinstance(cache_key, list) and all(isinstance(key, str) for key in cache_key):
-                # map 聚合 sidecar 的键列表是 gc 的契约来源;逐项 sidecar
-                # 只是冗余,缺失时也不得误删 item 缓存。
-                referenced.update(cache_key)
+    for run_name in retained:
+        try:
+            with _SecureDirectory(runs_root / run_name, create=False) as run_directory:
+                for name in run_directory.names():
+                    if not name.endswith(".json.meta.json"):
+                        continue
+                    try:
+                        info = run_directory.stat(name)
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    try:
+                        with _open_regular_file_at(
+                            run_directory,
+                            name,
+                            identity=_storage_file_identity,
+                            expected_identity=_storage_file_identity(info),
+                            phase="reading cache metadata",
+                            error=_storage_file_error,
+                        ) as handle:
+                            metadata = json.loads(handle.read().decode("utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(metadata, dict):
+                        continue
+                    cache_key = metadata.get("cache_key")
+                    if isinstance(cache_key, str):
+                        referenced.add(cache_key)
+                    elif isinstance(cache_key, list) and all(
+                        isinstance(key, str) for key in cache_key
+                    ):
+                        # map 聚合 sidecar 的键列表是 gc 的契约来源;逐项 sidecar
+                        # 只是冗余,缺失时也不得误删 item 缓存。
+                        referenced.update(cache_key)
+        except FileNotFoundError:
+            continue
 
-    removed = 0
-    for cache_path in cache_root.glob("*.json"):
-        if cache_path.stem not in referenced:
-            cache_path.unlink()
-            removed += 1
-    return removed
+    try:
+        with _SecureDirectory(cache_root, create=False) as cache_directory:
+            removed = 0
+            for name in cache_directory.names():
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    info = cache_directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if Path(name).stem not in referenced:
+                    cache_directory.unlink(name)
+                    removed += 1
+            return removed
+    except FileNotFoundError:
+        return 0
 
 
 def gc_artifacts(artifacts_path: Path, keep_last: int) -> int:
@@ -763,42 +800,139 @@ def _archive_stale(
     artifact: dict[str, Any],
     ensure_archive_id: Callable[[], str],
 ) -> None:
-    if not artifact_path.is_file():
-        return
+    source_name = artifact_path.name
+    sidecar_name = f"{source_name}.meta.json"
+    # A first write has no run directory yet; write_artifact will create it
+    # through the safe atomic writer.  This probe only distinguishes absence;
+    # any existing symlink is still rejected by SecureDirectory below.
     try:
-        with artifact_path.open(encoding="utf-8") as handle:
-            previous = json.load(handle)
-        changed = sha(previous) != sha(artifact)
-    except (OSError, json.JSONDecodeError):
-        changed = True
-    if not changed:
+        artifact_path.parent.lstat()
+    except FileNotFoundError:
         return
-    destination = artifact_path.parent / "history" / ensure_archive_id()
-    destination.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(artifact_path), destination / artifact_path.name)
-    sidecar = Path(f"{artifact_path}.meta.json")
-    if sidecar.is_file():
-        shutil.move(str(sidecar), destination / sidecar.name)
+    with _SecureDirectory(artifact_path.parent, create=False) as source_directory:
+        try:
+            artifact_info = source_directory.stat(source_name)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(artifact_info.st_mode):
+            raise ValueError(f"Artifact must not be a symlink: {artifact_path}")
+        if not stat.S_ISREG(artifact_info.st_mode):
+            raise ValueError(f"Artifact must be a regular file: {artifact_path}")
+
+        try:
+            with _open_regular_file_at(
+                source_directory,
+                source_name,
+                identity=_storage_file_identity,
+                expected_identity=_storage_file_identity(artifact_info),
+                phase="archiving",
+                error=_storage_file_error,
+            ) as handle:
+                previous = json.loads(handle.read().decode("utf-8"))
+            changed = sha(previous) != sha(artifact)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            changed = True
+        if not changed:
+            return
+
+        try:
+            sidecar_info = source_directory.stat(sidecar_name)
+        except FileNotFoundError:
+            sidecar_info = None
+        if sidecar_info is not None and not stat.S_ISREG(sidecar_info.st_mode):
+            raise ValueError(f"Artifact sidecar must be a regular file: {artifact_path}.meta.json")
+
+        archive_id = _validate_path_component(str(ensure_archive_id()), "History ID")
+        destination = artifact_path.parent / "history" / archive_id
+        with _SecureDirectory(destination, create=True) as destination_directory:
+            source_directory.verify_bound()
+            try:
+                destination_directory.stat(source_name)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"History artifact already exists: {destination / source_name}"
+                )
+            if sidecar_info is not None:
+                try:
+                    destination_directory.stat(sidecar_name)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise FileExistsError(
+                        f"History sidecar already exists: {destination / sidecar_name}"
+                    )
+            _rename_at(
+                source_name,
+                source_name,
+                source_directory=source_directory,
+                destination_directory=destination_directory,
+            )
+            if sidecar_info is not None:
+                _rename_at(
+                    sidecar_name,
+                    sidecar_name,
+                    source_directory=source_directory,
+                    destination_directory=destination_directory,
+                )
+
+
+def _iter_json_values(root: Path) -> Iterable[Any]:
+    """Yield regular JSON files below a descriptor-bound directory tree."""
+    try:
+        with _SecureDirectory(root, create=False) as directory:
+            for name in directory.names():
+                try:
+                    info = directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                child = root / name
+                if stat.S_ISDIR(info.st_mode):
+                    yield from _iter_json_values(child)
+                    continue
+                if not name.endswith(".json") or not stat.S_ISREG(info.st_mode):
+                    continue
+                try:
+                    with _open_regular_file_at(
+                        directory,
+                        name,
+                        identity=_storage_file_identity,
+                        expected_identity=_storage_file_identity(info),
+                        phase="reading retained JSON",
+                        error=_storage_file_error,
+                    ) as handle:
+                        value = json.loads(handle.read().decode("utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    continue
+                yield value
+    except FileNotFoundError:
+        return
 
 
 def _referenced_blob_digests(runs_root: Path, keep_last: int) -> set[str]:
     """Collect blob digests from retained artifact JSON, including nested map items."""
     if keep_last < 0:
         raise ValueError("keep_last must be non-negative")
-    if not runs_root.is_dir():
+    try:
+        with _SecureDirectory(runs_root, create=False) as runs_directory:
+            run_names = []
+            for name in runs_directory.names():
+                try:
+                    info = runs_directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    run_names.append(name)
+    except FileNotFoundError:
         return set()
-    runs = sorted((path for path in runs_root.iterdir() if path.is_dir()), key=run_sort_key)
+    ordered_runs = sorted((Path(name) for name in run_names), key=run_sort_key)
+    retained = ordered_runs[-keep_last:] if keep_last else []
     referenced: set[str] = set()
-    for run in runs[-keep_last:] if keep_last else []:
+    for run in retained:
         # Retained sidecars, failures, and durable attempt receipts are all
         # evidence roots. Materialization still ignores attachment markers.
-        retained_json = list(run.rglob("*.json"))
-        for artifact_path in retained_json:
-            try:
-                with artifact_path.open(encoding="utf-8") as handle:
-                    artifact = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
+        for artifact in _iter_json_values(runs_root / run):
             for reference in _blob_references(artifact):
                 digest = reference.get("kigumi_blob")
                 if isinstance(digest, str):
@@ -838,16 +972,37 @@ def _run_artifacts(runs_root: Path, run_id: str) -> dict[str, dict[str, Any]]:
     _validate_path_component(run_id, "Run ID")
     run_path = runs_root / run_id
     artifacts: dict[str, dict[str, Any]] = {}
-    if not run_path.is_dir():
+    try:
+        directory = _SecureDirectory(run_path, create=False)
+        directory.__enter__()
+    except FileNotFoundError:
         return artifacts
-    for path in sorted(run_path.glob("*.json")):
-        if path.name.startswith("_") or path.name.endswith(".json.meta.json"):
-            continue
-        try:
-            with path.open(encoding="utf-8") as handle:
-                artifact = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(artifact, dict):
-            artifacts[path.stem] = artifact
+    try:
+        for name in sorted(directory.names()):
+            if name.startswith("_") or not name.endswith(".json"):
+                continue
+            if name.endswith(".json.meta.json"):
+                continue
+            try:
+                info = directory.stat(name)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            try:
+                with _open_regular_file_at(
+                    directory,
+                    name,
+                    identity=_storage_file_identity,
+                    expected_identity=_storage_file_identity(info),
+                    phase="reading run artifact",
+                    error=_storage_file_error,
+                ) as handle:
+                    artifact = json.loads(handle.read().decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(artifact, dict):
+                artifacts[Path(name).stem] = artifact
+    finally:
+        directory.close()
     return artifacts

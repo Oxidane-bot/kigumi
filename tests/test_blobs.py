@@ -497,7 +497,10 @@ replaced = False
 
 def open_race(path, flags, mode=0o777, *, dir_fd=None):
     global replaced
-    if Path(path) == source_path and not replaced:
+    # The shared boundary intentionally opens the final name relative to a
+    # bound directory descriptor, so the race hook keys on that descriptor
+    # plus the digest name rather than a path-based open.
+    if dir_fd is not None and str(path) == digest and not replaced:
         replaced = True
         source_path.unlink()
         os.mkfifo(source_path)

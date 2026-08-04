@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import os
 import stat
-import sys
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from hashlib import sha256
@@ -17,6 +16,13 @@ FileIdentity: TypeAlias = tuple[int, ...]
 FileError: TypeAlias = Callable[[str, Path], BaseException]
 IdentityFactory: TypeAlias = Callable[[os.stat_result], FileIdentity]
 _ORIGINAL_OS_LINK = os.link
+_ORIGINAL_OS_OPEN = os.open
+_ORIGINAL_OS_MKDIR = os.mkdir
+_ORIGINAL_OS_RENAME = os.rename
+_ORIGINAL_OS_STAT = os.stat
+_ORIGINAL_OS_UNLINK = os.unlink
+_ORIGINAL_OS_RMDIR = os.rmdir
+_ORIGINAL_OS_FSTAT = os.fstat
 
 # macOS exposes these directories as root-level symlinks.  They are stable
 # system aliases, unlike a symlink introduced anywhere inside a project path.
@@ -67,21 +73,17 @@ def _secure_directory_supported() -> bool:
     return (
         all(
             operation in supported
-            for operation in (os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir)
+            for operation in (
+                _ORIGINAL_OS_OPEN,
+                _ORIGINAL_OS_MKDIR,
+                _ORIGINAL_OS_RENAME,
+                _ORIGINAL_OS_STAT,
+                _ORIGINAL_OS_UNLINK,
+                _ORIGINAL_OS_RMDIR,
+            )
         )
         and hasattr(os, "O_DIRECTORY")
         and hasattr(os, "O_NOFOLLOW")
-    )
-
-
-def _secure_blob_store_supported() -> bool:
-    """Return whether the blob publisher can link within a bound directory."""
-    supported = getattr(os, "supports_dir_fd", ())
-    follow_symlinks = getattr(os, "supports_follow_symlinks", ())
-    return (
-        _secure_directory_supported()
-        and _ORIGINAL_OS_LINK in supported
-        and _ORIGINAL_OS_LINK in follow_symlinks
     )
 
 
@@ -89,8 +91,17 @@ def _secure_directory_error(path: Path) -> OSError:
     """Build the explicit fail-closed error for unsupported secure directory I/O."""
     return OSError(
         errno.ENOTSUP,
-        "Secure directory I/O requires descriptor-relative no-follow operations: " + str(path),
+        "Secure directory I/O requires descriptor-relative directory I/O and no-follow operations: "
+        + str(path),
     )
+
+
+def _default_file_identity(info: os.stat_result) -> FileIdentity:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _default_file_error(message: str, path: Path) -> ValueError:
+    return ValueError(f"File {message}: {path}")
 
 
 class SecureDirectory:
@@ -183,7 +194,7 @@ class SecureDirectory:
             named = self._absolute.lstat()
         except FileNotFoundError as caught:
             raise ValueError(f"Secure directory changed: {self.path}") from caught
-        opened = os.fstat(self.fd)
+        opened = _ORIGINAL_OS_FSTAT(self.fd)
         if (
             not stat.S_ISDIR(named.st_mode)
             or not stat.S_ISDIR(opened.st_mode)
@@ -196,6 +207,17 @@ class SecureDirectory:
         self._verify_name(name)
         self.verify_bound()
         return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+
+    def names(self) -> list[str]:
+        """List direct child names from the already-bound directory descriptor."""
+        self.verify_bound()
+        return os.listdir(self.fd)
+
+    def mkdir(self, name: str, *, mode: int = 0o777) -> None:
+        """Create one child directory without following a replacement symlink."""
+        self._verify_name(name)
+        self.verify_bound()
+        os.mkdir(name, mode, dir_fd=self.fd)
 
     def temporary(self, prefix: str) -> tuple[int, str]:
         """Create a private temporary file relative to the bound directory."""
@@ -225,7 +247,9 @@ class SecureDirectory:
 
     def link(self, source: str, destination: str) -> None:
         """Create a hard link between two entries in this bound directory."""
-        if not _secure_blob_store_supported():
+        supported = getattr(os, "supports_dir_fd", ())
+        follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+        if _ORIGINAL_OS_LINK not in supported or _ORIGINAL_OS_LINK not in follow_symlinks:
             raise _secure_directory_error(self.path)
         self._verify_name(source)
         self._verify_name(destination)
@@ -267,6 +291,30 @@ class SecureDirectory:
         except OSError:
             return False
         return stat.S_ISLNK(info.st_mode)
+
+
+def rename_at(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    source_directory: SecureDirectory | None = None,
+    destination_directory: SecureDirectory | None = None,
+) -> None:
+    """Rename using bound descriptors for any managed directory side."""
+    source_name = str(source)
+    destination_name = str(destination)
+    if source_directory is not None:
+        source_directory._verify_name(source_name)
+        source_directory.verify_bound()
+    if destination_directory is not None:
+        destination_directory._verify_name(destination_name)
+        destination_directory.verify_bound()
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=None if source_directory is None else source_directory.fd,
+        dst_dir_fd=None if destination_directory is None else destination_directory.fd,
+    )
 
 
 def _write_target_error(directory: SecureDirectory, name: str) -> BaseException | None:
@@ -329,61 +377,18 @@ def secure_atomic_write_json(path: str | Path, obj: Any) -> None:
     secure_atomic_write_text(path, canonical_json(obj))
 
 
-_kigumi_safe_atomic_write_text = secure_atomic_write_text
-_kigumi_safe_atomic_write_json = secure_atomic_write_json
-
-
-def _artifact_atomic_write_text_bridge(path, text):
-    return _kigumi_safe_atomic_write_text(path, text)
-
-
-def _artifact_atomic_write_json_bridge(path, obj):
-    return _kigumi_safe_atomic_write_json(path, obj)
-
-
-def install_safe_artifact_writes() -> None:
-    """Make every already-imported artifact write reference the safe implementation.
-
-    Several framework modules retain the public artifact functions by direct import.  Updating
-    the function objects in place keeps those existing references bound while moving their
-    implementation behind this single descriptor-relative boundary.
-    """
-    artifacts = sys.modules.get(f"{__package__}.artifacts")
-    if artifacts is None:
-        return
-
-    artifacts._kigumi_safe_atomic_write_text = secure_atomic_write_text
-    artifacts._kigumi_safe_atomic_write_json = secure_atomic_write_json
-    for name, bridge in (
-        ("atomic_write_text", _artifact_atomic_write_text_bridge),
-        ("atomic_write_json", _artifact_atomic_write_json_bridge),
-    ):
-        target = getattr(artifacts, name)
-        if getattr(target, "_kigumi_safe_bridge", False):
-            continue
-        target.__code__ = bridge.__code__
-        target.__defaults__ = bridge.__defaults__
-        target.__kwdefaults__ = bridge.__kwdefaults__
-        target._kigumi_safe_bridge = True
-
-
-def _blob_error(message: str, path: Path) -> ValueError:
-    return ValueError(f"Blob {message}: {path}")
-
-
-def _blob_file_identity(info: os.stat_result) -> FileIdentity:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-
-
 def _open_regular_file_at(
     directory: SecureDirectory,
     name: str,
     *,
+    identity: IdentityFactory = _default_file_identity,
     expected_identity: FileIdentity | None = None,
     phase: str,
+    error: FileError = _default_file_error,
 ) -> BinaryIO:
-    """Open one blob entry relative to a bound directory without following a symlink."""
+    """Open one regular entry relative to a bound directory without following a symlink."""
     directory._verify_name(name)
+    directory.verify_bound()
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -396,199 +401,18 @@ def _open_regular_file_at(
         descriptor = os.open(name, flags, dir_fd=directory.fd)
     except OSError as caught:
         if caught.errno == errno.ELOOP:
-            raise _blob_error("must not be a symlink", path) from caught
+            raise error("must not be a symlink", path) from caught
         raise
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
-            raise _blob_error("must reference a regular file", path)
-        if expected_identity is not None and _blob_file_identity(opened) != expected_identity:
-            raise _blob_error(f"changed {phase}", path)
+            raise error("must reference a regular file", path)
+        if expected_identity is not None and identity(opened) != expected_identity:
+            raise error(f"changed {phase}", path)
         return os.fdopen(descriptor, "rb", closefd=True)
     except BaseException:
         os.close(descriptor)
         raise
-
-
-def _blob_digest_at(
-    directory: SecureDirectory,
-    name: str,
-    *,
-    expected_identity: FileIdentity | None = None,
-) -> tuple[str, int, FileIdentity]:
-    """Hash one blob entry through one stable descriptor."""
-    path = directory.path / name
-    with _open_regular_file_at(
-        directory,
-        name,
-        expected_identity=expected_identity,
-        phase="before hashing",
-    ) as handle:
-        digest, size, _ = digest_open_file(
-            handle,
-            path,
-            identity=_blob_file_identity,
-            expected_identity=expected_identity,
-            before_phase="before hashing",
-            during_phase="during hashing",
-            chunk_size=1024 * 1024,
-            error=_blob_error,
-        )
-        identity = _blob_file_identity(os.fstat(handle.fileno()))
-    return digest, size, identity
-
-
-def _verify_blob_at(directory: SecureDirectory, name: str, digest: str) -> None:
-    """Verify an existing blob without resolving its parent path by name."""
-    info = directory.stat(name)
-    if stat.S_ISLNK(info.st_mode):
-        raise _blob_error("destination must not be a symlink", directory.path / name)
-    if not stat.S_ISREG(info.st_mode):
-        raise _blob_error("destination must be a regular file", directory.path / name)
-    actual_digest, _size, _identity = _blob_digest_at(
-        directory,
-        name,
-        expected_identity=_blob_file_identity(info),
-    )
-    if actual_digest != digest:
-        raise ValueError(f"Blob digest mismatch for {digest}: store content is {actual_digest}")
-
-
-def _publish_blob_if_absent(
-    directory: SecureDirectory,
-    temporary_name: str,
-    digest: str,
-) -> None:
-    """Publish a completed blob without replacing a concurrent destination."""
-    try:
-        directory.link(temporary_name, digest)
-    except FileExistsError:
-        _verify_blob_at(directory, digest, digest)
-
-
-def secure_blob_store_put(blob_store: Any, data: bytes) -> str:
-    """Descriptor-bound replacement for ``BlobStore.put``."""
-    if not isinstance(data, bytes):
-        raise TypeError("Blob data must be bytes")
-    digest = sha256(data).hexdigest()
-    root = Path(blob_store.root)
-    if not _secure_blob_store_supported():
-        raise _secure_directory_error(root)
-
-    with SecureDirectory(root, create=True) as directory:
-        try:
-            existing = directory.stat(digest)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            _verify_blob_at(directory, digest, digest)
-            return digest
-
-        descriptor, temporary_name = directory.temporary(".blob-")
-        try:
-            try:
-                with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                    descriptor = -1
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            finally:
-                if descriptor >= 0:
-                    with suppress(OSError):
-                        os.close(descriptor)
-
-            directory.verify_bound()
-            try:
-                existing = directory.stat(digest)
-            except FileNotFoundError:
-                existing = None
-            if existing is None:
-                _publish_blob_if_absent(directory, temporary_name, digest)
-            else:
-                _verify_blob_at(directory, digest, digest)
-        finally:
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            if temporary_name:
-                directory.unlink(temporary_name, missing_ok=True)
-    return digest
-
-
-def secure_blob_store_ingest(blob_store: Any, path: Path) -> tuple[str, int]:
-    """Descriptor-bound replacement for ``BlobStore.ingest``."""
-    source = Path(path)
-    root = Path(blob_store.root)
-    if not _secure_blob_store_supported():
-        raise _secure_directory_error(root)
-
-    digestor = sha256()
-    size = 0
-    with (
-        SecureDirectory(root, create=True) as directory,
-        open_regular_file(
-            source,
-            identity=_blob_file_identity,
-            expected_identity=None,
-            phase="before ingest",
-            error=_blob_error,
-        ) as input_handle,
-    ):
-        initial = verify_regular_descriptor(
-            input_handle,
-            source,
-            identity=_blob_file_identity,
-            expected_identity=None,
-            phase="before ingest",
-            error=_blob_error,
-        )
-        initial_identity = _blob_file_identity(initial)
-        descriptor, temporary_name = directory.temporary(".blob-")
-        try:
-            try:
-                with os.fdopen(descriptor, "wb", closefd=True) as output_handle:
-                    descriptor = -1
-                    for chunk in iter_file_chunks(input_handle, 1024 * 1024):
-                        digestor.update(chunk)
-                        output_handle.write(chunk)
-                        size += len(chunk)
-                    output_handle.flush()
-                    os.fsync(output_handle.fileno())
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-
-            verify_regular_descriptor(
-                input_handle,
-                source,
-                identity=_blob_file_identity,
-                expected_identity=initial_identity,
-                phase="during ingest",
-                error=_blob_error,
-            )
-            digest = digestor.hexdigest()
-            directory.verify_bound()
-            try:
-                existing = directory.stat(digest)
-            except FileNotFoundError:
-                existing = None
-            if existing is None:
-                _publish_blob_if_absent(directory, temporary_name, digest)
-            else:
-                _verify_blob_at(directory, digest, digest)
-        finally:
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            if temporary_name:
-                directory.unlink(temporary_name, missing_ok=True)
-    return digestor.hexdigest(), size
-
-
-def install_secure_blob_store_writes(blob_store_type: type) -> None:
-    """Install descriptor-bound publishers on the existing BlobStore type."""
-    blob_store_type.put = secure_blob_store_put
-    blob_store_type.ingest = secure_blob_store_ingest
 
 
 # Keep the low-level names discoverable for storage code that wants one shared write boundary.
@@ -602,7 +426,19 @@ def lstat_regular_file(
     error: FileError,
 ) -> os.stat_result:
     """Reject symlinks and special files before any descriptor is opened."""
-    info = path.lstat()
+    path = Path(path)
+    # Keep this lexical probe as an early error and race hook.  The
+    # descriptor-relative stat below is authoritative for the parent path.
+    try:
+        lexical = path.lstat()
+    except FileNotFoundError:
+        lexical = None
+    if lexical is not None and stat.S_ISLNK(lexical.st_mode):
+        raise error("must not be a symlink", path)
+    with SecureDirectory(path.parent, create=False) as directory:
+        info = directory.stat(path.name)
+    if stat.S_ISLNK(info.st_mode):
+        raise error("must not be a symlink", path)
     if not stat.S_ISREG(info.st_mode):
         raise error("must reference a regular file", path)
     return info
@@ -617,30 +453,35 @@ def open_regular_file(
     error: FileError,
 ) -> BinaryIO:
     """Open a regular file through a non-blocking, no-follow descriptor."""
-    lstat_regular_file(path, error=error)
+    initial = lstat_regular_file(path, error=error)
+    with SecureDirectory(Path(path).parent, create=False) as directory:
+        return _open_regular_file_at(
+            directory,
+            Path(path).name,
+            identity=identity,
+            expected_identity=expected_identity or identity(initial),
+            phase=phase,
+            error=error,
+        )
 
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as caught:
-        if getattr(caught, "errno", None) == errno.ELOOP:
-            raise error("must not be a symlink", path) from caught
-        raise
 
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise error("must reference a regular file", path)
-        if expected_identity is not None and identity(opened) != expected_identity:
-            raise error(f"changed {phase}", path)
-        return os.fdopen(descriptor, "rb", closefd=True)
-    except BaseException:
-        os.close(descriptor)
-        raise
+def read_regular_bytes(
+    path: str | Path,
+    *,
+    identity: IdentityFactory = _default_file_identity,
+    expected_identity: FileIdentity | None = None,
+    phase: str,
+    error: FileError = _default_file_error,
+) -> bytes:
+    """Read one regular file through the shared descriptor-relative boundary."""
+    with open_regular_file(
+        Path(path),
+        identity=identity,
+        expected_identity=expected_identity,
+        phase=phase,
+        error=error,
+    ) as handle:
+        return handle.read()
 
 
 def verify_regular_descriptor(

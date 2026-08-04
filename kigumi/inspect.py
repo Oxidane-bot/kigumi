@@ -17,6 +17,7 @@ from ._runstate import (
     RunManifestError,
     validate_run_path,
 )
+from ._safe_io import SecureDirectory, read_regular_bytes
 from .calling import read_call_cache
 from .errors import CacheIntegrityError
 from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
@@ -147,11 +148,12 @@ def load_call(llm_cache_path: Path, key_prefix: str) -> tuple[str, dict[str, Any
     """Load exactly one L1 payload selected by a cache-key prefix."""
     root = llm_cache_path / "llm"
     try:
-        candidates = sorted(
-            path
-            for path in root.iterdir()
-            if path.name.endswith(".json") and path.stem.startswith(key_prefix)
-        )
+        with SecureDirectory(root, create=False) as directory:
+            candidates = sorted(
+                root / name
+                for name in directory.names()
+                if name.endswith(".json") and Path(name).stem.startswith(key_prefix)
+            )
     except FileNotFoundError:
         candidates = []
     except OSError as error:
@@ -263,20 +265,29 @@ def _key_components_by_node(run_path: Path) -> dict[str, dict[str, Any] | None]:
         raise WorkflowProfileError(
             f"Run {run_path.name!r} durable path ownership validation failed: {error}"
         ) from error
-    if not run_path.is_dir():
-        return {}
     result: dict[str, dict[str, Any] | None] = {}
-    for sidecar in run_path.glob("*.json.meta.json"):
-        name = sidecar.name.removesuffix(".json.meta.json")
+    try:
+        with SecureDirectory(run_path, create=False) as directory:
+            names = sorted(name for name in directory.names() if name.endswith(".json.meta.json"))
+    except FileNotFoundError:
+        return result
+    for name in names:
+        sidecar = run_path / name
         key_components = _read_json(sidecar).get("key_components")
-        result[name] = key_components if isinstance(key_components, dict) else None
+        result[name.removesuffix(".json.meta.json")] = (
+            key_components if isinstance(key_components, dict) else None
+        )
     return result
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+        raw = read_regular_bytes(
+            path,
+            phase="reading inspect JSON",
+            error=lambda message, target: ValueError(f"Inspect JSON {message}: {target}"),
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}

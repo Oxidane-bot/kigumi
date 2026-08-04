@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import kigumi.blobs as blobs_module
+import kigumi._safe_io as safe_io
 import kigumi.store as store_module
 from kigumi.blobs import BlobStore
 from kigumi.store import materialize_artifact
@@ -69,23 +69,27 @@ def test_blob_materialize_does_not_follow_parent_symlink_installed_at_temp_creat
     outside = tmp_path / "outside"
     outside.mkdir()
     destination = parent / "result.bin"
-    original_mkstemp = blobs_module.tempfile.mkstemp
     raced = False
 
-    def mkstemp_with_parent_race(*args: object, **kwargs: object) -> tuple[int, str]:
+    original_temporary = safe_io.SecureDirectory.temporary
+
+    def temporary_with_parent_race(
+        directory: safe_io.SecureDirectory, prefix: str
+    ) -> tuple[int, str]:
         nonlocal raced
-        if kwargs.get("dir") == parent and not raced:
+        if directory.path == parent and not raced:
             raced = True
             parent.rename(moved_parent)
             _symlink_directory(parent, outside)
-        return original_mkstemp(*args, **kwargs)
+        return original_temporary(directory, prefix)
 
-    monkeypatch.setattr(blobs_module.tempfile, "mkstemp", mkstemp_with_parent_race)
+    monkeypatch.setattr(safe_io.SecureDirectory, "temporary", temporary_with_parent_race)
 
-    store.materialize(digest, destination)
+    with pytest.raises(ValueError, match="changed|symlink"):
+        store.materialize(digest, destination)
 
-    assert raced is False
-    assert (parent / "result.bin").read_bytes() == b"safe blob"
+    assert raced is True
+    assert not (moved_parent / "result.bin").exists()
     assert not (outside / "result.bin").exists()
 
 
@@ -153,7 +157,7 @@ def test_materialize_fails_closed_without_descriptor_relative_directory_io(
     store = BlobStore(tmp_path / "blobs")
     digest = store.put(b"platform boundary")
     destination = tmp_path / "result.bin"
-    monkeypatch.setattr(blobs_module, "_secure_directory_supported", lambda: False)
+    monkeypatch.setattr(safe_io, "_secure_directory_supported", lambda: False)
 
     with pytest.raises(OSError, match="descriptor-relative directory I/O"):
         store.materialize(digest, destination)

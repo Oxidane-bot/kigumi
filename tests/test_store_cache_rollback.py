@@ -12,6 +12,7 @@ from kigumi import EvidencePolicy
 from kigumi.artifacts import sha
 from kigumi.blobs import BlobStore
 from kigumi.calling import LLMCaller
+from kigumi.errors import CacheIntegrityError
 from kigumi.store import materialize_artifact, node_cache_path, read_node_cache, write_node_cache
 from kigumi.testing import FakeTransport
 
@@ -84,7 +85,7 @@ def test_cache_writes_reject_symlinked_parent_without_writing_outside_project(
         cache_root.mkdir()
         (cache_root / "llm").symlink_to(outside, target_is_directory=True)
 
-        with pytest.raises((OSError, ValueError)):
+        with pytest.raises((CacheIntegrityError, OSError, ValueError)):
             LLMCaller(FakeTransport(), cache_root).call("safe cache write")
 
         assert not list(outside.iterdir())

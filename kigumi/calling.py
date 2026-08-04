@@ -27,6 +27,7 @@ from ._safe_io import (
     digest_open_file,
     lstat_regular_file,
     open_regular_file,
+    read_regular_bytes,
 )
 from .artifacts import atomic_write_json, sha
 from .errors import CacheIntegrityError
@@ -312,14 +313,12 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
         cache_path = Path(cache_path)
         expected_key = cache_path.name.removesuffix(".json")
     try:
-        with open_regular_file(
+        raw = read_regular_bytes(
             cache_path,
             identity=_file_identity,
-            expected_identity=None,
             phase="reading L1 cache",
             error=lambda message, path: ValueError(f"call cache file {message}: {path}"),
-        ) as handle:
-            raw = handle.read()
+        )
     except FileNotFoundError:
         return CacheLookup("MISSING", None, None, None, "call cache file is missing")
     except (OSError, ValueError) as error:

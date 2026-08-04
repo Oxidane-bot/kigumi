@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+
+from ._safe_io import open_regular_file, secure_atomic_write_json, secure_atomic_write_text
 
 
 def canonical_json(obj: Any) -> str:
@@ -23,40 +24,42 @@ def sha(obj: Any) -> str:
     return sha256(text.encode("utf-8")).hexdigest()
 
 
+def _artifact_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _artifact_file_error(message: str, path: Path) -> ValueError:
+    return ValueError(f"Artifact file {message}: {path}")
+
+
+def _open_regular_file_for_hash(path: str | Path):
+    """Open a regular artifact file through the shared safe read boundary."""
+    return open_regular_file(
+        Path(path),
+        identity=_artifact_file_identity,
+        expected_identity=None,
+        phase="hashing",
+        error=_artifact_file_error,
+    )
+
+
 def sha256_file(path: str | Path) -> str:
     """Return a file's SHA-256 digest without loading the whole file into memory."""
     digest = sha256()
-    with Path(path).open("rb") as handle:
+    with _open_regular_file_for_hash(path) as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def atomic_write_text(path: str | Path, text: str) -> None:
-    """Atomically replace *path* with UTF-8 text, creating parents as needed."""
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    """Atomically replace *path* through the shared safe write boundary."""
+    secure_atomic_write_text(path, text)
 
 
 def atomic_write_json(path: str | Path, obj: Any) -> None:
     """Atomically write an object using :func:`canonical_json`."""
-    atomic_write_text(path, canonical_json(obj))
+    secure_atomic_write_json(path, obj)
 
 
 def write_artifact(path: str | Path, data: str, meta: Mapping[str, Any]) -> None:
