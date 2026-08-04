@@ -250,6 +250,68 @@ def node(inputs, ctx):
     assert [finding.lineno for finding in findings] == [6, 7, 8]
 
 
+def test_raw_io_propagates_callable_facts_through_reachable_helper_arguments() -> None:
+    """helper 的实际 callable 参数必须保留 raw、dynamic 与 opaque 事实。"""
+    source = """
+def node(inputs, ctx):
+    def raw_helper(reader):
+        return reader("raw-secret.txt").read()
+
+    def dynamic_helper(reader):
+        return reader("dynamic-secret.txt")
+
+    def opaque_helper(reader):
+        return reader("opaque-secret.txt")
+
+    raw_result = raw_helper(open)
+    dynamic_result = dynamic_helper(globals)
+    opaque_result = opaque_helper(globals()["open"])
+    return raw_result, dynamic_result, opaque_result
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/parameter-facts.py"))
+
+    assert [(finding.lineno, finding.snippet) for finding in findings] == [
+        (4, 'return reader("raw-secret.txt").read()'),
+        (7, 'return reader("dynamic-secret.txt")'),
+        (10, 'return reader("opaque-secret.txt")'),
+        (13, "dynamic_result = dynamic_helper(globals)"),
+        (14, 'opaque_result = opaque_helper(globals()["open"])'),
+    ]
+
+
+def test_raw_io_propagates_tuple_for_and_named_open_aliases() -> None:
+    """解构、for 绑定和 named expression 都不能隐藏 open alias。"""
+    source = """
+def node(inputs, ctx):
+    tuple_opener, tuple_reader = (open, Path("tuple-reader.txt").read_text)
+    tuple_result = tuple_opener("tuple-secret.txt").read(), tuple_reader()
+    for loop_opener in (open,):
+        loop_result = loop_opener("loop-secret.txt").read()
+    named_result = (named_opener := open)("named-secret.txt").read()
+    return tuple_result, loop_result, named_result
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/compound-aliases.py"))
+
+    assert [finding.lineno for finding in findings] == [4, 4, 6, 7]
+
+
+def test_raw_io_orders_same_line_findings_by_source_column() -> None:
+    """同一行中后产生的 helper finding 也必须按源码列号稳定排序。"""
+    source = """
+def node(inputs, ctx):
+    return (lambda: Path("early-secret.txt").read_text())(), globals()  # kigumi: raw-io-ok fixture
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/column-order.py"))
+
+    assert [finding.waived for finding in findings] == [True, False]
+    assert [finding._col_offset for finding in findings] == sorted(
+        finding._col_offset for finding in findings
+    )
+
+
 def test_raw_io_rejects_opaque_dynamic_callables_and_scans_executed_defaults() -> None:
     """动态 callable 采用硬切；helper 默认值在定义时执行，必须被扫描。"""
     source = """

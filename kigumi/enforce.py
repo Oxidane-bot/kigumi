@@ -35,6 +35,7 @@ class RawIOFinding:
     snippet: str
     waived: bool
     waiver_reason: str | None
+    _col_offset: int = field(default=0, init=False, repr=False, compare=False)
 
 
 class _CallableKind(Enum):
@@ -43,6 +44,7 @@ class _CallableKind(Enum):
     UNKNOWN = "unknown"
     RAW = "raw"
     DYNAMIC = "dynamic"
+    OPAQUE = "opaque"
 
 
 @dataclass
@@ -57,6 +59,7 @@ class _ScopeState:
     builtin_module_aliases: set[str] = field(default_factory=lambda: {"builtins"})
     instance_aliases: dict[str, str] = field(default_factory=dict)
     method_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
+    parameter_kinds: dict[str, _CallableKind] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,41 +100,43 @@ class _ScopeFacts(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802 -- ast protocol.
         for target in node.targets:
-            for name in _target_names(target):
-                self.bound_names.add(name)
-                if isinstance(target, ast.Name):
-                    self.assignments.append((name, node.value))
-                    if isinstance(node.value, ast.Lambda):
-                        self.lambdas[name] = node.value
+            self.bound_names.update(_target_names(target))
+            for name, expression in _target_value_pairs(target, node.value):
+                self.assignments.append((name, expression))
+                if isinstance(expression, ast.Lambda):
+                    self.lambdas[name] = expression
         self.visit(node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802 -- ast protocol.
         for name in _target_names(node.target):
             self.bound_names.add(name)
-            if isinstance(node.target, ast.Name) and node.value is not None:
-                self.assignments.append((name, node.value))
-                if isinstance(node.value, ast.Lambda):
-                    self.lambdas[name] = node.value
+        if node.value is not None:
+            for name, expression in _target_value_pairs(node.target, node.value):
+                self.assignments.append((name, expression))
+                if isinstance(expression, ast.Lambda):
+                    self.lambdas[name] = expression
         if node.value is not None:
             self.visit(node.value)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802 -- ast protocol.
         for name in _target_names(node.target):
             self.bound_names.add(name)
-            if isinstance(node.target, ast.Name):
-                self.assignments.append((name, node.value))
-                if isinstance(node.value, ast.Lambda):
-                    self.lambdas[name] = node.value
+        for name, expression in _target_value_pairs(node.target, node.value):
+            self.assignments.append((name, expression))
+            if isinstance(expression, ast.Lambda):
+                self.lambdas[name] = expression
         self.visit(node.value)
 
     def visit_For(self, node: ast.For) -> None:  # noqa: N802 -- ast protocol.
         self.bound_names.update(_target_names(node.target))
+        self.assignments.extend(_iter_binding_pairs(node.target, node.iter))
         self.visit(node.iter)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:  # noqa: N802 -- ast protocol.
         self.bound_names.update(_target_names(node.target))
+        self.assignments.extend(_iter_binding_pairs(node.target, node.iter))
         self.visit(node.iter)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
@@ -252,6 +257,7 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
             ),
         )
         findings.extend(visitor.findings)
+    _sort_raw_io_findings(findings)
     return findings
 
 
@@ -266,6 +272,7 @@ def check_raw_io_source(
     tree = ast.parse(text, filename=str(path))
     visitor = _RawIOVisitor(path, lines, context_name)
     visitor.visit(tree)
+    _sort_raw_io_findings(visitor.findings)
     return visitor.findings
 
 
@@ -432,6 +439,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             inherited_dynamic_aliases=state.dynamic_aliases,
             inherited_builtin_module_aliases=state.builtin_module_aliases,
             parameter_names=parameter_names,
+            parameter_kinds=state.parameter_kinds,
         )
         direct = _DirectRawIOVisitor(
             self.path,
@@ -472,15 +480,36 @@ class _RawIOVisitor(ast.NodeVisitor):
             method_aliases=direct.method_aliases,
         )
         for function in reachable:
-            self._scan_function(function, state=child_state)
+            function_name = (
+                function.name
+                if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+                else None
+            )
+            self._scan_function(
+                function,
+                state=_ScopeState(
+                    functions=child_state.functions,
+                    lambdas=child_state.lambdas,
+                    classes=child_state.classes,
+                    raw_aliases=child_state.raw_aliases,
+                    dynamic_aliases=child_state.dynamic_aliases,
+                    builtin_module_aliases=child_state.builtin_module_aliases,
+                    instance_aliases=child_state.instance_aliases,
+                    method_aliases=child_state.method_aliases,
+                    parameter_kinds=_parameter_kinds_for_function(
+                        function,
+                        direct.call_arguments.get(function_name, ())
+                        if function_name is not None
+                        else (),
+                    ),
+                ),
+            )
         for class_definition in reachable_classes:
             self._scan_class(
                 class_definition,
                 state=child_state,
                 requested_methods=direct.referenced_class_methods.get(class_definition.name, set()),
             )
-
-        self.findings.sort(key=lambda finding: (finding.lineno, finding.snippet, finding.waived))
 
     def _scan_class(
         self,
@@ -505,6 +534,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             inherited_dynamic_aliases=state.dynamic_aliases,
             inherited_builtin_module_aliases=state.builtin_module_aliases,
             parameter_names=set(),
+            parameter_kinds={},
         )
         direct = _DirectRawIOVisitor(
             self.path,
@@ -570,6 +600,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.referenced_names: set[str] = set()
         self.referenced_lambdas: set[ast.Lambda] = set()
         self.referenced_class_methods: dict[str, set[str]] = {}
+        self.call_arguments: dict[str, list[_CallableCall]] = {}
         self.instance_aliases = dict(instance_aliases or {})
         self.method_aliases = dict(method_aliases or {})
         self._visiting_call_target = False
@@ -603,6 +634,19 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 -- ast protocol.
+        if isinstance(node.func, ast.Name):
+            self.call_arguments.setdefault(node.func.id, []).append(
+                _CallableCall(
+                    positional=tuple(
+                        self._classify_callable(_unwrap_starred(argument)) for argument in node.args
+                    ),
+                    keywords={
+                        keyword.arg: self._classify_callable(_unwrap_starred(keyword.value))
+                        for keyword in node.keywords
+                        if keyword.arg is not None
+                    },
+                )
+            )
         dynamic_call = self._is_dynamic_call(node)
         if dynamic_call:
             if not self._dynamic_call_target_owned:
@@ -620,7 +664,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             callable_kind = self._classify_callable(argument)
             if callable_kind is _CallableKind.RAW:
                 self._append_raw_finding(argument)
-            elif callable_kind is _CallableKind.DYNAMIC:
+            elif _is_hard_dynamic_kind(callable_kind):
                 self._append_structural_finding(argument)
 
         if isinstance(node.func, ast.Lambda):
@@ -670,16 +714,12 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         return self._classify_callable(node.func) is _CallableKind.RAW
 
     def _is_dynamic_call(self, node: ast.Call) -> bool:
-        return (
+        return _is_hard_dynamic_kind(
             self._classify_callable(
                 node.func,
                 prefer_dynamic_call=True,
             )
-            is _CallableKind.DYNAMIC
         )
-
-    def _is_dynamic_callable_expression(self, expression: ast.expr) -> bool:
-        return self._classify_callable(expression) is _CallableKind.DYNAMIC
 
     def _classify_callable(
         self,
@@ -756,13 +796,15 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             _RAW_IO_WAIVER_PATTERN.search(self.lines[node.lineno - 1]) if allow_waiver else None
         )
         reason = waiver.group("reason").strip() if waiver else None
-        return RawIOFinding(
+        finding = RawIOFinding(
             path=self.path,
             lineno=node.lineno,
             snippet=line,
             waived=bool(reason),
             waiver_reason=reason if reason else "豁免必须写理由" if waiver else None,
         )
+        object.__setattr__(finding, "_col_offset", getattr(node, "col_offset", 0))
+        return finding
 
     def _visit_defaults(self, arguments: ast.arguments) -> None:
         for default in [*arguments.defaults, *(item for item in arguments.kw_defaults if item)]:
@@ -774,6 +816,62 @@ class _CallableAliases:
     raw: set[str]
     dynamic: set[str]
     builtin_modules: set[str]
+
+
+@dataclass(frozen=True)
+class _CallableCall:
+    positional: tuple[_CallableKind, ...]
+    keywords: dict[str, _CallableKind]
+
+
+def _parameter_kinds_for_function(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    calls: tuple[_CallableCall, ...] | list[_CallableCall],
+) -> dict[str, _CallableKind]:
+    """Bind known callable facts from calls to a local function's parameters."""
+    arguments = node.args
+    positional_parameters = [*arguments.posonlyargs, *arguments.args]
+    keyword_parameters = {parameter.arg for parameter in arguments.kwonlyargs}
+    keyword_parameters.update(parameter.arg for parameter in positional_parameters)
+    result: dict[str, _CallableKind] = {}
+
+    def record(name: str | None, callable_kind: _CallableKind) -> None:
+        if name is None or callable_kind is _CallableKind.UNKNOWN:
+            return
+        result[name] = _merge_callable_kinds(result.get(name), callable_kind)
+
+    for call in calls:
+        for index, callable_kind in enumerate(call.positional):
+            if index < len(positional_parameters):
+                record(positional_parameters[index].arg, callable_kind)
+            elif arguments.vararg is not None:
+                record(arguments.vararg.arg, callable_kind)
+        for name, callable_kind in call.keywords.items():
+            if name in keyword_parameters:
+                record(name, callable_kind)
+            elif arguments.kwarg is not None:
+                record(arguments.kwarg.arg, callable_kind)
+    return result
+
+
+def _merge_callable_kinds(
+    current: _CallableKind | None,
+    incoming: _CallableKind,
+) -> _CallableKind:
+    """Join call-site facts conservatively; a hard dynamic fact wins over raw."""
+    if current is None or current is _CallableKind.UNKNOWN:
+        return incoming
+    if incoming is _CallableKind.UNKNOWN:
+        return current
+    if _is_hard_dynamic_kind(current) or _is_hard_dynamic_kind(incoming):
+        if current is _CallableKind.OPAQUE or incoming is _CallableKind.OPAQUE:
+            return _CallableKind.OPAQUE
+        return _CallableKind.DYNAMIC
+    return _CallableKind.RAW
+
+
+def _unwrap_starred(expression: ast.AST) -> ast.AST:
+    return expression.value if isinstance(expression, ast.Starred) else expression
 
 
 def _collect_scope_facts(body: list[ast.stmt] | list[ast.expr]) -> _ScopeFacts:
@@ -791,6 +889,7 @@ def _collect_callable_aliases(
     inherited_dynamic_aliases: set[str] | None,
     inherited_builtin_module_aliases: set[str] | None,
     parameter_names: set[str],
+    parameter_kinds: dict[str, _CallableKind] | None = None,
 ) -> _CallableAliases:
     raw = set(inherited_raw_aliases or ()) - facts.bound_names - parameter_names
     raw.update(facts.imported_raw_aliases)
@@ -801,6 +900,15 @@ def _collect_callable_aliases(
     builtin_modules.difference_update(facts.bound_names)
     builtin_modules.difference_update(parameter_names)
     builtin_modules.update(facts.imported_builtin_module_aliases)
+    for name, callable_kind in (parameter_kinds or {}).items():
+        if name in facts.bound_names:
+            continue
+        if callable_kind is _CallableKind.RAW:
+            raw.add(name)
+            dynamic.discard(name)
+        elif _is_hard_dynamic_kind(callable_kind):
+            dynamic.add(name)
+            raw.discard(name)
     changed = True
     while changed:
         changed = False
@@ -817,7 +925,7 @@ def _collect_callable_aliases(
                     raw.add(name)
                     dynamic.discard(name)
                     changed = True
-            elif callable_kind is _CallableKind.DYNAMIC and (name not in dynamic or name in raw):
+            elif _is_hard_dynamic_kind(callable_kind) and (name not in dynamic or name in raw):
                 dynamic.add(name)
                 raw.discard(name)
                 changed = True
@@ -869,6 +977,17 @@ def _classify_callable_expression(
             return _CallableKind.DYNAMIC
         return _CallableKind.UNKNOWN
 
+    if isinstance(expression, ast.NamedExpr):
+        callable_kind = _classify_callable_expression(
+            expression.value,
+            context_name=context_name,
+            raw_aliases=raw_aliases,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+            prefer_dynamic_call=False,
+        )
+        return callable_kind if callable_kind is _CallableKind.RAW else _CallableKind.UNKNOWN
+
     if isinstance(expression, ast.Call) and _is_raw_getattr_expression(expression):
         return _CallableKind.RAW
 
@@ -877,7 +996,9 @@ def _classify_callable_expression(
         dynamic_aliases=dynamic_aliases,
         builtin_module_aliases=builtin_module_aliases,
     ):
-        return _CallableKind.DYNAMIC
+        return (
+            _CallableKind.OPAQUE if isinstance(expression, ast.Subscript) else _CallableKind.DYNAMIC
+        )
 
     return _CallableKind.UNKNOWN
 
@@ -892,6 +1013,10 @@ def _is_raw_getattr_expression(expression: ast.Call) -> bool:
         return False
     method = expression.args[1].value
     return method in _RAW_METHOD_NAMES
+
+
+def _is_hard_dynamic_kind(callable_kind: _CallableKind) -> bool:
+    return callable_kind in {_CallableKind.DYNAMIC, _CallableKind.OPAQUE}
 
 
 def _is_dynamic_lookup_expression(
@@ -965,6 +1090,52 @@ def _parameter_names(arguments: ast.arguments) -> set[str]:
             *([arguments.kwarg] if arguments.kwarg else []),
         ]
     }
+
+
+def _sort_raw_io_findings(findings: list[RawIOFinding]) -> None:
+    findings.sort(
+        key=lambda finding: (
+            finding.lineno,
+            finding._col_offset,
+            finding.snippet,
+            finding.waived,
+            finding.waiver_reason or "",
+        )
+    )
+
+
+def _sequence_elements(expression: ast.AST) -> list[ast.expr] | None:
+    if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
+        return list(expression.elts)
+    return None
+
+
+def _target_value_pairs(target: ast.AST, value: ast.AST) -> list[tuple[str, ast.expr]]:
+    if isinstance(target, ast.Name):
+        return [(target.id, value)] if isinstance(value, ast.expr) else []
+    if isinstance(target, ast.Starred):
+        return _target_value_pairs(target.value, value)
+    if not isinstance(target, (ast.Tuple, ast.List)):
+        return []
+    values = _sequence_elements(value)
+    if values is None:
+        return []
+    pairs: list[tuple[str, ast.expr]] = []
+    for target_element, value_element in zip(target.elts, values, strict=False):
+        pairs.extend(_target_value_pairs(target_element, value_element))
+    return pairs
+
+
+def _iter_binding_pairs(target: ast.AST, iterable: ast.AST) -> list[tuple[str, ast.expr]]:
+    values = _sequence_elements(iterable)
+    if values is None:
+        return []
+    if isinstance(target, ast.Name):
+        return [(target.id, value) for value in values]
+    pairs: list[tuple[str, ast.expr]] = []
+    for value in values:
+        pairs.extend(_target_value_pairs(target, value))
+    return pairs
 
 
 def _target_names(target: ast.AST) -> set[str]:
