@@ -19,6 +19,7 @@ from kigumi.prompt import (
     clip,
     inject,
     load_template,
+    preflight,
     render_items,
     render_template,
     schema_format_section,
@@ -114,6 +115,22 @@ def test_prompt_resolution_lineage_inputs_are_deeply_immutable() -> None:
     canonical["messages"][0]["parts"][0]["metadata"]["labels"].append("changed")
     assert resolution.digest == digest
     assert nested_part["metadata"]["labels"] == ["source"]
+
+
+def test_frozen_message_parts_still_support_preflight_serialization() -> None:
+    resolution = PromptResolution(
+        spec_name="managed",
+        structure_digest="structure",
+        base={},
+        layers=(),
+        axes=(),
+        materials=(),
+        rendered_sha256="rendered",
+        rendered_bytes=8,
+        messages=[Message("user", [{"kigumi_file_sha256": "a" * 64}])],
+    )
+
+    assert preflight(resolution).is_valid()
 
 
 @pytest.mark.parametrize("schema", [True, 1.0])

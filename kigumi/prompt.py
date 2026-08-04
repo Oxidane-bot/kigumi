@@ -1072,7 +1072,7 @@ def _prompt_digest(resolution: PromptResolution) -> str:
 def _part_bytes(part: str | dict[str, Any]) -> int:
     if isinstance(part, str):
         return len(part.encode("utf-8"))
-    return len(json.dumps(part, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    return len(json.dumps(_thaw_value(part), ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
 
 def _estimated_tokens(messages: list[Message]) -> int:
