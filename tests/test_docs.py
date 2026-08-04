@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -182,7 +183,7 @@ def test_release_workflows_gate_security_and_both_distribution_formats() -> None
     for workflow_name in ("ci.yml", "release.yml"):
         workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
         assert "distribution-smoke:" in workflow
-        assert 'python-version: ["3.11", "3.13"]' in workflow
+        assert 'python-version: ["3.11", "3.12", "3.13"]' in workflow
         assert 'format: ["wheel", "sdist"]' in workflow
 
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
@@ -191,6 +192,49 @@ def test_release_workflows_gate_security_and_both_distribution_formats() -> None
     assert "len(wheel_paths) != 1 or len(sdist_paths) != 1" in release
     assert "len(published) != 2" in release
     assert "local_paths = wheel_paths + sdist_paths" in release
+
+
+def test_locked_uv_workflows_require_a_tracked_lockfile() -> None:
+    """干净 git archive 也必须能执行所有 ``--locked`` workflow 步骤。"""
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "uv.lock" not in {line.strip() for line in gitignore if line.strip()}
+    assert (ROOT / "uv.lock").is_file()
+
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "uv.lock"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, "uv.lock must be tracked for clean checkout --locked runs"
+
+
+def test_013_docs_describe_current_guard_and_historical_boundaries() -> None:
+    """0.13 文档必须与递归 guard、schema-2 hard cut 和历史版本归属一致。"""
+    contracts = (ROOT / "docs" / "contracts" / "README.md").read_text(encoding="utf-8")
+    design = (ROOT / "DESIGN.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
+    adoption = (ROOT / "docs" / "adoption.md").read_text(encoding="utf-8")
+    design_flat = re.sub(r"\s+", " ", design)
+
+    assert "[分层 Prompt 解析契约](prompt-resolution.md) | Active (0.13.0)" in contracts
+    assert "递归跟随执行路径中可达的局部 helper/lambda" in design_flat
+    assert "递归跟随可达 helper/lambda" in api
+    assert "只扫匹配函数的最外层函数体" not in design
+    assert "顶层 `node`/`map`/`scan`/`foreach`/`agent` 装饰器函数的最外层函数体。" not in api
+    assert "schema-2 run manifest 禁止覆盖" in adoption
+    assert "0.6 manifest 禁止覆盖" not in adoption
+
+    history = design.split("## 修订记录", 1)[1]
+    assert (
+        "2026-08-03 0.11.0：managed request"
+        "（附件、响应 schema）、输入预检、`CACHE_SCHEMA=7`" in history
+    )
+    release_013 = history.split("2026-08-04 0.13.0：", 1)[1].split("\n", 1)[0]
+    assert "managed request" not in release_013
+    assert "输入预检" not in release_013
+    assert "CACHE_SCHEMA=7" not in release_013
 
 
 def test_verify_dist_covers_every_shipped_doc() -> None:

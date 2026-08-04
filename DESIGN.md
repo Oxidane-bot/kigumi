@@ -352,8 +352,8 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
    guard 输出含 waiver 清单。
 
 source_dirs 级扫描只属于 dag check、测试环与提交环。raw-io 在这些环节用
-`@*.node/map/scan/foreach/agent(...)` 装饰器作启发式过滤，只扫匹配函数的最外层函数体：
-这避免 helper 合法读文件的误报，但可能漏报；注册环仍是兜底。
+`@*.node/map/scan/foreach/agent(...)` 装饰器作为入口，递归跟随执行路径中可达的局部
+helper/lambda 及其默认参数；不可达的普通 helper 不产生误报，注册环仍是兜底。
 
 ### testing(pytest 插件,面向用户项目)
 - 磁带机夹具:FakeTransport 录制/回放——真实模型的畸形输出(幻觉多余键、
@@ -409,9 +409,12 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 
 ## 修订记录
 
-- 2026-08-04 0.13.0：managed request 的 attachment/schema lineage、输入预检、
-  `CACHE_SCHEMA=7` 与启用 `FileSlots` 时的跨进程 same-key single-flight 已落地；
-  `agent_executor_schema=5`、`agent_schema=3` 保持不变。
+- 2026-08-04 0.13.0：per-target durable retry/resume receipt chain、可达 helper/raw callable
+  guard 的 Greenfield hard cut、blob/物化 fail-closed 边界与 wheel/sdist 发行物验证已落地；
+  沿用既有缓存族，`agent_executor_schema=5`、`agent_schema=3` 保持不变。
+
+- 2026-08-03 0.11.0：managed request（附件、响应 schema）、输入预检、`CACHE_SCHEMA=7` 与启用
+  `FileSlots` 时的跨进程 same-key single-flight 已落地；预算仍不提供跨进程 durable 总账。
 
 - 2026-07-24 发布 0.6.0：统一 typed failure、EvidencePolicy、默认单 slot 的全局 Agent
   容量与 durable retry/resume；`CACHE_SCHEMA=4`、`agent_executor_schema=3`、

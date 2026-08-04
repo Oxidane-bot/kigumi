@@ -1736,7 +1736,7 @@ kigumi diff run-0041 run-0042 --json
 | 图形状/声明想整体过目 | `dag.render_mermaid(run_id)` 叠加运行态,挂起与被跳过节点会着色标出 |
 | retry 到期前 resume 没动作 | 这是正确行为；看 `pending_retries[].due_at`，由外部 supervisor 到期再调用 |
 | resume 报 ambiguous | 先核对 provider/Pi 日志，再用带 reason 的 `kigumi retry-resolve ... retry|fail` 裁决 |
-| 同 run 报 declaration changed | 0.6 manifest 禁止覆盖；用原声明 resume，或为新声明创建新 run_id |
+| 同 run 报 declaration changed | schema-2 run manifest 禁止覆盖；用原声明 resume，或为新声明创建新 run_id |
 
 `explain` 的判定语义与 `plan` 完全一致:上游 miss 导致成分无法诚实计算时报
 `unknown`(并给 `pending_on`),不猜测原因;对照的 run 没有该节点 sidecar 报

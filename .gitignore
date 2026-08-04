@@ -1,8 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
-# Lock is not tracked (library convention); application projects should track it
-uv.lock
 dist/
 .pytest_cache/
 .ruff_cache/

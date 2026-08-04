@@ -360,8 +360,8 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
   `.call()` 与 `.llm()`。
 - `check_paths(source_dirs: list[Path]) -> list[Finding]`：递归检查目录中的 Python 文件的
   循环裸 LLM 调用；不存在的目录跳过。
-- `check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]`：检查一个模块中
-  顶层 `node`/`map`/`scan`/`foreach`/`agent` 装饰器函数的最外层函数体。
+- `check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]`：以模块中顶层
+  `node`/`map`/`scan`/`foreach`/`agent` 装饰器函数为入口，递归跟随可达 helper/lambda 及其默认参数。
 - `check_raw_io_node_paths(source_dirs: list[Path]) -> list[RawIOFinding]`：对目录递归执行
   上一项节点装饰器过滤后的 raw-I/O 检查。
 - `check_raw_io_source(text: str, path: Path, *, context_name: str = "ctx") -> list[RawIOFinding]`：

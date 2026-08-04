@@ -84,7 +84,7 @@ def test_release_candidate_identity_is_explicit_and_unreleased_stays_empty() -> 
 
 def test_revised_contracts_are_indexed_as_0_13() -> None:
     index = (ROOT / "docs" / "contracts" / "README.md").read_text(encoding="utf-8")
-    for filename in ("guards.md", "retry-resume.md"):
+    for filename in ("guards.md", "retry-resume.md", "prompt-resolution.md"):
         document = (ROOT / "docs" / "contracts" / filename).read_text(encoding="utf-8")
         status = re.search(r"^Status: (Active \(\d+\.\d+\.\d+\))$", document, re.MULTILINE)
         assert status is not None
