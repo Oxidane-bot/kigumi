@@ -442,6 +442,9 @@ class _RawIOVisitor(ast.NodeVisitor):
         classes.update(facts.classes)
         lambdas = dict(state.lambdas)
         lambdas.update(facts.lambdas)
+        for name, expression in _expanded_callable_assignments(facts):
+            if isinstance(expression, ast.Lambda):
+                lambdas[name] = expression
 
         aliases = _collect_callable_aliases(
             facts,
@@ -480,6 +483,13 @@ class _RawIOVisitor(ast.NodeVisitor):
             class_definition = classes.get(name)
             if class_definition is not None:
                 reachable_classes.add(class_definition)
+        pending = list(reachable)
+        while pending:
+            function = pending.pop()
+            for default_lambda in direct.default_lambdas.get(id(function), ()):
+                if default_lambda not in reachable:
+                    reachable.add(default_lambda)
+                    pending.append(default_lambda)
         child_state = _ScopeState(
             functions=functions,
             lambdas=lambdas,
@@ -614,17 +624,21 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.findings: list[RawIOFinding] = []
         self.referenced_names: set[str] = set()
         self.referenced_lambdas: set[ast.Lambda] = set()
+        self.default_lambdas: dict[int, set[ast.Lambda]] = {}
         self.referenced_class_methods: dict[str, set[str]] = {}
         self.call_arguments: dict[str, list[_CallableCall]] = {}
+        self._owned_opaque_subscripts: set[int] = set()
         self.instance_aliases = dict(instance_aliases or {})
         self.method_aliases = dict(method_aliases or {})
         self._visiting_call_target = False
         self._dynamic_call_target_owned = False
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        self._record_default_lambdas(node)
         self._visit_defaults(node.args)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802 -- ast protocol.
+        self._record_default_lambdas(node)
         self._visit_defaults(node.args)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802 -- ast protocol.
@@ -653,7 +667,9 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             self.call_arguments.setdefault(node.func.id, []).append(
                 _CallableCall(
                     positional=tuple(
-                        self._classify_callable(_unwrap_starred(argument)) for argument in node.args
+                        callable_kind
+                        for argument in node.args
+                        for callable_kind in self._classify_positional_argument(argument)
                     ),
                     keywords={
                         keyword.arg: self._classify_callable(_unwrap_starred(keyword.value))
@@ -680,6 +696,8 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             if callable_kind is _CallableKind.RAW:
                 self._append_raw_finding(argument)
             elif _is_hard_dynamic_kind(callable_kind):
+                if _is_builtin_dict_lookup(argument, self.builtin_module_aliases):
+                    self._owned_opaque_subscripts.add(id(argument))
                 self._append_structural_finding(argument)
 
         if isinstance(node.func, ast.Lambda):
@@ -707,6 +725,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         # Defaults execute when the lambda is created, even if its body is never
         # called.  The body itself remains a separate scope and is scanned only
         # when the lambda is reachable from an executed call/callback.
+        self._record_default_lambdas(node)
         self._visit_defaults(node.args)
 
     def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 -- ast protocol.
@@ -721,6 +740,15 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self._record_class_method_reference(node)
         if not self._visiting_call_target and _is_dynamic_builtin_attribute(
             node, self.builtin_module_aliases
+        ):
+            self._append_structural_finding(node)
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802 -- ast protocol.
+        if (
+            not self._visiting_call_target
+            and id(node) not in self._owned_opaque_subscripts
+            and _is_builtin_dict_lookup(node, self.builtin_module_aliases)
         ):
             self._append_structural_finding(node)
         self.generic_visit(node)
@@ -750,6 +778,13 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             builtin_module_aliases=self.builtin_module_aliases,
             prefer_dynamic_call=prefer_dynamic_call,
         )
+
+    def _classify_positional_argument(self, argument: ast.expr) -> tuple[_CallableKind, ...]:
+        if isinstance(argument, ast.Starred):
+            values = _sequence_elements(argument.value)
+            if values is not None:
+                return tuple(self._classify_callable(value) for value in values)
+        return (self._classify_callable(_unwrap_starred(argument)),)
 
     def _callback_arguments(self, node: ast.Call) -> list[ast.expr]:
         """Return callback positions whose bodies execute during this call."""
@@ -824,6 +859,20 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
     def _visit_defaults(self, arguments: ast.arguments) -> None:
         for default in [*arguments.defaults, *(item for item in arguments.kw_defaults if item)]:
             self.visit(default)
+
+    def _record_default_lambdas(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> None:
+        defaults = [*node.args.defaults, *(item for item in node.args.kw_defaults if item)]
+        lambdas = {
+            candidate
+            for default in defaults
+            for candidate in ast.walk(default)
+            if isinstance(candidate, ast.Lambda)
+        }
+        if lambdas:
+            self.default_lambdas[id(node)] = lambdas
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1079,9 @@ def _expanded_callable_assignments(facts: _ScopeFacts) -> list[tuple[str, ast.ex
     while changed:
         changed = False
         for name, expression in assignments:
+            element = _resolve_static_sequence_element(expression, sequence_aliases)
+            if element is not None:
+                changed |= add_assignment(name, element)
             values = _resolve_static_sequence(expression, sequence_aliases)
             if values is None:
                 continue
@@ -1076,6 +1128,24 @@ def _resolve_static_sequence(
     if isinstance(expression, ast.Name):
         return sequence_aliases.get(expression.id)
     return None
+
+
+def _resolve_static_sequence_element(
+    expression: ast.AST,
+    sequence_aliases: dict[str, list[ast.expr]],
+) -> ast.expr | None:
+    if not isinstance(expression, ast.Subscript):
+        return None
+    values = _resolve_static_sequence(expression.value, sequence_aliases)
+    if values is None or not isinstance(expression.slice, ast.Constant):
+        return None
+    index = expression.slice.value
+    if not isinstance(index, int) or isinstance(index, bool):
+        return None
+    try:
+        return values[index]
+    except IndexError:
+        return None
 
 
 def _target_value_pairs_from_elements(
@@ -1205,6 +1275,8 @@ def _is_dynamic_lookup_call(
     builtin_module_aliases: set[str],
 ) -> bool:
     """Recognize dynamic lookup producers without banning ordinary data reads."""
+    if _is_builtin_dict_attribute(expression, builtin_module_aliases):
+        return True
     if not isinstance(expression, ast.Call):
         return False
     if isinstance(expression.func, ast.Name):
@@ -1225,6 +1297,28 @@ def _is_dynamic_builtin_attribute(
         and isinstance(expression.value, ast.Name)
         and expression.value.id in builtin_module_aliases
         and expression.attr in _DYNAMIC_CALLABLE_NAMES
+    )
+
+
+def _is_builtin_dict_attribute(
+    expression: ast.AST,
+    builtin_module_aliases: set[str],
+) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in builtin_module_aliases
+        and expression.attr == "__dict__"
+    )
+
+
+def _is_builtin_dict_lookup(
+    expression: ast.AST,
+    builtin_module_aliases: set[str],
+) -> bool:
+    return isinstance(expression, ast.Subscript) and _is_builtin_dict_attribute(
+        expression.value,
+        builtin_module_aliases,
     )
 
 

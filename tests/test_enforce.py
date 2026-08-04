@@ -209,6 +209,26 @@ def node(inputs, ctx):
     ]
 
 
+def test_raw_io_reaches_inline_callable_in_a_reachable_helper_default() -> None:
+    """inline lambda 与可达 helper 的默认 callable 都必须进入扫描边界。"""
+    source = """
+def node(inputs, ctx):
+    reader = lambda: Path("inline-secret.txt").read_text()
+
+    def helper(reader=lambda: Path("default-inline-secret.txt").read_text()):
+        return reader()
+
+    return reader(), helper()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/inline-callables.py"))
+
+    assert [(finding.lineno, finding.snippet) for finding in findings] == [
+        (3, 'reader = lambda: Path("inline-secret.txt").read_text()'),
+        (5, 'def helper(reader=lambda: Path("default-inline-secret.txt").read_text()):'),
+    ]
+
+
 def test_raw_io_scans_reachable_nested_class_methods_but_skips_unreachable_helpers() -> None:
     """可达 class method 必须 fail-closed，但未调用的 helper 不得误报。"""
     source = """
@@ -340,6 +360,24 @@ def node(inputs, ctx):
     assert [finding.lineno for finding in findings] == [8, 9]
 
 
+def test_raw_io_propagates_indexed_container_aliases_and_starred_helper_arguments() -> None:
+    """容器下标和静态星号参数都不能隐藏 raw callable。"""
+    source = """
+def node(inputs, ctx):
+    readers = [open]
+    reader = readers[0]
+
+    def helper(reader):
+        return reader("helper-secret.txt").read()
+
+    return reader("alias-secret.txt").read(), helper(*[open])
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/container-callables.py"))
+
+    assert [finding.lineno for finding in findings] == [7, 9]
+
+
 def test_raw_io_orders_same_line_findings_by_source_column() -> None:
     """同一行中后产生的 helper finding 也必须按源码列号稳定排序。"""
     source = """
@@ -388,6 +426,24 @@ def node(inputs, ctx):
 
     assert [(finding.lineno, finding.snippet, finding.waived) for finding in findings] == [
         (3, 'return globals()["open"]("secret.txt").read()', False)
+    ]
+
+
+def test_raw_io_rejects_builtins_dict_callable_lookup_but_not_arbitrary_subscripts() -> None:
+    """builtins.__dict__ 的 callable lookup 是 opaque；普通动态下标仍保持未知。"""
+    source = """
+import builtins
+
+def node(inputs, ctx):
+    opaque = builtins.__dict__["open"]
+    return opaque("secret.txt").read(), readers[index]("not-proven-raw")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/builtin-dict.py"))
+
+    assert [(finding.lineno, finding.snippet, finding.waived) for finding in findings] == [
+        (5, 'opaque = builtins.__dict__["open"]', False),
+        (6, 'return opaque("secret.txt").read(), readers[index]("not-proven-raw")', False),
     ]
 
 
