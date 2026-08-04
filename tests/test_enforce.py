@@ -112,6 +112,116 @@ def batch(prompts, ctx):
     assert [finding.lineno for finding in findings] == [3, 4]
 
 
+def test_loop_guard_rejects_method_aliases_and_dynamic_aliases_with_waivers() -> None:
+    """ctx.call/llm 的别名不能把模型调用藏在循环里。"""
+    source = """
+def node(items, ctx):
+    call = ctx.call
+    llm = ctx.llm
+    dynamic = getattr(ctx, method_name)
+    for item in items:
+        call(item)  # kigumi: raw-llm-ok explicit alias fixture
+        llm(item)
+        dynamic(item)
+"""
+
+    findings = check_source(source, Path("nodes/loop-aliases.py"))
+
+    assert [(finding.snippet, finding.waived, finding.waiver_reason) for finding in findings] == [
+        ("call(item)  # kigumi: raw-llm-ok explicit alias fixture", True, "explicit alias fixture"),
+        ("llm(item)", False, None),
+        ("dynamic(item)", False, None),
+    ]
+
+
+def test_loop_guard_rejects_model_higher_order_callbacks() -> None:
+    """map/filter 的已知 callback 位置不能绕过循环模型调用守卫。"""
+    source = """
+def helper(item, ctx):
+    return ctx.call(item)
+
+def node(items, ctx):
+    call = ctx.call
+    for item in items:
+        list(map(helper, items))  # kigumi: raw-llm-ok callback fixture
+        list(filter(ctx.call, items))
+        list(map(lambda value: call(value), items))  # kigumi: raw-llm-ok lambda fixture
+"""
+
+    findings = check_source(source, Path("nodes/higher-order-loop.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "list(map(helper, items))  # kigumi: raw-llm-ok callback fixture",
+        "list(filter(ctx.call, items))",
+        "list(map(lambda value: call(value), items))  # kigumi: raw-llm-ok lambda fixture",
+    ]
+    assert [(finding.waived, finding.waiver_reason) for finding in findings] == [
+        (True, "callback fixture"),
+        (False, None),
+        (True, "lambda fixture"),
+    ]
+
+
+def test_loop_guard_treats_model_map_and_filter_callbacks_as_implicit_loops() -> None:
+    """没有显式 for 时，map/filter 的模型 callback 仍然是循环调用。"""
+    source = """
+def node(items, ctx):
+    list(map(lambda item: ctx.call(item), items))  # kigumi: raw-llm-ok implicit map fixture
+    list(filter(lambda item: ctx.llm(item), items))
+"""
+
+    findings = check_source(source, Path("nodes/implicit-loop-callbacks.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "list(map(lambda item: ctx.call(item), items))  # kigumi: raw-llm-ok implicit map fixture",
+        "list(filter(lambda item: ctx.llm(item), items))",
+    ]
+    assert [(finding.waived, finding.waiver_reason) for finding in findings] == [
+        (True, "implicit map fixture"),
+        (False, None),
+    ]
+
+
+def test_raw_io_rejects_builtins_namespace_and_vars_lookup_without_waivers() -> None:
+    """__builtins__ 与 vars(builtins) 都是不可证明的 raw-I/O 动态边界。"""
+    source = """
+import builtins
+
+def node(inputs, ctx):
+    from_namespace = __builtins__["open"]  # kigumi: raw-io-ok not a structural waiver
+    first = from_namespace("first-secret.txt").read()
+    from_vars = vars(builtins)["open"]  # kigumi: raw-io-ok not a structural waiver
+    second = from_vars("second-secret.txt").read()
+    return first, second
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/dynamic-builtins.py"))
+
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'from_namespace = __builtins__["open"]  # kigumi: raw-io-ok not a structural waiver',
+        'first = from_namespace("first-secret.txt").read()',
+        'from_vars = vars(builtins)["open"]  # kigumi: raw-io-ok not a structural waiver',
+        'second = from_vars("second-secret.txt").read()',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_augmented_context_rebinding_honors_read_waiver() -> None:
+    """ctx += value 重新绑定上下文，后续 read_text 只能按 raw read 处理。"""
+    source = """
+def node(inputs, ctx):
+    ctx += Path("rebound.txt")
+    return ctx.read_text()  # kigumi: raw-io-ok fixture input
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/augmented-context.py"))
+
+    assert [(finding.snippet, finding.waived, finding.waiver_reason) for finding in findings] == [
+        ("return ctx.read_text()  # kigumi: raw-io-ok fixture input", True, "fixture input")
+    ]
+
+
 def test_raw_io_finds_only_direct_node_body_reads_and_honors_its_own_waiver() -> None:
     """教训 stale_file_cache: 节点体绕过 ctx 会让未声明输入复用陈旧缓存。"""
     source = """

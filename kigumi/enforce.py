@@ -12,8 +12,12 @@ from pathlib import Path
 
 _WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-llm-ok(?=\s|$)(?P<reason>.*?)\s*$")
 _RAW_IO_WAIVER_PATTERN = re.compile(r"#\s*kigumi:\s*raw-io-ok(?=\s|$)(?P<reason>.*?)\s*$")
-_DYNAMIC_BUILTIN_NAMES = frozenset({"eval", "exec", "__import__", "globals", "locals"})
+_DYNAMIC_BUILTIN_NAMES = frozenset(
+    {"eval", "exec", "__import__", "globals", "locals", "vars", "__builtins__"}
+)
 _DYNAMIC_CALLABLE_NAMES = _DYNAMIC_BUILTIN_NAMES | {"getattr"}
+_LOOP_MODEL_METHOD_NAMES = frozenset({"call", "llm"})
+_LOOP_HIGHER_ORDER_NAMES = frozenset({"map", "filter"})
 _RAW_METHOD_NAMES = frozenset({"open", "read_text", "read_bytes"})
 _DYNAMIC_DICT_METHOD_NAMES = frozenset({"get", "__getitem__"})
 
@@ -88,7 +92,7 @@ class _ScopeState:
     classes: dict[str, ast.ClassDef] = field(default_factory=dict)
     raw_aliases: set[str] = field(default_factory=set)
     dynamic_aliases: set[str] = field(default_factory=set)
-    builtin_module_aliases: set[str] = field(default_factory=lambda: {"builtins"})
+    builtin_module_aliases: set[str] = field(default_factory=lambda: {"builtins", "__builtins__"})
     instance_aliases: dict[str, str] = field(default_factory=dict)
     method_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
     parameter_kinds: dict[str, _CallableKind] = field(default_factory=dict)
@@ -260,7 +264,7 @@ def check_source(text: str, path: Path) -> list[Finding]:
     lines = text.splitlines()
     comments = _source_comments(text)
     tree = ast.parse(text, filename=str(path))
-    visitor = _LoopCallVisitor(path, lines, comments)
+    visitor = _LoopCallVisitor(path, lines, comments, tree)
     visitor.visit(tree)
     return visitor.findings
 
@@ -347,12 +351,23 @@ def check_raw_io_source(
 
 
 class _LoopCallVisitor(ast.NodeVisitor):
-    def __init__(self, path: Path, lines: list[str], comments: dict[int, str]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        lines: list[str],
+        comments: dict[int, str],
+        tree: ast.AST,
+    ) -> None:
         self.path = path
         self.lines = lines
         self.comments = comments
         self.loop_depth = 0
+        self.callback_depth = 0
         self.findings: list[Finding] = []
+        (
+            self.model_aliases,
+            self.model_callback_names,
+        ) = _collect_loop_model_facts(tree)
 
     def visit_For(self, node: ast.For) -> None:  # noqa: N802 -- ast visitor protocol.
         self._visit_loop(node)
@@ -377,30 +392,163 @@ class _LoopCallVisitor(ast.NodeVisitor):
         self._visit_loop(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 -- ast visitor protocol.
-        if (
-            self.loop_depth
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"call", "llm"}
+        higher_order = self._is_model_higher_order_callback(node)
+        if not self.callback_depth and (
+            (self.loop_depth and self._is_model_call(node)) or higher_order
         ):
-            snippet = self.lines[node.lineno - 1].strip()
-            waiver = _waiver_match(self.comments, node.lineno, _WAIVER_PATTERN)
-            reason = waiver.group("reason").strip() if waiver else None
-            waiver_reason = reason if reason else "豁免必须写理由" if waiver else None
-            self.findings.append(
-                Finding(
-                    path=self.path,
-                    lineno=node.lineno,
-                    snippet=snippet,
-                    waived=bool(reason),
-                    waiver_reason=waiver_reason,
-                )
+            self._append_finding(node)
+        previous_callback_depth = self.callback_depth
+        if higher_order:
+            self.callback_depth += 1
+        try:
+            self.generic_visit(node)
+        finally:
+            self.callback_depth = previous_callback_depth
+
+    def _is_model_call(self, node: ast.Call) -> bool:
+        return _is_loop_model_callable(node.func, self.model_aliases)
+
+    def _is_model_higher_order_callback(self, node: ast.Call) -> bool:
+        if not (isinstance(node.func, ast.Name) and node.func.id in _LOOP_HIGHER_ORDER_NAMES):
+            return False
+        callback = _first_loop_callback_argument(node.args)
+        if callback is None:
+            return False
+        if isinstance(callback, ast.Lambda):
+            return _contains_loop_model_call(
+                callback.body,
+                self.model_aliases,
+                self.model_callback_names,
             )
-        self.generic_visit(node)
+        return _is_loop_model_callable(callback, self.model_aliases) or (
+            isinstance(callback, ast.Name) and callback.id in self.model_callback_names
+        )
+
+    def _append_finding(self, node: ast.AST) -> None:
+        snippet = self.lines[node.lineno - 1].strip()
+        waiver = _waiver_match(self.comments, node.lineno, _WAIVER_PATTERN)
+        reason = waiver.group("reason").strip() if waiver else None
+        waiver_reason = reason if reason else "豁免必须写理由" if waiver else None
+        self.findings.append(
+            Finding(
+                path=self.path,
+                lineno=node.lineno,
+                snippet=snippet,
+                waived=bool(reason),
+                waiver_reason=waiver_reason,
+            )
+        )
 
     def _visit_loop(self, node: ast.AST) -> None:
         self.loop_depth += 1
         self.generic_visit(node)
         self.loop_depth -= 1
+
+
+def _collect_loop_model_facts(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Collect the small, syntactic model-call facts used by the loop guard.
+
+    This intentionally proves only direct ``.call``/``.llm`` aliases, dynamic
+    ``getattr`` aliases, and named callbacks whose bodies contain one of those
+    calls.  It is a finite AST boundary, not an attempt to evaluate arbitrary
+    Python callables.
+    """
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+    ]
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in assignments:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+                value = node.value
+            else:
+                targets = [node.target]
+                value = node.value
+            if value is None or not _is_loop_model_callable(value, aliases):
+                continue
+            for target in targets:
+                for name in _target_names(target):
+                    if name not in aliases:
+                        aliases.add(name)
+                        changed = True
+
+    callback_names: set[str] = set()
+    callback_bindings = [
+        node for node in assignments if isinstance(node, ast.Assign | ast.AnnAssign)
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and _contains_loop_model_call(node.body, aliases, callback_names)
+                and node.name not in callback_names
+            ):
+                callback_names.add(node.name)
+                changed = True
+        for node in callback_bindings:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+                value = node.value
+            else:
+                targets = [node.target]
+                value = node.value
+            if not _contains_loop_model_call(value, aliases, callback_names):
+                continue
+            for target in targets:
+                for name in _target_names(target):
+                    if name not in callback_names:
+                        callback_names.add(name)
+                        changed = True
+    return aliases, callback_names
+
+
+def _contains_loop_model_call(
+    node: ast.AST | list[ast.AST] | None,
+    aliases: set[str],
+    callback_names: set[str],
+) -> bool:
+    if node is None:
+        return False
+    roots = node if isinstance(node, list) else [node]
+    return any(
+        isinstance(candidate, ast.Call)
+        and (
+            _is_loop_model_callable(candidate.func, aliases)
+            or (isinstance(candidate.func, ast.Name) and candidate.func.id in callback_names)
+        )
+        for root in roots
+        for candidate in ast.walk(root)
+    )
+
+
+def _is_loop_model_callable(expression: ast.AST, aliases: set[str]) -> bool:
+    if isinstance(expression, ast.Attribute):
+        return expression.attr in _LOOP_MODEL_METHOD_NAMES
+    if isinstance(expression, ast.Name):
+        return expression.id in aliases
+    return (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and expression.func.id == "getattr"
+    )
+
+
+def _first_loop_callback_argument(arguments: list[ast.expr]) -> ast.expr | None:
+    if not arguments:
+        return None
+    callback = arguments[0]
+    if isinstance(callback, ast.Starred) and isinstance(
+        callback.value, (ast.List, ast.Tuple, ast.Set)
+    ):
+        return callback.value.elts[0] if callback.value.elts else None
+    return callback
 
 
 class _RawIOVisitor(ast.NodeVisitor):
@@ -777,6 +925,10 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self._invalidate_context_target(node.target)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:  # noqa: N802 -- ast protocol.
+        self.generic_visit(node)
+        self._invalidate_context_target(node.target)
+
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802 -- ast protocol.
         self._record_assignment(node.target, node.value)
         self.generic_visit(node)
@@ -970,6 +1122,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self._record_class_method_reference(node)
         if not self._visiting_call_target and (
             _is_dynamic_builtin_attribute(node, self.builtin_module_aliases)
+            or _is_dynamic_builtin_namespace_attribute(node, self.builtin_module_aliases)
             or _is_dynamic_dict_lookup_attribute(
                 node,
                 dynamic_aliases=self.dynamic_aliases,
@@ -1359,7 +1512,7 @@ def _collect_callable_aliases(
     dynamic.update(import_aliases)
     dynamic.update(facts.imported_dynamic_aliases)
     dynamic.difference_update(raw)
-    builtin_modules = set(inherited_builtin_module_aliases or {"builtins"})
+    builtin_modules = set(inherited_builtin_module_aliases or {"builtins", "__builtins__"})
     builtin_modules.difference_update(facts.bound_names)
     builtin_modules.difference_update(parameter_names)
     builtin_modules.update(facts.imported_builtin_module_aliases)
@@ -1680,6 +1833,8 @@ def _classify_callable_expression(
         return _CallableKind.UNKNOWN
 
     if isinstance(expression, ast.Subscript):
+        if _is_dynamic_builtin_namespace_subscript(expression):
+            return _CallableKind.OPAQUE
         element = _resolve_static_container_element(expression, sequence_aliases)
         if element is not None:
             return _classify_callable_expression(
@@ -1699,6 +1854,8 @@ def _classify_callable_expression(
                 return _CallableKind.OPAQUE
 
     if isinstance(expression, ast.Attribute):
+        if _is_dynamic_builtin_namespace_attribute(expression, builtin_module_aliases):
+            return _CallableKind.DYNAMIC
         if _is_dynamic_dict_lookup_attribute(
             expression,
             dynamic_aliases=dynamic_aliases,
@@ -1765,6 +1922,8 @@ def _is_dynamic_lookup_expression(
     builtin_module_aliases: set[str],
 ) -> bool:
     if isinstance(expression, ast.Subscript):
+        if _is_dynamic_builtin_namespace_subscript(expression):
+            return True
         if _is_builtin_dict_subscript(expression, builtin_module_aliases):
             return _is_builtin_dict_lookup(expression, builtin_module_aliases)
         if isinstance(expression.value, ast.Name) and expression.value.id in dynamic_aliases:
@@ -1801,6 +1960,8 @@ def _is_dynamic_lookup_call(
     ):
         return True
     if _is_builtin_dict_attribute(expression, builtin_module_aliases):
+        return True
+    if _is_dynamic_builtin_namespace_attribute(expression, builtin_module_aliases):
         return True
     if _is_dynamic_dict_attribute(expression, dynamic_aliases):
         return True
@@ -1895,6 +2056,26 @@ def _is_dynamic_builtin_attribute(
         and isinstance(expression.value, ast.Name)
         and expression.value.id in builtin_module_aliases
         and expression.attr in _DYNAMIC_CALLABLE_NAMES
+    )
+
+
+def _is_dynamic_builtin_namespace_attribute(
+    expression: ast.AST,
+    builtin_module_aliases: set[str],
+) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id == "__builtins__"
+        and expression.value.id in builtin_module_aliases
+    )
+
+
+def _is_dynamic_builtin_namespace_subscript(expression: ast.AST) -> bool:
+    return (
+        isinstance(expression, ast.Subscript)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id == "__builtins__"
     )
 
 
