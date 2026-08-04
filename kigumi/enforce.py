@@ -121,6 +121,7 @@ class _ScopeFacts(ast.NodeVisitor):
     imported_dynamic_aliases: set[str] = field(default_factory=set)
     imported_import_aliases: set[str] = field(default_factory=set)
     imported_builtin_module_aliases: set[str] = field(default_factory=set)
+    imported_higher_order_aliases: set[str] = field(default_factory=set)
     deferred_unpackings: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
     deferred_iterations: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
 
@@ -224,7 +225,9 @@ class _ScopeFacts(ast.NodeVisitor):
         for alias in node.names:
             local_name = alias.asname or alias.name
             self.bound_names.add(local_name)
-            if node.module == "builtins" and alias.name == "open":
+            if node.module == "builtins" and alias.name in _LOOP_HIGHER_ORDER_NAMES:
+                self.imported_higher_order_aliases.add(local_name)
+            elif node.module == "builtins" and alias.name == "open":
                 self.imported_raw_aliases.add(local_name)
             elif node.module == "builtins" and alias.name == "__dict__":
                 # ``from builtins import __dict__ as namespace`` is the same
@@ -399,6 +402,7 @@ class _LoopScope:
     higher_order_aliases: frozenset[str]
     opaque_aliases: frozenset[str]
     safe_aliases: frozenset[str]
+    builtin_module_aliases: frozenset[str]
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
 
     def classify(self, expression: ast.AST) -> _LoopCallableKind:
@@ -412,11 +416,15 @@ class _LoopScope:
         if isinstance(expression, ast.Starred):
             return self.classify(expression.value)
         if isinstance(expression, ast.Attribute):
-            return (
-                _LoopCallableKind.MODEL
-                if expression.attr in _LOOP_MODEL_METHOD_NAMES
-                else _LoopCallableKind.UNKNOWN
-            )
+            if expression.attr in _LOOP_MODEL_METHOD_NAMES:
+                return _LoopCallableKind.MODEL
+            if (
+                expression.attr in _LOOP_HIGHER_ORDER_NAMES
+                and isinstance(expression.value, ast.Name)
+                and expression.value.id in self.builtin_module_aliases
+            ):
+                return _LoopCallableKind.HIGHER_ORDER
+            return _LoopCallableKind.UNKNOWN
         if isinstance(expression, ast.Call):
             if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
                 return _LoopCallableKind.MODEL
@@ -457,6 +465,20 @@ def _build_loop_scope(
     inherited_higher = set(parent.higher_order_aliases if parent else ()) - local_names
     inherited_opaque = set(parent.opaque_aliases if parent else ()) - local_names
     inherited_safe = set(parent.safe_aliases if parent else ()) - local_names
+    builtin_module_aliases = set(parent.builtin_module_aliases if parent else ()) - local_names
+    builtin_module_aliases.update(facts.imported_builtin_module_aliases)
+    for _ in range(max(1, len(facts.assignments) + 1)):
+        changed = False
+        for name, expression in facts.assignments:
+            if (
+                isinstance(expression, ast.Name)
+                and expression.id in builtin_module_aliases
+                and name not in builtin_module_aliases
+            ):
+                builtin_module_aliases.add(name)
+                changed = True
+        if not changed:
+            break
     functions = dict(parent.functions if parent else {})
     for name in local_names:
         functions.pop(name, None)
@@ -475,6 +497,7 @@ def _build_loop_scope(
             ),
             higher_order_aliases=frozenset(
                 inherited_higher
+                | facts.imported_higher_order_aliases
                 | {
                     name
                     for name, kind in local_kinds.items()
@@ -489,6 +512,7 @@ def _build_loop_scope(
                 inherited_safe
                 | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.SAFE}
             ),
+            builtin_module_aliases=frozenset(builtin_module_aliases),
             functions=functions,
         )
         for name, expressions in bindings.items():
@@ -512,6 +536,7 @@ def _build_loop_scope(
         ),
         higher_order_aliases=frozenset(
             inherited_higher
+            | facts.imported_higher_order_aliases
             | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.HIGHER_ORDER}
         ),
         opaque_aliases=frozenset(
@@ -522,6 +547,7 @@ def _build_loop_scope(
             inherited_safe
             | {name for name, kind in local_kinds.items() if kind is _LoopCallableKind.SAFE}
         ),
+        builtin_module_aliases=frozenset(builtin_module_aliases),
         functions=functions,
     )
 
@@ -1724,6 +1750,13 @@ def _unwrap_starred(expression: ast.AST) -> ast.AST:
     return expression.value if isinstance(expression, ast.Starred) else expression
 
 
+def _unwrap_named_expr(expression: ast.AST) -> ast.AST:
+    """Return the value hidden by any number of walrus expressions."""
+    while isinstance(expression, ast.NamedExpr):
+        expression = expression.value
+    return expression
+
+
 def _collect_scope_facts(body: list[ast.stmt] | list[ast.expr]) -> _ScopeFacts:
     facts = _ScopeFacts()
     for statement in body:
@@ -2136,7 +2169,11 @@ def _classify_callable_expression(
             import_aliases=import_aliases,
             prefer_dynamic_call=False,
         )
-        return callable_kind if callable_kind is _CallableKind.RAW else _CallableKind.UNKNOWN
+        if callable_kind is _CallableKind.RAW:
+            return callable_kind
+        return (
+            _CallableKind.OPAQUE if _is_hard_dynamic_kind(callable_kind) else _CallableKind.UNKNOWN
+        )
 
     if isinstance(expression, ast.Call | ast.Subscript) and _is_dynamic_lookup_expression(
         expression,
@@ -2168,10 +2205,11 @@ def _is_dynamic_lookup_expression(
             # refusing only known names leaves ``builtins.__dict__[key]`` as a
             # straightforward raw-I/O bypass.
             return True
-        if isinstance(expression.value, ast.Name) and expression.value.id in dynamic_aliases:
+        value = _unwrap_named_expr(expression.value)
+        if isinstance(value, ast.Name) and value.id in dynamic_aliases:
             return True
         return _is_dynamic_lookup_call(
-            expression.value,
+            value,
             dynamic_aliases=dynamic_aliases,
             builtin_module_aliases=builtin_module_aliases,
         )
@@ -2189,6 +2227,7 @@ def _is_dynamic_lookup_call(
     builtin_module_aliases: set[str],
 ) -> bool:
     """Recognize dynamic lookup producers without banning ordinary data reads."""
+    expression = _unwrap_named_expr(expression)
     if _is_dynamic_dict_lookup_attribute(
         expression,
         dynamic_aliases=dynamic_aliases,
@@ -2238,6 +2277,7 @@ def _is_dynamic_value_expression(
     dynamic_aliases: set[str],
     builtin_module_aliases: set[str],
 ) -> bool:
+    expression = _unwrap_named_expr(expression)
     if isinstance(expression, ast.Name):
         return expression.id in dynamic_aliases
     if isinstance(expression, ast.Call | ast.Subscript):
@@ -2293,10 +2333,13 @@ def _is_dynamic_builtin_attribute(
     expression: ast.AST,
     builtin_module_aliases: set[str],
 ) -> bool:
+    expression_value = (
+        _unwrap_named_expr(expression.value) if isinstance(expression, ast.Attribute) else None
+    )
     return (
         isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in builtin_module_aliases
+        and isinstance(expression_value, ast.Name)
+        and expression_value.id in builtin_module_aliases
         and expression.attr in _DYNAMIC_CALLABLE_NAMES
     )
 
@@ -2305,27 +2348,31 @@ def _is_dynamic_builtin_namespace_attribute(
     expression: ast.AST,
     builtin_module_aliases: set[str],
 ) -> bool:
+    expression_value = (
+        _unwrap_named_expr(expression.value) if isinstance(expression, ast.Attribute) else None
+    )
     return (
         isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id == "__builtins__"
-        and expression.value.id in builtin_module_aliases
+        and isinstance(expression_value, ast.Name)
+        and expression_value.id == "__builtins__"
+        and expression_value.id in builtin_module_aliases
     )
 
 
 def _is_dynamic_builtin_namespace_subscript(expression: ast.AST) -> bool:
-    return (
-        isinstance(expression, ast.Subscript)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id == "__builtins__"
-    )
+    if not isinstance(expression, ast.Subscript):
+        return False
+    value = _unwrap_named_expr(expression.value)
+    return isinstance(value, ast.Name) and value.id == "__builtins__"
 
 
 def _is_dynamic_dict_attribute(expression: ast.AST, dynamic_aliases: set[str]) -> bool:
+    if not isinstance(expression, ast.Attribute):
+        return False
+    value = _unwrap_named_expr(expression.value)
     return (
-        isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in dynamic_aliases
+        isinstance(value, ast.Name)
+        and value.id in dynamic_aliases
         and expression.attr == "__dict__"
     )
 
@@ -2348,20 +2395,22 @@ def _is_dynamic_dict_lookup_attribute(
 
 
 def _is_dynamic_module_attribute(expression: ast.AST, dynamic_aliases: set[str]) -> bool:
+    if not isinstance(expression, ast.Attribute):
+        return False
+    value = _unwrap_named_expr(expression.value)
     return (
-        isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in dynamic_aliases
-        and expression.attr == "modules"
+        isinstance(value, ast.Name) and value.id in dynamic_aliases and expression.attr == "modules"
     )
 
 
 def _is_dynamic_import_attribute(expression: ast.AST, dynamic_aliases: set[str]) -> bool:
+    if not isinstance(expression, ast.Attribute):
+        return False
+    value = _unwrap_named_expr(expression.value)
     return (
-        isinstance(expression, ast.Attribute)
-        and expression.attr == "import_module"
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in dynamic_aliases
+        expression.attr == "import_module"
+        and isinstance(value, ast.Name)
+        and value.id in dynamic_aliases
     )
 
 
@@ -2369,10 +2418,12 @@ def _is_builtin_dict_attribute(
     expression: ast.AST,
     builtin_module_aliases: set[str],
 ) -> bool:
+    if not isinstance(expression, ast.Attribute):
+        return False
+    value = _unwrap_named_expr(expression.value)
     return (
-        isinstance(expression, ast.Attribute)
-        and isinstance(expression.value, ast.Name)
-        and expression.value.id in builtin_module_aliases
+        isinstance(value, ast.Name)
+        and value.id in builtin_module_aliases
         and expression.attr == "__dict__"
     )
 

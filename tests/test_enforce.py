@@ -1205,6 +1205,31 @@ def node(inputs, ctx):
     ]
 
 
+def test_raw_io_rejects_walrus_dynamic_builtin_dictionary_lookup() -> None:
+    """A named expression cannot hide an opaque builtin dictionary lookup."""
+    source = """
+import builtins
+from builtins import __dict__ as namespace
+
+def node(inputs, ctx):
+    first = (dictionary := builtins.__dict__)[key]
+    second = (dictionary := namespace)[key]
+    third = (dictionary := __builtins__)[key]
+    return first("one.txt"), second("two.txt"), third("three.txt")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/walrus-builtin-dict.py"))
+
+    assert [(finding.lineno, finding.snippet, finding.waived) for finding in findings] == [
+        (6, "first = (dictionary := builtins.__dict__)[key]", False),
+        (7, "second = (dictionary := namespace)[key]", False),
+        (8, "third = (dictionary := __builtins__)[key]", False),
+        (9, 'return first("one.txt"), second("two.txt"), third("three.txt")', False),
+        (9, 'return first("one.txt"), second("two.txt"), third("three.txt")', False),
+        (9, 'return first("one.txt"), second("two.txt"), third("three.txt")', False),
+    ]
+
+
 def test_loop_guard_uses_scope_local_facts_and_finite_opaque_boundaries() -> None:
     """Aliases are local; unknown aliases and higher-order callbacks need review."""
     source = """
@@ -1261,3 +1286,39 @@ def node(items, ctx):
 """
 
     assert check_source(source, Path("nodes/safe-loop-code.py")) == []
+
+
+def test_loop_guard_rejects_imported_and_qualified_builtin_map_filter_callbacks() -> None:
+    """Only known builtin map/filter spellings participate in the finite guard."""
+    source = """
+from builtins import map as mapper
+import builtins as builtin_functions
+import builtins
+
+def increment(item):
+    return item + 1
+
+def node(items, ctx):
+    list(mapper(lambda item: ctx.call(item), items))  # kigumi: raw-llm-ok imported map fixture
+    list(builtin_functions.filter(lambda item: ctx.llm(item), items))
+    list(builtins.map(lambda item: ctx.call(item), items))
+    list(builtin_functions.map(increment, items))
+    list(mapper(str, items))
+"""
+
+    findings = check_source(source, Path("nodes/builtin-map-filter.py"))
+
+    assert [
+        (finding.lineno, finding.snippet, finding.waived, finding.waiver_reason)
+        for finding in findings
+    ] == [
+        (
+            10,
+            "list(mapper(lambda item: ctx.call(item), items))  # "
+            "kigumi: raw-llm-ok imported map fixture",
+            True,
+            "imported map fixture",
+        ),
+        (11, "list(builtin_functions.filter(lambda item: ctx.llm(item), items))", False, None),
+        (12, "list(builtins.map(lambda item: ctx.call(item), items))", False, None),
+    ]
