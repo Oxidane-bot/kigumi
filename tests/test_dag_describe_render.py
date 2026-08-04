@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+import kigumi._runstate as runstate_module
 from kigumi import PromptRef, PromptSpec
 from tests._dag_helpers import _make_dag
 
@@ -279,6 +280,70 @@ def test_render_mermaid_rejects_a_symlinked_run_root(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="owned durable path"):
         dag.render_mermaid(result.run_id)
+
+
+def test_render_mermaid_rejects_post_validation_ordinary_run_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    result = dag.run(run_id="ordinary-render")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    replacement = tmp_path / "external-render"
+    replacement.mkdir()
+    (replacement / "sentinel.txt").write_text("external", encoding="utf-8")
+    moved = tmp_path / "moved-render"
+    original_validate = runstate_module.validate_run_path
+    swapped = False
+
+    def validate_then_replace(path: Path) -> Path:
+        nonlocal swapped
+        validated = original_validate(path)
+        if not swapped and Path(path) == run_path:
+            swapped = True
+            run_path.rename(moved)
+            replacement.rename(run_path)
+        return validated
+
+    monkeypatch.setattr(runstate_module, "validate_run_path", validate_then_replace)
+
+    with pytest.raises(ValueError, match="owned durable path"):
+        dag.render_mermaid(result.run_id)
+
+    assert swapped is True
+    assert [path.name for path in run_path.iterdir()] == ["sentinel.txt"]
+
+
+def test_render_mermaid_rejects_incomplete_external_attempts_directory(
+    tmp_path: Path,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    result = dag.run(run_id="incomplete-render")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    attempts = run_path / "attempts"
+    moved = tmp_path / "moved-attempts"
+    replacement = tmp_path / "external-attempts"
+    replacement.mkdir()
+    (replacement / "sentinel.txt").write_text("external", encoding="utf-8")
+    attempts.rename(moved)
+    replacement.rename(attempts)
+
+    with pytest.raises(ValueError, match="durable state|owned durable path"):
+        dag.render_mermaid(result.run_id)
+
+    assert [path.name for path in attempts.iterdir()] == ["sentinel.txt"]
 
 
 @pytest.mark.parametrize("scope", ["attempts", "target"])

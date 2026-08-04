@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 import pytest
 
 import kigumi._execution as execution_module
+import kigumi._runstate as runstate_module
 import kigumi.dag as dag_module
 from kigumi import (
     AmbiguousAttemptError,
@@ -123,6 +124,44 @@ def test_retry_is_durable_pending_and_resume_runs_only_when_due(tmp_path: Path) 
     target = next(attempts.iterdir())
     assert json.loads((target / "attempt-0001.json").read_text())["status"] == "retry_scheduled"
     assert json.loads((target / "attempt-0002.json").read_text())["status"] == "completed"
+
+
+def test_resume_rejects_post_validation_ordinary_run_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _SequenceTransport([Response("done", {"total_tokens": 1}, "stop")])
+    dag = _retry_dag(
+        tmp_path,
+        transport,
+        RetryPolicy(initial_delay_seconds=0, jitter="none"),
+    )
+    result = dag.run(run_id="ordinary-resume")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    replacement = tmp_path / "external-resume"
+    replacement.mkdir()
+    forged_manifest = replacement / "_run.json"
+    forged_manifest.write_text('{"status": "forged"}', encoding="utf-8")
+    moved = tmp_path / "moved-resume"
+    original_read = runstate_module.AttemptStore._read_owned_json
+    swapped = False
+
+    def read_then_replace(store: Any, path: Path) -> tuple[dict[str, Any] | None, bool]:
+        nonlocal swapped
+        value = original_read(store, path)
+        if not swapped and Path(path) == run_path / "_run.json":
+            swapped = True
+            run_path.rename(moved)
+            replacement.rename(run_path)
+        return value
+
+    monkeypatch.setattr(runstate_module.AttemptStore, "_read_owned_json", read_then_replace)
+
+    with pytest.raises(RunManifestError, match="manifest|owned|durable"):
+        dag.resume(result.run_id)
+
+    assert swapped is True
+    assert (run_path / "_run.json").read_text(encoding="utf-8") == '{"status": "forged"}'
 
 
 def test_dag_manifest_prechecks_reject_external_manifest_symlink(tmp_path: Path) -> None:

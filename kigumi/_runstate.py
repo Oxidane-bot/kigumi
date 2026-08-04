@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ._safe_io import SecureDirectory, _open_regular_file_at
-from .artifacts import atomic_write_json, canonical_json, sha
+from ._safe_io import atomic_write_json as _path_atomic_write_json
+from .artifacts import canonical_json, sha
 from .failures import canonical_failure
 from .retry import AmbiguousAttemptError, RetryPolicy
 
@@ -61,47 +62,155 @@ _MANIFEST_GENERATION_FIELD = "manifest_generation"
 _SIDECAR_DIGEST_FIELD = "sidecar_sha256"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
 _PROCESS_TARGET_LEASES_LOCK = threading.RLock()
+# Kept as a module seam for existing fault-injection tests; owned run writes do
+# not use this path-based fallback.
+atomic_write_json = _path_atomic_write_json
 
 
-def _open_lock_file(path: Path, label: str) -> Any:
+def _directory_from_fd(path: Path, descriptor: int) -> SecureDirectory:
+    """Wrap an already-open directory without reopening its lexical path."""
+    directory = SecureDirectory.__new__(SecureDirectory)
+    directory.path = Path(path)
+    directory.create = False
+    directory.fd = descriptor
+    directory._fds = [descriptor]
+    directory._created = []
+    directory._absolute = Path(os.path.abspath(path))
+    return directory
+
+
+def _open_directory_at(
+    parent: SecureDirectory,
+    name: str,
+    path: Path,
+    *,
+    create: bool,
+) -> SecureDirectory:
+    """Open one child directory relative to an already-bound parent."""
+    parent._verify_name(name)
+    parent.verify_bound()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent.fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        with suppress(FileExistsError):
+            os.mkdir(name, 0o777, dir_fd=parent.fd)
+        descriptor = os.open(name, flags, dir_fd=parent.fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise RunManifestError(f"Bound directory must not be a symlink: {path}") from error
+        raise
+
+    directory = _directory_from_fd(path, descriptor)
+    try:
+        directory.verify_bound()
+    except BaseException:
+        directory.close()
+        raise
+    return directory
+
+
+def _open_lock_file_at(directory: SecureDirectory, name: str, label: str) -> Any:
+    """Open one lock file relative to a directory already bound by inode."""
+    directory._verify_name(name)
+    directory.verify_bound()
+    path = directory.path / name
+    try:
+        existing = directory.stat(name)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        raise RunManifestError(f"{label} must not be a symlink: {path}")
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise RunManifestError(f"{label} must reference a regular file: {path}")
+
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory.fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise RunManifestError(f"{label} must not be a symlink: {path}") from error
+        raise RunManifestError(f"{label} could not be opened safely: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RunManifestError(f"{label} must reference a regular file: {path}")
+        return os.fdopen(descriptor, "r+b", closefd=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_lock_file(
+    path: Path,
+    label: str,
+    *,
+    directory: SecureDirectory | None = None,
+) -> Any:
     """Open one lock file without following its parent or final entry."""
     path = Path(path)
+    if directory is not None:
+        return _open_lock_file_at(directory, path.name, label)
     try:
         with SecureDirectory(path.parent, create=True) as directory:
-            try:
-                existing = directory.stat(path.name)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None and stat.S_ISLNK(existing.st_mode):
-                raise RunManifestError(f"{label} must not be a symlink: {path}")
-            if existing is not None and not stat.S_ISREG(existing.st_mode):
-                raise RunManifestError(f"{label} must reference a regular file: {path}")
-
-            flags = (
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_NONBLOCK", 0)
-            )
-            try:
-                descriptor = os.open(path.name, flags, 0o600, dir_fd=directory.fd)
-            except OSError as error:
-                if error.errno == errno.ELOOP:
-                    raise RunManifestError(f"{label} must not be a symlink: {path}") from error
-                raise RunManifestError(f"{label} could not be opened safely: {path}") from error
-            try:
-                opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode):
-                    raise RunManifestError(f"{label} must reference a regular file: {path}")
-                return os.fdopen(descriptor, "r+b", closefd=True)
-            except BaseException:
-                os.close(descriptor)
-                raise
+            return _open_lock_file_at(directory, path.name, label)
     except RunManifestError:
         raise
     except (OSError, ValueError) as error:
         raise RunManifestError(f"{label} could not be opened safely: {path}") from error
+
+
+def _atomic_write_json_at(directory: SecureDirectory, name: str, value: Any) -> None:
+    """Atomically write canonical JSON relative to a bound directory."""
+    directory._verify_name(name)
+    directory.verify_bound()
+    try:
+        existing = directory.stat(name)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (
+        stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+    ):
+        raise RunManifestError(f"Write target must be a regular file: {directory.path / name}")
+
+    descriptor, temporary_name = directory.temporary(f".{name}.")
+    try:
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+                descriptor = -1
+                handle.write(canonical_json(value))
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+        directory.verify_bound()
+        try:
+            existing = directory.stat(name)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+        ):
+            raise RunManifestError(f"Write target must be a regular file: {directory.path / name}")
+        directory.rename(temporary_name, name)
+        temporary_name = ""
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+        if temporary_name:
+            with suppress(OSError, ValueError):
+                directory.unlink(temporary_name, missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -178,9 +287,10 @@ class AttemptStore:
 
     def __init__(self, run_root: Path, manifest_identity: dict[str, Any]) -> None:
         self.run_root = Path(run_root)
-        validate_run_path(self.run_root)
         self.manifest_path = self.run_root / "_run.json"
         self.identity = json.loads(canonical_json(manifest_identity))
+        self._runs_directory: SecureDirectory | None = None
+        self._run_directory: SecureDirectory | None = None
         self._receipt_chain_lock = threading.RLock()
         self._run_lock_local = threading.local()
         absolute_root = Path(os.path.abspath(self.run_root))
@@ -191,12 +301,214 @@ class AttemptStore:
         self._fence_manifest_generation = False
         self._terminal_status_admission_generation: int | None = None
         self._state_mutated_since_status = False
+        self._bind_existing_directories()
+        # Keep the descriptor binding ahead of this lexical compatibility check.
+        # If a caller replaces an already validated ordinary directory while the
+        # check is in flight, every later owned operation still verifies the inode
+        # captured above instead of binding the replacement.
+        validate_run_path(self.run_root)
 
     def __del__(self) -> None:
         """Release process-local target descriptors when a store is discarded."""
         for target in tuple(getattr(self, "_target_leases", {})):
             with suppress(BaseException):
                 self._release_target_lease(target)
+        for directory in (
+            getattr(self, "_run_directory", None),
+            getattr(self, "_runs_directory", None),
+        ):
+            with suppress(BaseException):
+                if directory is not None:
+                    directory.close()
+
+    def _bind_existing_directories(self) -> None:
+        """Bind the existing runs parent and run directory, if present."""
+        parent = SecureDirectory(self.run_root.parent, create=False)
+        try:
+            parent.__enter__()
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            parent.close()
+            raise RunManifestError(
+                f"Durable run path could not be bound safely: {error}"
+            ) from error
+        try:
+            try:
+                info = parent.stat(self.run_root.name)
+            except FileNotFoundError:
+                self._runs_directory = parent
+                return
+            if stat.S_ISLNK(info.st_mode):
+                raise RunManifestError(f"Durable run path must not be a symlink: {self.run_root}")
+            if not stat.S_ISDIR(info.st_mode):
+                raise RunManifestError(f"Durable run path must be a directory: {self.run_root}")
+            child = _open_directory_at(
+                parent,
+                self.run_root.name,
+                self.run_root,
+                create=False,
+            )
+            self._runs_directory = parent
+            self._run_directory = child
+        except RunManifestError:
+            parent.close()
+            raise
+        except (OSError, ValueError) as error:
+            parent.close()
+            raise RunManifestError(
+                f"Durable run path could not be bound safely: {self.run_root}"
+            ) from error
+
+    def _bind_for_access(self, *, create_parent: bool, create_run: bool) -> None:
+        """Bind the runs parent and run directory exactly once, by descriptor."""
+        if self._runs_directory is None:
+            parent = SecureDirectory(self.run_root.parent, create=create_parent)
+            try:
+                parent.__enter__()
+            except BaseException:
+                parent.close()
+                raise
+            self._runs_directory = parent
+        else:
+            try:
+                self._runs_directory.verify_bound()
+            except (OSError, ValueError) as error:
+                raise RunManifestError(
+                    f"Durable runs directory is no longer owned: {self.run_root.parent}"
+                ) from error
+
+        if self._run_directory is None:
+            try:
+                self._run_directory = _open_directory_at(
+                    self._runs_directory,
+                    self.run_root.name,
+                    self.run_root,
+                    create=create_run,
+                )
+            except FileNotFoundError:
+                if create_run:
+                    raise
+                raise
+        else:
+            try:
+                self._run_directory.verify_bound()
+            except (OSError, ValueError) as error:
+                raise RunManifestError(
+                    f"Durable run directory is no longer owned: {self.run_root}"
+                ) from error
+
+    def _verify_binding(self) -> None:
+        self._bind_for_access(create_parent=False, create_run=False)
+
+    def _owned_relative_parts(self, path: Path) -> tuple[str, ...]:
+        root = Path(os.path.abspath(self.run_root))
+        candidate = Path(os.path.abspath(path))
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as error:
+            raise RunManifestError(
+                f"Durable path escapes the bound run directory: {path}"
+            ) from error
+        return relative.parts
+
+    @contextmanager
+    def _owned_directory(self, path: Path, *, create: bool) -> Iterator[SecureDirectory]:
+        """Yield a run child directory opened from the bound run descriptor."""
+        self._bind_for_access(create_parent=create, create_run=create)
+        parts = self._owned_relative_parts(path)
+        assert self._run_directory is not None
+        current = self._run_directory
+        opened: list[SecureDirectory] = []
+        try:
+            relative: list[str] = []
+            for component in parts:
+                relative.append(component)
+                current = _open_directory_at(
+                    current,
+                    component,
+                    self.run_root.joinpath(*relative),
+                    create=create,
+                )
+                opened.append(current)
+            current.verify_bound()
+            yield current
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError) as error:
+            if isinstance(error, RunManifestError):
+                raise
+            raise RunManifestError(f"Durable run path is no longer owned: {path}") from error
+        finally:
+            for directory in reversed(opened):
+                directory.close()
+
+    def _owned_stat(self, path: Path) -> os.stat_result:
+        with self._owned_directory(Path(path).parent, create=False) as directory:
+            return directory.stat(Path(path).name)
+
+    def _owned_exists(self, path: Path) -> bool:
+        try:
+            self._owned_stat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _owned_names(self, path: Path) -> list[str]:
+        with self._owned_directory(path, create=False) as directory:
+            return directory.names()
+
+    def _owned_unlink(self, path: Path, *, missing_ok: bool = False) -> None:
+        with self._owned_directory(Path(path).parent, create=False) as directory:
+            directory.unlink(Path(path).name, missing_ok=missing_ok)
+
+    def _write_owned_json(self, path: Path, value: Any) -> None:
+        with self._owned_directory(Path(path).parent, create=True) as directory:
+            _atomic_write_json_at(directory, Path(path).name, value)
+
+    def _read_owned_bytes(self, path: Path) -> tuple[bytes | None, BaseException | None]:
+        try:
+            with self._owned_directory(Path(path).parent, create=False) as directory:
+                try:
+                    with _open_regular_file_at(
+                        directory,
+                        Path(path).name,
+                        phase="before reading durable JSON",
+                    ) as handle:
+                        return handle.read(), None
+                except FileNotFoundError:
+                    return None, None
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError, RunManifestError) as error:
+            return None, error
+
+    def _read_owned_json(self, path: Path) -> tuple[dict[str, Any] | None, bool]:
+        raw, read_error = self._read_owned_bytes(Path(path))
+        if read_error is not None:
+            return None, True
+        if raw is None:
+            return None, False
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, True
+        return (value, False) if isinstance(value, dict) else (None, True)
+
+    def _owned_integrity_error(self, path: Path, expected_schema: int) -> StateIntegrityError:
+        raw, read_error = self._read_owned_bytes(Path(path))
+        if read_error is not None:
+            parse_error: BaseException | str = read_error
+        elif raw is None:
+            parse_error = FileNotFoundError(str(path))
+        else:
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                parse_error = error
+            else:
+                parse_error = TypeError(f"expected a JSON object, got {type(value).__name__}")
+        return StateIntegrityError(path, expected_schema, parse_error)
 
     @contextmanager
     def _run_locked(self) -> Iterator[None]:
@@ -209,6 +521,7 @@ class AttemptStore:
         """
         validate_run_path(self.run_root)
         with self._receipt_chain_lock:
+            self._bind_for_access(create_parent=True, create_run=True)
             depth = getattr(self._run_lock_local, "depth", 0)
             if depth:
                 self._run_lock_local.depth = depth + 1
@@ -218,7 +531,12 @@ class AttemptStore:
                     self._run_lock_local.depth = depth
                 return
 
-            with _open_lock_file(self._run_lock_path, "Run lock") as handle:
+            assert self._runs_directory is not None
+            with _open_lock_file(
+                self._run_lock_path,
+                "Run lock",
+                directory=self._runs_directory,
+            ) as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 self._run_lock_local.depth = 1
                 try:
@@ -273,7 +591,13 @@ class AttemptStore:
                 if not old_handle.closed:
                     fcntl.flock(old_handle.fileno(), fcntl.LOCK_UN)
                     old_handle.close()
-            handle = _open_lock_file(path, f"Target {target!r} lease")
+            self._verify_binding()
+            assert self._runs_directory is not None
+            handle = _open_lock_file(
+                path,
+                f"Target {target!r} lease",
+                directory=self._runs_directory,
+            )
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
@@ -371,7 +695,7 @@ class AttemptStore:
             )
         next_generation = current + 1 if advance_generation else current
         manifest[_MANIFEST_GENERATION_FIELD] = next_generation
-        atomic_write_json(self.manifest_path, manifest)
+        self._write_owned_json(self.manifest_path, manifest)
         self._manifest_generation = next_generation
         if advance_generation:
             self._terminal_status_admission_generation = None
@@ -392,12 +716,11 @@ class AttemptStore:
     def initialize(self) -> dict[str, Any]:
         """Create a new manifest or fail closed against an existing run."""
         with self._run_locked():
-            self.run_root.mkdir(parents=True, exist_ok=True)
-            existing, corrupted = self._read_json_safe(self.manifest_path)
+            existing, corrupted = self._read_owned_json(self.manifest_path)
             if corrupted:
-                raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
+                raise self._owned_integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
             if existing is None:
-                if any(self.run_root.iterdir()):
+                if self._owned_names(self.run_root):
                     raise RunManifestError(
                         f"Run {self.run_root.name!r} predates run manifest schema 2 and "
                         "cannot be resumed"
@@ -414,7 +737,7 @@ class AttemptStore:
                     _RECOVERY_DECISION_LEDGER_FIELD: {},
                     _RECOVERY_DECISION_LEDGER_DIGEST_FIELD: sha({}),
                 }
-                atomic_write_json(self.manifest_path, manifest)
+                self._write_owned_json(self.manifest_path, manifest)
                 self._manifest_generation = 0
                 self._fence_manifest_generation = True
                 return manifest
@@ -586,9 +909,9 @@ class AttemptStore:
             states = self._validate_all_attempt_receipts()
             self._validate_run_materializations(states, reject_orphan_target=target)
             state_path = self._state_path(target)
-            state, corrupted = self._read_json_safe(state_path)
+            state, corrupted = self._read_owned_json(state_path)
             if corrupted:
-                raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
+                raise self._owned_integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
             policy_digest = policy.digest if policy is not None else None
             resolutions = prompt_resolutions or {}
             if state is None:
@@ -736,7 +1059,7 @@ class AttemptStore:
                 raise ValueError("Recovery attempts must advance by exactly one")
             self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
             next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
-            if next_receipt.exists():
+            if self._owned_exists(next_receipt):
                 raise RunManifestError(
                     f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
                 )
@@ -862,7 +1185,7 @@ class AttemptStore:
             to_attempt = from_attempt if decision == "fail" else from_attempt + 1
             if decision != "fail":
                 next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
-                if next_receipt.exists():
+                if self._owned_exists(next_receipt):
                     raise RunManifestError(
                         f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
                     )
@@ -973,7 +1296,7 @@ class AttemptStore:
             canonical = json.loads(canonical_json(candidate))
             attempt = int(state["attempt"])
             filename = f"candidate-{attempt:04d}.json"
-            atomic_write_json(self._target_root(target) / filename, canonical)
+            self._write_owned_json(self._target_root(target) / filename, canonical)
             state.update(
                 {
                     "status": "success_candidate",
@@ -1017,9 +1340,9 @@ class AttemptStore:
                     "completed state is missing its success candidate",
                 )
             sidecar_path = Path(f"{self._target_artifact_path(target)}.meta.json")
-            metadata, corrupted = self._read_json_safe(sidecar_path)
+            metadata, corrupted = self._read_owned_json(sidecar_path)
             if corrupted:
-                raise self._integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
+                raise self._owned_integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
             if metadata is None:
                 raise StateIntegrityError(
                     sidecar_path,
@@ -1159,7 +1482,7 @@ class AttemptStore:
                 "reason": reason.strip(),
                 "resolved_at": iso_now(),
             }
-            atomic_write_json(
+            self._write_owned_json(
                 self._target_root(target) / f"resolution-{attempt:04d}.json",
                 resolution,
             )
@@ -1190,17 +1513,22 @@ class AttemptStore:
             states = self._validate_all_attempt_receipts()
             self._validate_run_materializations(states, reject_orphan_target=target)
             path = self._state_path(target)
-            state, corrupted = self._read_json_safe(path)
+            state, corrupted = self._read_owned_json(path)
             if corrupted:
-                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+                raise self._owned_integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
             if state is not None:
                 self._validate_state_binding(target, state)
-            elif self._receipt_chain(target) or any(
-                self._target_root(target).glob("attempt-*.json")
-            ):
-                raise RunManifestError(
-                    f"Attempt receipts for {target!r} exist without a durable state"
-                )
+            else:
+                try:
+                    receipt_names = self._owned_names(self._target_root(target))
+                except FileNotFoundError:
+                    receipt_names = []
+                if self._receipt_chain(target) or any(
+                    name.startswith("attempt-") and name.endswith(".json") for name in receipt_names
+                ):
+                    raise RunManifestError(
+                        f"Attempt receipts for {target!r} exist without a durable state"
+                    )
             return state
 
     def _start_attempt(
@@ -1234,7 +1562,8 @@ class AttemptStore:
         if recovery:
             state["recovery"] = json.loads(canonical_json(recovery))
         target_root = self._target_root(target)
-        target_root.mkdir(parents=True, exist_ok=True)
+        with self._owned_directory(target_root, create=True):
+            pass
         self._write_state(target, state)
         return {"action": "run", "state": state}
 
@@ -1495,9 +1824,9 @@ class AttemptStore:
                         RUN_MANIFEST_SCHEMA,
                         "recovery decision ledger receipt digest is invalid",
                     )
-                receipt, corrupted = self._read_json_safe(receipt_path)
+                receipt, corrupted = self._read_owned_json(receipt_path)
                 if corrupted:
-                    raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+                    raise self._owned_integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
                 if receipt is None:
                     raise StateIntegrityError(
                         receipt_path,
@@ -1564,10 +1893,10 @@ class AttemptStore:
         return entry
 
     def _required_manifest(self) -> dict[str, Any]:
-        validate_run_path(self.run_root)
-        manifest, corrupted = self._read_json_safe(self.manifest_path)
+        self._verify_binding()
+        manifest, corrupted = self._read_owned_json(self.manifest_path)
         if corrupted:
-            raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
+            raise self._owned_integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
         if manifest is None:
             raise RunManifestError(f"Missing or invalid run manifest: {self.manifest_path}")
         self._validate_manifest(manifest)
@@ -1676,7 +2005,7 @@ class AttemptStore:
         self._validate_receipt_chain(target_digest, [*chain, entry], self.manifest_path)
         state.pop(_STATE_DIGEST_FIELD, None)
         state[_STATE_DIGEST_FIELD] = entry[_STATE_DIGEST_FIELD]
-        atomic_write_json(self._state_path(target), state)
+        self._write_owned_json(self._state_path(target), state)
         self._write_receipt(target, attempt, state)
         chains[target_digest] = [*chain, entry]
         self._commit_manifest(manifest, advance_generation=False)
@@ -1685,7 +2014,7 @@ class AttemptStore:
     def _write_receipt(self, target: str, attempt: int, state: dict[str, Any]) -> None:
         if state.get(_STATE_DIGEST_FIELD) != self._state_digest(state):
             raise RunManifestError(f"Attempt state for {target!r} is not content-bound")
-        atomic_write_json(
+        self._write_owned_json(
             self._target_root(target) / f"attempt-{attempt:04d}.json",
             state,
         )
@@ -1743,9 +2072,9 @@ class AttemptStore:
             )
         self._validate_candidate_binding(target, state)
         receipt_path = self._target_root(target) / f"attempt-{attempt:04d}.json"
-        receipt, corrupted = self._read_json_safe(receipt_path)
+        receipt, corrupted = self._read_owned_json(receipt_path)
         if corrupted:
-            raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+            raise self._owned_integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
         self._validate_recovery_receipt_binding(state, path, target)
         self._validate_recovery_decision_state(target, state)
         if receipt is None:
@@ -1841,9 +2170,9 @@ class AttemptStore:
                 "success candidate path is invalid",
             )
         candidate_path = self._target_root(target) / filename
-        candidate, corrupted = self._read_json_safe(candidate_path)
+        candidate, corrupted = self._read_owned_json(candidate_path)
         if corrupted:
-            raise self._integrity_error(candidate_path, SUCCESS_CANDIDATE_SCHEMA)
+            raise self._owned_integrity_error(candidate_path, SUCCESS_CANDIDATE_SCHEMA)
         if candidate is None:
             raise StateIntegrityError(
                 candidate_path,
@@ -1983,9 +2312,9 @@ class AttemptStore:
                 "recovery receipt binding is incomplete or invalid",
             )
         receipt_path = self._recovery_receipt_path(file_name, error_path=state_path)
-        receipt, corrupted = self._read_json_safe(receipt_path)
+        receipt, corrupted = self._read_owned_json(receipt_path)
         if corrupted:
-            raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+            raise self._owned_integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
         if receipt is None:
             raise StateIntegrityError(
                 receipt_path,
@@ -2050,7 +2379,7 @@ class AttemptStore:
             raise RunManifestError("recovery receipt must contain a recovery_time")
         stem = f"recovery-{recovery_time}"
         suffix = 0
-        with SecureDirectory(self.run_root, create=False) as directory:
+        with self._owned_directory(self.run_root, create=False) as directory:
             while True:
                 suffix_text = "" if suffix == 0 else f"-{suffix}"
                 name = f"{stem}{suffix_text}.json"
@@ -2088,10 +2417,20 @@ class AttemptStore:
         chain = self._receipt_chain(target, manifest=manifest)
         last_by_attempt = {entry["attempt"]: entry for entry in chain}
         receipt_attempts: set[int] = set()
-        for path in sorted(self._target_root(target).glob("attempt-*.json")):
-            receipt, corrupted = self._read_json_safe(path)
+        target_root = self._target_root(target)
+        try:
+            receipt_names = sorted(
+                name
+                for name in self._owned_names(target_root)
+                if name.startswith("attempt-") and name.endswith(".json")
+            )
+        except FileNotFoundError:
+            receipt_names = []
+        for name in receipt_names:
+            path = target_root / name
+            receipt, corrupted = self._read_owned_json(path)
             if corrupted:
-                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+                raise self._owned_integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
             if receipt is None:
                 continue
             prefix, separator, attempt_text = path.stem.partition("-")
@@ -2131,10 +2470,10 @@ class AttemptStore:
         manifest = self._required_manifest()
         attempts_root = self.run_root / "attempts"
         try:
-            attempts_info = attempts_root.lstat()
+            attempts_info = self._owned_stat(attempts_root)
         except FileNotFoundError:
             attempts_info = None
-        except OSError as error:
+        except (OSError, RunManifestError) as error:
             raise StateIntegrityError(
                 attempts_root,
                 ATTEMPT_RECEIPT_SCHEMA,
@@ -2152,7 +2491,7 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "attempts path must be a directory",
             )
-        if not attempts_root.is_dir():
+        if attempts_info is None:
             if manifest[_RECEIPT_CHAIN_FIELD]:
                 raise StateIntegrityError(
                     attempts_root,
@@ -2164,10 +2503,19 @@ class AttemptStore:
         states: list[dict[str, Any]] = []
         target_digests: set[str] = set()
         target_roots: list[Path] = []
-        for path in attempts_root.iterdir():
+        try:
+            target_names = self._owned_names(attempts_root)
+        except (OSError, RunManifestError) as error:
+            raise StateIntegrityError(
+                attempts_root,
+                ATTEMPT_RECEIPT_SCHEMA,
+                f"attempts directory listing failed: {error}",
+            ) from error
+        for name in target_names:
+            path = attempts_root / name
             try:
-                info = path.lstat()
-            except OSError as error:
+                info = self._owned_stat(path)
+            except (OSError, RunManifestError) as error:
                 raise StateIntegrityError(
                     path,
                     ATTEMPT_RECEIPT_SCHEMA,
@@ -2190,9 +2538,9 @@ class AttemptStore:
         for target_root in sorted(target_roots):
             target_digests.add(target_root.name)
             state_path = target_root / "state.json"
-            state, corrupted = self._read_json_safe(state_path)
+            state, corrupted = self._read_owned_json(state_path)
             if corrupted:
-                raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
+                raise self._owned_integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
             if state is not None:
                 target = state.get("target")
                 if not isinstance(target, str) or target_root.name != sha(target):
@@ -2206,16 +2554,20 @@ class AttemptStore:
                 states.append(state)
                 continue
 
-            receipt_paths = sorted(target_root.glob("attempt-*.json"))
+            receipt_paths = sorted(
+                target_root / name
+                for name in self._owned_names(target_root)
+                if name.startswith("attempt-") and name.endswith(".json")
+            )
             if not receipt_paths:
                 raise StateIntegrityError(
                     state_path,
                     ATTEMPT_RECEIPT_SCHEMA,
                     "durable state is missing",
                 )
-            receipt, receipt_corrupted = self._read_json_safe(receipt_paths[0])
+            receipt, receipt_corrupted = self._read_owned_json(receipt_paths[0])
             if receipt_corrupted or receipt is None:
-                raise self._integrity_error(receipt_paths[0], ATTEMPT_RECEIPT_SCHEMA)
+                raise self._owned_integrity_error(receipt_paths[0], ATTEMPT_RECEIPT_SCHEMA)
             target = receipt.get("target")
             if not isinstance(target, str) or target_root.name != sha(target):
                 raise StateIntegrityError(
@@ -2275,7 +2627,9 @@ class AttemptStore:
                 candidates[target] = candidate
 
         ignored_targets: set[str] = set()
-        for sidecar_path in sorted(self.run_root.glob("*.json.meta.json")):
+        run_names = self._owned_names(self.run_root)
+        for sidecar_name in sorted(name for name in run_names if name.endswith(".json.meta.json")):
+            sidecar_path = self.run_root / sidecar_name
             target = sidecar_path.name.removesuffix(".json.meta.json")
             if not target:
                 raise StateIntegrityError(
@@ -2339,7 +2693,8 @@ class AttemptStore:
                     "completed target run sidecar is missing",
                 )
 
-        for artifact_path in sorted(self.run_root.glob("*.json")):
+        for artifact_name in sorted(name for name in run_names if name.endswith(".json")):
+            artifact_path = self.run_root / artifact_name
             if (
                 artifact_path.name == "_run.json"
                 or artifact_path.name.startswith("recovery-")
@@ -2448,18 +2803,18 @@ class AttemptStore:
         sidecar_path: Path,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         artifact_path = self._target_artifact_path(target)
-        artifact, corrupted = self._read_json_safe(artifact_path)
+        artifact, corrupted = self._read_owned_json(artifact_path)
         if corrupted:
-            raise self._integrity_error(artifact_path, RUN_SIDECAR_SCHEMA)
+            raise self._owned_integrity_error(artifact_path, RUN_SIDECAR_SCHEMA)
         if artifact is None:
             raise StateIntegrityError(
                 artifact_path,
                 RUN_SIDECAR_SCHEMA,
                 "run artifact is missing",
             )
-        metadata, corrupted = self._read_json_safe(sidecar_path)
+        metadata, corrupted = self._read_owned_json(sidecar_path)
         if corrupted:
-            raise self._integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
+            raise self._owned_integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
         if metadata is None:
             raise StateIntegrityError(
                 sidecar_path,
@@ -2611,9 +2966,9 @@ class AttemptStore:
         return StateIntegrityError(path, expected_schema, cls._parse_error(path))
 
     def _required_json(self, path: Path) -> dict[str, Any]:
-        value, corrupted = self._read_json_safe(path)
+        value, corrupted = self._read_owned_json(path)
         if corrupted:
-            raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+            raise self._owned_integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
         if value is None:
             raise RunManifestError(f"Missing or invalid durable run state: {path}")
         if path.name == "state.json":
@@ -2635,16 +2990,15 @@ class AttemptStore:
 
 def validate_durable_run(run_root: Path) -> DurableRunSnapshot:
     """Validate one current schema-2 run for every read-only surface."""
-    validate_run_path(run_root)
+    store = AttemptStore(run_root, {})
     manifest_path = run_root / "_run.json"
-    manifest, corrupted = AttemptStore._read_json_safe(manifest_path)
+    manifest, corrupted = store._read_owned_json(manifest_path)
     if corrupted:
-        raise AttemptStore._integrity_error(manifest_path, RUN_MANIFEST_SCHEMA)
+        raise store._owned_integrity_error(manifest_path, RUN_MANIFEST_SCHEMA)
     if manifest is None:
         raise RunManifestError(f"Missing or invalid run manifest: {manifest_path}")
     if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
         raise RunManifestError(f"Run {run_root.name!r} has an unsupported manifest schema")
-    store = AttemptStore(run_root, {})
     validated_manifest = store._required_manifest()
     states = store._validate_all_attempt_receipts()
     candidates, materializations = store._validate_run_materializations(

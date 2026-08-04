@@ -137,6 +137,50 @@ def test_attempt_store_rejects_symlinked_run_root_and_runs_root(tmp_path: Path) 
         AttemptStore(linked_artifacts / "runs" / "run", {}).initialize()
 
 
+@pytest.mark.parametrize("scope", ["run", "runs"])
+def test_bound_run_ownership_rejects_ordinary_directory_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+) -> None:
+    """A no-symlink replacement must not receive run locks or durable writes."""
+    if scope == "run":
+        store = _store(tmp_path)
+    else:
+        store = AttemptStore(tmp_path / "artifacts" / "runs" / "run", {})
+        store.initialize()
+    original_validate = runstate_module.validate_run_path
+    replacement = tmp_path / f"external-{scope}"
+    replacement.mkdir()
+    (replacement / "sentinel.txt").write_text("external", encoding="utf-8")
+    moved = tmp_path / f"moved-{scope}"
+    original_run = store.run_root
+    original_runs = original_run.parent
+    swapped = False
+
+    def validate_then_replace(path: Path) -> Path:
+        nonlocal swapped
+        result = original_validate(path)
+        if not swapped and Path(path) == original_run:
+            swapped = True
+            if scope == "run":
+                original_run.rename(moved)
+                replacement.rename(original_run)
+            else:
+                original_runs.rename(moved)
+                replacement.rename(original_runs)
+        return result
+
+    monkeypatch.setattr(runstate_module, "validate_run_path", validate_then_replace)
+
+    with pytest.raises(RunManifestError, match="owned|changed|path"):
+        store.update_manifest("running")
+
+    assert swapped is True
+    replacement_path = original_run if scope == "run" else original_runs
+    assert [path.name for path in replacement_path.iterdir()] == ["sentinel.txt"]
+
+
 def test_durable_json_read_rejects_symlinked_parent_final_file_and_fifo(
     tmp_path: Path,
 ) -> None:

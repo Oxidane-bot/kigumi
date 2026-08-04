@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import kigumi._runstate as runstate_module
 from kigumi import CacheIntegrityError, EvidencePolicy, LLMCaller
 from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
@@ -163,6 +164,47 @@ def test_explain_without_run_id_uses_numeric_latest_run(tmp_path: Path) -> None:
         (run / "node.json.meta.json").write_text('{"status": "' + status + '"}', encoding="utf-8")
 
     assert dag._read_explain_sidecar("node", None) == {"status": "latest"}
+
+
+def test_explain_rejects_post_validation_ordinary_run_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    result = dag.run(run_id="ordinary-explain")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    replacement = tmp_path / "external-explain"
+    replacement.mkdir()
+    (replacement / "source.json.meta.json").write_text(
+        '{"status": "forged"}',
+        encoding="utf-8",
+    )
+    moved = tmp_path / "moved-explain"
+    original_validate = runstate_module.validate_run_path
+    swapped = False
+
+    def validate_then_replace(path: Path) -> Path:
+        nonlocal swapped
+        validated = original_validate(path)
+        if not swapped and Path(path) == run_path:
+            swapped = True
+            run_path.rename(moved)
+            replacement.rename(run_path)
+        return validated
+
+    monkeypatch.setattr(runstate_module, "validate_run_path", validate_then_replace)
+
+    with pytest.raises(ValueError, match="Invalid sidecar|owned|durable"):
+        dag._read_explain_sidecar("source", result.run_id)
+
+    assert swapped is True
+    assert json.loads((run_path / "source.json.meta.json").read_text()) == {"status": "forged"}
 
 
 def test_plan_forecasts_cache_without_calling_nodes_and_matches_run(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ import inspect
 import io
 import json
 import os
+import stat
 import struct
 import sys
 import textwrap
@@ -67,7 +68,8 @@ from .agents import (
     validate_agent_artifact,
     validate_agent_provenance,
 )
-from .artifacts import atomic_write_json, canonical_json, sha
+from .artifacts import atomic_write_json as _path_atomic_write_json
+from .artifacts import canonical_json, sha
 from .blobs import BlobStore
 from .calling import (
     BudgetExceeded,
@@ -113,6 +115,10 @@ _DYNAMIC_FILES_LEDGER_DIGEST_FIELD = "dynamic_files_ledger_sha256"
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
 CACHE_SCHEMA = 7
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
+
+# Kept as a module-level compatibility seam for callers that fault-inject the
+# old path writer; owned run writes below intentionally do not use it.
+atomic_write_json = _path_atomic_write_json
 
 
 class _ResourcePool:
@@ -508,6 +514,7 @@ class NodeContext:
         node: _Node,
         run_id: str,
         *,
+        attempt_store: AttemptStore | None = None,
         checkpoint_suffix: str | None = None,
         item_files: tuple[Path, ...] = (),
         prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
@@ -516,6 +523,7 @@ class NodeContext:
         self._dag = dag
         self._node = node
         self._run_id = run_id
+        self._attempt_store = attempt_store
         self._checkpoint_suffix = checkpoint_suffix
         self._item_files = item_files
         self._checkpoint_used = False
@@ -613,7 +621,8 @@ class NodeContext:
         if qualifiers:
             name = "@".join((name, *qualifiers))
         approval_path = self._dag._approval_path(self._run_id, name)
-        record, corrupted = AttemptStore._read_json_safe(approval_path)
+        attempts = self._attempt_store or AttemptStore(approval_path.parents[1], {})
+        record, corrupted = attempts._read_owned_json(approval_path)  # noqa: SLF001
         if corrupted:
             raise RunManifestError(
                 f"Checkpoint approval {name!r} in run {self._run_id!r} "
@@ -1355,6 +1364,8 @@ class Dag:
         force: Iterable[str] = (),
         workers: int = 1,
         resource_limits: Mapping[str | None, int] | None = None,
+        *,
+        _bound_attempt_store: AttemptStore | None = None,
     ) -> RunResult:
         """Run a topological target closure and persist every completed node artifact."""
         if type(workers) is not int or workers < 1:
@@ -1362,9 +1373,20 @@ class Dag:
         requested_force = tuple(force)
         existing_manifest: dict[str, Any] | None = None
         dynamic_files_ledger: dict[str, dict[str, list[dict[str, str]]]] = {}
+        bound_attempt_store = _bound_attempt_store
+        if bound_attempt_store is not None and run_id is None:
+            raise ValueError("A bound attempt store requires an existing run_id")
         if run_id is not None:
-            manifest_path = store.run_directory(self.config.artifacts_path, run_id) / "_run.json"
-            candidate_manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+            run_path = store.run_directory(self.config.artifacts_path, run_id)
+            if bound_attempt_store is None:
+                bound_attempt_store = AttemptStore(run_path, {})
+            elif Path(os.path.abspath(bound_attempt_store.run_root)) != Path(
+                os.path.abspath(run_path)
+            ):
+                raise ValueError("Bound attempt store does not match run_id")
+            candidate_manifest, manifest_corrupted = bound_attempt_store._read_owned_json(  # noqa: SLF001
+                run_path / "_run.json"
+            )
             if manifest_corrupted:
                 raise RunManifestError(f"Run {run_id!r} has no valid schema-2 run manifest")
             if isinstance(candidate_manifest, dict):
@@ -1421,19 +1443,19 @@ class Dag:
             self.config.resolve,
             (path for name in order for path in self._nodes[name].files),
         )
-        attempt_store = AttemptStore(
-            run_dir,
-            self._run_manifest_identity(
-                current_run_id,
-                selected,
-                requested_force,
-                order,
-                libs_hashes,
-                prompt_snapshot,
-                file_snapshot,
-                dynamic_files_ledger,
-            ),
+        run_identity = self._run_manifest_identity(
+            current_run_id,
+            selected,
+            requested_force,
+            order,
+            libs_hashes,
+            prompt_snapshot,
+            file_snapshot,
+            dynamic_files_ledger,
         )
+        attempt_store = bound_attempt_store or AttemptStore(run_dir, run_identity)
+        if bound_attempt_store is not None:
+            attempt_store.identity = json.loads(canonical_json(run_identity))
         attempt_store.initialize()
         if existing_manifest is not None:
             attempt_store.mark_resumed()
@@ -1506,8 +1528,8 @@ class Dag:
                 )
                 run_artifact = run_dir / f"{node.name}.json"
                 run_sidecar = run_dir / f"{node.name}.json.meta.json"
-                has_artifact = run_artifact.is_file()
-                has_sidecar = run_sidecar.is_file()
+                has_artifact = attempt_store._owned_exists(run_artifact)  # noqa: SLF001
+                has_sidecar = attempt_store._owned_exists(run_sidecar)  # noqa: SLF001
                 if existing_manifest is not None and (has_artifact or has_sidecar):
                     if not (has_artifact and has_sidecar):
                         raise RunManifestError(
@@ -1526,6 +1548,7 @@ class Dag:
                             state=prior_state,
                             validate_agent=node.executor == "agent",
                             prompt_resolutions=prompt_resolution_records,
+                            attempt_store=attempt_store,
                         )
                         origin = prior_metadata.get("origin_provenance")
                         if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -1649,6 +1672,7 @@ class Dag:
                                 state=prepared["state"],
                                 validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
+                                attempt_store=attempt_store,
                             )
                             origin = prior_metadata.get("origin_provenance")
                             if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -1687,6 +1711,7 @@ class Dag:
                                 self,
                                 node,
                                 current_run_id,
+                                attempt_store=attempt_store,
                                 prompt_resolutions=prompt_resolutions,
                                 file_snapshot=file_snapshot,
                             )
@@ -1768,7 +1793,7 @@ class Dag:
                                             capacity_error = AgentExecutionFailure(
                                                 runtime_code=(AgentRuntimeFailureCode.CAPACITY)
                                             )
-                                            atomic_write_json(
+                                            attempt_store._write_owned_json(  # noqa: SLF001
                                                 run_dir / "failures" / f"{node.name}.json",
                                                 {
                                                     "failure_schema": FAILURE_SCHEMA,
@@ -2134,7 +2159,10 @@ class Dag:
     ) -> RunResult:
         """Resume one schema-2 run under its originally bound declaration."""
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
-        manifest, manifest_corrupted = AttemptStore._read_json_safe(run_dir / "_run.json")
+        bound_attempts = AttemptStore(run_dir, {})
+        manifest, manifest_corrupted = bound_attempts._read_owned_json(  # noqa: SLF001
+            run_dir / "_run.json"
+        )
         if manifest_corrupted or manifest is None:
             raise RunManifestError(
                 f"Run {run_id!r} has no valid schema-2 run manifest and cannot be resumed"
@@ -2159,6 +2187,7 @@ class Dag:
             force=force,
             workers=workers,
             resource_limits=resource_limits,
+            _bound_attempt_store=bound_attempts,
         )
 
     def recover(
@@ -2196,8 +2225,9 @@ class Dag:
             raise ValueError("Recovery evidence must be a list of strings")
 
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
+        attempts = AttemptStore(run_dir, {})
         manifest_path = run_dir / "_run.json"
-        manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+        manifest, manifest_corrupted = attempts._read_owned_json(manifest_path)  # noqa: SLF001
         if manifest_corrupted or manifest is None:
             raise ValueError(f"Run {run_id!r} was not found or has no valid manifest")
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
@@ -2229,19 +2259,17 @@ class Dag:
                 self.config.resolve,
                 (path for name in order for path in self._nodes[name].files),
             )
-            attempts = AttemptStore(
-                run_dir,
-                self._run_manifest_identity(
-                    run_id,
-                    tuple(targets),
-                    tuple(force),
-                    order,
-                    libs_hashes,
-                    prompt_snapshot,
-                    file_snapshot,
-                    dynamic_files_ledger,
-                ),
+            run_identity = self._run_manifest_identity(
+                run_id,
+                tuple(targets),
+                tuple(force),
+                order,
+                libs_hashes,
+                prompt_snapshot,
+                file_snapshot,
+                dynamic_files_ledger,
             )
+            attempts.identity = json.loads(canonical_json(run_identity))
             attempts.initialize()
         except (OSError, RunManifestError, ValueError) as error:
             raise ValueError(f"Run {run_id!r} declaration cannot be recovered: {error}") from error
@@ -2317,17 +2345,12 @@ class Dag:
                 continue
             artifact_path = run_dir / f"{name}.json"
             sidecar_path = Path(f"{artifact_path}.meta.json")
-            if not artifact_path.is_file() or not sidecar_path.is_file():
-                continue
-            try:
-                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-                metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise ValueError(
-                    f"Inherited node {name!r} has invalid persisted artifacts"
-                ) from error
-            if not isinstance(artifact, dict) or not isinstance(metadata, dict):
+            artifact, artifact_corrupted = attempts._read_owned_json(artifact_path)  # noqa: SLF001
+            metadata, metadata_corrupted = attempts._read_owned_json(sidecar_path)  # noqa: SLF001
+            if artifact_corrupted or metadata_corrupted:
                 raise ValueError(f"Inherited node {name!r} has invalid persisted artifacts")
+            if artifact is None or metadata is None:
+                continue
             artifact_digest = sha(artifact)
             origin = metadata.get("origin_provenance")
             if (
@@ -2366,8 +2389,9 @@ class Dag:
         if action not in {"retry", "fail"}:
             raise ValueError("retry resolution action must be 'retry' or 'fail'")
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
+        attempts = AttemptStore(run_dir, {})
         manifest_path = run_dir / "_run.json"
-        manifest, manifest_corrupted = AttemptStore._read_json_safe(manifest_path)
+        manifest, manifest_corrupted = attempts._read_owned_json(manifest_path)  # noqa: SLF001
         if manifest_corrupted or manifest is None:
             raise RunManifestError(f"Run {run_id!r} has no valid manifest")
         if (
@@ -2375,7 +2399,6 @@ class Dag:
             or manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
         ):
             raise RunManifestError(f"Run {run_id!r} has no valid manifest")
-        attempts = AttemptStore(run_dir, {})
         attempts.resolve(
             target,
             attempt=attempt,
@@ -2506,11 +2529,14 @@ class Dag:
         ):
             return True
         run_root = attempt_store.run_root
-        if (run_root / f"{node_name}.json").exists() or (
-            run_root / f"{node_name}.json.meta.json"
-        ).exists():
+        if attempt_store._owned_exists(run_root / f"{node_name}.json") or (  # noqa: SLF001
+            attempt_store._owned_exists(run_root / f"{node_name}.json.meta.json")  # noqa: SLF001
+        ):
             return True
-        return any(run_root.glob(f"{node_name}@*.json"))
+        return any(
+            name.startswith(f"{node_name}@") and name.endswith(".json")
+            for name in attempt_store._owned_names(run_root)  # noqa: SLF001
+        )
 
     def _run_manifest_identity(
         self,
@@ -2610,18 +2636,17 @@ class Dag:
         state: Mapping[str, Any] | None = None,
         validate_agent: bool = False,
         prompt_resolutions: Mapping[str, Any] | None = None,
+        attempt_store: AttemptStore | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         artifact_path = run_dir / f"{label}.json"
         sidecar_path = Path(f"{artifact_path}.meta.json")
-        try:
-            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            metadata = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        owned_store = attempt_store or AttemptStore(run_dir, {})
+        artifact, artifact_corrupted = owned_store._read_owned_json(artifact_path)  # noqa: SLF001
+        metadata, metadata_corrupted = owned_store._read_owned_json(sidecar_path)  # noqa: SLF001
+        if artifact_corrupted or metadata_corrupted or artifact is None or metadata is None:
             raise RunManifestError(
                 f"Completed target {label!r} has missing or invalid run artifacts"
-            ) from error
-        if not isinstance(artifact, dict) or not isinstance(metadata, dict):
-            raise RunManifestError(f"Completed target {label!r} has invalid run artifacts")
+            )
         artifact_digest = sha(artifact)
         if state is None or state.get("status") != "completed":
             raise RunManifestError(
@@ -2642,12 +2667,11 @@ class Dag:
                 f"Completed target {label!r} has no valid success candidate ownership"
             )
         candidate_path = run_dir / "attempts" / sha(label) / candidate_file
-        try:
-            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        candidate, candidate_corrupted = owned_store._read_owned_json(candidate_path)  # noqa: SLF001
+        if candidate_corrupted or candidate is None:
             raise RunManifestError(
                 f"Completed target {label!r} has a missing or invalid success candidate"
-            ) from error
+            )
         if (
             not isinstance(candidate, dict)
             or candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
@@ -3150,25 +3174,37 @@ class Dag:
         """读取指定运行 sidecar；未指定时选择最新运行。"""
         root = store.runs_root(self.config.artifacts_path)
         if run_id is None:
-            runs = (
-                sorted((path for path in root.glob("*") if path.is_dir()), key=store.run_sort_key)
-                if root.is_dir()
-                else []
-            )
+            try:
+                with SecureDirectory(root, create=False) as runs_directory:
+                    runs = []
+                    for run_name in runs_directory.names():
+                        try:
+                            info = runs_directory.stat(run_name)
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISDIR(info.st_mode):
+                            runs.append(root / run_name)
+                    runs.sort(key=store.run_sort_key)
+            except FileNotFoundError:
+                runs = []
             if not runs:
                 return None
             run_dir = runs[-1]
         else:
             run_dir = store.run_directory(self.config.artifacts_path, run_id)
-            if not run_dir.is_dir():
-                raise ValueError(f"Run {run_id!r} does not exist")
         try:
-            with (run_dir / f"{name}.json.meta.json").open(encoding="utf-8") as handle:
-                metadata = json.load(handle)
-        except FileNotFoundError:
+            attempts = AttemptStore(run_dir, {})
+        except (FileNotFoundError, RunManifestError, OSError, ValueError) as error:
+            if run_id is not None:
+                raise ValueError(f"Run {run_id!r} does not exist") from error
             return None
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Invalid sidecar for {name!r} in run {run_dir.name!r}") from error
+        metadata, corrupted = attempts._read_owned_json(  # noqa: SLF001
+            run_dir / f"{name}.json.meta.json"
+        )
+        if not corrupted and metadata is None:
+            return None
+        if corrupted:
+            raise ValueError(f"Invalid sidecar for {name!r} in run {run_dir.name!r}")
         if not isinstance(metadata, dict):
             raise ValueError(f"Invalid sidecar for {name!r} in run {run_dir.name!r}")
         return metadata
@@ -3583,23 +3619,43 @@ class Dag:
             return None
         run_directory = store.run_directory(self.config.artifacts_path, run_id)
         try:
+            attempts = AttemptStore(run_directory, {})
+            # Preserve the public preflight seam, but perform it only after the
+            # AttemptStore has captured the directory descriptors.  A replacement
+            # made by this check is therefore rejected by the bound readers below.
             validate_run_path(run_directory)
-        except RunManifestError as error:
-            raise ValueError(f"Run {run_id!r} does not have an owned durable path") from error
-        if not run_directory.is_dir():
-            raise ValueError(f"Run {run_id!r} does not exist")
-        metadata = _read_run_metadata(run_directory)
+            manifest = attempts._required_manifest()  # noqa: SLF001
+            states = attempts._validate_all_attempt_receipts()  # noqa: SLF001
+            attempts._validate_run_materializations(  # noqa: SLF001
+                states,
+                manifest=manifest,
+            )
+        except FileNotFoundError as error:
+            raise ValueError(f"Run {run_id!r} does not exist") from error
+        except (OSError, RunManifestError, ValueError) as error:
+            raise ValueError(
+                f"Run {run_id!r} does not have an owned durable path: {error}"
+            ) from error
+        try:
+            metadata = _read_run_metadata(run_directory, attempts=attempts)
+        except FileNotFoundError as error:
+            raise ValueError(f"Run {run_id!r} does not exist") from error
+        except (OSError, RunManifestError, ValueError) as error:
+            raise ValueError(
+                f"Run {run_id!r} does not have an owned durable path: {error}"
+            ) from error
         approvals = run_directory / "approvals"
         try:
-            validate_run_path(approvals)
-        except RunManifestError as error:
+            pending_names = {
+                path.removesuffix(".pending.json")
+                for path in attempts._owned_names(approvals)  # noqa: SLF001
+                if path.endswith(".pending.json")
+                and not attempts._read_owned_json(approvals / path)[1]  # noqa: SLF001
+            }
+        except FileNotFoundError:
+            pending_names = set()
+        except (OSError, RunManifestError, ValueError) as error:
             raise ValueError(f"Run {run_id!r} has an unowned approvals directory") from error
-        pending_names: set[str] = set()
-        if approvals.is_dir():
-            for path in approvals.glob("*.pending.json"):
-                _pending, corrupted = AttemptStore._read_json_safe(path)
-                if not corrupted:
-                    pending_names.add(path.name[: -len(".pending.json")])
         pending_nodes = {
             name
             for name, node in self._nodes.items()
@@ -3610,34 +3666,7 @@ class Dag:
             )
         }
         attempt_states: dict[str, list[dict[str, Any]]] = {}
-        attempts_directory = run_directory / "attempts"
-        try:
-            with SecureDirectory(attempts_directory, create=False) as attempts:
-                attempt_names = sorted(attempts.names())
-        except FileNotFoundError:
-            attempt_names = []
-        except (OSError, ValueError) as error:
-            raise ValueError(f"Run {run_id!r} has an unowned attempts directory") from error
-
-        for attempt_name in attempt_names:
-            target_directory = attempts_directory / attempt_name
-            try:
-                with SecureDirectory(target_directory, create=False) as target:
-                    target_names = set(target.names())
-            except (OSError, ValueError) as error:
-                raise ValueError(
-                    f"Run {run_id!r} has an invalid attempt directory {attempt_name!r}"
-                ) from error
-            if "state.json" not in target_names:
-                continue
-            state_path = target_directory / "state.json"
-            state, corrupted = AttemptStore._read_json_safe(state_path)
-            if corrupted:
-                raise ValueError(
-                    f"Run {run_id!r} has an unsafe or corrupt attempt state {attempt_name!r}"
-                )
-            if state is None:
-                continue
+        for state in states:
             target_name = state.get("target")
             if not isinstance(target_name, str):
                 continue
@@ -3880,16 +3909,17 @@ class Dag:
         """Record approval bound to the pending payload; content changes void it."""
         approval_path = self._approval_path(run_id, name)
         pending_path = approval_path.with_suffix(".pending.json")
-        payload, corrupted = AttemptStore._read_json_safe(pending_path)
+        attempts = AttemptStore(approval_path.parents[1], {})
+        payload, corrupted = attempts._read_owned_json(pending_path)  # noqa: SLF001
         if corrupted:
             raise ValueError(f"Pending checkpoint {name!r} in run {run_id!r} is unsafe or corrupt")
         if payload is None:
             raise ValueError(f"No pending checkpoint {name!r} in run {run_id!r}")
-        atomic_write_json(approval_path, {"payload_sha": sha(payload), "data": data})
-        from ._safe_io import SecureDirectory
-
-        with SecureDirectory(pending_path.parent, create=False) as directory:
-            directory.unlink(pending_path.name)
+        attempts._write_owned_json(  # noqa: SLF001
+            approval_path,
+            {"payload_sha": sha(payload), "data": data},
+        )
+        attempts._owned_unlink(pending_path)  # noqa: SLF001
 
     def diff(self, run_a: str, run_b: str) -> dict[str, list[str]]:
         """Compare persisted node artifacts by canonical content hash."""
@@ -4144,8 +4174,8 @@ class Dag:
                     prior_state = attempt_store.state_for(target)
                     run_artifact = run_root / f"{target}.json"
                     run_sidecar = run_root / f"{target}.json.meta.json"
-                    has_artifact = run_artifact.is_file()
-                    has_sidecar = run_sidecar.is_file()
+                    has_artifact = attempt_store._owned_exists(run_artifact)  # noqa: SLF001
+                    has_sidecar = attempt_store._owned_exists(run_sidecar)  # noqa: SLF001
                     if has_artifact or has_sidecar:
                         if not (has_artifact and has_sidecar):
                             raise RunManifestError(
@@ -4163,6 +4193,7 @@ class Dag:
                                 cache_key,
                                 state=prior_state,
                                 prompt_resolutions=prompt_resolution_records,
+                                attempt_store=attempt_store,
                             )
                             cache_hit = prior_metadata.get("cache") == "hit"
                             if prior_metadata.get("cache_policy") == "off":
@@ -4231,6 +4262,7 @@ class Dag:
                                 cache_key,
                                 state=prepared["state"],
                                 prompt_resolutions=prompt_resolution_records,
+                                attempt_store=attempt_store,
                             )
                             resumed_completed = True
                         elif action == "candidate":
@@ -4257,6 +4289,7 @@ class Dag:
                                 self,
                                 node,
                                 run_id,
+                                attempt_store=attempt_store,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
                                 prompt_resolutions=prompt_resolutions,
@@ -4664,8 +4697,8 @@ class Dag:
                     prior_state = attempt_store.state_for(target)
                     run_artifact = run_root / f"{target}.json"
                     run_sidecar = run_root / f"{target}.json.meta.json"
-                    has_artifact = run_artifact.is_file()
-                    has_sidecar = run_sidecar.is_file()
+                    has_artifact = attempt_store._owned_exists(run_artifact)  # noqa: SLF001
+                    has_sidecar = attempt_store._owned_exists(run_sidecar)  # noqa: SLF001
                     if has_artifact or has_sidecar:
                         if not (has_artifact and has_sidecar):
                             raise RunManifestError(
@@ -4684,6 +4717,7 @@ class Dag:
                                 state=prior_state,
                                 validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
+                                attempt_store=attempt_store,
                             )
                             origin = prior_metadata.get("origin_provenance")
                             if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -4745,6 +4779,7 @@ class Dag:
                                 state=prepared["state"],
                                 validate_agent=node.executor == "agent",
                                 prompt_resolutions=prompt_resolution_records,
+                                attempt_store=attempt_store,
                             )
                             origin = prior_metadata.get("origin_provenance")
                             if isinstance(origin, dict) and isinstance(origin.get("agent"), dict):
@@ -4780,6 +4815,7 @@ class Dag:
                                 self,
                                 node,
                                 run_id,
+                                attempt_store=attempt_store,
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
                                 prompt_resolutions=prompt_resolutions,
@@ -5432,11 +5468,19 @@ def _describe_models(nodes: Iterable[_Node]) -> dict[str, list[dict[str, str | N
     }
 
 
-def _read_run_metadata(run_directory: Path) -> dict[str, dict[str, Any]]:
+def _read_run_metadata(
+    run_directory: Path,
+    *,
+    attempts: AttemptStore | None = None,
+) -> dict[str, dict[str, Any]]:
     """读取可用 sidecar；损坏 sidecar 不足以让纯渲染失败。"""
+    owned_store = attempts or AttemptStore(run_directory, {})
     metadata: dict[str, dict[str, Any]] = {}
-    for sidecar in run_directory.glob("*.json.meta.json"):
-        candidate, corrupted = AttemptStore._read_json_safe(sidecar)
+    for sidecar_name in owned_store._owned_names(run_directory):  # noqa: SLF001
+        if not sidecar_name.endswith(".json.meta.json"):
+            continue
+        sidecar = run_directory / sidecar_name
+        candidate, corrupted = owned_store._read_owned_json(sidecar)  # noqa: SLF001
         if corrupted:
             continue
         if candidate is not None and isinstance(candidate.get("node"), str):
@@ -5543,12 +5587,17 @@ def _recovery_payload(receipt: RecoveryReceipt) -> dict[str, Any]:
 
 def _recovery_decision_exists(run_dir: Path, from_attempt: int) -> bool:
     """Return whether this failed attempt already has an append-only decision."""
-    for path in sorted(run_dir.glob("recovery-*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Recovery receipt {path.name!r} is not valid JSON") from error
-        if not isinstance(payload, dict):
+    attempts = AttemptStore(run_dir, {})
+    for name in sorted(
+        name
+        for name in attempts._owned_names(run_dir)  # noqa: SLF001
+        if name.startswith("recovery-") and name.endswith(".json")
+    ):
+        path = run_dir / name
+        payload, corrupted = attempts._read_owned_json(path)  # noqa: SLF001
+        if corrupted:
+            raise ValueError(f"Recovery receipt {path.name!r} is not valid JSON")
+        if payload is None:
             raise ValueError(f"Recovery receipt {path.name!r} is not a JSON object")
         if payload.get("from_attempt") == from_attempt:
             return True
