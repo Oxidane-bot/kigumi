@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,31 @@ def _receipt_path(tmp_path: Path) -> Path:
 
 def _state_path(tmp_path: Path) -> Path:
     return tmp_path / "run" / "attempts" / sha("work") / "state.json"
+
+
+def _store_with_missing_historical_receipt(tmp_path: Path) -> AttemptStore:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    recovery = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 2,
+        "decision": "retry_not_started",
+        "reason": "the side effect never started",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    store.schedule_recovery(
+        "work",
+        from_attempt=1,
+        to_attempt=2,
+        recovery=recovery,
+        recovery_receipt=recovery,
+        inherited_nodes={},
+    )
+    (tmp_path / "run" / "attempts" / sha("work") / "attempt-0001.json").unlink()
+    return store
 
 
 def test_corrupt_attempt_receipt_fails_prepare_closed(tmp_path: Path) -> None:
@@ -267,6 +294,101 @@ def test_missing_current_receipt_after_side_effect_is_not_trusted_by_readers(
         store.pending_retries()
     with pytest.raises(AmbiguousAttemptError):
         store.ambiguous_attempts()
+
+
+def test_missing_historical_receipt_fails_closed_at_every_state_entrypoint(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_missing_historical_receipt(tmp_path)
+    operations = [
+        lambda: store.state_for("work"),
+        store.pending_retries,
+        store.ambiguous_attempts,
+        lambda: store.prepare("work", policy=None, declaration_digest="decl"),
+        lambda: store.mark_side_effect("work", {"kind": "provider"}),
+        lambda: store.mark_checkpoint("work", "checkpoint"),
+        lambda: store.save_candidate("work", {"value": "candidate"}),
+        lambda: store.mark_completed("work", artifact_sha256="a" * 64),
+        lambda: store.record_failure("work", RuntimeError("again"), policy=None),
+        lambda: store.resolve(
+            "work",
+            attempt=2,
+            action="retry",
+            reason="operator confirmed the effect did not complete",
+        ),
+        lambda: store.schedule_recovery(
+            "work",
+            from_attempt=2,
+            to_attempt=3,
+            recovery={"decision": "retry_not_started"},
+            inherited_nodes={},
+            recovery_receipt={
+                "recovery_time": "2026-08-04T12:00:01.000000Z",
+                "decision": "retry_not_started",
+            },
+        ),
+    ]
+
+    for operation in operations:
+        with pytest.raises(StateIntegrityError, match="historical attempt receipt"):
+            operation()
+
+
+def test_record_recovery_decision_makes_fail_and_retry_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    initial = _store(tmp_path)
+    initial.prepare("work", policy=None, declaration_digest="decl")
+    initial.record_failure("work", RuntimeError("terminal"), policy=None)
+    barrier = threading.Barrier(2)
+
+    def decide(decision: str) -> tuple[str, Any]:
+        attempts = AttemptStore(tmp_path / "run", {})
+        payload = {
+            "recovery_time": f"2026-08-04T12:00:0{1 if decision == 'fail' else 2}.000000Z",
+            "from_attempt": 1,
+            "to_attempt": 1 if decision == "fail" else 2,
+            "decision": decision,
+            "reason": f"operator chose {decision}",
+            "evidence_refs": [],
+            "recovered_by": "test",
+        }
+        barrier.wait()
+        try:
+            state = attempts.record_recovery_decision(
+                "work",
+                from_attempt=1,
+                decision=decision,
+                recovery=payload,
+                inherited_nodes={},
+                recovery_receipt=payload,
+            )
+        except BaseException as error:
+            return "error", error
+        return "ok", state
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(decide, ("fail", "retry_not_started")))
+
+    successes = [value for status, value in outcomes if status == "ok"]
+    failures = [value for status, value in outcomes if status == "error"]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], (RunManifestError, ValueError))
+    assert len(list((tmp_path / "run").glob("recovery-*.json"))) == 1
+
+    state = json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))
+    if successes[0]["status"] == "retry_scheduled":
+        assert state["attempt"] == 2
+        assert (tmp_path / "run" / "attempts" / sha("work") / "attempt-0002.json").is_file()
+    else:
+        assert successes[0]["status"] == "failed"
+        assert state["attempt"] == 1
+        assert not (tmp_path / "run" / "attempts" / sha("work") / "attempt-0002.json").exists()
+    assert state["recovery_receipt_file"]
+    assert state["recovery_receipt_sha256"] == sha(
+        json.loads((tmp_path / "run" / state["recovery_receipt_file"]).read_text(encoding="utf-8"))
+    )
 
 
 def test_recovery_receipt_is_bound_inside_schedule_recovery_transaction(

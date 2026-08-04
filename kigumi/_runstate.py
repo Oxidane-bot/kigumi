@@ -27,6 +27,7 @@ _RECEIPT_SEQUENCE_FIELD = "receipt_sequence"
 _PREVIOUS_RECEIPT_DIGEST_FIELD = "previous_receipt_sha256"
 _RECEIPT_CHAIN_FIELD = "attempt_receipt_chains"
 _TARGET_OWNER_FIELD = "target_owner_token"
+_RECOVERY_DECISION_FIELD = "recovery_decision"
 _RECOVERY_RECEIPT_FILE_FIELD = "recovery_receipt_file"
 _RECOVERY_RECEIPT_DIGEST_FIELD = "recovery_receipt_sha256"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
@@ -285,12 +286,14 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Run {self.run_root.name!r} declaration changed: {', '.join(changed)}"
                 )
+            self._validate_all_attempt_receipts()
             return existing
 
     def mark_resumed(self) -> None:
         """Record an operator/runtime resume without changing immutable run identity."""
         with self._run_locked():
             manifest = self._required_manifest()
+            self._validate_all_attempt_receipts()
             manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
             manifest["last_resumed_at"] = iso_now()
             manifest["updated_at"] = manifest["last_resumed_at"]
@@ -306,6 +309,7 @@ class AttemptStore:
     ) -> None:
         with self._run_locked():
             manifest = self._required_manifest()
+            self._validate_all_attempt_receipts()
             manifest["status"] = status
             manifest["updated_at"] = iso_now()
             manifest["pending_retries"] = pending_retries or []
@@ -449,11 +453,17 @@ class AttemptStore:
         closed on the next durable read.
         """
         with self._run_locked():
-            state_path = self._state_path(target)
-            state = self._required_json(state_path)
+            state = self._required_state(target)
             if state.get("status") != "failed" or state.get("attempt") != from_attempt:
                 raise ValueError(
                     f"Target {target!r} attempt {from_attempt} is not the active terminal failure"
+                )
+            if (
+                state.get(_RECOVERY_DECISION_FIELD) is not None
+                or state.get(_RECOVERY_RECEIPT_FILE_FIELD) is not None
+            ):
+                raise RunManifestError(
+                    f"Target {target!r} attempt {from_attempt} already has a recovery decision"
                 )
             if to_attempt != from_attempt + 1:
                 raise ValueError("Recovery attempts must advance by exactly one")
@@ -497,6 +507,95 @@ class AttemptStore:
             self._write_state(target, state)
             return state
 
+    def record_recovery_decision(
+        self,
+        target: str,
+        *,
+        from_attempt: int,
+        decision: Literal["retry_not_started", "retry_after_external_check", "fail"],
+        recovery: dict[str, Any],
+        inherited_nodes: dict[str, Any] | None = None,
+        recovery_receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Commit one mutually exclusive recovery decision for a failed attempt.
+
+        The failed-state check, decision marker, recovery receipt, and resulting
+        state transition all happen under the run lock.  Retry decisions bind the
+        receipt to the newly scheduled state; fail decisions bind it to the
+        terminal failed state.  Callers should use this method for operator
+        recovery instead of composing ``write_recovery_receipt`` with
+        ``schedule_recovery``.
+        """
+        valid_decisions = {
+            "retry_not_started",
+            "retry_after_external_check",
+            "fail",
+        }
+        if decision not in valid_decisions:
+            raise ValueError(f"Unknown recovery decision: {decision!r}")
+        if isinstance(from_attempt, bool) or not isinstance(from_attempt, int) or from_attempt < 1:
+            raise ValueError("from_attempt must be a positive integer")
+
+        with self._run_locked():
+            state = self._required_state(target)
+            if state.get("status") != "failed" or state.get("attempt") != from_attempt:
+                raise ValueError(
+                    f"Target {target!r} attempt {from_attempt} is not the active terminal failure"
+                )
+            if (
+                state.get(_RECOVERY_DECISION_FIELD) is not None
+                or state.get(_RECOVERY_RECEIPT_FILE_FIELD) is not None
+            ):
+                raise RunManifestError(
+                    f"Target {target!r} attempt {from_attempt} already has a recovery decision"
+                )
+
+            canonical_recovery = self._canonical_object(recovery, label="recovery decision")
+            if canonical_recovery.get("decision") not in {None, decision}:
+                raise ValueError("Recovery payload decision does not match the requested decision")
+            canonical_receipt = self._canonical_object(
+                recovery if recovery_receipt is None else recovery_receipt,
+                label="recovery receipt",
+            )
+            if canonical_receipt.get("decision") not in {None, decision}:
+                raise ValueError("Recovery receipt decision does not match the requested decision")
+
+            to_attempt = from_attempt if decision == "fail" else from_attempt + 1
+            if decision != "fail":
+                next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
+                if next_receipt.exists():
+                    raise RunManifestError(
+                        f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
+                    )
+
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            recovery_receipt_path = self._write_recovery_receipt_locked(canonical_receipt)
+            state[_RECOVERY_DECISION_FIELD] = decision
+            state["recovery"] = canonical_recovery
+            state[_RECOVERY_RECEIPT_FILE_FIELD] = recovery_receipt_path.relative_to(
+                self.run_root
+            ).as_posix()
+            state[_RECOVERY_RECEIPT_DIGEST_FIELD] = sha(canonical_receipt)
+            now = iso_now()
+            if decision == "fail":
+                state["updated_at"] = now
+            else:
+                canonical_inherited = json.loads(canonical_json(inherited_nodes or {}))
+                state.update(
+                    {
+                        "attempt": to_attempt,
+                        "status": "retry_scheduled",
+                        "next_attempt": to_attempt,
+                        "delay_seconds": 0.0,
+                        "due_at": now,
+                        "inherited_nodes": canonical_inherited,
+                        "updated_at": now,
+                    }
+                )
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
+            return state
+
     def write_recovery_receipt(self, payload: dict[str, Any]) -> Path:
         """Write a fail-decision recovery receipt under the run lock.
 
@@ -517,7 +616,7 @@ class AttemptStore:
     ) -> None:
         """Persist the provider/Agent side-effect boundary before crossing it."""
         with self._run_locked():
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if state.get("status") != "running":
                 raise RunManifestError(
                     f"Cannot mark side effect for {target!r} in non-running state"
@@ -535,7 +634,7 @@ class AttemptStore:
 
     def mark_checkpoint(self, target: str, checkpoint: str) -> None:
         with self._run_locked():
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if state.get("status") != "running":
                 raise RunManifestError(
                     f"Cannot mark checkpoint for {target!r} in non-running state"
@@ -554,7 +653,7 @@ class AttemptStore:
     def save_candidate(self, target: str, candidate: dict[str, Any]) -> dict[str, Any]:
         """Persist canonical success before cache sealing or materialization."""
         with self._run_locked():
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if state.get("status") != "running":
                 raise RunManifestError(f"Cannot save candidate for {target!r} in non-running state")
             self._require_target_lease(target, state)
@@ -577,7 +676,7 @@ class AttemptStore:
 
     def mark_completed(self, target: str, *, artifact_sha256: str) -> None:
         with self._run_locked():
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if state.get("status") == "completed":
                 if state.get("artifact_sha256") != artifact_sha256:
                     raise RunManifestError(
@@ -620,7 +719,7 @@ class AttemptStore:
         from .failures import failure_provider_kind, failure_retry_after_ms
 
         with self._run_locked():
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if state.get("status") != "running":
                 raise RunManifestError(f"Cannot record failure for {target!r} in non-running state")
             self._require_target_lease(target, state)
@@ -679,7 +778,7 @@ class AttemptStore:
                 raise ValueError("retry resolution reason must be non-empty")
             if action not in {"retry", "fail"}:
                 raise ValueError("retry resolution action must be 'retry' or 'fail'")
-            state = self._required_json(self._state_path(target))
+            state = self._required_state(target)
             if (
                 state.get("status") == "running"
                 and state.get("side_effect_started") is True
@@ -835,6 +934,7 @@ class AttemptStore:
                     ATTEMPT_RECEIPT_SCHEMA,
                     "state target path binding mismatch",
                 )
+            self._validate_attempt_receipts(target)
             self._validate_state_binding(target, state)
             if state.get("status") == status:
                 found.append(state)
@@ -1231,6 +1331,44 @@ class AttemptStore:
                         "historical attempt receipt is missing from the receipt chain",
                     )
 
+    def _validate_all_attempt_receipts(self) -> None:
+        """Validate every target before mutating run-level durable state."""
+        attempts_root = self.run_root / "attempts"
+        if not attempts_root.is_dir():
+            return
+        for target_root in sorted(path for path in attempts_root.iterdir() if path.is_dir()):
+            state_path = target_root / "state.json"
+            state, corrupted = self._read_json_safe(state_path)
+            if corrupted:
+                raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
+            if state is not None:
+                target = state.get("target")
+                if not isinstance(target, str) or target_root.name != sha(target):
+                    raise StateIntegrityError(
+                        state_path,
+                        ATTEMPT_RECEIPT_SCHEMA,
+                        "state target path binding mismatch",
+                    )
+                self._validate_attempt_receipts(target)
+                self._validate_state_binding(target, state)
+                continue
+
+            receipt_paths = sorted(target_root.glob("attempt-*.json"))
+            if not receipt_paths:
+                continue
+            receipt, receipt_corrupted = self._read_json_safe(receipt_paths[0])
+            if receipt_corrupted or receipt is None:
+                raise self._integrity_error(receipt_paths[0], ATTEMPT_RECEIPT_SCHEMA)
+            target = receipt.get("target")
+            if not isinstance(target, str) or target_root.name != sha(target):
+                raise StateIntegrityError(
+                    receipt_paths[0],
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "attempt receipt target path binding mismatch",
+                )
+            self._validate_attempt_receipts(target)
+            raise RunManifestError(f"Attempt receipts for {target!r} exist without a durable state")
+
     @staticmethod
     def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
         """Return ``(data, corrupted)`` while keeping missing distinct from torn JSON."""
@@ -1271,3 +1409,8 @@ class AttemptStore:
                 )
             self._validate_state_binding(target, value)
         return value
+
+    def _required_state(self, target: str) -> dict[str, Any]:
+        """Read one target only after its complete receipt history is trusted."""
+        self._validate_attempt_receipts(target)
+        return self._required_json(self._state_path(target))
