@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import kigumi.agents as agents_module
 import kigumi.pi as pi_module
 from kigumi import (
     AgentExecutionFailure,
@@ -284,6 +286,44 @@ def test_agent_spec_rejects_unsafe_capsules(tmp_path: Path) -> None:
             )
         with pytest.raises(ValueError):
             AgentSpec.load(capsule)
+
+
+def test_agent_spec_rejects_fifo_resources_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+    capsule = _capsule(tmp_path / "fifo")
+    target = capsule / "hooks" / "policy.ts"
+    target.unlink()
+    os.mkfifo(target)
+
+    with pytest.raises(ValueError, match="regular"):
+        AgentSpec.load(capsule)
+
+
+def test_agent_spec_rejects_symlink_raced_into_add_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capsule = _capsule(tmp_path / "race")
+    target = capsule / "hooks" / "policy.ts"
+    outside = tmp_path / "outside.ts"
+    outside.write_text("outside", encoding="utf-8")
+    original_open = agents_module.os.open
+    policy_opens = 0
+
+    def replace_on_add_reference(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal policy_opens
+        if path == "policy.ts" and kwargs.get("dir_fd") is not None:
+            policy_opens += 1
+            if policy_opens == 2:
+                target.unlink()
+                target.symlink_to(outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(agents_module.os, "open", replace_on_add_reference)
+
+    with pytest.raises(ValueError, match="regular|symlink"):
+        AgentSpec.load(capsule)
+    assert policy_opens >= 2
 
 
 def _fake_pi(path: Path) -> Path:

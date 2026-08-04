@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
+import os
 import re
+import stat
 import warnings
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
@@ -30,6 +34,87 @@ _SLOT_PATTERN = re.compile(r"{{([a-z_][a-z0-9_]*)}}")
 _NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]*")
 _SENTENCE_BOUNDARY = re.compile(r"[。！？.!?]")
 PROMPT_RESOLUTION_SCHEMA = 1
+_ORIGINAL_OS_OPEN = os.open
+
+
+def _read_regular_file_no_follow(root: Path, relative: str) -> bytes:
+    """Read one root-relative regular file through bound no-follow descriptors.
+
+    Prompt files are part of a run's input identity.  A path check followed by
+    ``Path.read_bytes`` leaves a replacement window in which a regular file can
+    become a symlink, FIFO, or another special file.  Open every directory and
+    the final file relative to descriptors so a parent replacement cannot
+    redirect the read, and use a non-blocking no-follow final descriptor so a
+    raced FIFO fails closed instead of blocking.
+    """
+    supported = getattr(os, "supports_dir_fd", ())
+    if (
+        _ORIGINAL_OS_OPEN not in supported
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+    ):
+        raise OSError(errno.ENOTSUP, "Prompt snapshot requires descriptor-relative no-follow I/O")
+
+    absolute_root = root.absolute()
+    parts = tuple(part for part in relative.split("/") if part)
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise ValueError(f"Unsafe prompt snapshot path: {relative!r}")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    descriptors: list[int] = []
+    file_descriptor = -1
+    try:
+        current = os.open(absolute_root.anchor, directory_flags)
+        descriptors.append(current)
+        for component in absolute_root.parts[1:]:
+            if component in {"", "."}:
+                continue
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+        for component in parts[:-1]:
+            current = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(current)
+
+        file_descriptor = os.open(parts[-1], file_flags, dir_fd=current)
+        before = os.fstat(file_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(
+                getattr(errno, "EFTYPE", errno.EINVAL),
+                f"Prompt snapshot is not a regular file: {relative}",
+            )
+        with os.fdopen(file_descriptor, "rb", closefd=True) as handle:
+            file_descriptor = -1
+            data = handle.read()
+            after = os.fstat(handle.fileno())
+        if len(data) != before.st_size or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError(errno.EAGAIN, f"Prompt snapshot changed while reading: {relative}")
+        return data
+    finally:
+        if file_descriptor >= 0:
+            with suppress(OSError):
+                os.close(file_descriptor)
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 class KigumiPromptWarning(UserWarning):
@@ -1083,22 +1168,12 @@ class PromptCatalogSnapshot:
         entries: dict[str, _CatalogEntry] = {}
         for name in sorted(names):
             checked = _validate_prompt_path(name)
-            candidate = root / f"{checked}.md"
             try:
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(resolved_root)
-            except (FileNotFoundError, OSError, ValueError) as error:
-                raise PromptDefinitionError(
-                    f"PromptRef {checked!r} must resolve to a .md file under {resolved_root}"
-                ) from error
-            if candidate.is_symlink() or not resolved.is_file() or resolved.suffix != ".md":
-                raise PromptDefinitionError(f"PromptRef {checked!r} must be a regular .md file")
-            try:
-                raw = resolved.read_bytes()
+                raw = _read_regular_file_no_follow(resolved_root, f"{checked}.md")
                 text = raw.decode("utf-8")
             except (OSError, UnicodeDecodeError) as error:
                 raise PromptDefinitionError(
-                    f"PromptRef {checked!r} must be readable UTF-8"
+                    f"PromptRef {checked!r} must be a regular, readable UTF-8 .md file"
                 ) from error
             entries[checked] = _CatalogEntry(checked, text, sha(text), len(raw))
         snapshot = cls(resolved_root, entries)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import FrozenInstanceError
 from hashlib import sha256 as hash_sha256
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+import kigumi.prompt as prompt_module
 from kigumi import (
     CarryRef,
     FileRef,
@@ -545,6 +547,47 @@ def test_file_ref_requires_injected_bytes(tmp_path: Path) -> None:
 
     with pytest.raises(PromptResolutionError, match="requires injected file_contents"):
         snapshot.resolve(spec, inputs={}, params={"path": str(real_file)})
+
+
+def test_prompt_snapshot_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    fifo = prompts / "base.md"
+    os.mkfifo(fifo)
+    spec = PromptSpec("managed", PromptRef("base"))
+
+    with pytest.raises(PromptDefinitionError, match="regular"):
+        PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
+
+
+def test_prompt_snapshot_rejects_symlink_installed_at_descriptor_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    prompt = prompts / "base.md"
+    prompt.write_text("safe", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    spec = PromptSpec("managed", PromptRef("base"))
+    original_open = prompt_module.os.open
+    raced = False
+
+    def replace_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal raced
+        if path == "base.md" and kwargs.get("dir_fd") is not None and not raced:
+            raced = True
+            prompt.unlink()
+            prompt.symlink_to(outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(prompt_module.os, "open", replace_before_open)
+
+    with pytest.raises(PromptDefinitionError, match="regular"):
+        PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
+    assert raced is True
 
 
 def test_file_ref_nested_path_from_participates_in_dynamic_kind_validation() -> None:

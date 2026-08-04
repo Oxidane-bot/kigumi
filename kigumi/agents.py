@@ -7,13 +7,17 @@ leaving scheduling, caching and output ownership to :mod:`kigumi.dag`.
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import mimetypes
+import os
 import shutil
+import stat
 import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -136,6 +140,214 @@ _CREDENTIAL_NAMES = {
     "secret",
     "token",
 }
+_ORIGINAL_OS_OPEN = os.open
+
+
+def _capsule_secure_io_supported() -> bool:
+    supported = getattr(os, "supports_dir_fd", ())
+    return (
+        _ORIGINAL_OS_OPEN in supported and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def _open_capsule_directory(
+    root: Path,
+    relative_parts: tuple[str, ...] = (),
+) -> tuple[int, list[int]]:
+    """Open a capsule directory and every path component without following symlinks."""
+    if not _capsule_secure_io_supported():
+        raise OSError(errno.ENOTSUP, "Agent capsule requires descriptor-relative no-follow I/O")
+    if any(part in {"", ".", ".."} for part in relative_parts):
+        raise ValueError(f"Unsafe Agent capsule path: {'/'.join(relative_parts)!r}")
+
+    absolute = root.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptors: list[int] = []
+    try:
+        current = os.open(absolute.anchor, flags)
+        descriptors.append(current)
+        for component in (*absolute.parts[1:], *relative_parts):
+            if component in {"", "."}:
+                continue
+            current = os.open(component, flags, dir_fd=current)
+            descriptors.append(current)
+        return current, descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
+def _open_capsule_regular_file(parent_fd: int, name: str, label: str) -> tuple[int, os.stat_result]:
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"Agent capsule resource must not be a symlink: {label}") from error
+        raise
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Agent capsule resource must be a regular file: {label}")
+        return descriptor, info
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise
+
+
+def _read_capsule_regular_file(root: Path, relative: str) -> bytes:
+    parts = tuple(relative.split("/"))
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Unsafe Agent capsule path: {relative!r}")
+    parent_fd, descriptors = _open_capsule_directory(root, parts[:-1])
+    descriptor = -1
+    try:
+        descriptor, before = _open_capsule_regular_file(parent_fd, parts[-1], relative)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            data = handle.read()
+            after = os.fstat(handle.fileno())
+        if len(data) != before.st_size or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError(errno.EAGAIN, f"Agent capsule resource changed while reading: {relative}")
+        return data
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+        for item in reversed(descriptors):
+            with suppress(OSError):
+                os.close(item)
+
+
+def _walk_capsule_directory(
+    root: Path,
+    relative: str = "",
+    *,
+    read_files: bool,
+) -> Iterable[tuple[str, bool, bytes | None]]:
+    """Walk one capsule directory through stable descriptors.
+
+    The yielded boolean identifies directories.  Regular files are opened with
+    ``O_NOFOLLOW|O_NONBLOCK`` even when their contents are not requested, so a
+    raced FIFO or symlink is rejected rather than followed or blocked.
+    """
+    parts = tuple(part for part in relative.split("/") if part)
+    directory_fd, descriptors = _open_capsule_directory(root, parts)
+    try:
+        yield relative, True, None
+        yield from _walk_capsule_fd(directory_fd, relative, read_files=read_files)
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _walk_capsule_fd(
+    directory_fd: int,
+    relative: str,
+    *,
+    read_files: bool,
+) -> Iterable[tuple[str, bool, bytes | None]]:
+    before = os.fstat(directory_fd)
+    try:
+        names = sorted(os.listdir(directory_fd))
+        for name in names:
+            child_relative = f"{relative}/{name}" if relative else name
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"Agent capsule may not contain symlinks: {child_relative}")
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    yield child_relative, True, None
+                    yield from _walk_capsule_fd(child_fd, child_relative, read_files=read_files)
+                finally:
+                    with suppress(OSError):
+                        os.close(child_fd)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(
+                    f"Agent capsule resource must be a regular file or directory: {child_relative}"
+                )
+            descriptor, before_file = _open_capsule_regular_file(
+                directory_fd,
+                name,
+                child_relative,
+            )
+            if not read_files:
+                with suppress(OSError):
+                    os.close(descriptor)
+                yield child_relative, False, None
+                continue
+            try:
+                with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                    descriptor = -1
+                    data = handle.read()
+                    after_file = os.fstat(handle.fileno())
+                if len(data) != before_file.st_size or (
+                    before_file.st_dev,
+                    before_file.st_ino,
+                    before_file.st_size,
+                    before_file.st_mtime_ns,
+                    before_file.st_ctime_ns,
+                ) != (
+                    after_file.st_dev,
+                    after_file.st_ino,
+                    after_file.st_size,
+                    after_file.st_mtime_ns,
+                    after_file.st_ctime_ns,
+                ):
+                    raise OSError(
+                        errno.EAGAIN,
+                        f"Agent capsule resource changed while reading: {child_relative}",
+                    )
+                yield child_relative, False, data
+            finally:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+    finally:
+        after = os.fstat(directory_fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError(
+                errno.EAGAIN,
+                f"Agent capsule directory changed while reading: {relative}",
+            )
 
 
 @dataclass(frozen=True)
@@ -164,17 +376,20 @@ class AgentSpec:
         root = root.resolve()
         _validate_capsule_tree(root)
         for directory_name in ("skills", "hooks"):
-            directory = root / directory_name
-            if directory.is_symlink() or not directory.is_dir():
+            try:
+                descriptors = _open_capsule_directory(root, (directory_name,))[1]
+            except (OSError, ValueError) as error:
                 raise ValueError(
                     f"Agent capsule must contain a regular {directory_name}/ directory"
-                )
-        manifest_path = root / "agent.toml"
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise ValueError("Agent capsule must contain a regular agent.toml")
+                ) from error
+            else:
+                for descriptor in reversed(descriptors):
+                    with suppress(OSError):
+                        os.close(descriptor)
         try:
-            manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+            manifest_bytes = _read_capsule_regular_file(root, "agent.toml")
+            manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
             raise ValueError(f"Invalid Agent manifest: {error}") from error
         if not isinstance(manifest, dict):
             raise ValueError("Agent manifest must be a TOML table")
@@ -223,37 +438,35 @@ class AgentSpec:
         except (TypeError, ValueError) as error:
             raise ValueError(f"Invalid Agent limits: {error}") from error
 
-        files: dict[str, bytes] = {"agent.toml": manifest_path.read_bytes()}
+        files: dict[str, bytes] = {"agent.toml": manifest_bytes}
         directories: set[str] = set()
         owners: dict[str, str] = {"agent.toml": "manifest"}
 
         def add_reference(raw: str, *, kind: str, directory: bool) -> None:
             relative = _capsule_path(raw, prefix=f"{kind}/" if kind != "system" else None)
-            target = root / relative
-            if (
-                target.is_symlink()
-                or (directory and not target.is_dir())
-                or (not directory and not target.is_file())
-            ):
-                expected = "directory" if directory else "file"
-                raise ValueError(f"Agent {kind} resource must be a regular {expected}: {raw!r}")
-            entries = [target, *sorted(target.rglob("*"))] if directory else [target]
-            for entry in entries:
-                rel = entry.relative_to(root).as_posix()
-                previous = owners.get(rel)
-                if previous is not None:
-                    raise ValueError(
-                        f"Agent resource {rel!r} is declared by both {previous!r} and {raw!r}"
-                    )
-                owners[rel] = raw
-                if entry.is_symlink():
-                    raise ValueError(f"Agent capsule may not contain symlinks: {rel}")
-                if entry.is_dir():
-                    directories.add(rel)
-                elif entry.is_file():
-                    files[rel] = entry.read_bytes()
+            try:
+                if directory:
+                    entries = _walk_capsule_directory(root, relative, read_files=True)
                 else:
-                    raise ValueError(f"Agent capsule resource is not a regular file: {rel}")
+                    entries = ((relative, False, _read_capsule_regular_file(root, relative)),)
+                for rel, is_directory, data in entries:
+                    if not is_directory and data is None:
+                        raise ValueError(f"Agent capsule resource has no bytes: {rel}")
+                    previous = owners.get(rel)
+                    if previous is not None:
+                        raise ValueError(
+                            f"Agent resource {rel!r} is declared by both {previous!r} and {raw!r}"
+                        )
+                    owners[rel] = raw
+                    if is_directory:
+                        directories.add(rel)
+                    else:
+                        files[rel] = data
+            except (OSError, ValueError) as error:
+                expected = "directory" if directory else "file"
+                raise ValueError(
+                    f"Agent {kind} resource must be a regular {expected}: {raw!r}"
+                ) from error
 
         add_reference(system_prompt, kind="system", directory=False)
         for resource in skills:
@@ -311,19 +524,23 @@ class AgentSpec:
 
 
 def _validate_capsule_tree(root: Path) -> None:
-    for path in root.rglob("*"):
-        relative = path.relative_to(root).as_posix()
-        if path.is_symlink():
-            raise ValueError(f"Agent capsule may not contain symlinks: {relative}")
-        lowered = path.name.lower()
-        sensitive_stem = Path(lowered).stem in {
-            "credential",
-            "credentials",
-            "secret",
-            "secrets",
-        }
-        if lowered == ".env" or lowered.startswith(".env.") or sensitive_stem:
-            raise ValueError(f"Agent capsule may not contain credential files: {relative}")
+    try:
+        for relative, is_directory, _data in _walk_capsule_directory(root, read_files=False):
+            if is_directory:
+                continue
+            lowered = Path(relative).name.lower()
+            sensitive_stem = Path(lowered).stem in {
+                "credential",
+                "credentials",
+                "secret",
+                "secrets",
+            }
+            if lowered == ".env" or lowered.startswith(".env.") or sensitive_stem:
+                raise ValueError(f"Agent capsule may not contain credential files: {relative}")
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(f"Agent capsule tree could not be read safely: {error}") from error
 
 
 def _reject_credentials(value: Any, path: tuple[str, ...] = ()) -> None:
