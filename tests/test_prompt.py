@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, Field
 
 import kigumi.prompt as prompt_module
+from kigumi.artifacts import sha
 from kigumi.prompt import (
+    Attachment,
     KigumiPromptWarning,
+    Message,
+    PromptResolution,
+    PromptResolutionError,
+    ResponseSpec,
     TemplateSlotError,
     clip,
     inject,
@@ -16,12 +23,33 @@ from kigumi.prompt import (
     render_template,
     schema_format_section,
     section,
+    validate_prompt_resolution_record,
 )
 
 GOLDEN_FAILURE = (
     "公共 prompt 成分变更 = 全项目缓存换族,确认有意变更后更新 golden 并在 CHANGELOG 标注缓存失效"
 )
 GOLDENS = Path(__file__).parent / "goldens"
+
+
+def _managed_record(
+    messages: list[Message],
+    attachments: list[Attachment],
+    response_spec: ResponseSpec,
+) -> dict[str, Any]:
+    return PromptResolution(
+        spec_name="managed",
+        structure_digest="structure",
+        base={},
+        layers=(),
+        axes=(),
+        materials=(),
+        rendered_sha256="rendered",
+        rendered_bytes=8,
+        messages=messages,
+        attachments=attachments,
+        response_spec=response_spec,
+    ).canonical()
 
 
 class SnapshotLocation(BaseModel):
@@ -33,6 +61,90 @@ class SnapshotModel(BaseModel):
     enabled: bool = Field(description="是否启用")
     location: SnapshotLocation = Field(description="地点")
     tags: list[str] = Field(description="标签")
+
+
+def test_managed_prompt_record_requires_all_request_fields_before_digest_validation() -> None:
+    messages = [Message(role="user", parts=["hello"])]
+    attachments = [
+        Attachment(
+            path="input.txt",
+            content_hash="a" * 64,
+            mime_type="text/plain",
+            size_bytes=5,
+        )
+    ]
+    response_spec = ResponseSpec(schema_sha256="b" * 64, format="structured")
+    record = _managed_record(messages, attachments, response_spec)
+
+    for missing, replacement in (
+        ("messages", []),
+        ("attachments", []),
+        ("response_spec", ResponseSpec()),
+    ):
+        candidate = dict(record)
+        candidate.pop(missing)
+        values: dict[str, Any] = {
+            "messages": messages,
+            "attachments": attachments,
+            "response_spec": response_spec,
+        }
+        values[missing] = replacement
+        candidate["resolution_digest"] = _managed_record(**values)["resolution_digest"]
+
+        with pytest.raises(PromptResolutionError, match="managed request fields"):
+            validate_prompt_resolution_record(candidate)
+
+
+def test_legacy_prompt_resolution_record_remains_compatible() -> None:
+    body = {
+        "prompt_resolution_schema": 1,
+        "spec": "legacy",
+        "structure_digest": "structure",
+        "base": {},
+        "layers": [],
+        "axes": [],
+        "materials": [],
+        "rendered": {"sha256": "rendered", "bytes": 8},
+    }
+    record = {**body, "resolution_digest": sha(body)}
+
+    validate_prompt_resolution_record(record)
+
+
+def test_attachment_manifest_metadata_is_not_prompt_lineage_identity() -> None:
+    """Prompt lineage keys attachment bytes, not path/MIME/preflight metadata."""
+    messages = [Message(role="user", parts=["hello"])]
+    response_spec = ResponseSpec()
+    content_hash = "a" * 64
+
+    baseline = _managed_record(
+        messages,
+        [
+            Attachment(
+                path="input.txt",
+                content_hash=content_hash,
+                mime_type="text/plain",
+                size_bytes=5,
+            )
+        ],
+        response_spec,
+    )
+    metadata_changed = _managed_record(
+        messages,
+        [
+            Attachment(
+                path="renamed.bin",
+                content_hash=content_hash,
+                mime_type="application/octet-stream",
+                size_bytes=999,
+            )
+        ],
+        response_spec,
+    )
+
+    assert baseline["attachments"][0]["mime_type"] == "text/plain"
+    assert baseline["attachments"][0]["size_bytes"] == 5
+    assert baseline["resolution_digest"] == metadata_changed["resolution_digest"]
 
 
 def test_inject_is_byte_stable_and_warns_for_numeric_dict_keys() -> None:

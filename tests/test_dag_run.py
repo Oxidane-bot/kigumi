@@ -220,6 +220,14 @@ def test_workers_must_be_positive(tmp_path: Path) -> None:
         dag.run(workers=0)
 
 
+@pytest.mark.parametrize("workers", [True, 1.5, float("nan"), "2"])
+def test_workers_must_be_a_strict_positive_int(tmp_path: Path, workers: Any) -> None:
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError, match="workers"):
+        dag.run(workers=workers)
+
+
 def test_concurrent_changed_run_declarations_fail_before_execution(tmp_path: Path) -> None:
     """Changed declarations are rejected before concurrent nodes can overwrite a run."""
     data = tmp_path / "data.txt"

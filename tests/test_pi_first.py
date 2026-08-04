@@ -68,7 +68,7 @@ def test_pi_workspace_secret_scan_fails_before_candidate_collection(tmp_path: Pa
     secret = "provider-secret-sentinel"
     output.write_bytes(b"x" * (64 * 1024 - 4) + secret.encode("utf-8"))
 
-    with pytest.raises(Exception, match="provider credential bytes"):
+    with pytest.raises(AgentResultError, match="provider credential bytes"):
         pi_module._assert_workspace_secrets_absent(tmp_path, (secret,))
 
     output.write_text('{"safe":true}', encoding="utf-8")
@@ -949,27 +949,52 @@ def test_pi_adapter_rejects_credentials_in_command_identity() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "runtime_code", "provider_kind", "message"),
+    ("mode", "expected_error", "runtime_code", "provider_kind", "message"),
     [
-        ("malformed", AgentRuntimeFailureCode.PROTOCOL, None, None),
-        ("crlf", None, None, "strict LF"),
-        ("nonzero", AgentRuntimeFailureCode.PROCESS_EXIT, None, None),
-        ("nonzero_after", AgentRuntimeFailureCode.PROCESS_EXIT, None, None),
-        ("missing", AgentRuntimeFailureCode.PROTOCOL, None, None),
-        ("interaction", AgentRuntimeFailureCode.POLICY, None, None),
-        ("turns", AgentRuntimeFailureCode.POLICY, None, None),
-        ("tools", AgentRuntimeFailureCode.POLICY, None, None),
-        ("bash", AgentRuntimeFailureCode.POLICY, None, None),
-        ("thinking_off", None, None, "thinking content"),
-        ("reasoning_usage_off", None, None, "reasoning tokens"),
-        ("response_model_drift", None, ProviderFailureKind.MODEL_MISMATCH, None),
-        ("auto_retry", AgentRuntimeFailureCode.POLICY, None, None),
+        (
+            "malformed",
+            AgentExecutionFailure,
+            AgentRuntimeFailureCode.PROTOCOL,
+            None,
+            None,
+        ),
+        ("crlf", AgentResultError, None, None, "strict LF"),
+        (
+            "nonzero",
+            AgentExecutionFailure,
+            AgentRuntimeFailureCode.PROCESS_EXIT,
+            None,
+            None,
+        ),
+        (
+            "nonzero_after",
+            AgentExecutionFailure,
+            AgentRuntimeFailureCode.PROCESS_EXIT,
+            None,
+            None,
+        ),
+        ("missing", AgentExecutionFailure, AgentRuntimeFailureCode.PROTOCOL, None, None),
+        ("interaction", AgentExecutionFailure, AgentRuntimeFailureCode.POLICY, None, None),
+        ("turns", AgentExecutionFailure, AgentRuntimeFailureCode.POLICY, None, None),
+        ("tools", AgentExecutionFailure, AgentRuntimeFailureCode.POLICY, None, None),
+        ("bash", AgentExecutionFailure, AgentRuntimeFailureCode.POLICY, None, None),
+        ("thinking_off", AgentResultError, None, None, "thinking content"),
+        ("reasoning_usage_off", AgentResultError, None, None, "reasoning tokens"),
+        (
+            "response_model_drift",
+            AgentExecutionFailure,
+            None,
+            ProviderFailureKind.MODEL_MISMATCH,
+            None,
+        ),
+        ("auto_retry", AgentExecutionFailure, AgentRuntimeFailureCode.POLICY, None, None),
     ],
 )
 def test_pi_rpc_adapter_fails_closed_and_keeps_redacted_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
+    expected_error: type[AgentExecutionFailure] | type[AgentResultError],
     runtime_code: AgentRuntimeFailureCode | None,
     provider_kind: ProviderFailureKind | None,
     message: str | None,
@@ -992,7 +1017,7 @@ def test_pi_rpc_adapter_fails_closed_and_keeps_redacted_evidence(
         "1.2.3",
         env_resolver=lambda: {"TEST_TOKEN": "very-secret"},
     )
-    with pytest.raises(Exception) as raised:
+    with pytest.raises(expected_error) as raised:
         adapter.run(
             AgentRequest(AgentTask("write"), {}, spec),
             AgentRunContext(

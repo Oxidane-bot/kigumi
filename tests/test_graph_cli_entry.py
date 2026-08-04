@@ -272,11 +272,12 @@ def _positionals(parser: argparse.ArgumentParser) -> list[str]:
     ]
 
 
-def test_registered_commands_and_dispatch_table_agree(tmp_path: Path) -> None:
+def test_registered_commands_and_dispatch_table_agree(tmp_path: Path, monkeypatch, capsys) -> None:
     """教训 unroutable_command: 注册了子命令但没有 handler,等于给出一个会崩的入口。
 
-    只断言"每个命令都能跑"会漏掉反向缺口:dispatch 表里多出的名字永远无法从 CLI
-    到达。两侧都对齐,才能保证注册面与实现面是同一个集合。
+    用 parser 生成有效参数，并让每个替身 handler 返回明确的 0 和输出；这里测试的是
+    路由本身，具体 handler 行为由各自的命令测试覆盖。两侧都对齐,才能保证注册面与实现面
+    是同一个集合。
     """
     dag = Dag(KigumiConfig(project_root=tmp_path, source_dirs=[]), object())  # type: ignore[arg-type]
     registered = set(_graph_commands(_build_cli_parser()))
@@ -284,21 +285,68 @@ def test_registered_commands_and_dispatch_table_agree(tmp_path: Path) -> None:
         "GRAPH_COMMAND_HELP and the registered subcommands disagree"
     )
 
-    dispatched = set()
-    for name in registered:
-        try:
-            dag.run_command(argparse.Namespace(command=name))
-        except KeyError as error:
-            # An unrouted command fails looking up its own name; anything else means
-            # the handler ran and failed later on the deliberately empty fixture.
-            if error.args[:1] == (name,):
-                continue
-            dispatched.add(name)
-        except Exception:
-            dispatched.add(name)
-        else:
-            dispatched.add(name)
-    assert dispatched == registered, f"registered but unroutable: {sorted(registered - dispatched)}"
+    expected_handlers = {
+        "check": "_cli_check",
+        "plan": "_cli_plan",
+        "graph": "_cli_graph",
+        "profile": "_cli_profile",
+        "explain": "_cli_explain",
+        "describe": "_cli_describe",
+        "resume": "_cli_resume",
+        "retry-resolve": "_cli_retry_resolve",
+        "recover": "_cli_recover",
+    }
+    argv_by_command = {
+        "check": ["check"],
+        "plan": ["plan"],
+        "graph": ["graph"],
+        "profile": ["profile"],
+        "explain": ["explain", "example"],
+        "describe": ["describe"],
+        "resume": ["resume", "run-1"],
+        "retry-resolve": [
+            "retry-resolve",
+            "run-1",
+            "example",
+            "--attempt",
+            "1",
+            "--action",
+            "fail",
+            "--reason",
+            "test",
+        ],
+        "recover": [
+            "recover",
+            "run-1",
+            "example",
+            "--attempt",
+            "1",
+            "--decision",
+            "fail",
+            "--reason",
+            "test",
+        ],
+    }
+    assert set(expected_handlers) == registered
+    assert set(argv_by_command) == registered
+
+    parser = _build_cli_parser()
+    dispatched: list[str] = []
+    for name in sorted(registered):
+        handler_name = expected_handlers[name]
+
+        def handler(args, *, command=name, target=handler_name):
+            assert args.command == command
+            dispatched.append(command)
+            print(f"dispatched {target}")
+            return 0
+
+        monkeypatch.setattr(dag, handler_name, handler)
+        args = parser.parse_args(argv_by_command[name])
+        assert dag.run_command(args) == 0
+        assert capsys.readouterr().out == f"dispatched {handler_name}\n"
+
+    assert dispatched == sorted(registered)
 
     table = inspect.getsource(Dag.run_command)
     for name in re.findall(r'"([a-z-]+)": self\._cli_', table):
@@ -337,6 +385,21 @@ def test_init_scaffolds_a_runnable_graph_entry(tmp_path: Path, monkeypatch, caps
         symbol = name.strip()
         if symbol:
             assert hasattr(kigumi, symbol), f"skeleton imports kigumi.{symbol}, which is missing"
+
+
+def test_init_scaffolds_a_graph_that_can_execute(tmp_path: Path, monkeypatch) -> None:
+    """The generated node must satisfy the runtime ``(inputs, ctx)`` contract."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    assert main(["init"]) == 0
+    importlib.invalidate_caches()
+    graph = importlib.import_module("nodes.graph")
+
+    result = graph.build_dag().run(run_id="init-generated")
+
+    assert result.artifacts["example"] == {"ok": "replace me"}
 
 
 def test_graph_command_without_dag_entry_names_the_fix(tmp_path: Path, monkeypatch, capsys) -> None:

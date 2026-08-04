@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from kigumi import CacheIntegrityError
+from kigumi.store import node_cache_path
 from tests._dag_helpers import _build_scan_dag, _make_dag
 
 
@@ -123,6 +125,37 @@ def test_scan_preserves_completed_prefix_after_item_failure(tmp_path: Path) -> N
     result = dag.run()
 
     assert result.map_items["chain"] == {"a": "hit", "b": "miss", "c": "miss"}
+
+
+def test_scan_run_preserves_cache_integrity_error_for_corrupt_item(
+    tmp_path: Path,
+) -> None:
+    """损坏的动态 item cache 必须 fail closed,且保留公开异常类型。"""
+    dag, executed = _build_scan_dag(
+        tmp_path,
+        [
+            {"id": "a", "value": 1},
+            {"id": "b", "value": 2},
+            {"id": "c", "value": 3},
+        ],
+    )
+    result = dag.run()
+    executed.clear()
+
+    sidecar = json.loads(
+        (tmp_path / "artifacts" / "runs" / result.run_id / "chain.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    cache_key = sidecar["cache_key"][0]
+    cache_path = node_cache_path(tmp_path / "artifacts", cache_key)
+    cache_path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(CacheIntegrityError) as error:
+        dag.run()
+
+    assert error.value.path == cache_path
+    assert executed == []
 
 
 def test_scan_plan_forecasts_prefix_and_matches_execution(tmp_path: Path) -> None:

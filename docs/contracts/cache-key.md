@@ -1,12 +1,12 @@
 # 缓存键契约
 
-Status: Active (0.9.0)
+Status: Active (0.11.0)
 
-> Unreleased：`CACHE_SCHEMA=7`，node cache envelope schema 3 保持不变；
+> v0.11.0 已发布 `CACHE_SCHEMA=7`，node cache envelope schema 3 保持不变；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
 > 硬切，不迁移 0.7.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
-> 本次 `libs` 按节点静态 import 闭包细化，沿用这个尚未发布的 7 轮换，不再把
+> 本次 `libs` 按节点静态 import 闭包细化，沿用这个已发布的 7 轮换，不再把
 > `CACHE_SCHEMA` 递增为 8。
 
 ## Purpose
@@ -113,9 +113,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    origin provenance、Agent schema 2 和 evidence miss 语义。0.7.0 再从 4 升至 5，并把
    envelope 升至 schema 3，以引入声明式 Prompt resolution、selected-only L3 成分和
    hash-bound origin。0.8.0 从 5 升至 6，以引入 `agent_schema=3` 的 session attachment
-   与 Agent scan executor 语义。Unreleased 从 6 升至 7，以绑定 managed request 的
+   与 Agent scan executor 语义。0.11.0 从 6 升至 7，以绑定 managed request 的
    attachment content hash、typed message digest 和 response schema identity；本次 `libs`
-   细化搭载同一未发布的 7 轮换，不新增第 8 次全项目换族。
+   细化搭载同一已发布的 7 轮换，不新增第 8 次全项目换族。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash

@@ -1256,6 +1256,13 @@ def _is_dynamic_lookup_expression(
     builtin_module_aliases: set[str],
 ) -> bool:
     if isinstance(expression, ast.Subscript):
+        # A statically named ``open`` lookup is an opaque raw-I/O callable and
+        # must remain a hard registration failure.  Other ``builtins.__dict__``
+        # lookups retain the import-analysis fallback boundary: the DAG import
+        # scanner handles dynamic imports, while the raw-I/O guard must not
+        # turn ``builtins.__dict__["__import__"]`` into a file-read finding.
+        if _is_builtin_dict_subscript(expression, builtin_module_aliases):
+            return _is_builtin_dict_raw_lookup(expression, builtin_module_aliases)
         return _is_dynamic_lookup_call(
             expression.value,
             dynamic_aliases=dynamic_aliases,
@@ -1316,10 +1323,28 @@ def _is_builtin_dict_lookup(
     expression: ast.AST,
     builtin_module_aliases: set[str],
 ) -> bool:
+    return _is_builtin_dict_raw_lookup(expression, builtin_module_aliases)
+
+
+def _is_builtin_dict_subscript(
+    expression: ast.AST,
+    builtin_module_aliases: set[str],
+) -> bool:
     return isinstance(expression, ast.Subscript) and _is_builtin_dict_attribute(
         expression.value,
         builtin_module_aliases,
     )
+
+
+def _is_builtin_dict_raw_lookup(
+    expression: ast.AST,
+    builtin_module_aliases: set[str],
+) -> bool:
+    if not _is_builtin_dict_subscript(expression, builtin_module_aliases):
+        return False
+    assert isinstance(expression, ast.Subscript)
+    key = expression.slice
+    return isinstance(key, ast.Constant) and key.value == "open"
 
 
 def _is_builtin_module_binding(expression: ast.AST, builtin_module_aliases: set[str]) -> bool:

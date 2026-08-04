@@ -123,6 +123,144 @@ def test_registration_rejects_raw_io_waiver_without_a_reason(tmp_path: Path) -> 
             return {"text": (tmp_path / "input.txt").read_text()}  # kigumi: raw-io-ok
 
 
+def test_registration_hard_fails_dynamic_callables_and_their_aliases(tmp_path: Path) -> None:
+    """注册入口必须执行动态解析硬切，而不是只依赖独立 AST 测试。"""
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError) as caught:
+
+        @dag.node("dynamic-callables")
+        def dynamic_callables(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+            method_name = "read_text"
+            globals_alias = globals
+            locals_alias = locals
+            getattr_alias = getattr
+            eval_alias = eval
+            exec_alias = exec
+            import_alias = __import__
+            return {
+                "globals": globals(),
+                "globals_alias": globals_alias(),
+                "locals": locals(),
+                "locals_alias": locals_alias(),
+                "getattr": getattr(Path, method_name),
+                "getattr_alias": getattr_alias(Path, "read_text"),
+                "eval": eval("1"),
+                "eval_alias": eval_alias("1"),
+                "exec": exec("pass"),
+                "exec_alias": exec_alias("pass"),
+                "import": __import__("pathlib"),
+                "import_alias": import_alias("pathlib"),
+            }
+
+    message = str(caught.value)
+    assert "Raw file reads are not allowed" in message
+    for snippet in (
+        "globals()",
+        "globals_alias()",
+        "locals()",
+        "locals_alias()",
+        "getattr(Path, method_name)",
+        'getattr_alias(Path, "read_text")',
+        'eval("1")',
+        'eval_alias("1")',
+        'exec("pass")',
+        'exec_alias("pass")',
+        '__import__("pathlib")',
+        'import_alias("pathlib")',
+    ):
+        assert snippet in message
+
+
+def test_registration_hard_fails_nested_classes_and_reachable_instance_method_alias(
+    tmp_path: Path,
+) -> None:
+    """nested class 与其可达的实例方法别名都必须在注册期被拒绝。"""
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError) as class_error:
+
+        @dag.node("nested-class")
+        def nested_class(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+
+            class Reader:
+                def read(self) -> str:
+                    return "controlled"
+
+            return {"reader": Reader}
+
+    assert "class Reader:" in str(class_error.value)
+
+    with pytest.raises(ValueError) as alias_error:
+
+        @dag.node("nested-method-alias")
+        def nested_method_alias(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs, ctx
+
+            class Reader:
+                def read(self) -> str:
+                    return Path("secret.txt").read_text()
+
+            reader = Reader()
+            method = reader.read
+            return {"text": method()}
+
+    alias_message = str(alias_error.value)
+    assert "class Reader:" in alias_message
+    assert 'return Path("secret.txt").read_text()' in alias_message
+
+
+def test_registration_allows_context_bound_reads(tmp_path: Path) -> None:
+    """ctx.read_text/read_bytes remain the approved declared-input boundary."""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("context-reads")
+    def context_reads(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        return {
+            "text": ctx.read_text("input.txt"),
+            "bytes": ctx.read_bytes("input.bin"),
+        }
+
+    assert context_reads.__name__ == "context_reads"
+
+
+def test_registration_rejects_every_direct_context_getattr_form(tmp_path: Path) -> None:
+    """getattr 的结果即使不立即调用，也不能绕过节点边界。"""
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("dynamic-context-reader-assignment")
+        def dynamic_context_reader_assignment(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs
+            reader = getattr(ctx, "read_text")  # noqa: B009 -- hard-cut regression probe.
+            return {"reader": reader}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("dynamic-context-reader-return")
+        def dynamic_context_reader_return(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs
+            return {"reader": getattr(ctx, "read_text")}  # noqa: B009
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("dynamic-context-params")
+        def dynamic_context_params(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs
+            return {"params": getattr(ctx, "params")}  # noqa: B009
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("dynamic-context-reader-call")
+        def dynamic_context_reader_call(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs
+            return {"text": getattr(ctx, "read_text")("input.txt")}  # noqa: B009
+
+
 def test_foreach_fixes_generator_declarations_for_every_item(tmp_path: Path) -> None:
     """教训 generator_exhaustion: 生成器声明只固定一次,第二项不允许静默变空。"""
     shared = tmp_path / "shared.txt"

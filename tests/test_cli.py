@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,44 @@ def test_init_creates_default_layout_and_refuses_repeat(
     assert 'agent_lock_dir = "artifacts/_locks/agents"' in config_text
     assert main(["init"]) == 1
     assert "already exists" in capsys.readouterr().err
+
+
+def test_installed_console_script_init_check_and_generated_graph_run(tmp_path: Path) -> None:
+    """The installed command must scaffold and execute a real downstream graph."""
+    executable = Path(sys.executable).with_name("kigumi")
+    assert executable.is_file(), f"expected installed console script at {executable}"
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
+
+    def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(executable), *arguments],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    initialized = run_cli("init")
+    assert initialized.returncode == 0, initialized.stderr
+    checked = run_cli("check")
+    assert checked.returncode == 0, checked.stderr
+
+    executed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from nodes.graph import build_dag; "
+                "result = build_dag().run(run_id='installed-init'); "
+                "assert result.artifacts['example'] == {'ok': 'replace me'}"
+            ),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert executed.returncode == 0, executed.stderr
 
 
 def test_init_hooks_refuses_existing_hook_and_missing_pyproject(

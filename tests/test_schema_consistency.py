@@ -19,6 +19,10 @@ from kigumi.prompt import PROMPT_RESOLUTION_SCHEMA
 from kigumi.store import _NODE_CACHE_ENVELOPE_SCHEMA
 
 ROOT = Path(__file__).resolve().parents[1]
+CHANGELOG_RELEASE_PATTERN = re.compile(
+    r"^## \[(?P<version>\d+\.\d+\.\d+)\](?: - \d{4}-\d{2}-\d{2})?$",
+    re.MULTILINE,
+)
 
 CODE_SCHEMAS: dict[str, int] = {
     "CACHE_SCHEMA": CACHE_SCHEMA,
@@ -282,6 +286,42 @@ def test_documented_schema_values_match_code() -> None:
             )
 
     assert not mismatches, "Schema documentation drift:\n" + "\n".join(mismatches)
+
+
+def test_cache_schema_seven_is_recorded_in_a_released_changelog_section() -> None:
+    """CACHE_SCHEMA=7 is a released cache-family rotation, not an Unreleased claim."""
+    assert CACHE_SCHEMA == 7
+
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = list(CHANGELOG_RELEASE_PATTERN.finditer(changelog))
+    assert headings, "CHANGELOG.md must contain dated release sections"
+
+    unreleased_end = headings[0].start()
+    unreleased = changelog[:unreleased_end]
+    assert not re.search(r"CACHE_SCHEMA\s*(?:=|升至)\s*7\b", unreleased)
+
+    released_sections: list[tuple[str, str]] = []
+    for index, heading in enumerate(headings):
+        body_end = headings[index + 1].start() if index + 1 < len(headings) else len(changelog)
+        released_sections.append((heading.group("version"), changelog[heading.end() : body_end]))
+
+    rotations = [
+        version
+        for version, body in released_sections
+        if re.search(r"CACHE_SCHEMA[^\n]*(?:升至|=)\s*7\b", body)
+    ]
+    assert rotations, "CACHE_SCHEMA=7 must be introduced by a dated release section"
+
+    stale_claims = [
+        version
+        for version, body in released_sections
+        if re.search(r"CACHE_SCHEMA|schema\s+7", body, re.IGNORECASE)
+        and re.search(r"尚未发布|未发布", body)
+    ]
+    assert not stale_claims, (
+        "Released CHANGELOG sections must not describe CACHE_SCHEMA=7 as unreleased: "
+        + ", ".join(stale_claims)
+    )
 
 
 def test_documented_schema_claims_join_wrapped_lines_and_report_start(

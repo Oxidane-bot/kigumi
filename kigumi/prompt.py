@@ -541,12 +541,12 @@ def validate_prompt_resolution_record(value: Any) -> None:
     """Validate one persisted schema-1 resolution without reconstructing Prompt text."""
     if not isinstance(value, Mapping) or value.get("prompt_resolution_schema") != 1:
         raise PromptResolutionError("persisted Prompt resolution has invalid schema")
-    digest = value.get("resolution_digest")
-    if not isinstance(digest, str):
-        raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-
     extension_keys = {"messages", "attachments", "response_spec"}
-    if not extension_keys & set(value):
+    present_extension_keys = extension_keys & set(value)
+    if not present_extension_keys:
+        digest = value.get("resolution_digest")
+        if not isinstance(digest, str):
+            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
         # Accept schema-1 records written before managed request fields existed. They
         # remain subject to the old digest check, while every newly written record
         # uses the content-addressed request digest below.
@@ -564,13 +564,23 @@ def validate_prompt_resolution_record(value: Any) -> None:
         if digest != sha(legacy_body):
             raise PromptResolutionError("persisted Prompt resolution failed digest validation")
     else:
+        missing_extension_keys = extension_keys - present_extension_keys
+        if missing_extension_keys:
+            missing = ", ".join(sorted(missing_extension_keys))
+            raise PromptResolutionError(
+                "persisted Prompt resolution has incomplete managed request fields; "
+                f"missing: {missing}"
+            )
+        digest = value.get("resolution_digest")
+        if not isinstance(digest, str):
+            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
         try:
             messages = [
                 Message(
                     role=record["role"],
                     parts=list(record["parts"]),
                 )
-                for record in value.get("messages", [])
+                for record in value["messages"]
             ]
             attachments = [
                 Attachment(
@@ -579,9 +589,9 @@ def validate_prompt_resolution_record(value: Any) -> None:
                     mime_type=record["mime_type"],
                     size_bytes=record["size_bytes"],
                 )
-                for record in value.get("attachments", [])
+                for record in value["attachments"]
             ]
-            response_spec_value = value.get("response_spec", {})
+            response_spec_value = value["response_spec"]
             if not isinstance(response_spec_value, Mapping):
                 raise TypeError("response_spec must be a mapping")
             response_spec = ResponseSpec(
@@ -718,7 +728,9 @@ def _prompt_digest(resolution: PromptResolution) -> str:
     body = resolution._body()
     # Preserve the original resolution provenance in the digest, but never make an
     # attachment's source path part of content identity. FileRef records retain
-    # their binding and content hash while dropping only the resolved path.
+    # their binding and content hash while dropping only the resolved path. MIME
+    # and byte count remain manifest/preflight metadata; content_hash is the
+    # attachment identity for Prompt lineage.
     body["attachments"] = [attachment.content_hash for attachment in resolution.attachments]
     body["materials"] = [
         {

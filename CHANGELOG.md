@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-04
+
+### 重大变更
+
+- Durable retry/resume 现在以 per-target append-only receipt chain 绑定 run state、attempt receipt
+  与 manifest；链缺失、断裂、回退、分叉或摘要不一致均 fail closed，已开始的外部副作用不会因
+  receipt 缺失而被重放。该完整性链是 Greenfield 硬切格式，不改变默认 `retry=None` 语义。
+- 守卫环对可达 helper、raw callable 别名、callback 与 opaque 动态调用采用更明确的静态边界；
+  nested class、`globals`/`locals`/`getattr`/`eval`/`exec`/`__import__` 等结构按硬切规则拒绝，
+  `raw-llm-ok` 与 `raw-io-ok` 仍保持独立且必须说明理由。
+- `kigumi init` 生成的 DAG 示例可直接执行；wheel 与 sdist 的安装后 CLI、文档、生成图运行和
+  metadata 均纳入发行物 smoke 验证。
+
+### 修复
+
+- 收紧 blob 与原始文件输入的 regular-file、descriptor-bound 和 preflight 边界，避免 FIFO、设备、
+  symlink、TOCTOU 与错误内容 blob 穿透校验。
+- 输出物化改为可回滚提交，失败时恢复 output ownership 与 staging；managed PromptResolution
+  缺失必需字段时 fail closed。
+- `Dag.plan`、scan、EvidencePolicy、workers 与损坏 cache 的错误路径统一为不重算的 fail-closed
+  行为，并补齐真实安装入口和发行物测试语义。
+
+### 兼容性
+
+- 本次不修改缓存键成分，也不新增缓存族；现有 `CACHE_SCHEMA=7` 继续沿用。
+
 ## [0.12.0] - 2026-08-03
 
 ### 新功能
@@ -46,7 +72,7 @@
   subject/metric 运行结果覆盖分开；这是报告格式变化，不轮换缓存族，`CACHE_SCHEMA` 不变。
 - **缓存族轮换**:`CACHE_SCHEMA` 升至 7。提示摘要现纳入附件内容哈希与响应 schema 标识,
   L1 调用缓存条目也开始写 `response_sha256`,因此旧缓存整体失效,首次运行会重新计费。
-  本次 `libs` 改为按节点静态 import 闭包取值，沿用这次尚未发布的 7 轮换，不再新增
+  本次 `libs` 改为按节点静态 import 闭包取值，沿用这次已发布的 7 轮换，不再新增
   `CACHE_SCHEMA=8` 的第二次全项目缓存换族。
 - 附件成为 `PromptResolution` 的一等成员(`Attachment` / `Message` / `ResponseSpec`),
   `FileRef` 端到端可用:换掉一个附件的内容就换缓存键,不再复用按旧文件算出的响应。
@@ -115,7 +141,7 @@
   在 `sys.path` 中的相对顺序。相对导入携带实际限定模块名并校验所有加载前缀，
   向上导入使用 climb 后的 package suffix；`ImportFrom` child 只有在 base 模块顶层 AST 明确
   证明为属性绑定时才保持节点粒度，缺失的 canonical `sys.modules` 条目也按不确定处理。这是
-  `CACHE_SCHEMA=7` 尚未发布期间的正确性修复，
+  `CACHE_SCHEMA=7` 已发布后的正确性修复，
   不新增缓存族轮换；该边界是源码 AST 分析，不宣称覆盖任意外部/native 运行时代码。
 - 继续修复 `libs` 残余粒度与 owner 边界：单参数/partial 绑定的 owner 查找、closure 别名、
   下标选择 lookup、实际到达的 nested function/class body/直接调用 Python function graph 都参与
@@ -135,7 +161,7 @@
   mapping hook、descriptor、partial subclass hook 或 custom metaclass hook。
 - 普通节点、map、scan、plan 与 explain 现在共用上述有效 L3 策略：不可复用时不再读取/写入残留
   cache，空 map/scan 也不会因 `all([])` 被误报为 aggregate hit。确定性 key、run manifest 与
-  resume/recover 保持稳定，不使用随机 nonce。这些修复搭载未发布的 `CACHE_SCHEMA=7`，不新增
+  resume/recover 保持稳定，不使用随机 nonce。这些修复搭载已发布的 `CACHE_SCHEMA=7`，不新增
   缓存族轮换。
 - 修复 `kigumi runs show` 的 recovery 建议：参数改为 shell-safe 命令渲染，要求在 `recover` 与
   随后的 `resume` 两条命令中都补回构造该 run 时使用的同一组实际重复

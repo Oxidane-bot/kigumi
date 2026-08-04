@@ -10,8 +10,11 @@ from typing import Any
 import pytest
 
 from kigumi import Dag, OutputOwnershipError
+from kigumi._execution import ExecutionEnvelope
+from kigumi.blobs import BlobStore
 from kigumi.calling import LLMCaller
 from kigumi.config import KigumiConfig
+from kigumi.store import materialize_artifact
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -20,6 +23,17 @@ def _make_dag(tmp_path: Path) -> Dag:
     config = KigumiConfig(project_root=tmp_path, source_dirs=[])
     transport = FakeTransport(repeat(Response("model output", {"total_tokens": 1}, "stop")))
     return Dag(config, LLMCaller(transport, tmp_path / "llm"))
+
+
+def _make_envelope(tmp_path: Path) -> ExecutionEnvelope:
+    return ExecutionEnvelope(
+        artifacts_path=tmp_path / "artifacts",
+        run_id="run-0001",
+        resolve=lambda path: tmp_path / path,
+        blob_store=BlobStore(tmp_path / "artifacts" / "_cache" / "blobs"),
+        ensure_archive_id=lambda: "0001",
+        approval_path=lambda name: tmp_path / "approvals" / name,
+    )
 
 
 def test_serial_output_collision_preserves_winner_and_claims_atomically(tmp_path: Path) -> None:
@@ -254,6 +268,138 @@ def test_text_and_nested_blob_duplicate_is_rejected_before_writing(tmp_path: Pat
         dag.run()
 
     assert not (tmp_path / "result.bin").exists()
+
+
+@pytest.mark.parametrize("blob_state", ["missing", "corrupt"])
+def test_mixed_text_and_blob_failure_leaves_no_project_text(
+    tmp_path: Path, blob_state: str
+) -> None:
+    blobs = BlobStore(tmp_path / "artifacts" / "_cache" / "blobs")
+    digest = "a" * 64
+    if blob_state == "corrupt":
+        blobs.root.mkdir(parents=True)
+        (blobs.root / digest).write_bytes(b"wrong bytes")
+
+    artifact = {
+        "files": {"first.txt": "written-before-failure"},
+        "nested": {
+            "blob": {
+                "kigumi_blob": digest,
+                "path": "second.bin",
+                "bytes": 3,
+            }
+        },
+    }
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        materialize_artifact(artifact, "mixed", lambda path: tmp_path / path, blobs)
+
+    assert not (tmp_path / "first.txt").exists()
+    assert not (tmp_path / "second.bin").exists()
+
+
+def test_commit_failure_rolls_back_all_prior_text_and_blob_replacements(
+    tmp_path: Path,
+) -> None:
+    blobs = BlobStore(tmp_path / "artifacts" / "_cache" / "blobs")
+    first = tmp_path / "first.txt"
+    first.write_text("original", encoding="utf-8")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "keep.txt").write_text("keep", encoding="utf-8")
+    first_digest = blobs.put(b"first blob")
+    second_digest = blobs.put(b"second blob")
+
+    artifact = {
+        "files": {
+            "first.txt": "replacement",
+            "new/second.txt": "new text",
+        },
+        "nested": {
+            "blobs": [
+                {"kigumi_blob": first_digest, "path": "first.bin", "bytes": 10},
+                {"kigumi_blob": second_digest, "path": "blocked", "bytes": 11},
+            ]
+        },
+    }
+
+    with pytest.raises(IsADirectoryError):
+        materialize_artifact(artifact, "transaction", lambda path: tmp_path / path, blobs)
+
+    assert first.read_text(encoding="utf-8") == "original"
+    assert not (tmp_path / "new").exists()
+    assert not (tmp_path / "first.bin").exists()
+    assert blocked.is_dir()
+    assert (blocked / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert not list(tmp_path.glob(".kigumi-materialize-*"))
+
+
+def test_failed_materialization_releases_provisional_output_ownership(
+    tmp_path: Path,
+) -> None:
+    envelope = _make_envelope(tmp_path)
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+
+    with pytest.raises(IsADirectoryError):
+        envelope.materialize(
+            "failed-node",
+            {"files": {"claimed.txt": "written-before-failure", "blocked": "not-written"}},
+        )
+
+    envelope.materialize("later-node", {"files": {"claimed.txt": "later"}})
+
+    assert (tmp_path / "claimed.txt").read_text(encoding="utf-8") == "later"
+
+
+def test_item_owner_rematerialization_preserves_the_original_owner(
+    tmp_path: Path,
+) -> None:
+    envelope = _make_envelope(tmp_path)
+    envelope.materialize("render@a", {"files": {"shared.txt": "item"}})
+
+    envelope.materialize(
+        "render",
+        {"files": {"shared.txt": "aggregate"}},
+        allow_item_owners=True,
+    )
+
+    with pytest.raises(OutputOwnershipError, match="render@a.*other"):
+        envelope.materialize("other", {"files": {"shared.txt": "other"}})
+
+    assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "aggregate"
+
+
+def test_claim_failure_does_not_commit_or_leave_staging(tmp_path: Path) -> None:
+    blobs = BlobStore(tmp_path / "artifacts" / "_cache" / "blobs")
+    digest = blobs.put(b"blob")
+    existing = tmp_path / "existing.txt"
+    existing.write_text("original", encoding="utf-8")
+    claimed: list[Path] = []
+
+    def reject(outputs: tuple[Path, ...]) -> None:
+        claimed.extend(outputs)
+        raise OutputOwnershipError("claim rejected")
+
+    artifact = {
+        "files": {"existing.txt": "replacement", "new.txt": "new text"},
+        "nested": {"blob": {"kigumi_blob": digest, "path": "new.bin", "bytes": 4}},
+    }
+
+    with pytest.raises(OutputOwnershipError, match="claim rejected"):
+        materialize_artifact(
+            artifact,
+            "claim-failure",
+            lambda path: tmp_path / path,
+            blobs,
+            claim=reject,
+        )
+
+    assert claimed == [tmp_path / "existing.txt", tmp_path / "new.txt", tmp_path / "new.bin"]
+    assert existing.read_text(encoding="utf-8") == "original"
+    assert not (tmp_path / "new.txt").exists()
+    assert not (tmp_path / "new.bin").exists()
+    assert not list(tmp_path.glob(".kigumi-materialize-*"))
 
 
 def test_cache_hit_can_rematerialize_output_for_same_producer(tmp_path: Path) -> None:

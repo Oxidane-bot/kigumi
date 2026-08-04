@@ -79,8 +79,9 @@ def build_dag() -> Dag:
     dag = Dag(config, caller)
 
     @dag.node("example", prompt_specs=())
-    def example(ctx) -> dict[str, str]:
+    def example(inputs, ctx) -> dict[str, str]:
         """Replace this with a real node; the docstring is required by `check`."""
+        del inputs, ctx
         return {"ok": "replace me"}
 
     return dag
