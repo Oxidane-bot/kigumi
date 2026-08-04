@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from ._safe_io import SecureDirectory, _open_regular_file_at
+from ._safe_io import SecureDirectory, _open_regular_file_at, _secure_directory_absolute
 from ._safe_io import atomic_write_json as _path_atomic_write_json
 from .artifacts import canonical_json, sha
 from .failures import canonical_failure
@@ -265,7 +265,15 @@ def validate_run_path(run_root: Path) -> Path:
     component is inspected with ``lstat`` so the check never follows a link.
     """
     path = Path(run_root)
-    absolute = Path(os.path.abspath(path))
+    try:
+        # SecureDirectory has the same narrow normalization: only the stable
+        # macOS system aliases are canonicalized.  Do not use realpath here;
+        # user-controlled symlinks must remain visible to this lstat walk.
+        absolute = _secure_directory_absolute(path)
+    except (OSError, ValueError) as error:
+        raise RunManifestError(
+            f"Durable run path ownership cannot be checked safely at {path}: {error}"
+        ) from error
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
@@ -293,7 +301,7 @@ class AttemptStore:
         self._run_directory: SecureDirectory | None = None
         self._receipt_chain_lock = threading.RLock()
         self._run_lock_local = threading.local()
-        absolute_root = Path(os.path.abspath(self.run_root))
+        absolute_root = _secure_directory_absolute(self.run_root)
         lock_name = f".kigumi-run-{sha(str(absolute_root))}.lock"
         self._run_lock_path = absolute_root.parent / lock_name
         self._target_leases: dict[str, tuple[str, Any]] = {}

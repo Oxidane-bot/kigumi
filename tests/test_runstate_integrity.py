@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -135,6 +136,25 @@ def test_attempt_store_rejects_symlinked_run_root_and_runs_root(tmp_path: Path) 
 
     with pytest.raises(RunManifestError, match="symlink"):
         AttemptStore(linked_artifacts / "runs" / "run", {}).initialize()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS root aliases are not present")
+def test_attempt_store_accepts_standard_macos_tempfile_path() -> None:
+    system_var = Path("/var")
+    if not system_var.is_symlink() or system_var.resolve(strict=True) != Path("/private/var"):
+        pytest.skip("host does not expose the macOS /var alias")
+
+    with tempfile.TemporaryDirectory(prefix="kigumi-runstate-") as directory:
+        root = Path(directory)
+        if system_var not in root.parents:
+            pytest.skip("temporary directory did not retain the /var spelling")
+
+        store = AttemptStore(root / "artifacts" / "runs" / "run", {})
+        store.initialize()
+        canonical_store = AttemptStore(root.resolve() / "artifacts" / "runs" / "run", {})
+
+        assert (store.run_root / "_run.json").is_file()
+        assert store._run_lock_path == canonical_store._run_lock_path
 
 
 @pytest.mark.parametrize("scope", ["run", "runs"])
