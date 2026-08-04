@@ -56,9 +56,10 @@ It is an unverified convenience label: the environment variables are freely
 settable, and the receipt does not record which source supplied the value. Treat
 it as a hint about who ran the recovery, not as an attestation.
 
-`recover()` takes no lock. It rejects a run that is still `running`, so it cannot
-race an executing run, but two concurrent `recover()` calls against the same
-terminally failed run are not serialised.
+`Dag.recover()` 的整个调用不由一把事务锁包住：`AttemptStore` 会为 durable state、receipt
+和 manifest 的读改写使用 run lock，但 recovery receipt 的写入仍在该边界之外。因此两个
+并发 `recover()` 调用不能被宣称为一个原子事务；调用方应处理其中一次在当前失败 attempt
+已被排队后拒绝的情况。
 
 Attempt receipts are append-only across recovery. Completed nodes from the
 failed run remain run-local evidence and are revalidated as inherited nodes;

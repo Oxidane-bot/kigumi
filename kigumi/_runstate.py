@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import threading
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +21,11 @@ RUN_SIDECAR_SCHEMA = 2
 FAILURE_SCHEMA = 2
 SUCCESS_CANDIDATE_SCHEMA = 2
 ATTEMPT_RECEIPT_SCHEMA = 2
+_STATE_DIGEST_FIELD = "state_sha256"
+_RECEIPT_SEQUENCE_FIELD = "receipt_sequence"
+_PREVIOUS_RECEIPT_DIGEST_FIELD = "previous_receipt_sha256"
+_RECEIPT_CHAIN_FIELD = "attempt_receipt_chains"
+_TARGET_OWNER_FIELD = "target_owner_token"
 
 
 def utc_now() -> datetime:
@@ -56,72 +66,165 @@ class AttemptStore:
         self.run_root = run_root
         self.manifest_path = run_root / "_run.json"
         self.identity = json.loads(canonical_json(manifest_identity))
+        self._receipt_chain_lock = threading.RLock()
+        self._run_lock_local = threading.local()
+        resolved_root = run_root.resolve()
+        lock_name = f".kigumi-run-{sha(str(resolved_root))}.lock"
+        self._run_lock_path = resolved_root.parent / lock_name
+        self._target_leases: dict[str, tuple[str, Any]] = {}
+
+    @contextmanager
+    def _run_locked(self) -> Iterator[None]:
+        """Serialize one run's durable read-modify-write transactions.
+
+        The advisory lock lives beside, rather than inside, the run directory so
+        its existence cannot turn a manifest-less legacy directory into a new
+        durable run.  The thread-local depth makes this lock safely re-entrant
+        for helpers such as ``prepare`` -> ``_write_state``.
+        """
+        with self._receipt_chain_lock:
+            depth = getattr(self._run_lock_local, "depth", 0)
+            if depth:
+                self._run_lock_local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._run_lock_local.depth = depth
+                return
+
+            self._run_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._run_lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._run_lock_local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._run_lock_local.depth = 0
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _target_lock_path(self, target: str, owner_token: str) -> Path:
+        return self._run_lock_path.with_name(
+            f"{self._run_lock_path.name}.target-{sha(target)}-{owner_token}.lock"
+        )
+
+    def _acquire_target_lease(self, target: str, owner_token: str | None = None) -> bool:
+        """Claim an active target attempt until it leaves execution.
+
+        The descriptor-backed flock is released by the operating system if the
+        owning process dies.  A second live executor therefore gets an explicit
+        busy error instead of restarting the same attempt and potentially
+        crossing the external side-effect boundary twice.
+        """
+        if target in self._target_leases:
+            return False
+        token = owner_token or uuid.uuid4().hex
+        path = self._target_lock_path(target, token)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            handle.close()
+            raise RunManifestError(
+                f"Target {target!r} busy: another executor owns its active attempt"
+            ) from error
+        self._target_leases[target] = (token, handle)
+        return True
+
+    def _target_owner_token(self, target: str) -> str:
+        lease = self._target_leases.get(target)
+        if lease is None:
+            raise RunManifestError(f"Target {target!r} has no active owner lease")
+        return lease[0]
+
+    def _release_target_lease(self, target: str) -> None:
+        lease = self._target_leases.pop(target, None)
+        if lease is None:
+            return
+        _, handle = lease
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def _clear_target_owner(self, target: str, state: dict[str, Any]) -> None:
+        state.pop(_TARGET_OWNER_FIELD, None)
+        self._release_target_lease(target)
 
     def initialize(self) -> dict[str, Any]:
         """Create a new manifest or fail closed against an existing run."""
-        self.run_root.mkdir(parents=True, exist_ok=True)
-        existing, corrupted = self._read_json_safe(self.manifest_path)
-        if corrupted:
-            raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
-        if existing is None:
-            if any(self.run_root.iterdir()):
+        with self._run_locked():
+            self.run_root.mkdir(parents=True, exist_ok=True)
+            existing, corrupted = self._read_json_safe(self.manifest_path)
+            if corrupted:
+                raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
+            if existing is None:
+                if any(self.run_root.iterdir()):
+                    raise RunManifestError(
+                        f"Run {self.run_root.name!r} predates run manifest schema 2 and "
+                        "cannot be resumed"
+                    )
+                now = iso_now()
+                manifest = {
+                    "run_manifest_schema": RUN_MANIFEST_SCHEMA,
+                    **self.identity,
+                    "status": "running",
+                    "created_at": now,
+                    "updated_at": now,
+                    _RECEIPT_CHAIN_FIELD: {},
+                }
+                atomic_write_json(self.manifest_path, manifest)
+                return manifest
+            if existing.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
                 raise RunManifestError(
-                    f"Run {self.run_root.name!r} predates run manifest schema 2 and "
-                    "cannot be resumed"
+                    f"Run {self.run_root.name!r} has an unsupported manifest schema"
                 )
-            now = iso_now()
-            manifest = {
-                "run_manifest_schema": RUN_MANIFEST_SCHEMA,
-                **self.identity,
-                "status": "running",
-                "created_at": now,
-                "updated_at": now,
-            }
-            atomic_write_json(self.manifest_path, manifest)
-            return manifest
-        if existing.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
-            raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
-        expected = {
-            key: value
-            for key, value in existing.items()
-            if key
-            not in {
-                "status",
-                "created_at",
-                "updated_at",
-                "pending_retries",
-                "ambiguous_attempts",
-                "failure",
-                "resume_count",
-                "last_resumed_at",
-                "workflow_profile",
-                "workflow_profile_digest",
-            }
-        }
-        actual = {
-            "run_manifest_schema": RUN_MANIFEST_SCHEMA,
-            **{
+            self._validate_receipt_chain_map(existing)
+            expected = {
                 key: value
-                for key, value in self.identity.items()
-                if key not in {"workflow_profile", "workflow_profile_digest"}
-            },
-        }
-        if expected != actual:
-            changed = sorted(
-                key for key in set(expected) | set(actual) if expected.get(key) != actual.get(key)
-            )
-            raise RunManifestError(
-                f"Run {self.run_root.name!r} declaration changed: {', '.join(changed)}"
-            )
-        return existing
+                for key, value in existing.items()
+                if key
+                not in {
+                    "status",
+                    "created_at",
+                    "updated_at",
+                    "pending_retries",
+                    "ambiguous_attempts",
+                    "failure",
+                    "resume_count",
+                    "last_resumed_at",
+                    "workflow_profile",
+                    "workflow_profile_digest",
+                    _RECEIPT_CHAIN_FIELD,
+                }
+            }
+            actual = {
+                "run_manifest_schema": RUN_MANIFEST_SCHEMA,
+                **{
+                    key: value
+                    for key, value in self.identity.items()
+                    if key not in {"workflow_profile", "workflow_profile_digest"}
+                },
+            }
+            if expected != actual:
+                changed = sorted(
+                    key
+                    for key in set(expected) | set(actual)
+                    if expected.get(key) != actual.get(key)
+                )
+                raise RunManifestError(
+                    f"Run {self.run_root.name!r} declaration changed: {', '.join(changed)}"
+                )
+            return existing
 
     def mark_resumed(self) -> None:
         """Record an operator/runtime resume without changing immutable run identity."""
-        manifest = self._required_json(self.manifest_path)
-        manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
-        manifest["last_resumed_at"] = iso_now()
-        manifest["updated_at"] = manifest["last_resumed_at"]
-        atomic_write_json(self.manifest_path, manifest)
+        with self._run_locked():
+            manifest = self._required_manifest()
+            manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+            manifest["last_resumed_at"] = iso_now()
+            manifest["updated_at"] = manifest["last_resumed_at"]
+            atomic_write_json(self.manifest_path, manifest)
 
     def update_manifest(
         self,
@@ -131,16 +234,17 @@ class AttemptStore:
         ambiguous_attempts: list[dict[str, Any]] | None = None,
         failure: dict[str, Any] | None = None,
     ) -> None:
-        manifest = self._required_json(self.manifest_path)
-        manifest["status"] = status
-        manifest["updated_at"] = iso_now()
-        manifest["pending_retries"] = pending_retries or []
-        manifest["ambiguous_attempts"] = ambiguous_attempts or []
-        if failure is not None:
-            manifest["failure"] = failure
-        elif status != "failed":
-            manifest.pop("failure", None)
-        atomic_write_json(self.manifest_path, manifest)
+        with self._run_locked():
+            manifest = self._required_manifest()
+            manifest["status"] = status
+            manifest["updated_at"] = iso_now()
+            manifest["pending_retries"] = pending_retries or []
+            manifest["ambiguous_attempts"] = ambiguous_attempts or []
+            if failure is not None:
+                manifest["failure"] = failure
+            elif status != "failed":
+                manifest.pop("failure", None)
+            atomic_write_json(self.manifest_path, manifest)
 
     def prepare(
         self,
@@ -151,88 +255,105 @@ class AttemptStore:
         prompt_resolutions: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return run, pending, candidate, or completed state for one target."""
-        self._validate_attempt_receipts(target)
-        state_path = self._state_path(target)
-        state, corrupted = self._read_json_safe(state_path)
-        if corrupted:
-            raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
-        policy_digest = policy.digest if policy is not None else None
-        if state is None:
-            return self._start_attempt(
-                target,
-                attempt=1,
+        with self._run_locked():
+            self._validate_attempt_receipts(target)
+            state_path = self._state_path(target)
+            state, corrupted = self._read_json_safe(state_path)
+            if corrupted:
+                raise self._integrity_error(state_path, ATTEMPT_RECEIPT_SCHEMA)
+            policy_digest = policy.digest if policy is not None else None
+            resolutions = prompt_resolutions or {}
+            if state is None:
+                if self._receipt_chain(target):
+                    raise RunManifestError(
+                        f"Attempt receipt chain for {target!r} exists without a durable state"
+                    )
+                self._acquire_target_lease(target)
+                return self._start_attempt(
+                    target,
+                    attempt=1,
+                    policy_digest=policy_digest,
+                    declaration_digest=declaration_digest,
+                    prompt_resolutions=resolutions,
+                )
+            self._validate_state(
+                state,
+                target=target,
                 policy_digest=policy_digest,
                 declaration_digest=declaration_digest,
-                prompt_resolutions=prompt_resolutions or {},
+                prompt_resolutions=resolutions,
             )
-        self._validate_state(
-            state,
-            target=target,
-            policy_digest=policy_digest,
-            declaration_digest=declaration_digest,
-            prompt_resolutions=prompt_resolutions or {},
-        )
-        status = state.get("status")
-        if status == "running":
-            attempt = int(state["attempt"])
-            if state.get("side_effect_started") is True:
-                state["status"] = "ambiguous"
-                state["updated_at"] = iso_now()
-                atomic_write_json(state_path, state)
-                self._write_receipt(target, attempt, state)
-                raise AmbiguousAttemptError(self.run_root.name, target, attempt)
-            return self._start_attempt(
-                target,
-                attempt=attempt,
-                policy_digest=policy_digest,
-                declaration_digest=declaration_digest,
-                prompt_resolutions=prompt_resolutions or {},
-                inherited_nodes=state.get("inherited_nodes"),
-                recovery=state.get("recovery"),
-            )
-        if status == "checkpoint_pending":
-            return self._start_attempt(
-                target,
-                attempt=int(state["attempt"]),
-                policy_digest=policy_digest,
-                declaration_digest=declaration_digest,
-                prompt_resolutions=prompt_resolutions or {},
-            )
-        if status == "retry_scheduled":
-            due = datetime.fromisoformat(str(state["due_at"]))
-            if utc_now() < due:
-                return {"action": "pending", "state": state}
-            return self._start_attempt(
-                target,
-                attempt=int(state["next_attempt"]),
-                policy_digest=policy_digest,
-                declaration_digest=declaration_digest,
-                prompt_resolutions=prompt_resolutions or {},
-                inherited_nodes=state.get("inherited_nodes"),
-                recovery=state.get("recovery"),
-            )
-        if status == "success_candidate":
-            candidate = self._required_json(
-                self._target_root(target) / str(state["candidate_file"])
-            )
-            if state.get("candidate_sha256") != sha(candidate):
-                raise RunManifestError(f"Success candidate for {target!r} failed digest validation")
-            return {
-                "action": "candidate",
-                "state": state,
-                "candidate": candidate,
-            }
-        if status == "completed":
-            return {"action": "completed", "state": state}
-        if status == "ambiguous":
-            raise AmbiguousAttemptError(
-                self.run_root.name,
-                target,
-                int(state["attempt"]),
-            )
-        if status == "failed":
-            return {"action": "failed", "state": state}
-        raise RunManifestError(f"Attempt state for {target!r} has invalid status {status!r}")
+            status = state.get("status")
+            if status == "running":
+                attempt = int(state["attempt"])
+                if state.get("side_effect_started") is True:
+                    state["status"] = "ambiguous"
+                    state["updated_at"] = iso_now()
+                    self._clear_target_owner(target, state)
+                    self._write_state(target, state)
+                    raise AmbiguousAttemptError(self.run_root.name, target, attempt)
+                already_owned = not self._acquire_target_lease(
+                    target,
+                    state.get(_TARGET_OWNER_FIELD),
+                )
+                if already_owned:
+                    return {"action": "run", "state": state}
+                return self._start_attempt(
+                    target,
+                    attempt=attempt,
+                    policy_digest=policy_digest,
+                    declaration_digest=declaration_digest,
+                    prompt_resolutions=resolutions,
+                    inherited_nodes=state.get("inherited_nodes"),
+                    recovery=state.get("recovery"),
+                )
+            if status == "checkpoint_pending":
+                self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+                return self._start_attempt(
+                    target,
+                    attempt=int(state["attempt"]),
+                    policy_digest=policy_digest,
+                    declaration_digest=declaration_digest,
+                    prompt_resolutions=resolutions,
+                )
+            if status == "retry_scheduled":
+                due = datetime.fromisoformat(str(state["due_at"]))
+                if utc_now() < due:
+                    return {"action": "pending", "state": state}
+                self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+                return self._start_attempt(
+                    target,
+                    attempt=int(state["next_attempt"]),
+                    policy_digest=policy_digest,
+                    declaration_digest=declaration_digest,
+                    prompt_resolutions=resolutions,
+                    inherited_nodes=state.get("inherited_nodes"),
+                    recovery=state.get("recovery"),
+                )
+            if status == "success_candidate":
+                candidate = self._required_json(
+                    self._target_root(target) / str(state["candidate_file"])
+                )
+                if state.get("candidate_sha256") != sha(candidate):
+                    raise RunManifestError(
+                        f"Success candidate for {target!r} failed digest validation"
+                    )
+                return {
+                    "action": "candidate",
+                    "state": state,
+                    "candidate": candidate,
+                }
+            if status == "completed":
+                return {"action": "completed", "state": state}
+            if status == "ambiguous":
+                raise AmbiguousAttemptError(
+                    self.run_root.name,
+                    target,
+                    int(state["attempt"]),
+                )
+            if status == "failed":
+                return {"action": "failed", "state": state}
+            raise RunManifestError(f"Attempt state for {target!r} has invalid status {status!r}")
 
     def schedule_recovery(
         self,
@@ -244,37 +365,39 @@ class AttemptStore:
         inherited_nodes: dict[str, Any],
     ) -> dict[str, Any]:
         """Queue a new manual recovery attempt without touching the failed receipt."""
-        state_path = self._state_path(target)
-        state = self._required_json(state_path)
-        if state.get("status") != "failed" or state.get("attempt") != from_attempt:
-            raise ValueError(
-                f"Target {target!r} attempt {from_attempt} is not the active terminal failure"
+        with self._run_locked():
+            state_path = self._state_path(target)
+            state = self._required_json(state_path)
+            if state.get("status") != "failed" or state.get("attempt") != from_attempt:
+                raise ValueError(
+                    f"Target {target!r} attempt {from_attempt} is not the active terminal failure"
+                )
+            if to_attempt != from_attempt + 1:
+                raise ValueError("Recovery attempts must advance by exactly one")
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
+            if next_receipt.exists():
+                raise RunManifestError(
+                    f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
+                )
+            canonical_recovery = json.loads(canonical_json(recovery))
+            canonical_inherited = json.loads(canonical_json(inherited_nodes))
+            now = iso_now()
+            state.update(
+                {
+                    "attempt": to_attempt,
+                    "status": "retry_scheduled",
+                    "next_attempt": to_attempt,
+                    "delay_seconds": 0.0,
+                    "due_at": now,
+                    "recovery": canonical_recovery,
+                    "inherited_nodes": canonical_inherited,
+                    "updated_at": now,
+                }
             )
-        if to_attempt != from_attempt + 1:
-            raise ValueError("Recovery attempts must advance by exactly one")
-        next_receipt = self._target_root(target) / f"attempt-{to_attempt:04d}.json"
-        if next_receipt.exists():
-            raise RunManifestError(
-                f"Recovery attempt receipt already exists for {target!r}: {next_receipt}"
-            )
-        canonical_recovery = json.loads(canonical_json(recovery))
-        canonical_inherited = json.loads(canonical_json(inherited_nodes))
-        now = iso_now()
-        state.update(
-            {
-                "attempt": to_attempt,
-                "status": "retry_scheduled",
-                "next_attempt": to_attempt,
-                "delay_seconds": 0.0,
-                "due_at": now,
-                "recovery": canonical_recovery,
-                "inherited_nodes": canonical_inherited,
-                "updated_at": now,
-            }
-        )
-        atomic_write_json(state_path, state)
-        self._write_receipt(target, to_attempt, state)
-        return state
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
+            return state
 
     def mark_side_effect(
         self,
@@ -282,66 +405,76 @@ class AttemptStore:
         active_effect: dict[str, Any] | None = None,
     ) -> None:
         """Persist the provider/Agent side-effect boundary before crossing it."""
-        state = self._required_json(self._state_path(target))
-        if state.get("status") != "running":
-            raise RunManifestError(f"Cannot mark side effect for {target!r} in non-running state")
-        if active_effect is not None:
-            canonical = json.loads(canonical_json(active_effect))
-            if not isinstance(canonical, dict):
-                raise RunManifestError("active side effect must be a canonical object")
-            state["active_effect"] = canonical
-        state["side_effect_started"] = True
-        state.setdefault("side_effect_started_at", iso_now())
-        state["updated_at"] = iso_now()
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, int(state["attempt"]), state)
+        with self._run_locked():
+            state = self._required_json(self._state_path(target))
+            if state.get("status") != "running":
+                raise RunManifestError(
+                    f"Cannot mark side effect for {target!r} in non-running state"
+                )
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            state[_TARGET_OWNER_FIELD] = self._target_owner_token(target)
+            if active_effect is not None:
+                canonical = json.loads(canonical_json(active_effect))
+                if not isinstance(canonical, dict):
+                    raise RunManifestError("active side effect must be a canonical object")
+                state["active_effect"] = canonical
+            state["side_effect_started"] = True
+            state.setdefault("side_effect_started_at", iso_now())
+            state["updated_at"] = iso_now()
+            self._write_state(target, state)
 
     def mark_checkpoint(self, target: str, checkpoint: str) -> None:
-        state = self._required_json(self._state_path(target))
-        state.update(
-            {
-                "status": "checkpoint_pending",
-                "checkpoint": checkpoint,
-                "updated_at": iso_now(),
-            }
-        )
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, int(state["attempt"]), state)
+        with self._run_locked():
+            state = self._required_json(self._state_path(target))
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            state.update(
+                {
+                    "status": "checkpoint_pending",
+                    "checkpoint": checkpoint,
+                    "updated_at": iso_now(),
+                }
+            )
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
 
     def save_candidate(self, target: str, candidate: dict[str, Any]) -> dict[str, Any]:
         """Persist canonical success before cache sealing or materialization."""
-        state = self._required_json(self._state_path(target))
-        if state.get("status") != "running":
-            raise RunManifestError(f"Cannot save candidate for {target!r} in non-running state")
-        canonical = json.loads(canonical_json(candidate))
-        attempt = int(state["attempt"])
-        filename = f"candidate-{attempt:04d}.json"
-        atomic_write_json(self._target_root(target) / filename, canonical)
-        state.update(
-            {
-                "status": "success_candidate",
-                "candidate_file": filename,
-                "candidate_sha256": sha(canonical),
-                "succeeded_at": iso_now(),
-                "updated_at": iso_now(),
-            }
-        )
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, attempt, state)
-        return canonical
+        with self._run_locked():
+            state = self._required_json(self._state_path(target))
+            if state.get("status") != "running":
+                raise RunManifestError(f"Cannot save candidate for {target!r} in non-running state")
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            canonical = json.loads(canonical_json(candidate))
+            attempt = int(state["attempt"])
+            filename = f"candidate-{attempt:04d}.json"
+            atomic_write_json(self._target_root(target) / filename, canonical)
+            state.update(
+                {
+                    "status": "success_candidate",
+                    "candidate_file": filename,
+                    "candidate_sha256": sha(canonical),
+                    "succeeded_at": iso_now(),
+                    "updated_at": iso_now(),
+                }
+            )
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
+            return canonical
 
     def mark_completed(self, target: str, *, artifact_sha256: str) -> None:
-        state = self._required_json(self._state_path(target))
-        state.update(
-            {
-                "status": "completed",
-                "artifact_sha256": artifact_sha256,
-                "completed_at": iso_now(),
-                "updated_at": iso_now(),
-            }
-        )
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, int(state["attempt"]), state)
+        with self._run_locked():
+            state = self._required_json(self._state_path(target))
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            state.update(
+                {
+                    "status": "completed",
+                    "artifact_sha256": artifact_sha256,
+                    "completed_at": iso_now(),
+                    "updated_at": iso_now(),
+                }
+            )
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
 
     def record_failure(
         self,
@@ -354,46 +487,50 @@ class AttemptStore:
         """Persist terminal or retry-scheduled failure state."""
         from .failures import failure_provider_kind, failure_retry_after_ms
 
-        state = self._required_json(self._state_path(target))
-        attempt = int(state["attempt"])
-        failure = canonical_failure(error)
-        retryable = (
-            policy is not None
-            and attempt < policy.max_attempts
-            and policy.allows(failure_provider_kind(error))
-        )
-        state["failure"] = failure
-        state["calls"] = json.loads(canonical_json(calls or []))
-        state["failed_at"] = iso_now()
-        if retryable:
-            schedule = policy.schedule(
-                run_id=self.run_root.name,
-                target=target,
-                attempt=attempt,
-                retry_after_ms=failure_retry_after_ms(error),
+        with self._run_locked():
+            state = self._required_json(self._state_path(target))
+            self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
+            attempt = int(state["attempt"])
+            failure = canonical_failure(error)
+            retryable = (
+                policy is not None
+                and attempt < policy.max_attempts
+                and policy.allows(failure_provider_kind(error))
             )
-            state.update(
-                {
-                    "status": "retry_scheduled",
-                    "next_attempt": schedule.next_attempt,
-                    "delay_seconds": schedule.delay_seconds,
-                    "due_at": schedule.due_at,
-                    "updated_at": iso_now(),
-                }
-            )
-            action = "pending"
-        else:
-            state.update({"status": "failed", "updated_at": iso_now()})
-            action = "failed"
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, attempt, state)
-        return {"action": action, "state": state}
+            state["failure"] = failure
+            state["calls"] = json.loads(canonical_json(calls or []))
+            state["failed_at"] = iso_now()
+            if retryable:
+                schedule = policy.schedule(
+                    run_id=self.run_root.name,
+                    target=target,
+                    attempt=attempt,
+                    retry_after_ms=failure_retry_after_ms(error),
+                )
+                state.update(
+                    {
+                        "status": "retry_scheduled",
+                        "next_attempt": schedule.next_attempt,
+                        "delay_seconds": schedule.delay_seconds,
+                        "due_at": schedule.due_at,
+                        "updated_at": iso_now(),
+                    }
+                )
+                action = "pending"
+            else:
+                state.update({"status": "failed", "updated_at": iso_now()})
+                action = "failed"
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
+            return {"action": action, "state": state}
 
     def pending_retries(self) -> list[dict[str, Any]]:
-        return self._states_with("retry_scheduled")
+        with self._run_locked():
+            return self._states_with("retry_scheduled")
 
     def ambiguous_attempts(self) -> list[dict[str, Any]]:
-        return self._states_with("ambiguous")
+        with self._run_locked():
+            return self._states_with("ambiguous")
 
     def resolve(
         self,
@@ -403,63 +540,73 @@ class AttemptStore:
         action: Literal["retry", "fail"],
         reason: str,
     ) -> dict[str, Any]:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("retry resolution reason must be non-empty")
-        state = self._required_json(self._state_path(target))
-        if (
-            state.get("status") == "running"
-            and state.get("side_effect_started") is True
-            and state.get("attempt") == attempt
-        ):
-            state["status"] = "ambiguous"
-            state["updated_at"] = iso_now()
-            atomic_write_json(self._state_path(target), state)
-            self._write_receipt(target, attempt, state)
-        if state.get("status") != "ambiguous" or state.get("attempt") != attempt:
-            raise ValueError(
-                f"Target {target!r} attempt {attempt} is not the active ambiguous attempt"
-            )
-        resolution = {
-            "attempt_receipt_schema": ATTEMPT_RECEIPT_SCHEMA,
-            "target": target,
-            "attempt": attempt,
-            "action": action,
-            "reason": reason.strip(),
-            "resolved_at": iso_now(),
-        }
-        atomic_write_json(
-            self._target_root(target) / f"resolution-{attempt:04d}.json",
-            resolution,
-        )
-        state["resolution"] = resolution
-        state["updated_at"] = iso_now()
-        if action == "retry":
-            state.update(
-                {
-                    "status": "retry_scheduled",
-                    "next_attempt": attempt + 1,
-                    "delay_seconds": 0.0,
-                    "due_at": iso_now(),
-                }
-            )
-        else:
-            state["status"] = "failed"
-            state["failure"] = {
-                "failure_type": "manual_resolution",
-                "action": "fail",
-                "reason_digest": sha(reason.strip()),
+        with self._run_locked():
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("retry resolution reason must be non-empty")
+            state = self._required_json(self._state_path(target))
+            if (
+                state.get("status") == "running"
+                and state.get("side_effect_started") is True
+                and state.get("attempt") == attempt
+            ):
+                state["status"] = "ambiguous"
+                state["updated_at"] = iso_now()
+                self._clear_target_owner(target, state)
+                self._write_state(target, state)
+            if state.get("status") != "ambiguous" or state.get("attempt") != attempt:
+                raise ValueError(
+                    f"Target {target!r} attempt {attempt} is not the active ambiguous attempt"
+                )
+            resolution = {
+                "attempt_receipt_schema": ATTEMPT_RECEIPT_SCHEMA,
+                "target": target,
+                "attempt": attempt,
+                "action": action,
+                "reason": reason.strip(),
+                "resolved_at": iso_now(),
             }
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, attempt, state)
-        return state
+            atomic_write_json(
+                self._target_root(target) / f"resolution-{attempt:04d}.json",
+                resolution,
+            )
+            state["resolution"] = resolution
+            state["updated_at"] = iso_now()
+            if action == "retry":
+                state.update(
+                    {
+                        "status": "retry_scheduled",
+                        "next_attempt": attempt + 1,
+                        "delay_seconds": 0.0,
+                        "due_at": iso_now(),
+                    }
+                )
+            else:
+                state["status"] = "failed"
+                state["failure"] = {
+                    "failure_type": "manual_resolution",
+                    "action": "fail",
+                    "reason_digest": sha(reason.strip()),
+                }
+            self._clear_target_owner(target, state)
+            self._write_state(target, state)
+            return state
 
     def state_for(self, target: str) -> dict[str, Any] | None:
-        self._validate_attempt_receipts(target)
-        path = self._state_path(target)
-        state, corrupted = self._read_json_safe(path)
-        if corrupted:
-            raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
-        return state
+        with self._run_locked():
+            self._validate_attempt_receipts(target)
+            path = self._state_path(target)
+            state, corrupted = self._read_json_safe(path)
+            if corrupted:
+                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
+            if state is not None:
+                self._validate_state_binding(target, state)
+            elif self._receipt_chain(target) or any(
+                self._target_root(target).glob("attempt-*.json")
+            ):
+                raise RunManifestError(
+                    f"Attempt receipts for {target!r} exist without a durable state"
+                )
+            return state
 
     def _start_attempt(
         self,
@@ -480,6 +627,7 @@ class AttemptStore:
             "attempt": attempt,
             "status": "running",
             "side_effect_started": False,
+            _TARGET_OWNER_FIELD: self._target_owner_token(target),
             "policy_digest": policy_digest,
             "declaration_digest": declaration_digest,
             "prompt_resolutions": json.loads(canonical_json(prompt_resolutions)),
@@ -492,8 +640,7 @@ class AttemptStore:
             state["recovery"] = json.loads(canonical_json(recovery))
         target_root = self._target_root(target)
         target_root.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self._state_path(target), state)
-        self._write_receipt(target, attempt, state)
+        self._write_state(target, state)
         return {"action": "run", "state": state}
 
     def _validate_state(
@@ -505,6 +652,7 @@ class AttemptStore:
         declaration_digest: str,
         prompt_resolutions: dict[str, Any],
     ) -> None:
+        self._validate_state_binding(target, state)
         if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
             raise RunManifestError(f"Attempt state for {target!r} has unsupported schema")
         if (
@@ -525,7 +673,17 @@ class AttemptStore:
             state, corrupted = self._read_json_safe(path)
             if corrupted:
                 raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
-            if state is not None and state.get("status") == status:
+            if state is None:
+                continue
+            target = state.get("target")
+            if not isinstance(target, str) or path.parent.name != sha(target):
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "state target path binding mismatch",
+                )
+            self._validate_state_binding(target, state)
+            if state.get("status") == status:
                 found.append(state)
         return found
 
@@ -535,22 +693,294 @@ class AttemptStore:
     def _state_path(self, target: str) -> Path:
         return self._target_root(target) / "state.json"
 
+    @staticmethod
+    def _is_sha256(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and value == value.lower()
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    @classmethod
+    def _validate_receipt_chain(
+        cls,
+        target_digest: str,
+        chain: Any,
+        path: Path,
+    ) -> None:
+        if not isinstance(chain, list):
+            raise RunManifestError(f"Receipt chain at {path} must be a JSON list")
+        if not cls._is_sha256(target_digest):
+            raise RunManifestError(f"Receipt chain target key at {path} is not a SHA-256 digest")
+        for index, entry in enumerate(chain, start=1):
+            if not isinstance(entry, dict):
+                raise RunManifestError(f"Receipt chain entry {index} at {path} is not an object")
+            if entry.get("target_digest") != target_digest:
+                raise RunManifestError(
+                    f"Receipt chain entry {index} at {path} has a target binding mismatch"
+                )
+            if (
+                type(entry.get(_RECEIPT_SEQUENCE_FIELD)) is not int
+                or entry.get(_RECEIPT_SEQUENCE_FIELD) != index
+            ):
+                raise RunManifestError(
+                    f"Receipt chain entry {index} at {path} has an invalid sequence"
+                )
+            attempt = entry.get("attempt")
+            if type(attempt) is not int or attempt < 1:
+                raise RunManifestError(
+                    f"Receipt chain entry {index} at {path} has an invalid attempt"
+                )
+            state_digest = entry.get(_STATE_DIGEST_FIELD)
+            if not cls._is_sha256(state_digest):
+                raise RunManifestError(
+                    f"Receipt chain entry {index} at {path} has an invalid state digest"
+                )
+            previous = entry.get(_PREVIOUS_RECEIPT_DIGEST_FIELD)
+            if index == 1:
+                if previous is not None:
+                    raise RunManifestError(
+                        f"Receipt chain entry {index} at {path} has an unexpected predecessor"
+                    )
+            elif previous != chain[index - 2].get(_STATE_DIGEST_FIELD):
+                raise RunManifestError(
+                    f"Receipt chain entry {index} at {path} is not linked to its predecessor"
+                )
+
+    @classmethod
+    def _validate_receipt_chain_map(cls, manifest: dict[str, Any]) -> None:
+        chains = manifest.get(_RECEIPT_CHAIN_FIELD)
+        if not isinstance(chains, dict):
+            raise RunManifestError(f"Run manifest is missing the {_RECEIPT_CHAIN_FIELD} anchor")
+        manifest_path = Path("_run.json")
+        for target_digest, chain in chains.items():
+            cls._validate_receipt_chain(target_digest, chain, manifest_path)
+
+    def _required_manifest(self) -> dict[str, Any]:
+        manifest, corrupted = self._read_json_safe(self.manifest_path)
+        if corrupted:
+            raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
+        if manifest is None:
+            raise RunManifestError(f"Missing or invalid run manifest: {self.manifest_path}")
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
+        self._validate_receipt_chain_map(manifest)
+        return manifest
+
+    def _receipt_chain(
+        self,
+        target: str,
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if manifest is None:
+            manifest = self._required_manifest()
+        target_digest = sha(target)
+        chain = manifest[_RECEIPT_CHAIN_FIELD].get(target_digest, [])
+        self._validate_receipt_chain(target_digest, chain, self.manifest_path)
+        return chain
+
+    @staticmethod
+    def _state_digest(state: dict[str, Any]) -> str:
+        payload = {key: value for key, value in state.items() if key != _STATE_DIGEST_FIELD}
+        return sha(payload)
+
+    def _write_state(self, target: str, state: dict[str, Any]) -> None:
+        with self._run_locked():
+            self._write_state_locked(target, state)
+
+    def _write_state_locked(self, target: str, state: dict[str, Any]) -> None:
+        """Append a state snapshot and bind it to the run-manifest receipt chain."""
+        target_digest = sha(target)
+        if state.get("target") != target or state.get("target_digest") != target_digest:
+            raise RunManifestError(f"Attempt state for {target!r} has an invalid target binding")
+        attempt = state.get("attempt")
+        if type(attempt) is not int or attempt < 1:
+            raise RunManifestError(f"Attempt state for {target!r} has invalid attempt")
+
+        manifest = self._required_manifest()
+        chains = manifest[_RECEIPT_CHAIN_FIELD]
+        chain = list(self._receipt_chain(target, manifest=manifest))
+        current_fields = {
+            _STATE_DIGEST_FIELD: state.get(_STATE_DIGEST_FIELD),
+            _RECEIPT_SEQUENCE_FIELD: state.get(_RECEIPT_SEQUENCE_FIELD),
+            _PREVIOUS_RECEIPT_DIGEST_FIELD: state.get(_PREVIOUS_RECEIPT_DIGEST_FIELD),
+        }
+        present = [field in state for field in current_fields]
+        if any(present) and not all(present):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "state receipt-chain fields are incomplete",
+            )
+        if chain and not any(present):
+            # A fresh state is allowed here for a new retry attempt or for the
+            # documented restart of an attempt that never crossed its effect
+            # boundary.  A loaded state always carries the previous chain head.
+            pass
+        elif chain and (
+            current_fields[_RECEIPT_SEQUENCE_FIELD] != len(chain)
+            or current_fields[_STATE_DIGEST_FIELD] != chain[-1][_STATE_DIGEST_FIELD]
+        ):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "state is not descended from the manifest receipt-chain head",
+            )
+
+        sequence = len(chain) + 1
+        previous_digest = chain[-1][_STATE_DIGEST_FIELD] if chain else None
+        state.pop(_STATE_DIGEST_FIELD, None)
+        state[_RECEIPT_SEQUENCE_FIELD] = sequence
+        state[_PREVIOUS_RECEIPT_DIGEST_FIELD] = previous_digest
+        state[_STATE_DIGEST_FIELD] = self._state_digest(state)
+        entry = {
+            "target_digest": target_digest,
+            _RECEIPT_SEQUENCE_FIELD: sequence,
+            "attempt": attempt,
+            _PREVIOUS_RECEIPT_DIGEST_FIELD: previous_digest,
+            _STATE_DIGEST_FIELD: state[_STATE_DIGEST_FIELD],
+        }
+        self._validate_receipt_chain(target_digest, [*chain, entry], self.manifest_path)
+        state.pop(_STATE_DIGEST_FIELD, None)
+        state[_STATE_DIGEST_FIELD] = entry[_STATE_DIGEST_FIELD]
+        atomic_write_json(self._state_path(target), state)
+        self._write_receipt(target, attempt, state)
+        chains[target_digest] = [*chain, entry]
+        atomic_write_json(self.manifest_path, manifest)
+
     def _write_receipt(self, target: str, attempt: int, state: dict[str, Any]) -> None:
+        if state.get(_STATE_DIGEST_FIELD) != self._state_digest(state):
+            raise RunManifestError(f"Attempt state for {target!r} is not content-bound")
         atomic_write_json(
             self._target_root(target) / f"attempt-{attempt:04d}.json",
             state,
         )
 
+    def _validate_state_binding(self, target: str, state: dict[str, Any]) -> None:
+        """Validate state, its current receipt twin, and the manifest chain head."""
+        path = self._state_path(target)
+        if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
+            raise RunManifestError(f"Attempt state for {target!r} has unsupported schema")
+        if state.get("target") != target or state.get("target_digest") != sha(target):
+            raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "target binding mismatch")
+        attempt = state.get("attempt")
+        if type(attempt) is not int or attempt < 1:
+            raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "attempt binding is invalid")
+        if state.get(_STATE_DIGEST_FIELD) != self._state_digest(state):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "state content digest does not match the state payload",
+            )
+        chain = self._receipt_chain(target)
+        if not chain:
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "state has no manifest receipt-chain anchor",
+            )
+        head = chain[-1]
+        if (
+            state.get(_RECEIPT_SEQUENCE_FIELD) != head[_RECEIPT_SEQUENCE_FIELD]
+            or state.get(_PREVIOUS_RECEIPT_DIGEST_FIELD) != head[_PREVIOUS_RECEIPT_DIGEST_FIELD]
+            or state.get(_STATE_DIGEST_FIELD) != head[_STATE_DIGEST_FIELD]
+            or state.get("attempt") != head["attempt"]
+        ):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "state does not match the manifest receipt-chain head",
+            )
+        receipt_path = self._target_root(target) / f"attempt-{attempt:04d}.json"
+        receipt, corrupted = self._read_json_safe(receipt_path)
+        if corrupted:
+            raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+        if receipt is None:
+            return
+        self._validate_receipt_record(receipt_path, receipt, target, attempt)
+        if receipt != state:
+            raise StateIntegrityError(
+                receipt_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "current state and attempt receipt are not identical",
+            )
+
+    def _validate_receipt_record(
+        self,
+        path: Path,
+        receipt: dict[str, Any],
+        target: str,
+        expected_attempt: int,
+    ) -> None:
+        if receipt.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
+            raise RunManifestError(f"Attempt receipt {path} has unsupported schema")
+        if receipt.get("target") != target or receipt.get("target_digest") != sha(target):
+            raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "target binding mismatch")
+        if type(receipt.get("attempt")) is not int or receipt.get("attempt") != expected_attempt:
+            raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "attempt binding mismatch")
+        if (
+            type(receipt.get(_RECEIPT_SEQUENCE_FIELD)) is not int
+            or receipt.get(_RECEIPT_SEQUENCE_FIELD) < 1
+        ):
+            raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "receipt sequence is invalid")
+        if not self._is_sha256(receipt.get(_STATE_DIGEST_FIELD)):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "receipt state digest is invalid",
+            )
+        if receipt.get(_STATE_DIGEST_FIELD) != self._state_digest(receipt):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "receipt content digest does not match the receipt payload",
+            )
+
     def _validate_attempt_receipts(self, target: str) -> None:
         """Reject a present torn receipt while allowing an absent receipt."""
+        manifest = self._required_manifest()
+        chain = self._receipt_chain(target, manifest=manifest)
+        last_by_attempt = {entry["attempt"]: entry for entry in chain}
+        receipt_attempts: set[int] = set()
         for path in sorted(self._target_root(target).glob("attempt-*.json")):
             receipt, corrupted = self._read_json_safe(path)
             if corrupted:
                 raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
-            if receipt is not None and receipt.get("attempt_receipt_schema") != (
-                ATTEMPT_RECEIPT_SCHEMA
+            if receipt is None:
+                continue
+            prefix, separator, attempt_text = path.stem.partition("-")
+            if prefix != "attempt" or separator != "-" or not attempt_text.isdigit():
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "attempt receipt filename is invalid",
+                )
+            attempt = int(attempt_text)
+            self._validate_receipt_record(path, receipt, target, attempt)
+            receipt_attempts.add(attempt)
+            anchor = last_by_attempt.get(attempt)
+            if anchor is None or (
+                receipt.get(_RECEIPT_SEQUENCE_FIELD) != anchor[_RECEIPT_SEQUENCE_FIELD]
+                or receipt.get(_STATE_DIGEST_FIELD) != anchor[_STATE_DIGEST_FIELD]
+                or receipt.get(_PREVIOUS_RECEIPT_DIGEST_FIELD)
+                != anchor[_PREVIOUS_RECEIPT_DIGEST_FIELD]
             ):
-                raise RunManifestError(f"Attempt receipt {path} has unsupported schema")
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "attempt receipt is not anchored in the manifest receipt chain",
+                )
+        if chain:
+            current_attempt = chain[-1]["attempt"]
+            for attempt in last_by_attempt:
+                if attempt not in receipt_attempts and attempt != current_attempt:
+                    raise StateIntegrityError(
+                        self._target_root(target) / f"attempt-{attempt:04d}.json",
+                        ATTEMPT_RECEIPT_SCHEMA,
+                        "historical attempt receipt is missing from the receipt chain",
+                    )
 
     @staticmethod
     def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
@@ -582,4 +1012,13 @@ class AttemptStore:
             raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
         if value is None:
             raise RunManifestError(f"Missing or invalid durable run state: {path}")
+        if path.name == "state.json":
+            target = value.get("target")
+            if not isinstance(target, str) or path.parent.name != sha(target):
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "state target path binding mismatch",
+                )
+            self._validate_state_binding(target, value)
         return value
