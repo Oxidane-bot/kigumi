@@ -18,13 +18,22 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from .artifacts import atomic_write_json, atomic_write_text, canonical_json, sha, write_artifact
-from .blobs import BlobStore, _rename_at, _SecureDirectory
+from ._safe_io import (
+    SecureDirectory as _SecureDirectory,
+)
+from ._safe_io import (
+    atomic_write_json,
+    atomic_write_text,
+    install_safe_artifact_writes,
+    install_secure_blob_store_writes,
+)
+from .artifacts import canonical_json, sha, write_artifact
+from .blobs import BlobStore, _rename_at
 from .errors import OutputOwnershipError
 
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
-_NODE_CACHE_ENVELOPE_SCHEMA = 3
+_NODE_CACHE_ENVELOPE_SCHEMA = 4
 _ROLLBACK_MARKER_NAME = "rollback.json"
 _ORIGIN_PROVENANCE_FIELDS = (
     "artifact_sha256",
@@ -42,6 +51,9 @@ _ORIGIN_PROVENANCE_FIELDS = (
 )
 _ORIGIN_KINDS = frozenset(("call", "agent", "code"))
 _EVIDENCE_MODES = frozenset(("full", "redacted", "hash_only"))
+
+install_safe_artifact_writes()
+install_secure_blob_store_writes(BlobStore)
 
 CacheState = Literal["MISSING", "VALID", "CORRUPT"]
 
@@ -96,6 +108,7 @@ def blob_store_root(artifacts_path: Path) -> Path:
 
 def node_cache_path(artifacts_path: Path, cache_key: str) -> Path:
     """Return the on-disk location for one content-addressed node cache entry."""
+    _validate_path_component(cache_key, "Cache key")
     return artifacts_path / "_cache" / "nodes" / f"{cache_key}.json"
 
 

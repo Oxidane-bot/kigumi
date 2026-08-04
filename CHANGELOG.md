@@ -23,12 +23,17 @@
   symlink、TOCTOU 与错误内容 blob 穿透校验。
 - 输出物化改为可回滚提交，失败时恢复 output ownership 与 staging；managed PromptResolution
   缺失必需字段时 fail closed。
+- L1/L3/BlobStore 的发布写入统一经过 descriptor-relative、no-follow 的安全目录与 atomic
+  write 边界；父级 symlink 不再能把缓存或 blob 写到项目根外，不支持该能力的平台显式返回
+  `ENOTSUP`。
 - `Dag.plan`、scan、EvidencePolicy、workers 与损坏 cache 的错误路径统一为不重算的 fail-closed
   行为，并补齐真实安装入口和发行物测试语义。
 
 ### 兼容性
 
-- 本次不修改缓存键成分，也不新增缓存族；现有 `CACHE_SCHEMA=7` 继续沿用。
+- L3 内容键成分不变，`CACHE_SCHEMA=7` 继续沿用且不新增缓存族；但 node cache envelope
+  从 schema 3 正式升至 schema 4，以绑定请求的 `cache_key`。这是 Greenfield 格式硬切，旧
+  schema 3 条目按 `CORRUPT` 拒绝，不提供迁移或兼容 shim。
 
 ## [0.12.0] - 2026-08-03
 

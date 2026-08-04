@@ -1,8 +1,9 @@
 # 缓存键契约
 
-Status: Active (0.11.0)
+Status: Active (0.13.0)
 
-> v0.11.0 已发布 `CACHE_SCHEMA=7`，node cache envelope schema 3 保持不变；
+> v0.13.0 的 L3 内容键 `CACHE_SCHEMA=7` 保持不变，但 node cache envelope 正式升至 schema 4；
+> 旧 schema 3 条目（即使已经带有 `cache_key`）按 `CORRUPT` 拒绝，不迁移；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
 > 硬切，不迁移 0.7.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
@@ -115,7 +116,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    hash-bound origin。0.8.0 从 5 升至 6，以引入 `agent_schema=3` 的 session attachment
    与 Agent scan executor 语义。0.11.0 从 6 升至 7，以绑定 managed request 的
    attachment content hash、typed message digest 和 response schema identity；本次 `libs`
-   细化搭载同一已发布的 7 轮换，不新增第 8 次全项目换族。
+   细化搭载同一已发布的 7 轮换，不新增第 8 次全项目换族。0.13.0 将 node cache
+   envelope 从 schema 3 升至 schema 4，以正式绑定请求的 L3 `cache_key`；这是 Greenfield
+   envelope 硬切，不迁移旧 schema 3 条目，也不改变内容键 `CACHE_SCHEMA`。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash
@@ -123,8 +126,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    未选中候选的完整字节 universe 只进入 run manifest graph identity，因此改它可复用相同
    selected-only L3 条目，但旧 run 因声明 identity 漂移拒绝 resume。未声明的字符串 CALL
    不伪造 PromptSpec 成分，receipt 只记录为 unmanaged。
-10. node cache envelope schema 3 固定保存 canonical artifact、artifact SHA-256、首次执行的
-    immutable origin provenance 与 origin digest。warm hit 不得以 replay metadata 覆盖 origin。
+10. node cache envelope schema 4 固定保存请求绑定的 `cache_key`、canonical artifact、artifact
+    SHA-256、首次执行的 immutable origin provenance 与 origin digest。warm hit 不得以 replay
+    metadata 覆盖 origin；schema 3 或缺少/错绑 `cache_key` 的 envelope 都是 `CORRUPT`。
 11. EvidencePolicy digest 不匹配按 evidence miss 执行，但不改变 key components；RetryPolicy
     digest、Agent slots/lock/timeout、`ResourceRequest` 与 `resource_limits` 也不属于内容键。
 

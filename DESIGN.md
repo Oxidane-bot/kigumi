@@ -335,7 +335,7 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
 - `store.py` 是存储布局层，依赖方向固定为 `dag -> store`；它管理 run、节点缓存、
   归档、物化、审批与 GC，不能反向理解图或调度。
 - `blobs.py` 是内容寻址二进制仓；`slots.py` 负责跨进程限流与自适应容量。
-- node cache envelope schema 3 同时保存 canonical artifact、artifact/origin digest 与
+- node cache envelope schema 4 同时保存请求绑定的 cache_key、canonical artifact、artifact/origin digest 与
   immutable origin；schema-2 run sidecar 分离 current resolution 和 origin resolution；
   GC 从 retained sidecar、failure、attempt receipt 和 candidate 递归追踪 blob/attachment。
 

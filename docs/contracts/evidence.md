@@ -20,7 +20,7 @@ replay 的同一 origin。实现权威为 `kigumi/evidence.py`、`kigumi/calling
    attachments、published outputs、可选 `files` 与可选非物化 session attachment。usage、
    duration、workspace manifest、RPC、stderr、trajectory、Hook/policy evidence 和 queue/slot
    metadata 属于 origin provenance，不得回流 canonical artifact。
-4. node cache envelope schema 3 保存 artifact、artifact digest 与 hash-bound immutable
+4. node cache envelope schema 4 保存请求绑定的 cache key、artifact、artifact digest 与 hash-bound immutable
    origin；schema-2 cold/warm sidecar 同时保存当前 run 重新解析的 Prompt selection 和同一
    immutable origin。policy canonical digest 写入 origin 与 run manifest。
 5. policy digest 不匹配是 evidence miss，不改变 L3 内容键。普通 CALL 可从 L1 replay payload
