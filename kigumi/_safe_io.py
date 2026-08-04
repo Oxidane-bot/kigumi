@@ -494,8 +494,26 @@ def read_regular_bytes(
     phase: str,
     error: FileError = _default_file_error,
     snapshot: bool = False,
+    allow_atomic_replace: bool = False,
 ) -> bytes:
-    """Read one regular file through the shared descriptor-relative boundary."""
+    """Read one regular file through the shared descriptor-relative boundary.
+
+    ``allow_atomic_replace`` is a deliberately narrow cache-read mode.  It may
+    only be combined with ``snapshot`` and accepts a complete descriptor when
+    the bound parent directory now names a different regular inode.  A change
+    to the opened inode itself, a short read, or a non-regular replacement is
+    still rejected.  Source-file callers must keep the default strict mode.
+    """
+    if allow_atomic_replace:
+        if not snapshot:
+            raise ValueError("allow_atomic_replace requires snapshot=True")
+        return _read_regular_bytes_allowing_atomic_replace(
+            Path(path),
+            identity=identity,
+            expected_identity=expected_identity,
+            phase=phase,
+            error=error,
+        )
     with open_regular_file(
         Path(path),
         identity=identity,
@@ -524,6 +542,67 @@ def read_regular_bytes(
             error=error,
         )
         return raw
+
+
+def _read_regular_bytes_allowing_atomic_replace(
+    path: Path,
+    *,
+    identity: IdentityFactory,
+    expected_identity: FileIdentity | None,
+    phase: str,
+    error: FileError,
+) -> bytes:
+    """Read a complete cache descriptor while tolerating an atomic path swap."""
+    with SecureDirectory(path.parent, create=False) as directory:
+        handle = _open_regular_file_at(
+            directory,
+            path.name,
+            identity=identity,
+            expected_identity=expected_identity,
+            phase=phase,
+            error=error,
+        )
+        try:
+            initial = verify_regular_descriptor(
+                handle,
+                path,
+                identity=identity,
+                expected_identity=expected_identity,
+                phase=phase,
+                error=error,
+            )
+            raw = handle.read()
+            final = verify_regular_descriptor(
+                handle,
+                path,
+                identity=identity,
+                expected_identity=None,
+                phase=phase,
+                error=error,
+            )
+            if final.st_size != len(raw):
+                raise error(f"changed {phase}", path)
+
+            # Keep the parent descriptor bound while checking the name.  This
+            # rejects a symlink/FIFO installed during the read and detects a
+            # parent-directory replacement without following either one.
+            current = directory.stat(path.name)
+            if stat.S_ISLNK(current.st_mode):
+                raise error("must not be a symlink", path)
+            if not stat.S_ISREG(current.st_mode):
+                raise error("must reference a regular file", path)
+
+            same_inode = (current.st_dev, current.st_ino) == (
+                final.st_dev,
+                final.st_ino,
+            )
+            if same_inode and (
+                identity(final) != identity(initial) or identity(current) != identity(final)
+            ):
+                raise error(f"changed {phase}", path)
+            return raw
+        finally:
+            handle.close()
 
 
 def verify_regular_descriptor(

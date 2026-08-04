@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ import pytest
 
 from kigumi._runstate import RunManifestError
 from kigumi.artifacts import atomic_write_json, sha
-from kigumi.calling import DryRunError, LLMCaller
+from kigumi.calling import DryRunError, LLMCaller, read_call_cache
 from kigumi.config import KigumiConfig
 from kigumi.dag import CheckpointPending, Dag
 from kigumi.testing import FakeTransport
@@ -120,6 +122,148 @@ def test_l1_reader_accepts_a_legitimate_atomic_replacement(
     assert failures == []
     assert result in ([old_payload["response"]], [new_payload["response"]])
     assert caller.transport.requests == []
+
+
+def test_l1_reader_accepts_replacement_after_old_descriptor_is_open(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A replaced old inode may change ctime after its complete read snapshot."""
+    import kigumi._safe_io as safe_io
+
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = "cache-key"
+    path = tmp_path / "llm" / f"{key}.json"
+    old_payload = {
+        "meta": {"key": key},
+        "response": "old complete response",
+        "response_sha256": sha("old complete response"),
+    }
+    new_payload = {
+        "meta": {"key": key},
+        "response": "new complete response",
+        "response_sha256": sha("new complete response"),
+    }
+    atomic_write_json(path, old_payload)
+
+    original_verify = safe_io.verify_regular_descriptor
+    verify_calls = 0
+
+    def replace_before_final_verify(handle, target, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            atomic_write_json(path, new_payload)
+        return original_verify(handle, target, **kwargs)
+
+    monkeypatch.setattr(safe_io, "verify_regular_descriptor", replace_before_final_verify)
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "VALID"
+    assert lookup.data == old_payload
+    assert caller.transport.requests == []
+
+
+def test_l1_reader_rejects_in_place_truncation_after_read(tmp_path: Path, monkeypatch: Any) -> None:
+    """An in-place truncation is not an atomic replacement and stays corrupt."""
+    import kigumi._safe_io as safe_io
+
+    key = "cache-key"
+    path = tmp_path / "llm" / f"{key}.json"
+    payload = {
+        "meta": {"key": key},
+        "response": "complete response",
+        "response_sha256": sha("complete response"),
+    }
+    atomic_write_json(path, payload)
+
+    original_verify = safe_io.verify_regular_descriptor
+    verify_calls = 0
+
+    def truncate_before_final_verify(handle, target, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            path.write_bytes(b"")
+        return original_verify(handle, target, **kwargs)
+
+    monkeypatch.setattr(safe_io, "verify_regular_descriptor", truncate_before_final_verify)
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    assert "read failed" in (lookup.reason or "")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="mkfifo is unavailable")
+def test_l1_reader_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    """The cache boundary must reject a FIFO without waiting for a writer."""
+    path = tmp_path / "llm" / "cache-key.json"
+    path.parent.mkdir()
+    os.mkfifo(path)
+
+    started = time.monotonic()
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    assert time.monotonic() - started < 1
+
+
+def test_l1_reader_stays_valid_under_atomic_replacement_pressure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Repeated descriptor reads accept either complete side of atomic swaps."""
+    import kigumi._safe_io as safe_io
+
+    key = "cache-key"
+    path = tmp_path / "llm" / f"{key}.json"
+    payloads = [
+        {
+            "meta": {"key": key},
+            "response": "old complete response",
+            "response_sha256": sha("old complete response"),
+        },
+        {
+            "meta": {"key": key},
+            "response": "new complete response",
+            "response_sha256": sha("new complete response"),
+        },
+    ]
+    atomic_write_json(path, payloads[0])
+
+    original_open = safe_io._open_regular_file_at
+
+    def yield_after_open(directory, name, **kwargs):
+        handle = original_open(directory, name, **kwargs)
+        if name == path.name:
+            time.sleep(0.0005)
+        return handle
+
+    monkeypatch.setattr(safe_io, "_open_regular_file_at", yield_after_open)
+    writes = 160
+    writer_done = threading.Event()
+    failures: list[BaseException] = []
+    states: list[str] = []
+
+    def write_cache() -> None:
+        try:
+            for index in range(writes):
+                atomic_write_json(path, payloads[index % len(payloads)])
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=write_cache)
+    writer.start()
+    for _ in range(writes):
+        states.append(read_call_cache(path).state)
+    writer.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert failures == []
+    assert writer_done.is_set()
+    assert states and set(states) == {"VALID"}
 
 
 def _make_dag(tmp_path: Path) -> Dag:
