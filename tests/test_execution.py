@@ -153,24 +153,16 @@ def test_write_sidecar_uses_cache_entry_snapshot_for_cache_hits(
     )
 
 
-def test_write_sidecar_keeps_legacy_cache_key_read_when_snapshot_is_omitted(
-    tmp_path: Path,
-) -> None:
+def test_write_sidecar_rejects_cache_hit_without_snapshot(tmp_path: Path) -> None:
     envelope = _envelope(tmp_path)
     artifact = envelope.seal({"answer": "cached"}, "key", label="Node 'work'")
 
-    envelope.write_sidecar(
-        "work",
-        artifact,
-        "key",
-        cache_hit=True,
-        seconds=0.25,
-        calls=[],
-    )
-
-    metadata = json.loads(
-        (tmp_path / "artifacts" / "runs" / "run-0001" / "work.json.meta.json").read_text(
-            encoding="utf-8"
+    with pytest.raises(ValueError, match="cache entry snapshot"):
+        envelope.write_sidecar(
+            "work",
+            artifact,
+            "key",
+            cache_hit=True,
+            seconds=0.25,
+            calls=[],
         )
-    )
-    assert metadata["origin_provenance"]["artifact_sha256"] == sha(artifact)

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import kigumi.cli as cli_module
 from kigumi import (
     PromptRef,
     PromptSpec,
@@ -425,6 +426,71 @@ def test_init_hooks_refuses_existing_hook_and_missing_pyproject(
     monkeypatch.chdir(second)
     assert main(["init", "--hooks"]) == 1
     assert existing.read_text(encoding="utf-8") == "custom hook\n"
+
+
+def test_init_preflights_conflicting_destinations_before_mutating(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A destination conflict leaves the pyproject and project tree untouched."""
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = 'sample'\n"
+    pyproject.write_text(original, encoding="utf-8")
+    (tmp_path / "nodes").write_text("project code\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init"]) == 1
+    assert pyproject.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "prompts").exists()
+    assert not (tmp_path / "artifacts").exists()
+    assert "must be a directory" in capsys.readouterr().err
+
+
+def test_init_rejects_directory_symlink_before_mutating(tmp_path: Path, monkeypatch) -> None:
+    """Init never scaffolds through a user-controlled directory symlink."""
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = 'sample'\n"
+    pyproject.write_text(original, encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "artifacts"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support directory symlinks: {error}")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["init"]) == 1
+    assert pyproject.read_text(encoding="utf-8") == original
+    assert not (outside / ".gitkeep").exists()
+    assert not (tmp_path / "prompts").exists()
+
+
+def test_init_rolls_back_after_a_late_write_failure(tmp_path: Path, monkeypatch) -> None:
+    """A failure after pyproject and directory writes restores every prior mutation."""
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = 'sample'\n"
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    real_write = cli_module.atomic_write_text
+
+    def fail_on_agent_rules(path: Path, text: str) -> None:
+        if Path(path).name == "AGENTS.md":
+            raise OSError("injected init write failure")
+        real_write(path, text)
+
+    monkeypatch.setattr(cli_module, "atomic_write_text", fail_on_agent_rules)
+
+    assert main(["init"]) == 1
+    assert pyproject.read_text(encoding="utf-8") == original
+    for path in (
+        tmp_path / "prompts",
+        tmp_path / "artifacts",
+        tmp_path / "nodes",
+        tmp_path / "lib",
+        tmp_path / "CLAUDE.md",
+        tmp_path / "AGENTS.md",
+    ):
+        assert not path.exists(), path
 
 
 def test_init_writes_agent_docs_for_claude_and_codex(

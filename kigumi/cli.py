@@ -6,16 +6,20 @@ import argparse
 import importlib
 import inspect
 import json
+import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ._runstate import RUN_MANIFEST_SCHEMA
-from .artifacts import atomic_write_text, canonical_json
+from ._safe_io import secure_atomic_write_text as atomic_write_text
+from .artifacts import canonical_json
 from .config import KigumiConfig, find_project_root, load_config, load_env
 from .dag import GRAPH_COMMAND_HELP, Dag, register_graph_commands
 from .docs import SHIPPED_DOCS, read_doc
@@ -385,27 +389,231 @@ def _print_doc(name: str) -> int:
     return 0
 
 
-def _init(root: Path, *, hooks: bool) -> int:
-    pyproject = root / "pyproject.toml"
-    if not pyproject.is_file():
-        _error("no pyproject.toml found; run uv init first")
-        return 1
+class _InitValidationError(ValueError):
+    """A preflight error that must not leave a partial scaffold behind."""
+
+
+@dataclass(frozen=True)
+class _InitPlan:
+    """All init writes computed before the first filesystem mutation."""
+
+    root: Path
+    directories: tuple[Path, ...]
+    empty_files: tuple[Path, ...]
+    writes: tuple[tuple[Path, str], ...]
+    entry_path: Path | None
+    hook_path: Path | None
+
+
+def _init_lstat(path: Path) -> os.stat_result | None:
+    """Inspect a path without following its final component."""
     try:
-        with pyproject.open("rb") as handle:
-            document = tomllib.load(handle)
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _InitValidationError(f"cannot inspect {path}: {error}") from error
+
+
+def _init_identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _validate_init_destination(
+    root: Path,
+    path: Path,
+    *,
+    kind: str,
+    label: str,
+    required: bool = False,
+) -> None:
+    """Validate every existing component of an init destination.
+
+    ``Path.mkdir`` and ordinary text reads follow directory symlinks.  Init is a
+    project-layout operation, so an existing symlink anywhere below the project
+    root is ambiguous and is rejected before any write is attempted.
+    """
+    root = root.absolute()
+    path = path.absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise _InitValidationError(f"{label} must stay inside the project root") from error
+    if any(part == ".." for part in relative.parts):
+        raise _InitValidationError(f"{label} must not contain '..'")
+
+    current = root
+    parts = relative.parts
+    for index, part in enumerate(parts):
+        current = current / part
+        info = _init_lstat(current)
+        if info is None:
+            if required and index == len(parts) - 1:
+                raise _InitValidationError(f"{label} does not exist: {current}")
+            return
+        if stat.S_ISLNK(info.st_mode):
+            raise _InitValidationError(f"{label} must not contain a symlink: {current}")
+        if index != len(parts) - 1:
+            if not stat.S_ISDIR(info.st_mode):
+                raise _InitValidationError(f"{label} parent is not a directory: {current}")
+            continue
+        if kind == "directory" and not stat.S_ISDIR(info.st_mode):
+            raise _InitValidationError(f"{label} must be a directory: {current}")
+        if kind == "file" and not stat.S_ISREG(info.st_mode):
+            raise _InitValidationError(f"{label} must be a regular file: {current}")
+
+
+def _read_init_text(path: Path, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise _InitValidationError(f"cannot read {label} {path}: {error}") from error
+
+
+class _InitTransaction:
+    """Journal init mutations so a late write failure restores the project."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.absolute()
+        self.created_directories: list[tuple[Path, tuple[int, int]]] = []
+        self.created_files: list[tuple[Path, tuple[int, int]]] = []
+        self.original_files: dict[Path, tuple[str, int]] = {}
+
+    def ensure_directory(self, path: Path) -> None:
+        _validate_init_destination(
+            self.root,
+            path,
+            kind="directory",
+            label="init directory",
+        )
+        relative = path.absolute().relative_to(self.root)
+        current = self.root
+        for part in relative.parts:
+            current = current / part
+            info = _init_lstat(current)
+            if info is not None:
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise _InitValidationError(
+                        f"init directory must be a non-symlink directory: {current}"
+                    )
+                continue
+            try:
+                current.mkdir()
+            except FileExistsError as error:
+                info = _init_lstat(current)
+                if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise _InitValidationError(
+                        f"init directory appeared as a non-directory: {current}"
+                    ) from error
+                continue
+            info = _init_lstat(current)
+            if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise _InitValidationError(f"init directory was not created safely: {current}")
+            self.created_directories.append((current, _init_identity(info)))
+
+    def write_text(self, path: Path, text: str) -> None:
+        _validate_init_destination(
+            self.root,
+            path,
+            kind="file",
+            label="init file",
+        )
+        info = _init_lstat(path)
+        is_new = info is None
+        if not is_new:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise _InitValidationError(f"init file must be a regular file: {path}")
+            if path not in self.original_files:
+                self.original_files[path] = (
+                    _read_init_text(path, "init file"),
+                    stat.S_IMODE(info.st_mode),
+                )
+        atomic_write_text(path, text)
+        if is_new:
+            created = _init_lstat(path)
+            if (
+                created is None
+                or stat.S_ISLNK(created.st_mode)
+                or not stat.S_ISREG(created.st_mode)
+            ):
+                raise _InitValidationError(f"init file was not created safely: {path}")
+            self.created_files.append((path, _init_identity(created)))
+
+    def chmod(self, path: Path, mode: int) -> None:
+        info = _init_lstat(path)
+        if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise _InitValidationError(f"cannot set mode on non-regular init file: {path}")
+        os.chmod(path, mode, follow_symlinks=False)
+
+    def rollback(self) -> list[str]:
+        """Undo this transaction, refusing to remove paths whose identity changed."""
+        errors: list[str] = []
+        for path, identity in reversed(self.created_files):
+            try:
+                info = _init_lstat(path)
+                if info is None:
+                    continue
+                if stat.S_ISREG(info.st_mode) and _init_identity(info) == identity:
+                    path.unlink()
+                else:
+                    errors.append(f"did not remove changed file {path}")
+            except OSError as error:
+                errors.append(f"could not remove {path}: {error}")
+
+        for path, (text, mode) in self.original_files.items():
+            try:
+                info = _init_lstat(path)
+                if info is not None and (
+                    stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                ):
+                    errors.append(f"did not restore changed file {path}")
+                    continue
+                # Use the descriptor-relative writer directly during rollback so a
+                # fault-injected forward write cannot also disable restoration.
+                _restore_atomic_write_text(path, text)
+                os.chmod(path, mode, follow_symlinks=False)
+            except (OSError, ValueError) as error:
+                errors.append(f"could not restore {path}: {error}")
+
+        for path, identity in reversed(self.created_directories):
+            try:
+                info = _init_lstat(path)
+                if info is None:
+                    continue
+                if stat.S_ISDIR(info.st_mode) and _init_identity(info) == identity:
+                    path.rmdir()
+                else:
+                    errors.append(f"did not remove changed directory {path}")
+            except OSError as error:
+                errors.append(f"could not remove {path}: {error}")
+        return errors
+
+
+def _plan_init(root: Path, *, hooks: bool) -> _InitPlan:
+    """Validate and materialize the complete init plan without mutating disk."""
+    root = Path(root).absolute()
+    root_info = _init_lstat(root)
+    if root_info is None or stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise _InitValidationError(f"project root must be a non-symlink directory: {root}")
+
+    pyproject = root / "pyproject.toml"
+    _validate_init_destination(
+        root,
+        pyproject,
+        kind="file",
+        label="pyproject.toml",
+        required=True,
+    )
+    existing = _read_init_text(pyproject, "pyproject.toml")
+    try:
+        document = tomllib.loads(existing)
     except tomllib.TOMLDecodeError as error:
-        _error(f"invalid pyproject.toml: {error}")
-        return 1
-    if isinstance(document.get("tool"), dict) and "kigumi" in document["tool"]:
-        _error("[tool.kigumi] already exists")
-        return 1
-    hook_path = root / ".git" / "hooks" / "pre-commit"
-    if hooks and not (root / ".git").is_dir():
-        _error("cannot install hooks outside a git repository")
-        return 1
-    if hooks and hook_path.exists():
-        _error("refusing to overwrite existing pre-commit hook")
-        return 1
+        raise _InitValidationError(f"invalid pyproject.toml: {error}") from error
+    tool = document.get("tool")
+    if tool is not None and not isinstance(tool, dict):
+        raise _InitValidationError("pyproject.toml [tool] must be a table")
+    if isinstance(tool, dict) and "kigumi" in tool:
+        raise _InitValidationError("[tool.kigumi] already exists")
 
     block = (
         "\n\n[tool.kigumi]\n"
@@ -419,42 +627,136 @@ def _init(root: Path, *, hooks: bool) -> int:
         "agent_slot_timeout_seconds = 300\n"
         f'dag_entry = "{DAG_ENTRY_MODULE}:build_dag"\n'
     )
-    existing = pyproject.read_text(encoding="utf-8")
-    atomic_write_text(pyproject, existing.rstrip() + block)
-    config = KigumiConfig(project_root=root)
-    for directory in [
-        config.prompts_path,
-        config.artifacts_path,
-        config.llm_cache_path,
-        *config.source_paths,
-    ]:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / ".gitkeep").touch(exist_ok=True)
-    _append_gitignore(root / ".gitignore", f"{config.artifacts_dir.rstrip('/')}/")
-    entry_path = _write_dag_entry(root)
-    _write_agent_docs(root)
+    updated_pyproject = existing.rstrip() + block
+    try:
+        prospective = tomllib.loads(updated_pyproject)
+    except tomllib.TOMLDecodeError as error:
+        raise _InitValidationError(f"generated pyproject.toml is invalid: {error}") from error
+    prospective_tool = prospective.get("tool")
+    if not isinstance(prospective_tool, dict) or not isinstance(
+        prospective_tool.get("kigumi"), dict
+    ):
+        raise _InitValidationError("generated [tool.kigumi] configuration is invalid")
+
+    directories = tuple(
+        root / relative for relative in ("prompts", "artifacts", "artifacts/_llm", "nodes", "lib")
+    )
+    for directory in directories:
+        _validate_init_destination(
+            root,
+            directory,
+            kind="directory",
+            label="init directory",
+        )
+
+    empty_files: list[Path] = []
+    for directory in (*directories[:2], directories[3], directories[4]):
+        gitkeep = directory / ".gitkeep"
+        _validate_init_destination(root, gitkeep, kind="file", label=".gitkeep")
+        if _init_lstat(gitkeep) is None:
+            empty_files.append(gitkeep)
+    llm_gitkeep = directories[2] / ".gitkeep"
+    _validate_init_destination(root, llm_gitkeep, kind="file", label=".gitkeep")
+    if _init_lstat(llm_gitkeep) is None:
+        empty_files.append(llm_gitkeep)
+
+    entry_path = root / (DAG_ENTRY_MODULE.replace(".", "/") + ".py")
+    _validate_init_destination(root, entry_path, kind="file", label="DAG entry")
+    entry_exists = _init_lstat(entry_path) is not None
+    if not entry_exists:
+        package_init = entry_path.parent / "__init__.py"
+        _validate_init_destination(root, package_init, kind="file", label="nodes package")
+        if _init_lstat(package_init) is None:
+            empty_files.append(package_init)
+    planned_entry = entry_path if not entry_exists else None
+
+    writes: list[tuple[Path, str]] = [(pyproject, updated_pyproject)]
+
+    gitignore = root / ".gitignore"
+    _validate_init_destination(root, gitignore, kind="file", label=".gitignore")
+    artifact_ignore = "artifacts/"
+    gitignore_info = _init_lstat(gitignore)
+    if gitignore_info is None:
+        writes.append((gitignore, artifact_ignore + "\n"))
+    else:
+        gitignore_text = _read_init_text(gitignore, ".gitignore")
+        lines = gitignore_text.splitlines()
+        if artifact_ignore not in lines:
+            writes.append((gitignore, "\n".join([*lines, artifact_ignore]) + "\n"))
+
+    if planned_entry is not None:
+        writes.append((planned_entry, DAG_ENTRY_TEMPLATE))
+
+    try:
+        brief = _demote_brief_headings(read_doc("brief")).strip()
+    except (FileNotFoundError, KeyError, OSError) as error:
+        raise _InitValidationError(f"cannot load shipped brief for init: {error}") from error
+    agent_block = f"\n{_AGENT_DOCS_SENTINEL}\n{brief}\n"
+    for filename in ("CLAUDE.md", "AGENTS.md"):
+        path = root / filename
+        _validate_init_destination(root, path, kind="file", label=filename)
+        info = _init_lstat(path)
+        if info is None:
+            writes.append((path, agent_block.lstrip("\n")))
+            continue
+        text = _read_init_text(path, filename)
+        if _AGENT_DOCS_SENTINEL not in text:
+            writes.append((path, text.rstrip() + "\n" + agent_block))
+
+    hook_path: Path | None = None
     if hooks:
-        hook_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n")
-        hook_path.chmod(0o755)
+        git_root = root / ".git"
+        _validate_init_destination(root, git_root, kind="directory", label=".git", required=True)
+        hooks_dir = git_root / "hooks"
+        _validate_init_destination(root, hooks_dir, kind="directory", label="git hooks")
+        hook_path = hooks_dir / "pre-commit"
+        _validate_init_destination(root, hook_path, kind="file", label="pre-commit hook")
+        if _init_lstat(hook_path) is not None:
+            raise _InitValidationError("refusing to overwrite existing pre-commit hook")
+        writes.append((hook_path, "#!/bin/sh\nuv run kigumi guard --changed\n"))
+
+    return _InitPlan(
+        root=root,
+        directories=directories,
+        empty_files=tuple(empty_files),
+        writes=tuple(writes),
+        entry_path=planned_entry,
+        hook_path=hook_path,
+    )
+
+
+_restore_atomic_write_text = atomic_write_text
+
+
+def _init(root: Path, *, hooks: bool) -> int:
+    try:
+        plan = _plan_init(root, hooks=hooks)
+    except _InitValidationError as error:
+        _error(str(error))
+        return 1
+
+    transaction = _InitTransaction(plan.root)
+    try:
+        for directory in plan.directories:
+            transaction.ensure_directory(directory)
+        for empty_file in plan.empty_files:
+            transaction.write_text(empty_file, "")
+        for path, text in plan.writes:
+            transaction.write_text(path, text)
+        if plan.hook_path is not None:
+            transaction.chmod(plan.hook_path, 0o755)
+    except Exception as error:
+        rollback_errors = transaction.rollback()
+        detail = f"; rollback incomplete: {', '.join(rollback_errors)}" if rollback_errors else ""
+        _error(f"init failed: {error}{detail}")
+        return 1
+
     print("initialized kigumi project")
-    if entry_path is not None:
-        relative = entry_path.relative_to(root)
+    if plan.entry_path is not None:
+        relative = plan.entry_path.relative_to(plan.root)
         print(f"  wrote {relative} (fill in build_dag, then: kigumi describe)")
         print(f'  optional standalone command: [project.scripts] dag = "{DAG_ENTRY_MODULE}:main"')
     return 0
-
-
-def _write_dag_entry(root: Path) -> Path | None:
-    """Write the graph entry-point skeleton, never overwriting existing project code."""
-    package = root / DAG_ENTRY_MODULE.split(".")[0]
-    entry_path = root / (DAG_ENTRY_MODULE.replace(".", "/") + ".py")
-    if entry_path.exists():
-        return None
-    package.mkdir(parents=True, exist_ok=True)
-    (package / "__init__.py").touch(exist_ok=True)
-    atomic_write_text(entry_path, DAG_ENTRY_TEMPLATE)
-    return entry_path
 
 
 _AGENT_DOCS_SENTINEL = "<!-- kigumi-agent-docs -->"
@@ -483,33 +785,6 @@ def _demote_brief_headings(brief: str) -> str:
                 line = f"{match.group(1)}#{match.group(2)}{line[match.end() :]}"
         lines.append(line)
     return "".join(lines)
-
-
-def _write_agent_docs(root: Path) -> None:
-    """Append kigumi framework guidance to CLAUDE.md and AGENTS.md (idempotent).
-
-    Called unconditionally by ``kigumi init``.  The HTML sentinel prevents
-    double-injection if the pyproject ``[tool.kigumi]`` block is ever manually
-    removed and ``init`` is re-run.
-    """
-    body = _demote_brief_headings(read_doc("brief")).strip()
-    block = f"\n{_AGENT_DOCS_SENTINEL}\n{body}\n"
-    for filename in ("CLAUDE.md", "AGENTS.md"):
-        path = root / filename
-        if path.is_file():
-            existing = path.read_text(encoding="utf-8")
-            if _AGENT_DOCS_SENTINEL in existing:
-                continue
-            atomic_write_text(path, existing.rstrip() + "\n" + block)
-        else:
-            atomic_write_text(path, block.lstrip("\n"))
-
-
-def _append_gitignore(path: Path, entry: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-    if entry not in lines:
-        lines.append(entry)
-        atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def _guard(config: KigumiConfig, *, changed: bool) -> int:

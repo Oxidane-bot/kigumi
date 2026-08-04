@@ -203,7 +203,7 @@ class ExecutionEnvelope:
         if cache_hit and cache_entry is not None:
             entry = cache_entry
         elif cache_hit and isinstance(cache_key, str):
-            entry = store.read_cache_entry(self.artifacts_path, cache_key)
+            raise ValueError("cache-hit sidecars require the cache entry snapshot")
         else:
             entry = None
         safe_calls = _scrub_call_params(calls, mode=evidence_policy.request)
