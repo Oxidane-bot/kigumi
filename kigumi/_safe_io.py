@@ -22,10 +22,8 @@ _ORIGINAL_OS_LINK = os.link
 # system aliases, unlike a symlink introduced anywhere inside a project path.
 # Keep the allowlist explicit: resolving arbitrary path components here would
 # undo the no-follow boundary this module is intended to provide.
-_SYSTEM_DIRECTORY_ALIASES = (
-    (Path("/etc"), Path("/private/etc")),
-    (Path("/tmp"), Path("/private/tmp")),
-    (Path("/var"), Path("/private/var")),
+_SYSTEM_DIRECTORY_ALIASES = tuple(
+    (Path(os.sep, name), Path(os.sep, "private", name)) for name in ("etc", "tmp", "var")
 )
 
 
