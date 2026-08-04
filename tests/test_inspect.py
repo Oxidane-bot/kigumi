@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -8,9 +9,11 @@ import pytest
 import kigumi.inspect as inspect_module
 from kigumi._runstate import AttemptStore
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
+from kigumi.calling import LLMCaller
 from kigumi.errors import CacheIntegrityError
 from kigumi.inspect import diff_components, diff_run_views, load_call, trace_run
 from kigumi.profile import WorkflowProfileError
+from kigumi.testing import FakeTransport
 
 
 def _sidecar(
@@ -125,6 +128,34 @@ def test_trace_run_groups_map_items_and_links_llm_payloads(tmp_path: Path) -> No
     assert traced_call["model"] == "provider/model"
     assert traced["nodes"][1]["key_components"] == {"prompt": "prompt-sha"}
     assert "warnings" not in traced
+
+
+def test_trace_keeps_attachment_direct_chat_unmanaged_with_lineage(tmp_path: Path) -> None:
+    """Trace must use the explicit PromptSpec marker, not resolution presence."""
+    artifacts = tmp_path / "artifacts"
+    llm_cache = tmp_path / "caller-cache"
+    run_root = artifacts / "runs" / "unmanaged-file-chat"
+    source = tmp_path / "attachment.txt"
+    contents = b"trace attachment"
+    source.write_bytes(contents)
+
+    caller = LLMCaller(FakeTransport(), llm_cache)
+    caller.call([{"role": "user", "content": {"kigumi_file": str(source)}}])
+    call = caller.calls[0]
+
+    _trace_manifest(run_root, ["node"])
+    _sidecar(run_root, "node", calls=[call])
+
+    traced = trace_run(artifacts, llm_cache, "unmanaged-file-chat")
+    traced_call = traced["nodes"][0]["calls"][0]
+
+    assert traced_call["managed"] is False
+    assert traced_call["prompt_resolution"] == call["prompt_resolution"]
+    resolution = traced_call["prompt_resolution"]
+    assert resolution["spec"] == "unmanaged"
+    assert resolution["attachments"][0]["content_hash"] == sha256(contents).hexdigest()
+    assert resolution["phase"] == "primary"
+    assert resolution["repair_round"] == 0
 
 
 def test_trace_run_warns_for_missing_payload_and_filters_node(tmp_path: Path) -> None:

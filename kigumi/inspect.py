@@ -23,7 +23,7 @@ from ._runstate import (
 )
 from ._safe_io import SecureDirectory
 from .artifacts import sha
-from .calling import read_call_cache
+from .calling import _is_managed_prompt_resolution, read_call_cache
 from .errors import CacheIntegrityError
 from .profile import (
     WORKFLOW_PROFILE_SCHEMA,
@@ -437,7 +437,7 @@ def _trace_entry(
                     "prompt_sha": call.get("prompt_sha"),
                     "seconds": call.get("seconds"),
                     "usage": call.get("usage"),
-                    "managed": isinstance(call.get("prompt_resolution"), dict),
+                    "managed": _is_managed_prompt_resolution(call.get("prompt_resolution")),
                     "prompt_resolution": call.get("prompt_resolution"),
                     "payload_path": payload_path,
                 }
