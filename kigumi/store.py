@@ -9,14 +9,15 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from .artifacts import atomic_write_json, atomic_write_text, canonical_json, sha, write_artifact
-from .blobs import BlobStore
+from .blobs import BlobStore, _rename_at, _SecureDirectory
 from .errors import OutputOwnershipError
 
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
@@ -380,7 +381,9 @@ def materialize_artifact(
             f"Artifact for {node_name!r} contains duplicate output path(s): "
             + ", ".join(sorted(duplicates))
         )
-    staging_root = Path(tempfile.mkdtemp(prefix=".kigumi-materialize-", dir=project_root))
+    # Keep staging private and independent of the project path.  The final commit below is
+    # descriptor-relative, so no project-side temporary pathname is ever used as a write target.
+    staging_root = Path(tempfile.mkdtemp(prefix=".kigumi-materialize-")).resolve()
     try:
         staged_outputs: list[tuple[Path, Path]] = []
         for relative_path, _destination, contents in resolved_text:
@@ -406,60 +409,90 @@ def materialize_artifact(
 
 
 def _commit_staged_outputs(staged_outputs: list[tuple[Path, Path]], staging_root: Path) -> None:
-    """Replace all staged outputs, restoring prior paths if any replacement fails."""
+    """Replace all staged outputs through bound directories, restoring prior paths on failure."""
     rollback_root = Path(tempfile.mkdtemp(prefix=".kigumi-rollback-", dir=staging_root))
-    changes: list[tuple[Path, Path | None, bool]] = []
-    created_parents: list[Path] = []
+    changes: list[tuple[_SecureDirectory, str, str | None, bool]] = []
     try:
-        for index, (staged, destination) in enumerate(staged_outputs):
-            _ensure_destination_parent(destination, created_parents)
-            backup: Path | None = None
-            if _path_exists(destination):
-                if destination.is_dir():
-                    raise IsADirectoryError(f"Cannot replace output directory: {destination}")
-                backup = rollback_root / str(index)
-                destination.replace(backup)
-            changes.append((destination, backup, False))
-            staged.replace(destination)
-            changes[-1] = (destination, backup, True)
-    except BaseException:
-        _rollback_staged_outputs(changes, created_parents)
-        raise
+        with ExitStack() as directories:
+            rollback_directory = directories.enter_context(
+                _SecureDirectory(rollback_root, create=False)
+            )
+            resolved: list[tuple[Path, _SecureDirectory, str]] = []
+            destination_directories: list[_SecureDirectory] = []
+            try:
+                for staged, destination in staged_outputs:
+                    parent = directories.enter_context(
+                        _SecureDirectory(destination.parent, create=True)
+                    )
+                    destination_directories.append(parent)
+                    parent.verify_bound()
+                    resolved.append((staged, parent, destination.name))
+
+                for index, (staged, destination_directory, destination_name) in enumerate(resolved):
+                    destination_directory.verify_bound()
+                    try:
+                        destination_info = destination_directory.stat(destination_name)
+                    except FileNotFoundError:
+                        destination_info = None
+                    if destination_info is not None and stat.S_ISLNK(destination_info.st_mode):
+                        raise ValueError(
+                            "Materialization destination must not be a symlink: "
+                            f"{destination_directory.path / destination_name}"
+                        )
+                    if destination_info is not None and stat.S_ISDIR(destination_info.st_mode):
+                        raise IsADirectoryError(
+                            "Cannot replace output directory: "
+                            f"{destination_directory.path / destination_name}"
+                        )
+
+                    backup_name: str | None = None
+                    if destination_info is not None:
+                        backup_name = str(index)
+                        _rename_at(
+                            destination_name,
+                            backup_name,
+                            source_directory=destination_directory,
+                            destination_directory=rollback_directory,
+                        )
+                    changes.append((destination_directory, destination_name, backup_name, False))
+                    _rename_at(
+                        staged, destination_name, destination_directory=destination_directory
+                    )
+                    changes[-1] = (destination_directory, destination_name, backup_name, True)
+            except BaseException:
+                _rollback_staged_outputs(changes, rollback_directory, destination_directories)
+                raise
     finally:
         shutil.rmtree(rollback_root, ignore_errors=True)
 
 
 def _rollback_staged_outputs(
-    changes: list[tuple[Path, Path | None, bool]], created_parents: list[Path]
+    changes: list[tuple[_SecureDirectory, str, str | None, bool]],
+    rollback_directory: _SecureDirectory,
+    destination_directories: list[_SecureDirectory],
 ) -> None:
     """Undo committed replacements and remove directories created for staging targets."""
-    for destination, backup, installed in reversed(changes):
-        if installed:
-            destination.unlink(missing_ok=True)
-        if backup is not None and _path_exists(backup):
-            backup.replace(destination)
-    for directory in sorted(set(created_parents), key=lambda path: len(path.parts), reverse=True):
-        with suppress(OSError):
-            directory.rmdir()
-
-
-def _ensure_destination_parent(destination: Path, created: list[Path]) -> None:
-    """Create missing destination parents while retaining enough information to undo them."""
-    missing: list[Path] = []
-    parent = destination.parent
-    while not _path_exists(parent):
-        missing.append(parent)
-        if parent.parent == parent:
-            break
-        parent = parent.parent
-    for directory in reversed(missing):
-        directory.mkdir()
-        created.append(directory)
-
-
-def _path_exists(path: Path) -> bool:
-    """Return whether a path exists, including a dangling symbolic link."""
-    return path.exists() or path.is_symlink()
+    try:
+        for destination_directory, destination_name, backup_name, installed in reversed(changes):
+            if installed:
+                with suppress(FileNotFoundError):
+                    destination_directory.unlink(destination_name)
+            if backup_name is not None:
+                with suppress(FileNotFoundError):
+                    _rename_at(
+                        backup_name,
+                        destination_name,
+                        source_directory=rollback_directory,
+                        destination_directory=destination_directory,
+                    )
+    finally:
+        # A failed materialization must not leave directories that it created solely for outputs.
+        seen: set[int] = set()
+        for destination_directory in reversed(destination_directories):
+            identity = id(destination_directory)
+            if identity not in seen:
+                destination_directory.remove_created()
+                seen.add(identity)
 
 
 def _output_destination(

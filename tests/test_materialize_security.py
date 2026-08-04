@@ -1,0 +1,122 @@
+"""TOCTOU regression tests for materialized project outputs."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+import kigumi.blobs as blobs_module
+from kigumi.blobs import BlobStore
+from kigumi.store import materialize_artifact
+
+
+def _symlink_directory(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support directory symlinks: {error}")
+
+
+def test_text_materialize_does_not_follow_parent_symlink_installed_at_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    parent = project / "output"
+    parent.mkdir()
+    moved_parent = project / "output-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = parent / "result.txt"
+    original_replace = Path.replace
+    raced = False
+
+    def replace_with_parent_race(path: Path, target: Path) -> Path:
+        nonlocal raced
+        if target == destination and not raced:
+            raced = True
+            parent.rename(moved_parent)
+            _symlink_directory(parent, outside)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", replace_with_parent_race)
+
+    materialize_artifact(
+        {"files": {"output/result.txt": "safe text"}},
+        "text-race",
+        lambda path: project / path,
+        BlobStore(tmp_path / "blobs"),
+    )
+
+    assert raced is False
+    assert (parent / "result.txt").read_text(encoding="utf-8") == "safe text"
+    assert not (outside / "result.txt").exists()
+
+
+def test_blob_materialize_does_not_follow_parent_symlink_installed_at_temp_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BlobStore(tmp_path / "blobs")
+    digest = store.put(b"safe blob")
+    project = tmp_path / "project"
+    project.mkdir()
+    parent = project / "output"
+    parent.mkdir()
+    moved_parent = project / "output-original"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = parent / "result.bin"
+    original_mkstemp = blobs_module.tempfile.mkstemp
+    raced = False
+
+    def mkstemp_with_parent_race(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal raced
+        if kwargs.get("dir") == parent and not raced:
+            raced = True
+            parent.rename(moved_parent)
+            _symlink_directory(parent, outside)
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(blobs_module.tempfile, "mkstemp", mkstemp_with_parent_race)
+
+    store.materialize(digest, destination)
+
+    assert raced is False
+    assert (parent / "result.bin").read_bytes() == b"safe blob"
+    assert not (outside / "result.bin").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory symlink setup is privilege-dependent")
+def test_materialize_rejects_a_parent_symlink_before_writing(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    parent = project / "output"
+    _symlink_directory(parent, outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_artifact(
+            {"files": {"output/result.txt": "must not escape"}},
+            "symlink-parent",
+            lambda path: project / path,
+            BlobStore(tmp_path / "blobs"),
+        )
+
+    assert not (outside / "result.txt").exists()
+
+
+def test_materialize_fails_closed_without_descriptor_relative_directory_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BlobStore(tmp_path / "blobs")
+    digest = store.put(b"platform boundary")
+    destination = tmp_path / "result.bin"
+    monkeypatch.setattr(blobs_module, "_secure_directory_supported", lambda: False)
+
+    with pytest.raises(OSError, match="descriptor-relative directory I/O"):
+        store.materialize(digest, destination)
+
+    assert not destination.exists()
