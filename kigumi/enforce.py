@@ -74,6 +74,8 @@ class _ScopeFacts(ast.NodeVisitor):
     imported_raw_aliases: set[str] = field(default_factory=set)
     imported_dynamic_aliases: set[str] = field(default_factory=set)
     imported_builtin_module_aliases: set[str] = field(default_factory=set)
+    deferred_unpackings: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
+    deferred_iterations: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
 
     def visit(self, node: ast.AST) -> None:
         """Collect facts using the standard AST visitor protocol."""
@@ -101,42 +103,41 @@ class _ScopeFacts(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802 -- ast protocol.
         for target in node.targets:
             self.bound_names.update(_target_names(target))
-            for name, expression in _target_value_pairs(target, node.value):
-                self.assignments.append((name, expression))
-                if isinstance(expression, ast.Lambda):
-                    self.lambdas[name] = expression
+            self._record_target_assignment(target, node.value)
         self.visit(node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802 -- ast protocol.
         for name in _target_names(node.target):
             self.bound_names.add(name)
         if node.value is not None:
-            for name, expression in _target_value_pairs(node.target, node.value):
-                self.assignments.append((name, expression))
-                if isinstance(expression, ast.Lambda):
-                    self.lambdas[name] = expression
+            self._record_target_assignment(node.target, node.value)
         if node.value is not None:
             self.visit(node.value)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802 -- ast protocol.
         for name in _target_names(node.target):
             self.bound_names.add(name)
-        for name, expression in _target_value_pairs(node.target, node.value):
-            self.assignments.append((name, expression))
-            if isinstance(expression, ast.Lambda):
-                self.lambdas[name] = expression
+        self._record_target_assignment(node.target, node.value)
         self.visit(node.value)
 
     def visit_For(self, node: ast.For) -> None:  # noqa: N802 -- ast protocol.
         self.bound_names.update(_target_names(node.target))
-        self.assignments.extend(_iter_binding_pairs(node.target, node.iter))
+        pairs = _iter_binding_pairs(node.target, node.iter)
+        if pairs:
+            self.assignments.extend(pairs)
+        else:
+            self.deferred_iterations.append((node.target, node.iter))
         self.visit(node.iter)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:  # noqa: N802 -- ast protocol.
         self.bound_names.update(_target_names(node.target))
-        self.assignments.extend(_iter_binding_pairs(node.target, node.iter))
+        pairs = _iter_binding_pairs(node.target, node.iter)
+        if pairs:
+            self.assignments.extend(pairs)
+        else:
+            self.deferred_iterations.append((node.target, node.iter))
         self.visit(node.iter)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
@@ -175,6 +176,16 @@ class _ScopeFacts(ast.NodeVisitor):
                 self.imported_raw_aliases.add(local_name)
             elif node.module == "builtins" and alias.name in _DYNAMIC_CALLABLE_NAMES:
                 self.imported_dynamic_aliases.add(local_name)
+
+    def _record_target_assignment(self, target: ast.AST, value: ast.expr) -> None:
+        pairs = _target_value_pairs(target, value)
+        if pairs:
+            for name, expression in pairs:
+                self.assignments.append((name, expression))
+                if isinstance(expression, ast.Lambda):
+                    self.lambdas[name] = expression
+        elif isinstance(target, (ast.Tuple, ast.List, ast.Starred)):
+            self.deferred_unpackings.append((target, value))
 
 
 def waiver_reasons(text: str) -> list[str]:
@@ -501,6 +512,10 @@ class _RawIOVisitor(ast.NodeVisitor):
                         direct.call_arguments.get(function_name, ())
                         if function_name is not None
                         else (),
+                        context_name=context_name,
+                        raw_aliases=child_state.raw_aliases,
+                        dynamic_aliases=child_state.dynamic_aliases,
+                        builtin_module_aliases=child_state.builtin_module_aliases,
                     ),
                 ),
             )
@@ -827,12 +842,19 @@ class _CallableCall:
 def _parameter_kinds_for_function(
     node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
     calls: tuple[_CallableCall, ...] | list[_CallableCall],
+    *,
+    context_name: str | None,
+    raw_aliases: set[str],
+    dynamic_aliases: set[str],
+    builtin_module_aliases: set[str],
 ) -> dict[str, _CallableKind]:
-    """Bind known callable facts from calls to a local function's parameters."""
+    """Bind callable facts from calls and statically known parameter defaults."""
     arguments = node.args
     positional_parameters = [*arguments.posonlyargs, *arguments.args]
+    all_parameters = [*positional_parameters, *arguments.kwonlyargs]
     keyword_parameters = {parameter.arg for parameter in arguments.kwonlyargs}
     keyword_parameters.update(parameter.arg for parameter in positional_parameters)
+    default_kinds: dict[str, _CallableKind] = {}
     result: dict[str, _CallableKind] = {}
 
     def record(name: str | None, callable_kind: _CallableKind) -> None:
@@ -840,17 +862,68 @@ def _parameter_kinds_for_function(
             return
         result[name] = _merge_callable_kinds(result.get(name), callable_kind)
 
+    def classify_default(expression: ast.expr) -> _CallableKind:
+        return _classify_callable_expression(
+            expression,
+            context_name=context_name,
+            raw_aliases=raw_aliases,
+            dynamic_aliases=dynamic_aliases,
+            builtin_module_aliases=builtin_module_aliases,
+        )
+
+    positional_defaults = list(arguments.defaults)
+    if positional_defaults:
+        for parameter, default in zip(
+            positional_parameters[-len(positional_defaults) :], positional_defaults, strict=True
+        ):
+            callable_kind = classify_default(default)
+            if callable_kind is not _CallableKind.UNKNOWN:
+                default_kinds[parameter.arg] = callable_kind
+    for parameter, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
+        if default is not None:
+            callable_kind = classify_default(default)
+            if callable_kind is not _CallableKind.UNKNOWN:
+                default_kinds[parameter.arg] = callable_kind
+
+    if not calls:
+        return default_kinds
+
     for call in calls:
+        supplied: dict[str, _CallableKind] = {}
+
         for index, callable_kind in enumerate(call.positional):
             if index < len(positional_parameters):
-                record(positional_parameters[index].arg, callable_kind)
+                name = positional_parameters[index].arg
             elif arguments.vararg is not None:
-                record(arguments.vararg.arg, callable_kind)
+                name = arguments.vararg.arg
+            else:
+                name = None
+            if name is not None:
+                supplied[name] = _merge_callable_kinds(supplied.get(name), callable_kind)
         for name, callable_kind in call.keywords.items():
             if name in keyword_parameters:
-                record(name, callable_kind)
+                parameter_name = name
             elif arguments.kwarg is not None:
-                record(arguments.kwarg.arg, callable_kind)
+                parameter_name = arguments.kwarg.arg
+            else:
+                parameter_name = None
+            if parameter_name is not None:
+                supplied[parameter_name] = _merge_callable_kinds(
+                    supplied.get(parameter_name), callable_kind
+                )
+
+        for parameter in all_parameters:
+            record(
+                parameter.arg,
+                supplied.get(
+                    parameter.arg,
+                    default_kinds.get(parameter.arg, _CallableKind.UNKNOWN),
+                ),
+            )
+        if arguments.vararg is not None:
+            record(arguments.vararg.arg, supplied.get(arguments.vararg.arg, _CallableKind.UNKNOWN))
+        if arguments.kwarg is not None:
+            record(arguments.kwarg.arg, supplied.get(arguments.kwarg.arg, _CallableKind.UNKNOWN))
     return result
 
 
@@ -909,10 +982,11 @@ def _collect_callable_aliases(
         elif _is_hard_dynamic_kind(callable_kind):
             dynamic.add(name)
             raw.discard(name)
+    assignments = _expanded_callable_assignments(facts)
     changed = True
     while changed:
         changed = False
-        for name, expression in facts.assignments:
+        for name, expression in assignments:
             callable_kind = _classify_callable_expression(
                 expression,
                 context_name=context_name,
@@ -936,6 +1010,92 @@ def _collect_callable_aliases(
                 builtin_modules.add(name)
                 changed = True
     return _CallableAliases(raw=raw, dynamic=dynamic, builtin_modules=builtin_modules)
+
+
+def _expanded_callable_assignments(facts: _ScopeFacts) -> list[tuple[str, ast.expr]]:
+    """Expand statically resolvable sequence aliases before classifying bindings."""
+    assignments = list(facts.assignments)
+    seen = {_assignment_key(name, expression) for name, expression in assignments}
+    sequence_aliases: dict[str, list[ast.expr]] = {}
+
+    def add_assignment(name: str, expression: ast.expr) -> bool:
+        key = _assignment_key(name, expression)
+        if key in seen:
+            return False
+        seen.add(key)
+        assignments.append((name, expression))
+        return True
+
+    changed = True
+    while changed:
+        changed = False
+        for name, expression in assignments:
+            values = _resolve_static_sequence(expression, sequence_aliases)
+            if values is None:
+                continue
+            if name not in sequence_aliases:
+                sequence_aliases[name] = values
+                changed = True
+
+        for target, value in facts.deferred_unpackings:
+            values = _resolve_static_sequence(value, sequence_aliases)
+            if values is None:
+                continue
+            for name, expression in _target_value_pairs_from_elements(target, values):
+                changed |= add_assignment(name, expression)
+
+        for target, iterable in facts.deferred_iterations:
+            values = _resolve_static_sequence(iterable, sequence_aliases)
+            if values is None:
+                continue
+            if isinstance(target, ast.Name):
+                pairs = [(target.id, value) for value in values]
+            else:
+                pairs = [
+                    pair
+                    for value in values
+                    for pair in _target_value_pairs_from_elements(target, [value])
+                ]
+            for name, expression in pairs:
+                changed |= add_assignment(name, expression)
+
+    return assignments
+
+
+def _assignment_key(name: str, expression: ast.expr) -> tuple[str, str]:
+    return name, ast.dump(expression, annotate_fields=True, include_attributes=False)
+
+
+def _resolve_static_sequence(
+    expression: ast.AST,
+    sequence_aliases: dict[str, list[ast.expr]],
+) -> list[ast.expr] | None:
+    direct_values = _sequence_elements(expression)
+    if direct_values is not None:
+        return direct_values
+    if isinstance(expression, ast.Name):
+        return sequence_aliases.get(expression.id)
+    return None
+
+
+def _target_value_pairs_from_elements(
+    target: ast.AST,
+    values: list[ast.expr],
+) -> list[tuple[str, ast.expr]]:
+    if isinstance(target, ast.Name):
+        return [(target.id, values[0])] if len(values) == 1 else []
+    if isinstance(target, ast.Starred):
+        return _target_value_pairs_from_elements(target.value, values)
+    if not isinstance(target, (ast.Tuple, ast.List)):
+        return []
+    pairs: list[tuple[str, ast.expr]] = []
+    for target_element, value_element in zip(target.elts, values, strict=False):
+        nested_values = _sequence_elements(value_element)
+        if isinstance(target_element, (ast.Tuple, ast.List)) and nested_values is not None:
+            pairs.extend(_target_value_pairs_from_elements(target_element, nested_values))
+        else:
+            pairs.extend(_target_value_pairs_from_elements(target_element, [value_element]))
+    return pairs
 
 
 def _classify_callable_expression(

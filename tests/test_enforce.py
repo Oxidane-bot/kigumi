@@ -280,6 +280,30 @@ def node(inputs, ctx):
     ]
 
 
+def test_raw_io_propagates_callable_facts_through_helper_defaults() -> None:
+    """helper 的默认 callable 也必须传播 raw、dynamic 与 opaque 事实。"""
+    source = """
+def node(inputs, ctx):
+    def raw_helper(reader=open):
+        return reader("raw-default.txt").read()
+
+    def dynamic_helper(reader=globals):
+        return reader("dynamic-default.txt")
+
+    def opaque_helper(reader=globals()["open"]):
+        return reader("opaque-default.txt")
+
+    return raw_helper(), dynamic_helper(), opaque_helper()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/default-facts.py"))
+
+    snippets = [finding.snippet for finding in findings]
+    assert any('return reader("raw-default.txt").read()' in snippet for snippet in snippets)
+    assert any('return reader("dynamic-default.txt")' in snippet for snippet in snippets)
+    assert any('return reader("opaque-default.txt")' in snippet for snippet in snippets)
+
+
 def test_raw_io_propagates_tuple_for_and_named_open_aliases() -> None:
     """解构、for 绑定和 named expression 都不能隐藏 open alias。"""
     source = """
@@ -295,6 +319,25 @@ def node(inputs, ctx):
     findings = check_raw_io_source(source, Path("nodes/compound-aliases.py"))
 
     assert [finding.lineno for finding in findings] == [4, 4, 6, 7]
+
+
+def test_raw_io_propagates_indirect_sequence_aliases_through_destructuring() -> None:
+    """先绑定到 tuple/list 的 alias 也不能绕过解构后的 raw-I/O 检查。"""
+    source = """
+def node(inputs, ctx):
+    tuple_pair = (open,)
+    tuple_reader, = tuple_pair
+    list_pair = [open]
+    list_reader, = list_pair
+    return (
+        tuple_reader("tuple-alias-secret.txt").read(),
+        list_reader("list-alias-secret.txt").read(),
+    )
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/indirect-aliases.py"))
+
+    assert [finding.lineno for finding in findings] == [8, 9]
 
 
 def test_raw_io_orders_same_line_findings_by_source_column() -> None:
