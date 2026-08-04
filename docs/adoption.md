@@ -1236,9 +1236,21 @@ pytest 插件激活后会追加 `kigumi_guard`：未豁免 finding 使该测试�
 ### 仓库 CI 的定时安全扫描
 
 本仓库的 `.github/workflows/security.yml` 独立于 push/pull_request CI，每周一
-04:17 UTC 自动运行，也支持 `workflow_dispatch` 手动运行。它审计 `uv sync --locked --extra dev`
-解析出的环境依赖，并运行只扫描 `kigumi/` 的 Bandit：pip-audit 使用固定版本，发现 CVE
-即失败；Bandit 的门槛是 medium 及以上，避免既有 low-only findings 让首日 job 失效。
+04:17 UTC 自动运行，也支持 `workflow_dispatch` 手动运行。它用
+`uv sync --locked --extra dev --no-install-project` 安装依赖，故尚未发布到 PyPI 的本地
+editable `kigumi` 不会被 `pip-audit` 当成外部依赖；同时运行只扫描 `kigumi/` 的 Bandit。
+pip-audit 使用固定版本，发现 CVE 即失败；Bandit 的门槛是 medium 及以上，避免既有
+low-only findings 让首日 job 失效。
+
+本地发行物检查要求目录中恰好有当前版本的一个 wheel 和一个 sdist。默认 `dist/` 已被
+Git 忽略，但可能留有历史构件；`scripts/verify_dist.py` 会列出它们并给出临时目录命令，
+不会擅自删除用户文件。需要绕开 stale 构件时可直接执行：
+
+```bash
+tmp_dist="$(mktemp -d)"
+uv build --out-dir "$tmp_dist"
+uv run python scripts/verify_dist.py --dist "$tmp_dist" --expected-version "$(uv run python -c 'import kigumi; print(kigumi.__version__)')"
+```
 定时 workflow 失败会按默认分支 GitHub Actions 的常规失败状态和通知设置呈现，不依赖第三方
 通知 action。
 

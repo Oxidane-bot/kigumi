@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import email
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -59,7 +60,7 @@ def verify(dist: Path, expected_version: str) -> None:
     wheels = sorted(dist.glob("kigumi-*.whl"))
     sdists = sorted(dist.glob("kigumi-*.tar.gz"))
     if len(wheels) != 1 or len(sdists) != 1:
-        raise RuntimeError("dist must contain exactly one Kigumi wheel and one sdist")
+        raise RuntimeError(_dist_layout_error(dist, expected_version, wheels, sdists))
 
     with zipfile.ZipFile(wheels[0]) as archive:
         wheel_names = set(archive.namelist())
@@ -99,12 +100,50 @@ def _reject_acp(names: set[str], kind: str) -> None:
         raise RuntimeError(f"{kind} contains removed ACP files: {acp}")
 
 
+def _dist_layout_error(
+    dist: Path,
+    expected_version: str,
+    wheels: list[Path],
+    sdists: list[Path],
+) -> str:
+    expected_wheel_prefix = f"kigumi-{expected_version}-"
+    expected_sdist_name = f"kigumi-{expected_version}.tar.gz"
+    stale = sorted(
+        path.name
+        for path in [*wheels, *sdists]
+        if not (
+            (path in wheels and path.name.startswith(expected_wheel_prefix))
+            or (path in sdists and path.name == expected_sdist_name)
+        )
+    )
+    stale_note = f"Stale or wrong-version artifacts were found: {stale}." if stale else ""
+    return (
+        f"{dist} must contain exactly one Kigumi {expected_version} wheel and one sdist; "
+        f"found wheels={[path.name for path in wheels]} and "
+        f"sdists={[path.name for path in sdists]}. {stale_note} "
+        "Existing files are not deleted. Build into a clean temporary directory and pass "
+        "it with --dist, for example:\n"
+        f'  tmp_dist="$(mktemp -d)" && uv build --out-dir "$tmp_dist" && '
+        "uv run python scripts/verify_dist.py "
+        f'--dist "$tmp_dist" --expected-version {expected_version}'
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dist", type=Path, default=Path("dist"))
+    parser.add_argument(
+        "--dist",
+        type=Path,
+        default=Path("dist"),
+        help="artifact directory; existing stale files are never deleted",
+    )
     parser.add_argument("--expected-version", required=True)
     args = parser.parse_args()
-    verify(args.dist, args.expected_version)
+    try:
+        verify(args.dist, args.expected_version)
+    except RuntimeError as error:
+        print(f"verify_dist: {error}", file=sys.stderr)
+        return 1
     print(f"verified dist for kigumi {args.expected_version}")
     return 0
 

@@ -21,14 +21,29 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      - name: Install the project and dev dependency set
-        run: uv sync --locked --extra dev --python 3.13
+      - name: Install locked dev dependency set without the local project
+        run: uv sync --locked --extra dev --no-install-project --python 3.13
       - name: Audit dependencies (CVE findings fail)
         run: |
-          # Resolve the venv target instead of duplicating its Python-version path in YAML.
-          site_packages="$(uv run --python 3.13 python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          # Resolve the dependency-only venv target instead of duplicating its Python-version
+          # path in YAML. --no-project keeps the checkout's editable package out of the target.
+          audit_python="$(uv run --no-project --python 3.13 python -c 'import sys; print(sys.executable)')"
+          site_packages="$($audit_python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
           if [ ! -d "$site_packages" ]; then
             echo "::error::pip-audit target does not exist: $site_packages"
+            exit 1
+          fi
+          if "$audit_python" - <<'PY'
+          import importlib.metadata
+
+          try:
+              importlib.metadata.version("kigumi")
+          except importlib.metadata.PackageNotFoundError:
+              raise SystemExit(1)
+          raise SystemExit(0)
+          PY
+          then
+            echo "::error::pip-audit target contains the local kigumi project package"
             exit 1
           fi
           # Prevent an empty target from producing pip-audit's misleading green result.
