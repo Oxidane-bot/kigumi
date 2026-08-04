@@ -6,6 +6,7 @@ from kigumi.enforce import (
     RawIOFinding,
     check_paths,
     check_raw_io_node_paths,
+    check_raw_io_node_source,
     check_raw_io_source,
     check_source,
 )
@@ -824,3 +825,128 @@ def indexed(inputs, ctx):
     findings = check_raw_io_node_paths([source.parent])
 
     assert [(finding.lineno, finding.waived) for finding in findings] == [(5, False)]
+
+
+def test_raw_io_path_guard_scans_top_level_definition_expressions() -> None:
+    """顶层节点的 decorator/default/annotation 也在函数定义时执行。"""
+    source = """
+@dag.node("top")
+@open("decorator-open-secret.txt")
+@Path("decorator-secret.txt").read_text()
+def top(
+    reader=open,
+    opened=open("default-open-secret.txt"),
+    value=Path("default-secret.txt").read_text(),
+    typed: Path("annotation-secret.txt").read_text() = None,
+    opened_type: open("annotation-open-secret.txt") = None,
+) -> Path("return-secret.txt").read_text():
+    return reader("default-open-secret.txt").read()
+"""
+
+    findings = check_raw_io_node_source(source, Path("nodes/top-level-definition.py"))
+
+    assert {
+        '@open("decorator-open-secret.txt")',
+        '@Path("decorator-secret.txt").read_text()',
+        'opened=open("default-open-secret.txt"),',
+        'value=Path("default-secret.txt").read_text(),',
+        'typed: Path("annotation-secret.txt").read_text() = None,',
+        'opened_type: open("annotation-open-secret.txt") = None,',
+        ') -> Path("return-secret.txt").read_text():',
+        'return reader("default-open-secret.txt").read()',
+    } <= {finding.snippet for finding in findings}
+
+
+def test_raw_io_propagates_negative_subscripts_and_static_dict_containers() -> None:
+    """负下标与静态 dict callable 不能成为 raw open 的事实传播旁路。"""
+    source = """
+def node(inputs, ctx):
+    readers = [open]
+    dict_readers = {"reader": readers[-1]}
+    reader = dict_readers["reader"]
+    return reader("negative-dict-secret.txt").read()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/static-containers.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'return reader("negative-dict-secret.txt").read()',
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_closes_builtin_alias_importlib_and_sys_modules_open_chains() -> None:
+    """builtin/module 字典链在落到 open 时必须仍是可审计的 raw-I/O 事实。"""
+    source = """
+import builtins
+import importlib
+import sys
+
+def node(inputs, ctx):
+    builtin_dict = builtins.__dict__
+    builtin_reader = builtin_dict["open"]
+    first = builtin_reader("builtin-alias-secret.txt").read()
+
+    imported_module = importlib.import_module("builtins")
+    second = imported_module.__dict__["open"]("importlib-secret.txt").read()
+    fourth = importlib.import_module("builtins").__dict__["open"](
+        "inline-importlib-secret.txt"
+    ).read()
+
+    module_table = sys.modules
+    sys_builtin = module_table["builtins"]
+    third = sys_builtin.__dict__["open"]("sys-modules-secret.txt").read()
+
+    return first, second, third
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/module-open-chains.py"))
+
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'builtin_reader = builtin_dict["open"]',
+        'first = builtin_reader("builtin-alias-secret.txt").read()',
+        'second = imported_module.__dict__["open"]("importlib-secret.txt").read()',
+        'fourth = importlib.import_module("builtins").__dict__["open"](',
+        'third = sys_builtin.__dict__["open"]("sys-modules-secret.txt").read()',
+    } <= snippets
+    assert 'imported_module = importlib.import_module("builtins")' not in snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_does_not_expand_import_module_names_into_ordinary_attributes() -> None:
+    """importlib/sys 的普通属性保持 unknown，不把模块名本身变成无界误报。"""
+    source = """
+import importlib
+import sys
+
+def node(inputs, ctx):
+    return importlib.util, sys.version
+"""
+
+    assert check_raw_io_source(source, Path("nodes/ordinary-module-attributes.py")) == []
+
+
+def test_raw_io_propagates_static_lambda_star_and_keyword_arguments() -> None:
+    """静态 star/**kwargs 展开必须传播 raw callable，并跟进 lambda 体。"""
+    source = """
+def node(inputs, ctx):
+    def invoke(reader):
+        return reader("keyword-secret.txt").read()
+
+    invoke(**{"reader": open})
+    def run(reader):
+        return reader()
+
+    callbacks = [lambda: Path("lambda-secret.txt").read_text()]
+    return invoke(**{"reader": open}), run(*callbacks)
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/static-callable-arguments.py"))
+
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'return reader("keyword-secret.txt").read()',
+        'callbacks = [lambda: Path("lambda-secret.txt").read_text()]',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)

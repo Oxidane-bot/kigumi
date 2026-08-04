@@ -47,8 +47,11 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
    identity，不绑定附件路径或 transport 层 base64。`prompt_resolution_schema=1` 只有一条
    managed 持久化轨道：record 必须同时包含 `messages`、`attachments`、`response_spec` 以及
    其他 canonical 字段，并使用包含消息、附件内容摘要和 `ResponseSpec` 的 managed request digest。
-   缺少字段、字段类型错误或摘要不一致都必须 fail closed；旧 legacy body 不属于可接受形态，不能
-   把它当作普通 cache miss，也不能猜测缺失字段。
+   `base`、`layers`、`axes`、`materials`、`rendered` 的每个 record 都必须满足其完整字段集合、
+   嵌套引用形状和整数/字符串类型；缺少字段、字段类型错误或摘要不一致都必须 fail closed。
+   带 CALL lineage 的 record 必须成组包含字符串 `base_resolution_digest`、`phase`（`primary`
+   或 `repair`）和非负整数 `repair_round`，并满足 primary=0、repair>0 及 base digest 绑定。
+   旧 legacy body 不属于可接受形态，不能把它当作普通 cache miss，也不能猜测缺失字段。
 10. `preflight()` 在缓存查找和 provider 请求前检查估算 token、附件数量和总字节数；违规抛
     `RequestTooLarge`，不得静默调用 `clip()`。
 11. `ctx.resolve_prompt()` 只返回预解析对象；只有 `ctx.call(resolved)` 或把该对象直接作为

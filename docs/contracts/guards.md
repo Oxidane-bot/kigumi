@@ -21,11 +21,11 @@ Status: Active (0.13.0)
 ## Invariants
 
 1. raw-I/O 注册检查从节点函数体递归跟随**可达的局部 helper/lambda**；未被节点执行路径引用的普通 helper 函数体不产生误报。
-   但是 nested helper 的默认参数、decorator 与 annotation 在函数定义时执行，因此这些表达式始终扫描。
+   但是顶层节点和 nested helper 的默认参数、decorator 与 annotation 在函数定义时执行，因此这些表达式始终扫描。
 2. 节点执行范围内禁止 nested class。class method 是 AST 无法证明的执行边界，不能靠扫描方法体声称已经覆盖。
-3. raw callable 的直接别名（如 `open_alias = open`、`reader = Path(...).read_text`）、已知 callback 位置（`map`/`filter`）以及可证明的静态序列传播（如 `readers[0]`、`helper(*readers)`、`map(*[open], ...)`）必须被识别。
-   `globals`、`locals`、`getattr`、`eval`、`exec`、直接 `__import__`、`builtins.__dict__` 的已知 raw/dynamic callable lookup，以及下标得到的 opaque callable 采用硬切：使用或调用即违规。
-   `builtins.__dict__["__import__"]` 本身是动态 import 边界：纯 import 不制造 raw-I/O finding，由动态 import 分析负责；一旦其结果继续到 raw/opaque callable，整条链必须硬切。
+3. raw callable 的直接别名（如 `open_alias = open`、`reader = Path(...).read_text`）、已知 callback 位置（`map`/`filter`）以及可证明的静态容器传播（序列的正/负下标、字面量 `dict`、`helper(*readers)`、静态 `**kwargs`、`map(*[open], ...)`）必须被识别。
+   `globals`、`locals`、`getattr`、`eval`、`exec`、直接 `__import__`、`builtins.__dict__` 的 alias、`importlib`/`sys.modules` 链、已知 raw/dynamic callable lookup，以及下标得到的 opaque callable 采用硬切：使用或调用即违规。
+   `builtins.__dict__["__import__"]` 及纯动态 `importlib.import_module(...)` 本身是动态 import 边界：纯 import 不制造 raw-I/O finding，由动态 import 分析负责；一旦其结果继续到 raw/opaque callable，整条链必须硬切。
    任意未知数据下标仍保持 unknown，不因存在 `readers[index]` 就作无边界推断。
 4. `ctx` 只有在仍绑定到节点上下文参数时才豁免 `read_text`/`read_bytes`；重新绑定后同名方法按 raw read 扫描。
    硬切结构违规不接受 `raw-io-ok` 豁免；真正的、静态可证明的 raw read 仍可使用带理由的 `raw-io-ok`。
@@ -34,7 +34,7 @@ Status: Active (0.13.0)
 
 这些规则是一个有边界的 AST 检查器，不是 Python 解释器，也不承诺发现任意动态调用。
 为了让契约可证明，节点必须避免 opaque callable、动态名称解析和 nested class，使用显式命名
-helper 或 `ctx.read_text`/`ctx.read_bytes`；只有静态字面量序列的 callable 事实才会传播。
+helper 或 `ctx.read_text`/`ctx.read_bytes`；只有静态字面量序列/dict 的 callable 事实才会传播。
 
 ## Failure behavior
 

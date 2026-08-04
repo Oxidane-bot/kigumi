@@ -537,6 +537,154 @@ def _thaw_value(value: Any) -> Any:
     return value
 
 
+def _record_fields(
+    value: Any,
+    *,
+    required: set[str],
+    optional: set[str] | None = None,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping")
+    if any(not isinstance(field, str) for field in value):
+        raise TypeError(f"{label} keys must be strings")
+    fields = set(value)
+    missing = required - fields
+    extra = fields - required - (optional or set())
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing: {', '.join(sorted(missing))}")
+        if extra:
+            details.append(f"extra: {', '.join(sorted(extra))}")
+        raise TypeError(f"{label} has invalid fields ({'; '.join(details)})")
+    return value
+
+
+def _record_text(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{label} must be a non-empty string")
+    return value
+
+
+def _record_bytes(value: Any, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _record_path(value: Any, *, label: str) -> None:
+    if not isinstance(value, list):
+        raise TypeError(f"{label} must be a list")
+    for part in value:
+        if isinstance(part, bool) or not isinstance(part, str | int):
+            raise TypeError(f"{label} has an invalid segment")
+        if isinstance(part, str) and not part:
+            raise TypeError(f"{label} has an empty string segment")
+
+
+def _validate_persisted_value_ref(value: Any, *, label: str, allow_file_ref: bool) -> None:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping")
+    kind = _record_text(value.get("kind"), label=f"{label}.kind")
+    if kind in {"input", "param"}:
+        _record_fields(value, required={"kind", "name", "path"}, label=label)
+        _record_text(value["name"], label=f"{label}.name")
+        _record_path(value["path"], label=f"{label}.path")
+    elif kind in {"item", "carry"}:
+        _record_fields(value, required={"kind", "path"}, label=label)
+        _record_path(value["path"], label=f"{label}.path")
+    elif kind == "file_ref" and allow_file_ref:
+        _record_fields(value, required={"kind", "path_from"}, label=label)
+        _validate_persisted_value_ref(
+            value["path_from"],
+            label=f"{label}.path_from",
+            allow_file_ref=False,
+        )
+    else:
+        raise TypeError(f"{label}.kind is not an allowed Prompt value reference")
+
+
+def _validate_persisted_descriptor(value: Any, *, label: str) -> None:
+    _record_fields(value, required={"ref", "sha256", "bytes"}, label=label)
+    _record_text(value["ref"], label=f"{label}.ref")
+    _record_text(value["sha256"], label=f"{label}.sha256")
+    _record_bytes(value["bytes"], label=f"{label}.bytes")
+
+
+def _validate_persisted_layer(value: Any, *, index: int) -> None:
+    label = f"layers[{index}]"
+    record = _record_fields(
+        value,
+        required={"slot", "ref", "sha256", "bytes"},
+        optional={"axis", "selected"},
+        label=label,
+    )
+    _record_text(record["slot"], label=f"{label}.slot")
+    _record_text(record["ref"], label=f"{label}.ref")
+    _record_text(record["sha256"], label=f"{label}.sha256")
+    _record_bytes(record["bytes"], label=f"{label}.bytes")
+    axis_fields = {"axis", "selected"} & set(record)
+    if axis_fields and axis_fields != {"axis", "selected"}:
+        raise TypeError(f"{label} axis selection fields must be complete")
+    if axis_fields:
+        _record_text(record["axis"], label=f"{label}.axis")
+        _record_text(record["selected"], label=f"{label}.selected")
+
+
+def _validate_persisted_axis(value: Any, *, index: int) -> None:
+    label = f"axes[{index}]"
+    record = _record_fields(
+        value,
+        required={"name", "selector", "selected", "ref", "sha256"},
+        label=label,
+    )
+    _record_text(record["name"], label=f"{label}.name")
+    _validate_persisted_value_ref(
+        record["selector"],
+        label=f"{label}.selector",
+        allow_file_ref=False,
+    )
+    _record_text(record["selected"], label=f"{label}.selected")
+    _record_text(record["ref"], label=f"{label}.ref")
+    _record_text(record["sha256"], label=f"{label}.sha256")
+
+
+def _validate_persisted_file_manifest(value: Any, *, label: str) -> None:
+    record = _record_fields(
+        value,
+        required={"path", "path_from", "sha256", "bytes"},
+        label=label,
+    )
+    _record_text(record["path"], label=f"{label}.path")
+    _validate_persisted_value_ref(
+        record["path_from"],
+        label=f"{label}.path_from",
+        allow_file_ref=False,
+    )
+    _record_text(record["sha256"], label=f"{label}.sha256")
+    _record_bytes(record["bytes"], label=f"{label}.bytes")
+
+
+def _validate_persisted_material(value: Any, *, index: int) -> None:
+    label = f"materials[{index}]"
+    record = _record_fields(
+        value,
+        required={"slot", "source", "title", "sha256", "bytes"},
+        optional={"file_ref"},
+        label=label,
+    )
+    _record_text(record["slot"], label=f"{label}.slot")
+    _validate_persisted_value_ref(record["source"], label=f"{label}.source", allow_file_ref=True)
+    title = record["title"]
+    if title is not None and (not isinstance(title, str) or not title.strip()):
+        raise TypeError(f"{label}.title must be a non-empty string or null")
+    _record_text(record["sha256"], label=f"{label}.sha256")
+    _record_bytes(record["bytes"], label=f"{label}.bytes")
+    if "file_ref" in record:
+        _validate_persisted_file_manifest(record["file_ref"], label=f"{label}.file_ref")
+
+
 def validate_prompt_resolution_record(value: Any) -> None:
     """Validate one persisted schema-1 resolution without reconstructing Prompt text."""
     if not isinstance(value, Mapping):
@@ -551,6 +699,8 @@ def validate_prompt_resolution_record(value: Any) -> None:
         or schema != PROMPT_RESOLUTION_SCHEMA
     ):
         raise PromptResolutionError("persisted Prompt resolution has invalid schema")
+    if any(not isinstance(field, str) for field in value):
+        raise PromptResolutionError("persisted Prompt resolution has invalid schema fields")
     required_fields = {
         "prompt_resolution_schema",
         "spec",
@@ -565,17 +715,23 @@ def validate_prompt_resolution_record(value: Any) -> None:
         "response_spec",
         "resolution_digest",
     }
+    lineage_fields = {"base_resolution_digest", "phase", "repair_round"}
     missing_fields = required_fields - set(value)
     if missing_fields:
         missing = ", ".join(sorted(missing_fields))
         raise PromptResolutionError(
             f"persisted Prompt resolution has incomplete managed request fields; missing: {missing}"
         )
+    extra_fields = set(value) - required_fields - lineage_fields
+    if extra_fields:
+        extra = ", ".join(sorted(extra_fields))
+        raise PromptResolutionError(
+            f"persisted Prompt resolution has invalid managed request fields; extra: {extra}"
+        )
 
     try:
         digest = value["resolution_digest"]
-        if not isinstance(digest, str) or not digest:
-            raise PromptResolutionError("persisted Prompt resolution failed digest validation")
+        _record_text(digest, label="resolution_digest")
 
         spec_name = value["spec"]
         structure_digest = value["structure_digest"]
@@ -588,27 +744,28 @@ def validate_prompt_resolution_record(value: Any) -> None:
         attachments_value = value["attachments"]
         response_spec_value = value["response_spec"]
 
-        if not isinstance(spec_name, str) or not spec_name:
-            raise TypeError("spec must be a non-empty string")
-        if not isinstance(structure_digest, str) or not structure_digest:
-            raise TypeError("structure_digest must be a non-empty string")
-        if not isinstance(base, Mapping):
-            raise TypeError("base must be a mapping")
-        if not all(
-            isinstance(records, list) and all(isinstance(record, Mapping) for record in records)
-            for records in (layers, axes, materials)
-        ):
-            raise TypeError("layer, axis, and material records must be lists of mappings")
-        if not isinstance(rendered, Mapping):
-            raise TypeError("rendered must be a mapping")
-        rendered_sha256 = rendered["sha256"]
-        rendered_bytes = rendered["bytes"]
-        if not isinstance(rendered_sha256, str) or not rendered_sha256:
-            raise TypeError("rendered sha256 must be a non-empty string")
-        if isinstance(rendered_bytes, bool) or not isinstance(rendered_bytes, int):
-            raise TypeError("rendered bytes must be an integer")
-        if rendered_bytes < 0:
-            raise ValueError("rendered bytes must be non-negative")
+        _record_text(spec_name, label="spec")
+        _record_text(structure_digest, label="structure_digest")
+        _validate_persisted_descriptor(base, label="base")
+        if not isinstance(layers, list):
+            raise TypeError("layers must be a list")
+        if not isinstance(axes, list):
+            raise TypeError("axes must be a list")
+        if not isinstance(materials, list):
+            raise TypeError("materials must be a list")
+        for index, record in enumerate(layers):
+            _validate_persisted_layer(record, index=index)
+        for index, record in enumerate(axes):
+            _validate_persisted_axis(record, index=index)
+        for index, record in enumerate(materials):
+            _validate_persisted_material(record, index=index)
+        rendered_record = _record_fields(
+            rendered,
+            required={"sha256", "bytes"},
+            label="rendered",
+        )
+        rendered_sha256 = _record_text(rendered_record["sha256"], label="rendered.sha256")
+        rendered_bytes = _record_bytes(rendered_record["bytes"], label="rendered.bytes")
         if not isinstance(messages_value, list):
             raise TypeError("messages must be a list")
         messages = []
@@ -659,14 +816,48 @@ def validate_prompt_resolution_record(value: Any) -> None:
             response_spec=response_spec,
         )
         actual_digest = resolution.digest
+    except PromptResolutionError:
+        raise
     except (KeyError, TypeError, ValueError) as error:
         raise PromptResolutionError(
-            "persisted Prompt resolution has invalid managed request fields"
+            f"persisted Prompt resolution has invalid managed request fields: {error}"
         ) from error
     if digest != actual_digest:
         raise PromptResolutionError("persisted Prompt resolution failed digest validation")
-    if "base_resolution_digest" in value and value["base_resolution_digest"] != digest:
-        raise PromptResolutionError("persisted Prompt resolution has a mismatched base resolution")
+    present_lineage = lineage_fields & set(value)
+    if present_lineage:
+        if present_lineage != lineage_fields:
+            missing = ", ".join(sorted(lineage_fields - present_lineage))
+            raise PromptResolutionError(
+                f"persisted Prompt resolution has incomplete call lineage; missing: {missing}"
+            )
+        base_resolution_digest = value["base_resolution_digest"]
+        phase = value["phase"]
+        repair_round = value["repair_round"]
+        if not isinstance(base_resolution_digest, str) or not base_resolution_digest:
+            raise PromptResolutionError(
+                "persisted Prompt resolution has invalid call lineage base_resolution_digest"
+            )
+        if not isinstance(phase, str) or phase not in {"primary", "repair"}:
+            raise PromptResolutionError(
+                "persisted Prompt resolution has invalid call lineage phase"
+            )
+        if isinstance(repair_round, bool) or not isinstance(repair_round, int):
+            raise PromptResolutionError(
+                "persisted Prompt resolution has invalid call lineage repair_round"
+            )
+        if (
+            repair_round < 0
+            or (phase == "primary" and repair_round != 0)
+            or (phase == "repair" and repair_round == 0)
+        ):
+            raise PromptResolutionError(
+                "persisted Prompt resolution has invalid call lineage phase/repair_round"
+            )
+        if base_resolution_digest != digest:
+            raise PromptResolutionError(
+                "persisted Prompt resolution has a mismatched base resolution"
+            )
 
 
 @dataclass(frozen=True)

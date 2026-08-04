@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -49,6 +48,9 @@ class _CallableKind(Enum):
     OPAQUE = "opaque"
 
 
+_StaticContainer = tuple[ast.expr, ...] | dict[object, ast.expr]
+
+
 @dataclass
 class _ScopeState:
     """Facts inherited while following one locally reachable execution scope."""
@@ -62,7 +64,7 @@ class _ScopeState:
     instance_aliases: dict[str, str] = field(default_factory=dict)
     method_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
     parameter_kinds: dict[str, _CallableKind] = field(default_factory=dict)
-    sequence_aliases: dict[str, tuple[ast.expr, ...]] = field(default_factory=dict)
+    sequence_aliases: dict[str, _StaticContainer] = field(default_factory=dict)
     context_name: str | None = None
     import_aliases: set[str] = field(default_factory=set)
 
@@ -78,6 +80,7 @@ class _ScopeFacts(ast.NodeVisitor):
     bound_names: set[str] = field(default_factory=set)
     imported_raw_aliases: set[str] = field(default_factory=set)
     imported_dynamic_aliases: set[str] = field(default_factory=set)
+    imported_import_aliases: set[str] = field(default_factory=set)
     imported_builtin_module_aliases: set[str] = field(default_factory=set)
     deferred_unpackings: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
     deferred_iterations: list[tuple[ast.AST, ast.expr]] = field(default_factory=list)
@@ -172,6 +175,11 @@ class _ScopeFacts(ast.NodeVisitor):
             self.bound_names.add(local_name)
             if alias.name == "builtins":
                 self.imported_builtin_module_aliases.add(local_name)
+            elif alias.name in {"importlib", "sys"}:
+                self.imported_dynamic_aliases.add(local_name)
+                # Keep imported module names out of the bare-name dynamic
+                # finding path while retaining their dynamic lookup facts.
+                self.imported_import_aliases.add(local_name)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802 -- ast protocol.
         for alias in node.names:
@@ -180,6 +188,12 @@ class _ScopeFacts(ast.NodeVisitor):
             if node.module == "builtins" and alias.name == "open":
                 self.imported_raw_aliases.add(local_name)
             elif node.module == "builtins" and alias.name in _DYNAMIC_CALLABLE_NAMES:
+                self.imported_dynamic_aliases.add(local_name)
+                if alias.name == "__import__":
+                    self.imported_import_aliases.add(local_name)
+            elif node.module == "importlib" and alias.name == "import_module":
+                self.imported_import_aliases.add(local_name)
+            elif node.module == "sys" and alias.name == "modules":
                 self.imported_dynamic_aliases.add(local_name)
 
     def _record_target_assignment(self, target: ast.AST, value: ast.expr) -> None:
@@ -425,6 +439,19 @@ class _RawIOVisitor(ast.NodeVisitor):
             return
         self._scanned_functions.add(identity)
         state = state or _ScopeState()
+        if is_root and not state.parameter_kinds:
+            state.parameter_kinds.update(
+                _parameter_kinds_for_function(
+                    node,
+                    (),
+                    context_name=self.context_name,
+                    raw_aliases=state.raw_aliases,
+                    dynamic_aliases=state.dynamic_aliases,
+                    builtin_module_aliases=state.builtin_module_aliases,
+                    sequence_aliases=state.sequence_aliases,
+                    import_aliases=state.import_aliases,
+                )
+            )
 
         body: list[ast.stmt] | list[ast.expr] = (
             [node.body] if isinstance(node, ast.Lambda) else node.body
@@ -483,6 +510,11 @@ class _RawIOVisitor(ast.NodeVisitor):
             sequence_aliases=aliases.sequence_aliases,
             import_aliases=aliases.import_aliases,
         )
+        if is_root:
+            # The module evaluates a top-level node's definition expressions
+            # before the node can run: decorators, defaults and annotations
+            # are part of the raw-I/O boundary too.
+            direct._visit_definition_expressions(node)
         for statement in body:
             direct.visit(statement)
         self.findings.extend(direct.findings)
@@ -522,11 +554,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             import_aliases=aliases.import_aliases,
         )
         for function in reachable:
-            function_name = (
-                function.name
-                if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
-                else None
-            )
+            function_name = _callable_binding_name(function, lambdas)
             self._scan_function(
                 function,
                 state=_ScopeState(
@@ -647,7 +675,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         builtin_module_aliases: set[str],
         instance_aliases: dict[str, str] | None = None,
         method_aliases: dict[str, tuple[str, str]] | None = None,
-        sequence_aliases: dict[str, tuple[ast.expr, ...]] | None = None,
+        sequence_aliases: dict[str, _StaticContainer] | None = None,
         import_aliases: set[str] | None = None,
     ) -> None:
         self.path = path
@@ -764,9 +792,8 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
                         for callable_kind in self._classify_positional_argument(argument)
                     ),
                     keywords={
-                        keyword.arg: self._classify_callable(_unwrap_starred(keyword.value))
-                        for keyword in node.keywords
-                        if keyword.arg is not None
+                        name: self._classify_callable(_unwrap_starred(value))
+                        for name, value in self._expanded_keyword_arguments(node.keywords)
                     },
                 )
             )
@@ -800,6 +827,12 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
             for callable_expression in self._static_callable_expressions(expression):
                 if isinstance(callable_expression, ast.Lambda):
                     self.referenced_lambdas.add(callable_expression)
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                for _, value in self._expanded_keyword_arguments([keyword]):
+                    for callable_expression in self._static_callable_expressions(value):
+                        if isinstance(callable_expression, ast.Lambda):
+                            self.referenced_lambdas.add(callable_expression)
 
         # Visit the call target for helper/class reachability, but suppress its
         # bare dynamic-reference finding: the enclosing Call already owns the
@@ -900,6 +933,22 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
                 return tuple(self._classify_callable(value) for value in values)
         return (self._classify_callable(_unwrap_starred(argument)),)
 
+    def _expanded_keyword_arguments(
+        self,
+        keywords: list[ast.keyword],
+    ) -> list[tuple[str, ast.expr]]:
+        expanded: list[tuple[str, ast.expr]] = []
+        for keyword in keywords:
+            if keyword.arg is not None:
+                expanded.append((keyword.arg, keyword.value))
+                continue
+            values = _resolve_static_mapping(keyword.value, self.sequence_aliases)
+            if values is not None:
+                expanded.extend(
+                    (key, value) for key, value in values.items() if isinstance(key, str)
+                )
+        return expanded
+
     def _callback_arguments(self, node: ast.Call) -> list[ast.expr]:
         """Return callback positions whose bodies execute during this call."""
         function = node.func
@@ -921,11 +970,17 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         return expanded
 
     def _static_callable_expressions(self, expression: ast.AST) -> list[ast.expr]:
-        expression = _unwrap_starred(expression)
+        if isinstance(expression, ast.Starred):
+            values = _resolve_static_sequence(expression.value, self.sequence_aliases)
+            return [
+                callable_expression
+                for value in values or ()
+                for callable_expression in self._static_callable_expressions(value)
+            ]
         if isinstance(expression, ast.Lambda):
             return [expression]
         if isinstance(expression, ast.Subscript):
-            element = _resolve_static_sequence_element(expression, self.sequence_aliases)
+            element = _resolve_static_container_element(expression, self.sequence_aliases)
             if element is not None:
                 return self._static_callable_expressions(element)
         return []
@@ -1043,7 +1098,7 @@ class _CallableAliases:
     raw: set[str]
     dynamic: set[str]
     builtin_modules: set[str]
-    sequence_aliases: dict[str, tuple[ast.expr, ...]]
+    sequence_aliases: dict[str, _StaticContainer]
     import_aliases: set[str]
 
 
@@ -1061,7 +1116,7 @@ def _parameter_kinds_for_function(
     raw_aliases: set[str],
     dynamic_aliases: set[str],
     builtin_module_aliases: set[str],
-    sequence_aliases: dict[str, tuple[ast.expr, ...]] | None = None,
+    sequence_aliases: dict[str, _StaticContainer] | None = None,
     import_aliases: set[str] | None = None,
 ) -> dict[str, _CallableKind]:
     """Bind callable facts from calls and statically known parameter defaults."""
@@ -1187,13 +1242,14 @@ def _collect_callable_aliases(
     inherited_builtin_module_aliases: set[str] | None,
     parameter_names: set[str],
     parameter_kinds: dict[str, _CallableKind] | None = None,
-    inherited_sequence_aliases: dict[str, tuple[ast.expr, ...]] | None = None,
+    inherited_sequence_aliases: dict[str, _StaticContainer] | None = None,
     inherited_import_aliases: set[str] | None = None,
 ) -> _CallableAliases:
     raw = set(inherited_raw_aliases or ()) - facts.bound_names - parameter_names
     raw.update(facts.imported_raw_aliases)
     dynamic = set(inherited_dynamic_aliases or ()) - facts.bound_names - parameter_names
     import_aliases = set(inherited_import_aliases or ()) - facts.bound_names - parameter_names
+    import_aliases.update(facts.imported_import_aliases)
     dynamic.update(import_aliases)
     dynamic.update(facts.imported_dynamic_aliases)
     dynamic.difference_update(raw)
@@ -1216,7 +1272,7 @@ def _collect_callable_aliases(
             dynamic.add(name)
             raw.discard(name)
             import_aliases.discard(name)
-    inherited_sequences = {
+    inherited_sequences: dict[str, _StaticContainer] = {
         name: values
         for name, values in (inherited_sequence_aliases or {}).items()
         if name not in facts.bound_names and name not in parameter_names
@@ -1282,13 +1338,13 @@ def _expanded_callable_assignments(facts: _ScopeFacts) -> list[tuple[str, ast.ex
 def _expanded_callable_bindings(
     facts: _ScopeFacts,
     *,
-    inherited_sequence_aliases: dict[str, tuple[ast.expr, ...]] | None = None,
-) -> tuple[list[tuple[str, ast.expr]], dict[str, tuple[ast.expr, ...]]]:
-    """Return callable assignments plus the statically proven sequence bindings."""
+    inherited_sequence_aliases: dict[str, _StaticContainer] | None = None,
+) -> tuple[list[tuple[str, ast.expr]], dict[str, _StaticContainer]]:
+    """Return callable assignments plus statically proven sequence/dict bindings."""
     assignments = list(facts.assignments)
     seen = {_assignment_key(name, expression) for name, expression in assignments}
-    sequence_aliases: dict[str, list[ast.expr]] = {
-        name: list(values)
+    sequence_aliases: dict[str, _StaticContainer] = {
+        name: values
         for name, values in (inherited_sequence_aliases or {}).items()
         if name not in facts.bound_names
     }
@@ -1305,10 +1361,10 @@ def _expanded_callable_bindings(
     while changed:
         changed = False
         for name, expression in assignments:
-            element = _resolve_static_sequence_element(expression, sequence_aliases)
+            element = _resolve_static_container_element(expression, sequence_aliases)
             if element is not None:
                 changed |= add_assignment(name, element)
-            values = _resolve_static_sequence(expression, sequence_aliases)
+            values = _resolve_static_container(expression, sequence_aliases)
             if values is None:
                 continue
             if name not in sequence_aliases:
@@ -1337,18 +1393,18 @@ def _expanded_callable_bindings(
             for name, expression in pairs:
                 changed |= add_assignment(name, expression)
 
-    # A local name with any unresolved reassignment is not a static sequence.
+    # A local name with any unresolved reassignment is not a static container.
     # This keeps ``unknown[index]`` unknown instead of turning one earlier
     # literal assignment into an unbounded false positive.
     for name in set(facts.bound_names):
         expressions = [expression for binding, expression in assignments if binding == name]
         if expressions and any(
-            _resolve_static_sequence(expression, sequence_aliases) is None
+            _resolve_static_container(expression, sequence_aliases) is None
             for expression in expressions
         ):
             sequence_aliases.pop(name, None)
 
-    return assignments, {name: tuple(values) for name, values in sequence_aliases.items()}
+    return assignments, sequence_aliases
 
 
 def _assignment_key(name: str, expression: ast.expr) -> tuple[str, str]:
@@ -1357,32 +1413,99 @@ def _assignment_key(name: str, expression: ast.expr) -> tuple[str, str]:
 
 def _resolve_static_sequence(
     expression: ast.AST,
-    sequence_aliases: dict[str, Sequence[ast.expr]],
+    sequence_aliases: dict[str, _StaticContainer],
 ) -> list[ast.expr] | None:
     direct_values = _sequence_elements(expression)
     if direct_values is not None:
         return direct_values
     if isinstance(expression, ast.Name):
-        return sequence_aliases.get(expression.id)
+        values = sequence_aliases.get(expression.id)
+        return list(values) if isinstance(values, tuple) else None
     return None
+
+
+def _resolve_static_mapping(
+    expression: ast.AST,
+    sequence_aliases: dict[str, _StaticContainer],
+) -> dict[object, ast.expr] | None:
+    direct_values = _mapping_elements(expression)
+    if direct_values is not None:
+        return direct_values
+    if isinstance(expression, ast.Name):
+        values = sequence_aliases.get(expression.id)
+        return dict(values) if isinstance(values, dict) else None
+    return None
+
+
+def _resolve_static_container(
+    expression: ast.AST,
+    sequence_aliases: dict[str, _StaticContainer],
+) -> _StaticContainer | None:
+    sequence = _resolve_static_sequence(expression, sequence_aliases)
+    if sequence is not None:
+        return tuple(sequence)
+    return _resolve_static_mapping(expression, sequence_aliases)
 
 
 def _resolve_static_sequence_element(
     expression: ast.AST,
-    sequence_aliases: dict[str, Sequence[ast.expr]],
+    sequence_aliases: dict[str, _StaticContainer],
 ) -> ast.expr | None:
     if not isinstance(expression, ast.Subscript):
         return None
     values = _resolve_static_sequence(expression.value, sequence_aliases)
-    if values is None or not isinstance(expression.slice, ast.Constant):
+    if values is None:
         return None
-    index = expression.slice.value
-    if not isinstance(index, int) or isinstance(index, bool):
+    is_static, index = _static_subscript_key(expression.slice)
+    if not is_static or not isinstance(index, int) or isinstance(index, bool):
         return None
     try:
         return values[index]
     except IndexError:
         return None
+
+
+def _resolve_static_mapping_element(
+    expression: ast.AST,
+    sequence_aliases: dict[str, _StaticContainer],
+) -> ast.expr | None:
+    if not isinstance(expression, ast.Subscript):
+        return None
+    values = _resolve_static_mapping(expression.value, sequence_aliases)
+    if values is None:
+        return None
+    is_static, key = _static_subscript_key(expression.slice)
+    if not is_static:
+        return None
+    return values.get(key)
+
+
+def _resolve_static_container_element(
+    expression: ast.AST,
+    sequence_aliases: dict[str, _StaticContainer],
+) -> ast.expr | None:
+    return _resolve_static_sequence_element(
+        expression,
+        sequence_aliases,
+    ) or _resolve_static_mapping_element(expression, sequence_aliases)
+
+
+def _static_subscript_key(expression: ast.AST) -> tuple[bool, object]:
+    if isinstance(expression, ast.Constant):
+        try:
+            hash(expression.value)
+        except TypeError:
+            return False, None
+        return True, expression.value
+    if (
+        isinstance(expression, ast.UnaryOp)
+        and isinstance(expression.op, (ast.USub, ast.UAdd))
+        and isinstance(expression.operand, ast.Constant)
+    ):
+        value = expression.operand.value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return True, -value if isinstance(expression.op, ast.USub) else value
+    return False, None
 
 
 def _target_value_pairs_from_elements(
@@ -1412,7 +1535,7 @@ def _classify_callable_expression(
     raw_aliases: set[str],
     dynamic_aliases: set[str],
     builtin_module_aliases: set[str],
-    sequence_aliases: dict[str, tuple[ast.expr, ...]],
+    sequence_aliases: dict[str, _StaticContainer],
     import_aliases: set[str],
     prefer_dynamic_call: bool = False,
 ) -> _CallableKind:
@@ -1420,12 +1543,14 @@ def _classify_callable_expression(
     if _is_import_callable_expression(
         expression,
         import_aliases=import_aliases,
+        dynamic_aliases=dynamic_aliases,
         builtin_module_aliases=builtin_module_aliases,
     ) or (
         isinstance(expression, ast.Call)
         and _is_import_callable_expression(
             expression.func,
             import_aliases=import_aliases,
+            dynamic_aliases=dynamic_aliases,
             builtin_module_aliases=builtin_module_aliases,
         )
     ):
@@ -1449,7 +1574,7 @@ def _classify_callable_expression(
         return _CallableKind.UNKNOWN
 
     if isinstance(expression, ast.Subscript):
-        element = _resolve_static_sequence_element(expression, sequence_aliases)
+        element = _resolve_static_container_element(expression, sequence_aliases)
         if element is not None:
             return _classify_callable_expression(
                 element,
@@ -1468,10 +1593,18 @@ def _classify_callable_expression(
                 return _CallableKind.OPAQUE
 
     if isinstance(expression, ast.Attribute):
-        if expression.attr in {*_RAW_METHOD_NAMES, "__dict__"} and _is_dynamic_value_expression(
-            expression.value,
-            dynamic_aliases=dynamic_aliases,
-            builtin_module_aliases=builtin_module_aliases,
+        if expression.attr in {*_RAW_METHOD_NAMES, "__dict__", "modules"} and (
+            _is_dynamic_value_expression(
+                expression.value,
+                dynamic_aliases=dynamic_aliases,
+                builtin_module_aliases=builtin_module_aliases,
+            )
+        ):
+            return _CallableKind.DYNAMIC
+        if (
+            expression.attr == "__dict__"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id in builtin_module_aliases
         ):
             return _CallableKind.DYNAMIC
         if expression.attr in _RAW_METHOD_NAMES and not (
@@ -1522,6 +1655,8 @@ def _is_dynamic_lookup_expression(
     if isinstance(expression, ast.Subscript):
         if _is_builtin_dict_subscript(expression, builtin_module_aliases):
             return _is_builtin_dict_lookup(expression, builtin_module_aliases)
+        if isinstance(expression.value, ast.Name) and expression.value.id in dynamic_aliases:
+            return True
         return _is_dynamic_lookup_call(
             expression.value,
             dynamic_aliases=dynamic_aliases,
@@ -1545,6 +1680,10 @@ def _is_dynamic_lookup_call(
         return True
     if _is_dynamic_dict_attribute(expression, dynamic_aliases):
         return True
+    if _is_dynamic_module_attribute(expression, dynamic_aliases):
+        return True
+    if isinstance(expression, ast.Name):
+        return expression.id in dynamic_aliases
     if isinstance(expression, ast.Attribute) and expression.attr == "__dict__":
         return _is_dynamic_value_expression(
             expression.value,
@@ -1561,6 +1700,8 @@ def _is_dynamic_lookup_call(
         )
     if isinstance(expression.func, ast.Name):
         return _is_dynamic_callable_name(expression.func.id, dynamic_aliases)
+    if _is_dynamic_import_attribute(expression.func, dynamic_aliases):
+        return True
     return _is_dynamic_builtin_attribute(expression.func, builtin_module_aliases)
 
 
@@ -1591,11 +1732,30 @@ def _is_import_callable_expression(
     expression: ast.AST,
     *,
     import_aliases: set[str],
+    dynamic_aliases: set[str],
     builtin_module_aliases: set[str],
 ) -> bool:
     if isinstance(expression, ast.Name):
         return expression.id in import_aliases
+    if (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == "import_module"
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in dynamic_aliases
+    ):
+        return True
+    if isinstance(expression, ast.Subscript) and _is_dynamic_import_lookup(
+        expression, dynamic_aliases
+    ):
+        return True
     return _is_builtin_dict_import_lookup(expression, builtin_module_aliases)
+
+
+def _is_dynamic_import_lookup(expression: ast.Subscript, dynamic_aliases: set[str]) -> bool:
+    if not isinstance(expression.value, ast.Name) or expression.value.id not in dynamic_aliases:
+        return False
+    is_static, key = _static_subscript_key(expression.slice)
+    return is_static and key == "__import__"
 
 
 def _is_dynamic_callable_name(name: str, dynamic_aliases: set[str]) -> bool:
@@ -1620,6 +1780,24 @@ def _is_dynamic_dict_attribute(expression: ast.AST, dynamic_aliases: set[str]) -
         and isinstance(expression.value, ast.Name)
         and expression.value.id in dynamic_aliases
         and expression.attr == "__dict__"
+    )
+
+
+def _is_dynamic_module_attribute(expression: ast.AST, dynamic_aliases: set[str]) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in dynamic_aliases
+        and expression.attr == "modules"
+    )
+
+
+def _is_dynamic_import_attribute(expression: ast.AST, dynamic_aliases: set[str]) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == "import_module"
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in dynamic_aliases
     )
 
 
@@ -1693,6 +1871,18 @@ def _constructor_class_name(expression: ast.AST) -> str | None:
     return None
 
 
+def _callable_binding_name(
+    function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    lambdas: dict[str, ast.Lambda],
+) -> str | None:
+    if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+        return function.name
+    for name, candidate in lambdas.items():
+        if candidate is function:
+            return name
+    return None
+
+
 def _parameter_names(arguments: ast.arguments) -> set[str]:
     return {
         parameter.arg
@@ -1722,6 +1912,18 @@ def _sequence_elements(expression: ast.AST) -> list[ast.expr] | None:
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
         return list(expression.elts)
     return None
+
+
+def _mapping_elements(expression: ast.AST) -> dict[object, ast.expr] | None:
+    if not isinstance(expression, ast.Dict) or any(key is None for key in expression.keys):
+        return None
+    result: dict[object, ast.expr] = {}
+    for key, value in zip(expression.keys, expression.values, strict=True):
+        is_static, static_key = _static_subscript_key(key)
+        if not is_static:
+            return None
+        result[static_key] = value
+    return result
 
 
 def _target_value_pairs(target: ast.AST, value: ast.AST) -> list[tuple[str, ast.expr]]:

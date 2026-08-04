@@ -40,7 +40,7 @@ def _managed_record(
     return PromptResolution(
         spec_name="managed",
         structure_digest="structure",
-        base={},
+        base={"ref": "base", "sha256": "base-digest", "bytes": 0},
         layers=(),
         axes=(),
         materials=(),
@@ -162,6 +162,86 @@ def test_managed_prompt_record_rejects_digest_mismatch() -> None:
 
     with pytest.raises(PromptResolutionError, match="digest"):
         validate_prompt_resolution_record(record)
+
+
+@pytest.mark.parametrize(
+    ("section", "record"),
+    (
+        (
+            "layers",
+            {"slot": "layer", "ref": "fragment", "sha256": "digest"},
+        ),
+        (
+            "axes",
+            {
+                "name": "mode",
+                "selector": {},
+                "selected": "concise",
+                "ref": "concise",
+                "sha256": "digest",
+            },
+        ),
+        (
+            "materials",
+            {
+                "slot": "material",
+                "source": {},
+                "title": None,
+                "sha256": "digest",
+                "bytes": True,
+            },
+        ),
+    ),
+)
+def test_managed_prompt_record_validates_provenance_record_fields(
+    section: str, record: dict[str, Any]
+) -> None:
+    """重新计算 digest 也不能把缺字段/错类型的 provenance 伪装成合法记录。"""
+    candidate = _managed_record(
+        [Message(role="user", parts=["hello"])],
+        [],
+        ResponseSpec(),
+    )
+    candidate[section] = [record]
+    candidate["resolution_digest"] = sha(
+        {key: value for key, value in candidate.items() if key != "resolution_digest"}
+    )
+
+    with pytest.raises(PromptResolutionError, match="managed request fields"):
+        validate_prompt_resolution_record(candidate)
+
+
+def test_managed_prompt_record_requires_strict_call_lineage_fields() -> None:
+    """CALL lineage 的 phase/round/base digest 必须成组且类型和值严格。"""
+    record = _managed_record(
+        [Message(role="user", parts=["hello"])],
+        [],
+        ResponseSpec(),
+    )
+    digest = record["resolution_digest"]
+    valid_lineage = {
+        "base_resolution_digest": digest,
+        "phase": "primary",
+        "repair_round": 0,
+    }
+
+    validate_prompt_resolution_record({**record, **valid_lineage})
+
+    for invalid_lineage in (
+        {"phase": "primary", "repair_round": 0},
+        {"base_resolution_digest": digest, "phase": 1, "repair_round": 0},
+        {"base_resolution_digest": digest, "phase": "primary", "repair_round": True},
+        {"base_resolution_digest": 3, "phase": "primary", "repair_round": 0},
+        {"base_resolution_digest": digest, "phase": "repair", "repair_round": 0},
+    ):
+        with pytest.raises(PromptResolutionError, match="lineage"):
+            validate_prompt_resolution_record({**record, **invalid_lineage})
+
+    for missing in valid_lineage:
+        incomplete = {**record, **valid_lineage}
+        incomplete.pop(missing)
+        with pytest.raises(PromptResolutionError, match="lineage"):
+            validate_prompt_resolution_record(incomplete)
 
 
 def test_attachment_manifest_metadata_is_not_prompt_lineage_identity() -> None:
