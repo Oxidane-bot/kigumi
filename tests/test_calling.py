@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import stat
 import subprocess
 import sys
 import threading
@@ -15,6 +17,7 @@ import kigumi.calling as calling_module
 from kigumi import EvidencePolicy, ProviderFailure, ProviderFailureKind, observe
 from kigumi.artifacts import sha
 from kigumi.calling import Budget, BudgetExceeded, CacheIntegrityError, DryRunError, LLMCaller
+from kigumi.prompt import PreflightPolicy, RequestTooLarge
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -304,6 +307,85 @@ def test_budget_records_concurrently() -> None:
 
     assert all(not thread.is_alive() for thread in threads)
     assert budget.spent == workers * records_per_worker
+
+
+@pytest.mark.parametrize(
+    ("usage", "error_type"),
+    [
+        ({"total_tokens": -1}, ValueError),
+        ({"total_tokens": 1.5}, TypeError),
+        ({"total_tokens": True}, TypeError),
+        ({"total_tokens": "3"}, TypeError),
+        ({"total_tokens": None}, TypeError),
+        (None, TypeError),
+        ([], TypeError),
+    ],
+)
+def test_budget_rejects_malformed_usage_without_mutating_spend(
+    usage: object, error_type: type[Exception]
+) -> None:
+    """损坏的 provider 用量必须 fail closed，不能污染预算总账。"""
+    budget = Budget(max_tokens=10)
+
+    with pytest.raises(error_type):
+        budget.record(usage)  # type: ignore[arg-type]
+    assert budget.spent == 0
+
+    permit = budget.reserve(1)
+    with pytest.raises(error_type):
+        permit.commit(usage)  # type: ignore[arg-type]
+    assert budget.spent == 0
+    permit.cancel()
+
+
+@pytest.mark.parametrize(
+    ("estimate", "error_type"),
+    [
+        (True, TypeError),
+        (1.5, TypeError),
+        ("3", TypeError),
+        (None, TypeError),
+        (-1, ValueError),
+    ],
+)
+def test_budget_rejects_implicitly_coerced_estimates(
+    estimate: object, error_type: type[Exception]
+) -> None:
+    """预算 estimate 必须是严格的非负 int，不能接受隐式数值转换。"""
+    budget = Budget(max_tokens=10)
+
+    with pytest.raises(error_type):
+        budget.reserve(estimate)  # type: ignore[arg-type]
+
+    assert budget.spent == 0
+    assert budget._reserved == 0
+
+
+def test_budget_treats_transport_empty_usage_as_zero_tokens() -> None:
+    """transport 将缺失 usage 规范化为 {}, 其成功调用应记为零 token。"""
+    budget = Budget(max_tokens=10)
+
+    budget.record({})
+    permit = budget.reserve(1)
+    permit.commit({})
+
+    assert budget.spent == 0
+
+
+def test_provider_malformed_usage_is_rejected_before_cache_write(tmp_path: Path) -> None:
+    """非法 usage 不能先写成功缓存再让预算记账失败。"""
+    caller = LLMCaller(
+        FakeTransport([Response("answer", {"total_tokens": -1}, "stop")]),
+        tmp_path,
+        budget=Budget(max_tokens=10),
+    )
+
+    with pytest.raises(ValueError):
+        caller.call("hello")
+
+    assert list((tmp_path / "llm").glob("*.json")) == []
+    assert caller.budget is not None
+    assert caller.budget.spent == 0
 
 
 def test_cache_hit_skips_transport_and_budget(tmp_path: Path) -> None:
@@ -619,6 +701,134 @@ def test_kigumi_file_missing_or_unknown_format_fails_before_call(tmp_path: Path)
         caller.call([{"role": "user", "content": {"kigumi_file": str(unknown)}}])
 
     assert transport.requests == []
+
+
+def test_kigumi_file_size_preflight_happens_before_hashing(tmp_path: Path, monkeypatch) -> None:
+    """超限附件应先被 stat 拒绝，不能先完整读取/哈希文件。"""
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    opened: list[Path] = []
+    original_open = Path.open
+
+    def tracking_open(path: Path, *args, **kwargs):
+        if path == source:
+            opened.append(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    transport = FakeTransport()
+    caller = LLMCaller(
+        transport,
+        tmp_path / "cache",
+        preflight_policy=PreflightPolicy(max_attachment_bytes=0),
+    )
+
+    with pytest.raises(RequestTooLarge):
+        caller.call([{"role": "user", "content": {"kigumi_file": str(source)}}])
+
+    assert opened == []
+    assert transport.requests == []
+
+
+def test_kigumi_file_rejects_non_regular_file_before_hashing(tmp_path: Path) -> None:
+    """目录等非 regular 文件不能进入附件哈希路径。"""
+    directory = tmp_path / "payload.bin"
+    directory.mkdir()
+    caller = LLMCaller(FakeTransport(), tmp_path / "cache")
+
+    with pytest.raises(ValueError, match="regular file"):
+        caller.call([{"role": "user", "content": {"kigumi_file": str(directory)}}])
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mknod") or not hasattr(os, "makedev"), reason="device files are unavailable"
+)
+def test_kigumi_file_rejects_character_device_before_hashing(tmp_path: Path) -> None:
+    device = tmp_path / "device.bin"
+    try:
+        os.mknod(device, stat.S_IFCHR | 0o600, os.makedev(0, 0))
+    except (PermissionError, OSError) as error:
+        pytest.skip(f"character devices are unavailable: {error}")
+
+    with pytest.raises(ValueError, match="regular file"):
+        LLMCaller._file_reference({"kigumi_file": str(device)})
+
+
+def test_kigumi_file_accepts_a_hardlink_to_a_regular_file(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    source.write_bytes(b"hardlink payload")
+    alias = tmp_path / "alias.png"
+    try:
+        alias.hardlink_to(source)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support hardlinks: {error}")
+
+    transport = FakeTransport()
+    assert (
+        LLMCaller(transport, tmp_path / "cache").call(
+            [{"role": "user", "content": {"kigumi_file": str(alias)}}]
+        )
+        == "answer"
+    )
+
+
+def test_kigumi_file_rejects_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.png"
+    target.write_bytes(b"symlink payload")
+    alias = tmp_path / "alias.png"
+    try:
+        alias.symlink_to(target)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support symlinks: {error}")
+
+    with pytest.raises(ValueError, match="regular file|symlink"):
+        LLMCaller(FakeTransport(), tmp_path / "cache").call(
+            [{"role": "user", "content": {"kigumi_file": str(alias)}}]
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="mkfifo is unavailable")
+def test_kigumi_file_race_to_fifo_does_not_block(tmp_path: Path) -> None:
+    """stat 后路径变成 FIFO 时，附件哈希必须无阻塞地 fail closed。"""
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"payload")
+    script = """
+import os
+import sys
+from pathlib import Path
+
+import kigumi.calling as calling
+
+source = Path(sys.argv[1])
+original_open = calling.os.open
+replaced = False
+
+def open_race(path, flags, mode=0o777, *, dir_fd=None):
+    global replaced
+    if Path(path) == source and not replaced:
+        replaced = True
+        source.unlink()
+        os.mkfifo(source)
+    if dir_fd is None:
+        return original_open(path, flags, mode)
+    return original_open(path, flags, mode, dir_fd=dir_fd)
+
+calling.os.open = open_race
+calling.LLMCaller._file_reference({"kigumi_file": str(source)})
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(source)],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(f"附件在 FIFO 竞态中阻塞: {error}")
+
+    assert result.returncode != 0
+    assert "regular" in result.stderr.lower()
 
 
 def test_plain_messages_keep_existing_cache_key(tmp_path: Path) -> None:

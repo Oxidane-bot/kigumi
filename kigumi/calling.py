@@ -12,6 +12,7 @@ import contextvars
 import copy
 import json
 import mimetypes
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -21,7 +22,13 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
 
-from .artifacts import atomic_write_json, sha, sha256_file
+from ._safe_io import (
+    FileIdentity,
+    digest_open_file,
+    lstat_regular_file,
+    open_regular_file,
+)
+from .artifacts import atomic_write_json, sha
 from .errors import CacheIntegrityError
 from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
@@ -34,6 +41,8 @@ from .prompt import (
     Attachment,
     Message,
     PreflightPolicy,
+    PreflightReport,
+    PreflightViolation,
     PromptResolution,
     RequestTooLarge,
     ResolvedPrompt,
@@ -125,6 +134,27 @@ def _data_url(data: bytes, mime: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def _file_error(message: str, path: Path) -> ValueError:
+    return ValueError(f"kigumi_file {message}: {path}")
+
+
+def _file_identity(info: os.stat_result) -> FileIdentity:
+    """Return stable metadata used to reject obvious path/file races."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _regular_file_probe(path: Path) -> tuple[int, FileIdentity]:
+    """Inspect a path without following a symlink and require a regular file."""
+    info = lstat_regular_file(path, error=_file_error)
+    return info.st_size, _file_identity(info)
+
+
 class BudgetExceeded(RuntimeError):
     """Raised when a reservation or actual spend exceeds the configured ceiling."""
 
@@ -155,6 +185,89 @@ class _FileReference:
     size_bytes: int
     detail: Any
     has_detail: bool
+    identity: FileIdentity | None = None
+
+
+@dataclass(frozen=True)
+class _FilePreflight:
+    """Regular-file metadata collected before any attachment is hashed."""
+
+    path: Path
+    size_bytes: int
+    identity: FileIdentity
+
+
+def _open_regular_file(
+    path: Path,
+    *,
+    expected_identity: FileIdentity | None = None,
+    phase: str,
+) -> Any:
+    """Open one path as a non-blocking, descriptor-bound regular file.
+
+    The lstat is only an early rejection for ordinary symlinks and special files;
+    the descriptor's fstat is authoritative. O_NONBLOCK prevents a FIFO introduced
+    after lstat from blocking, and O_NOFOLLOW prevents a final symlink race on
+    platforms that expose that flag. All subsequent reads use this descriptor.
+    """
+    return open_regular_file(
+        path,
+        identity=_file_identity,
+        expected_identity=expected_identity,
+        phase=phase,
+        error=_file_error,
+    )
+
+
+def _hash_regular_file(probe: _FilePreflight) -> str:
+    """Hash a preflighted file through one stable descriptor."""
+    with _open_regular_file(
+        probe.path,
+        expected_identity=probe.identity,
+        phase="before hashing",
+    ) as handle:
+        digest, size, _ = digest_open_file(
+            handle,
+            probe.path,
+            identity=_file_identity,
+            expected_identity=probe.identity,
+            before_phase="before hashing",
+            during_phase="during hashing",
+            chunk_size=1024 * 1024,
+            error=_file_error,
+        )
+    if size != probe.size_bytes:
+        raise ValueError(f"kigumi_file changed during hashing: {probe.path}")
+    return digest
+
+
+def _read_preflighted_file(reference: _FileReference) -> bytes:
+    """Read a reference only after rechecking its regular-file identity and size."""
+    if reference.identity is None:
+        size_bytes, identity = _regular_file_probe(reference.path)
+        probe = _FilePreflight(reference.path, size_bytes, identity)
+    else:
+        probe = _FilePreflight(reference.path, reference.size_bytes, reference.identity)
+    with _open_regular_file(
+        probe.path,
+        expected_identity=probe.identity,
+        phase="after hashing",
+    ) as handle:
+        _digest, size, data = digest_open_file(
+            handle,
+            probe.path,
+            identity=_file_identity,
+            expected_identity=probe.identity,
+            before_phase="after hashing",
+            during_phase="after hashing",
+            chunk_size=1024 * 1024,
+            error=_file_error,
+            collect=True,
+            max_bytes=probe.size_bytes,
+        )
+    if size != probe.size_bytes or data is None:
+        raise ValueError(f"kigumi_file changed after hashing: {probe.path}")
+    return data
 
 
 @dataclass(frozen=True)
@@ -272,18 +385,27 @@ class Budget:
 
     @staticmethod
     def _coerce_tokens(value: int, *, name: str) -> int:
-        try:
-            tokens = int(value)
-        except (TypeError, ValueError) as error:
-            raise TypeError(f"{name} must be an integer") from error
-        if tokens < 0:
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an integer")
+        if value < 0:
             raise ValueError(f"{name} must be non-negative")
-        return tokens
+        return value
 
     @staticmethod
     def _usage_tokens(usage: dict[str, Any]) -> int:
-        total = usage.get("total_tokens", 0)
-        return int(total) if total is not None else 0
+        if not isinstance(usage, dict):
+            raise TypeError("usage must be a mapping")
+        if "total_tokens" not in usage:
+            # Some transports intentionally omit usage for a successful response;
+            # that remains a zero-token response, while an explicitly malformed
+            # total_tokens value is rejected below.
+            return 0
+        total = usage["total_tokens"]
+        if type(total) is not int:  # bool is an int subclass but not a token count.
+            raise TypeError("usage.total_tokens must be an integer")
+        if total < 0:
+            raise ValueError("usage.total_tokens must be non-negative")
+        return total
 
     def _commit(self, permit: BudgetPermit, usage: dict[str, Any]) -> None:
         total = self._usage_tokens(usage)
@@ -369,7 +491,10 @@ class LLMCaller:
                 "repair_round": 0,
             }
         normalized_messages = self._normalize_messages(messages)
-        prepared = self._prepare_file_references(normalized_messages)
+        prepared = self._prepare_file_references(
+            normalized_messages,
+            preflight_policy=self.preflight_policy,
+        )
         key_messages = prepared.key_messages if prepared is not None else normalized_messages
         cache_messages = prepared.cache_messages if prepared is not None else normalized_messages
         request_resolution = self._request_resolution(
@@ -531,6 +656,9 @@ class LLMCaller:
                 )
                 raise failure from None
             try:
+                # Validate provider usage before persisting a successful response;
+                # malformed accounting data must not poison the cache or budget.
+                Budget._usage_tokens(response.usage)
                 payload = {
                     "meta": self._meta(
                         key=key,
@@ -710,50 +838,136 @@ class LLMCaller:
         return len(str(content))
 
     @classmethod
-    def _prepare_file_references(cls, messages: list[dict[str, Any]]) -> _PreparedMessages | None:
+    def _prepare_file_references(
+        cls,
+        messages: list[dict[str, Any]],
+        *,
+        preflight_policy: PreflightPolicy = _DEFAULT_PREFLIGHT_POLICY,
+    ) -> _PreparedMessages | None:
+        values = [
+            value
+            for message in messages
+            for value in cls._content_file_references(message.get("content"))
+        ]
+        if not values:
+            return None
+        probes = cls._preflight_file_references(values, preflight_policy)
+        references = {
+            id(value): cls._file_reference(value, probe=probes[id(value)]) for value in values
+        }
         key_messages: list[dict[str, Any]] = []
         cache_messages: list[dict[str, Any]] = []
         transport_messages: list[dict[str, Any]] = []
         attachments: list[Attachment] = []
-        found_reference = False
 
         for message in messages:
-            prepared_content = cls._prepare_content(message.get("content"))
+            prepared_content = cls._prepare_content(
+                message.get("content"),
+                references=references,
+            )
             if prepared_content is None:
                 key_messages.append(message)
                 cache_messages.append(message)
                 transport_messages.append(message)
                 continue
 
-            found_reference = True
             key_content, cache_content, transport_content = prepared_content
-            attachments.extend(cls._content_attachments(message.get("content")))
+            attachments.extend(
+                cls._content_attachments(message.get("content"), references=references)
+            )
             key_messages.append({**message, "content": key_content})
             cache_messages.append({**message, "content": cache_content})
             transport_messages.append({**message, "content": transport_content})
 
-        if not found_reference:
-            return None
         return _PreparedMessages(key_messages, cache_messages, transport_messages, attachments)
 
     @classmethod
-    def _content_attachments(cls, content: Any) -> list[Attachment]:
+    def _content_file_references(cls, content: Any) -> list[dict[str, Any]]:
         if cls._is_file_reference(content):
-            values = [content]
-        elif isinstance(content, list):
-            values = content
-        else:
-            values = []
-        attachments: list[Attachment] = []
+            return [content]
+        if isinstance(content, list):
+            return [value for value in content if cls._is_file_reference(value)]
+        return []
+
+    @classmethod
+    def _preflight_file_references(
+        cls,
+        values: list[dict[str, Any]],
+        policy: PreflightPolicy,
+    ) -> dict[int, _FilePreflight]:
+        if len(values) > policy.max_attachments:
+            report = PreflightReport(
+                violations=[
+                    PreflightViolation(
+                        check="attachment_count",
+                        limit=policy.max_attachments,
+                        actual=len(values),
+                        message=(
+                            f"Attachment count {len(values)} exceeds limit {policy.max_attachments}"
+                        ),
+                    )
+                ],
+                estimated_tokens=0,
+                total_bytes=0,
+            )
+            raise RequestTooLarge(report)
+
+        probes: dict[int, _FilePreflight] = {}
+        total_bytes = 0
         for value in values:
-            if cls._is_file_reference(value):
-                attachments.append(cls._attachment(cls._file_reference(value)))
+            raw_path = value["kigumi_file"]
+            if not isinstance(raw_path, str):
+                raise ValueError("kigumi_file must be a path string")
+            path = Path(raw_path)
+            size_bytes, identity = _regular_file_probe(path)
+            probes[id(value)] = _FilePreflight(path, size_bytes, identity)
+            total_bytes += size_bytes
+
+        if total_bytes > policy.max_attachment_bytes:
+            report = PreflightReport(
+                violations=[
+                    PreflightViolation(
+                        check="attachment_bytes",
+                        limit=policy.max_attachment_bytes,
+                        actual=total_bytes,
+                        message=(
+                            f"Attachment bytes {total_bytes} exceed limit "
+                            f"{policy.max_attachment_bytes}"
+                        ),
+                    )
+                ],
+                estimated_tokens=0,
+                total_bytes=total_bytes,
+            )
+            raise RequestTooLarge(report)
+        return probes
+
+    @classmethod
+    def _content_attachments(
+        cls,
+        content: Any,
+        *,
+        references: dict[int, _FileReference] | None = None,
+    ) -> list[Attachment]:
+        attachments: list[Attachment] = []
+        for value in cls._content_file_references(content):
+            reference = (
+                references[id(value)] if references is not None else cls._file_reference(value)
+            )
+            attachments.append(cls._attachment(reference))
         return attachments
 
     @classmethod
-    def _prepare_content(cls, content: Any) -> tuple[Any, Any, Any] | None:
+    def _prepare_content(
+        cls,
+        content: Any,
+        *,
+        references: dict[int, _FileReference] | None = None,
+    ) -> tuple[Any, Any, Any] | None:
         if cls._is_file_reference(content):
-            reference = cls._file_reference(content)
+            reference = (
+                references[id(content)] if references is not None else cls._file_reference(content)
+            )
             return (
                 cls._key_reference(reference),
                 cls._cached_reference(content, reference),
@@ -773,7 +987,9 @@ class LLMCaller:
                 transport_content.append(part)
                 continue
             found_reference = True
-            reference = cls._file_reference(part)
+            reference = (
+                references[id(part)] if references is not None else cls._file_reference(part)
+            )
             key_content.append(cls._key_reference(reference))
             cache_content.append(cls._cached_reference(part, reference))
             transport_content.append(reference)
@@ -787,24 +1003,32 @@ class LLMCaller:
         return isinstance(value, dict) and "kigumi_file" in value
 
     @staticmethod
-    def _file_reference(value: dict[str, Any]) -> _FileReference:
+    def _file_reference(
+        value: dict[str, Any],
+        *,
+        probe: _FilePreflight | None = None,
+    ) -> _FileReference:
         raw_path = value["kigumi_file"]
         if not isinstance(raw_path, str):
             raise ValueError("kigumi_file must be a path string")
         path = Path(raw_path)
-        digest = sha256_file(path)
         mime = value.get("format")
         if mime is None:
             mime = mimetypes.guess_type(path.name)[0]
         if not isinstance(mime, str) or not mime:
             raise ValueError(f"Cannot infer MIME type for kigumi_file {path}")
+        if probe is None:
+            size_bytes, identity = _regular_file_probe(path)
+            probe = _FilePreflight(path, size_bytes, identity)
+        digest = _hash_regular_file(probe)
         return _FileReference(
             path=path,
             mime=mime,
             digest=digest,
-            size_bytes=path.stat().st_size,
+            size_bytes=probe.size_bytes,
             detail=value.get("detail"),
             has_detail="detail" in value,
+            identity=probe.identity,
         )
 
     @staticmethod
@@ -855,7 +1079,7 @@ class LLMCaller:
 
     @staticmethod
     def _expand_file_reference(reference: _FileReference) -> dict[str, Any]:
-        data = reference.path.read_bytes()
+        data = _read_preflighted_file(reference)
         # 缓存键在算哈希那一刻就定了;文件在发出前被换了内容,键与实际载荷
         # 就会脱钩——宁可拒发也不能让内容寻址变成谎言。
         if sha256(data).hexdigest() != reference.digest:
