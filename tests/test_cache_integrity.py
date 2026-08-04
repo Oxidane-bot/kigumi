@@ -203,6 +203,56 @@ def test_corrupt_l1_call_cache_is_reported_and_not_reexecuted(tmp_path: Path) ->
     assert caller.transport.requests == []
 
 
+def test_legacy_l1_call_cache_without_response_digest_is_corrupt_not_replayed(
+    tmp_path: Path,
+) -> None:
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = sha(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    path = tmp_path / "llm" / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"response": "legacy cached"}), encoding="utf-8")
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    assert lookup.reason is not None
+    assert "response_sha256" in lookup.reason
+    with pytest.raises(CacheIntegrityError):
+        caller.call("hello")
+    assert caller.transport.requests == []
+
+
+def test_new_l1_call_cache_with_response_digest_remains_valid_and_replayable(
+    tmp_path: Path,
+) -> None:
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = sha(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    path = tmp_path / "llm" / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"response": "new cached", "response_sha256": sha("new cached")}),
+        encoding="utf-8",
+    )
+
+    assert caller.call("hello") == "new cached"
+    assert caller.calls[0]["cache"] == "hit"
+    assert caller.transport.requests == []
+
+
 def test_valid_and_missing_l1_call_cache_states(tmp_path: Path) -> None:
     valid_path = tmp_path / "llm" / "valid.json"
     valid_path.parent.mkdir(parents=True)

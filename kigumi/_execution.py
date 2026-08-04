@@ -14,9 +14,22 @@ from ._declarations import CachePolicy
 from ._runstate import RUN_SIDECAR_SCHEMA
 from .artifacts import atomic_write_json, canonical_json, sha
 from .errors import CacheIntegrityError, OutputOwnershipError
-from .evidence import EvidencePolicy
+from .evidence import EvidenceMode, EvidencePolicy, scrub_evidence
 
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
+
+
+def _scrub_call_params(
+    calls: list[dict[str, Any]],
+    *,
+    mode: EvidenceMode,
+) -> list[dict[str, Any]]:
+    """Keep L3 call provenance free of raw provider parameters."""
+    scrubbed_calls = copy.deepcopy(calls)
+    for call in scrubbed_calls:
+        if "params" in call:
+            call["params"] = scrub_evidence(call["params"], mode=mode)
+    return scrubbed_calls
 
 
 class ExecutionEnvelope:
@@ -193,6 +206,7 @@ class ExecutionEnvelope:
             entry = store.read_cache_entry(self.artifacts_path, cache_key)
         else:
             entry = None
+        safe_calls = _scrub_call_params(calls, mode=evidence_policy.request)
         if entry is not None:
             if entry.state == "CORRUPT":
                 raise CacheIntegrityError(
@@ -224,8 +238,8 @@ class ExecutionEnvelope:
             "cache_policy": cache_policy,
             "outputs": sorted(outputs),
             "seconds": seconds,
-            "calls": copy.deepcopy(calls),
-            "execution_calls": copy.deepcopy(calls),
+            "calls": safe_calls,
+            "execution_calls": copy.deepcopy(safe_calls),
             "prompt_resolutions": copy.deepcopy(prompt_resolutions or {}),
             "prompt_resolutions_digest": sha(prompt_resolutions or {}),
             "origin_provenance": copy.deepcopy(origin),
@@ -257,7 +271,7 @@ def _origin_provenance(
     agent_provenance: dict[str, Any] | None = None,
     prompt_resolutions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    copied_calls = copy.deepcopy(calls)
+    copied_calls = _scrub_call_params(calls, mode=evidence_policy.request)
     agent = artifact.get("agent")
     spec = agent.get("spec") if isinstance(agent, dict) else None
     if copied_calls:

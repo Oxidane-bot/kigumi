@@ -297,13 +297,13 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
     response = cached.get("response")
     actual_sha256 = sha(response) if isinstance(response, str) else None
     expected_sha256 = cached.get("response_sha256")
-    if expected_sha256 is not None and not isinstance(expected_sha256, str):
+    if not isinstance(expected_sha256, str):
         return CacheLookup(
             "CORRUPT",
             None,
             None,
             actual_sha256,
-            "call cache response_sha256 is not a string",
+            "call cache response_sha256 is missing or not a string",
         )
     if not isinstance(response, str) or not response:
         return CacheLookup(
@@ -313,7 +313,7 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
             actual_sha256,
             "call cache response is missing or empty",
         )
-    if expected_sha256 is not None and expected_sha256 != actual_sha256:
+    if expected_sha256 != actual_sha256:
         return CacheLookup(
             "CORRUPT",
             None,
