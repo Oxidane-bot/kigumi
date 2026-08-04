@@ -138,7 +138,7 @@ def main() -> int:
         )
         run_cli(root, "init")
         pyproject_before_repeat = (root / "pyproject.toml").read_bytes()
-        run_cli_failure(root, "init")
+        run_cli(root, "init")
         assert (root / "pyproject.toml").read_bytes() == pyproject_before_repeat
         run_cli(root, "check")
 

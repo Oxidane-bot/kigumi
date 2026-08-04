@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from itertools import repeat
@@ -20,11 +21,12 @@ from tests._agent_helpers import make_agent_spec
 
 
 class _SleepingAdapter:
-    def __init__(self) -> None:
+    def __init__(self, *, start_barrier: threading.Barrier | None = None) -> None:
         self.runs = 0
         self.current = 0
         self.peak = 0
         self.lock = threading.Lock()
+        self.start_barrier = start_barrier
 
     def cache_identity(self) -> dict[str, Any]:
         return {"adapter": "sleeping", "version": 1}
@@ -38,6 +40,9 @@ class _SleepingAdapter:
             self.runs += 1
             self.current += 1
             self.peak = max(self.peak, self.current)
+        if self.start_barrier is not None:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                self.start_barrier.wait(timeout=2)
         time.sleep(0.05)
         with self.lock:
             self.current -= 1
@@ -79,7 +84,7 @@ def test_agent_capacity_defaults_to_one_and_explicit_slots_allow_parallelism(
         assert metadata["origin_provenance"]["agent"]["slot_identity"] == "slot_000"
         assert metadata["origin_provenance"]["agent"]["queue_wait_seconds"] >= 0
 
-    parallel_adapter = _SleepingAdapter()
+    parallel_adapter = _SleepingAdapter(start_barrier=threading.Barrier(2))
     _capacity_dag(tmp_path / "parallel", parallel_adapter, slots=2).run(workers=2)
     assert parallel_adapter.peak == 2
 

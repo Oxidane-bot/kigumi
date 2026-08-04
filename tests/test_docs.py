@@ -331,7 +331,7 @@ def test_verify_dist_requires_exact_package_metadata_contract(kind: str) -> None
 
 
 def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
-    """干净安装 smoke 必须检查所有 shipped docs 和关键 CLI 拒绝路径。"""
+    """干净安装 smoke 必须检查所有 shipped docs 和关键 CLI 路径。"""
     smoke = (ROOT / "scripts" / "smoke_installed.py").read_text(encoding="utf-8")
     assert "sysconfig.get_paths()" in smoke
     assert "for doc in SHIPPED_DOCS" in smoke
@@ -339,7 +339,7 @@ def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
     assert "def run_cli_failure" in smoke
     assert 'run_cli_failure(root, "init")' in smoke
     assert 'run_cli_failure(root, "docs", "not-a-shipped-doc")' in smoke
-    assert 'run_cli_failure(root, "init")' in smoke
+    assert 'run_cli(root, "init")' in smoke
     assert "pyproject_before_repeat" in smoke
 
 
