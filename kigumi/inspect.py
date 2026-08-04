@@ -11,7 +11,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ._runstate import ATTEMPT_RECEIPT_SCHEMA, DurableRunSnapshot
+from ._runstate import (
+    ATTEMPT_RECEIPT_SCHEMA,
+    DurableRunSnapshot,
+    RunManifestError,
+    validate_run_path,
+)
 from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
 from .store import run_directory
 
@@ -21,6 +26,12 @@ def trace_run(
 ) -> dict[str, Any]:
     """Join one run's sidecars to the corresponding L1 payload paths."""
     run_path = run_directory(artifacts_path, run_id)
+    try:
+        validate_run_path(run_path)
+    except RunManifestError as error:
+        raise WorkflowProfileError(
+            f"Run {run_id!r} durable path ownership validation failed: {error}"
+        ) from error
     if not run_path.is_dir():
         raise FileNotFoundError(f"run not found: {run_id}")
 
@@ -82,6 +93,12 @@ def durable_run_state(
     _snapshot: DurableRunSnapshot | None = None,
 ) -> dict[str, Any]:
     """Read supported durable run/attempt state without importing an executable DAG."""
+    try:
+        validate_run_path(run_path)
+    except RunManifestError as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
+        ) from error
     snapshot = _snapshot or _validate_run_integrity(run_path)
     if not snapshot.strict:
         raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
@@ -225,6 +242,12 @@ def _trace_entry(
 
 
 def _key_components_by_node(run_path: Path) -> dict[str, dict[str, Any] | None]:
+    try:
+        validate_run_path(run_path)
+    except RunManifestError as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
+        ) from error
     if not run_path.is_dir():
         return {}
     result: dict[str, dict[str, Any] | None] = {}

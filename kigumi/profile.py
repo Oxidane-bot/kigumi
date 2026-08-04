@@ -16,6 +16,7 @@ from ._runstate import (
     DurableRunSnapshot,
     RunManifestError,
     validate_durable_run,
+    validate_run_path,
 )
 from .artifacts import sha
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
@@ -31,6 +32,7 @@ class WorkflowProfileError(RuntimeError):
 def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
     """Validate the one shared durable snapshot used by all read surfaces."""
     try:
+        validate_run_path(run_path)
         return validate_durable_run(run_path)
     except (AmbiguousAttemptError, RunManifestError) as error:
         raise WorkflowProfileError(
@@ -45,6 +47,12 @@ def load_run_profile(
     _snapshot: DurableRunSnapshot | None = None,
 ) -> dict[str, Any]:
     """Load a runtime profile without importing or executing the registered DAG."""
+    try:
+        validate_run_path(run_path)
+    except RunManifestError as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
+        ) from error
     snapshot = _snapshot or _validate_run_integrity(run_path)
     if not snapshot.strict:
         raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")

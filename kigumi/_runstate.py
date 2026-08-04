@@ -24,6 +24,27 @@ RUN_SIDECAR_SCHEMA = 2
 FAILURE_SCHEMA = 2
 SUCCESS_CANDIDATE_SCHEMA = 2
 ATTEMPT_RECEIPT_SCHEMA = 2
+_RUN_STATUSES = frozenset(
+    {
+        "running",
+        "pending_retry",
+        "ambiguous",
+        "checkpoint_pending",
+        "completed",
+        "failed",
+    }
+)
+_ATTEMPT_STATUSES = frozenset(
+    {
+        "running",
+        "success_candidate",
+        "retry_scheduled",
+        "ambiguous",
+        "checkpoint_pending",
+        "completed",
+        "failed",
+    }
+)
 _STATE_DIGEST_FIELD = "state_sha256"
 _RECEIPT_SEQUENCE_FIELD = "receipt_sequence"
 _PREVIOUS_RECEIPT_DIGEST_FIELD = "previous_receipt_sha256"
@@ -82,12 +103,40 @@ class StateIntegrityError(RunManifestError):
         )
 
 
+def validate_run_path(run_root: Path) -> Path:
+    """Reject symlinked path components before any durable run access.
+
+    A run path is an ownership boundary.  Resolving it before validation would
+    make a symlinked ``runs`` root or run directory look like an ordinary
+    directory and would let durable writers operate in an external tree.
+    Missing trailing components are allowed for a new run; every existing
+    component is inspected with ``lstat`` so the check never follows a link.
+    """
+    path = Path(run_root)
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise RunManifestError(
+                f"Durable run path ownership cannot be checked at {current}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            raise RunManifestError(f"Durable run path must not contain a symlink: {current}")
+    return path
+
+
 class AttemptStore:
     """Own one 0.7 run's immutable declaration and mutable attempt receipts."""
 
     def __init__(self, run_root: Path, manifest_identity: dict[str, Any]) -> None:
-        self.run_root = run_root
-        self.manifest_path = run_root / "_run.json"
+        self.run_root = Path(run_root)
+        validate_run_path(self.run_root)
+        self.manifest_path = self.run_root / "_run.json"
         self.identity = json.loads(canonical_json(manifest_identity))
         self._receipt_chain_lock = threading.RLock()
         self._run_lock_local = threading.local()
@@ -115,6 +164,7 @@ class AttemptStore:
         durable run.  The thread-local depth makes this lock safely re-entrant
         for helpers such as ``prepare`` -> ``_write_state``.
         """
+        validate_run_path(self.run_root)
         with self._receipt_chain_lock:
             depth = getattr(self._run_lock_local, "depth", 0)
             if depth:
@@ -420,15 +470,7 @@ class AttemptStore:
         status: str,
         states: list[dict[str, Any]],
     ) -> None:
-        valid_statuses = {
-            "running",
-            "pending_retry",
-            "ambiguous",
-            "checkpoint_pending",
-            "completed",
-            "failed",
-        }
-        if status not in valid_statuses:
+        if status not in _RUN_STATUSES:
             raise ValueError(f"Unknown run status: {status!r}")
 
         current = manifest.get("status")
@@ -855,6 +897,7 @@ class AttemptStore:
                 canonical = json.loads(canonical_json(active_effect))
                 if not isinstance(canonical, dict):
                     raise RunManifestError("active side effect must be a canonical object")
+                self._validate_active_effect(self._state_path(target), canonical)
                 state["active_effect"] = canonical
             state["side_effect_started"] = True
             state.setdefault("side_effect_started_at", iso_now())
@@ -1253,9 +1296,86 @@ class AttemptStore:
     def _validate_manifest(self, manifest: dict[str, Any]) -> None:
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
+        if manifest.get("status") not in _RUN_STATUSES:
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                f"manifest status is invalid: {manifest.get('status')!r}",
+            )
         self._manifest_generation_value(manifest)
         self._validate_receipt_chain_map(manifest)
         self._validate_recovery_decision_ledger(manifest)
+
+    def _validate_manifest_state_consistency(
+        self,
+        manifest: dict[str, Any],
+        states: list[dict[str, Any]],
+    ) -> None:
+        """Require the published run status to agree with durable attempts."""
+        status = manifest.get("status")
+        state_statuses = [state.get("status") for state in states]
+        pending = manifest.get("pending_retries", [])
+        ambiguous = manifest.get("ambiguous_attempts", [])
+        if not isinstance(pending, list) or not isinstance(ambiguous, list):
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "manifest attempt status projections are invalid",
+            )
+        if status == "completed":
+            if any(value != "completed" for value in state_statuses):
+                raise StateIntegrityError(
+                    self.manifest_path,
+                    RUN_MANIFEST_SCHEMA,
+                    "manifest status completed does not match durable attempt state",
+                )
+            if pending or ambiguous:
+                raise StateIntegrityError(
+                    self.manifest_path,
+                    RUN_MANIFEST_SCHEMA,
+                    "completed manifest contains pending or ambiguous attempts",
+                )
+        elif status == "pending_retry" and "retry_scheduled" not in state_statuses:
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "manifest status pending_retry has no durable retry-scheduled attempt",
+            )
+        elif status == "ambiguous" and "ambiguous" not in state_statuses:
+            # ``resolve`` durably records the operator decision before its
+            # caller publishes the resulting run status.  Keep that narrow
+            # transition readable while still rejecting an unrelated status
+            # rewrite.
+            resolved = any(
+                state.get("resolution") is not None
+                and state.get("status") in {"retry_scheduled", "failed"}
+                for state in states
+            )
+            if not resolved:
+                raise StateIntegrityError(
+                    self.manifest_path,
+                    RUN_MANIFEST_SCHEMA,
+                    "manifest status ambiguous has no durable ambiguous attempt",
+                )
+        elif status == "checkpoint_pending" and "checkpoint_pending" not in state_statuses:
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "manifest status checkpoint_pending has no durable checkpoint attempt",
+            )
+        elif (
+            status == "failed"
+            and state_statuses
+            and not any(
+                value in {"failed", "retry_scheduled", "success_candidate"}
+                for value in state_statuses
+            )
+        ):
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "manifest status failed does not match durable attempt state",
+            )
 
     def _validate_recovery_decision_ledger(self, manifest: dict[str, Any]) -> None:
         """Validate the append-only recovery ledger and every bound receipt."""
@@ -1403,6 +1523,7 @@ class AttemptStore:
         return entry
 
     def _required_manifest(self) -> dict[str, Any]:
+        validate_run_path(self.run_root)
         manifest, corrupted = self._read_json_safe(self.manifest_path)
         if corrupted:
             raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
@@ -1463,6 +1584,7 @@ class AttemptStore:
         attempt = state.get("attempt")
         if type(attempt) is not int or attempt < 1:
             raise RunManifestError(f"Attempt state for {target!r} has invalid attempt")
+        self._validate_active_effect(self._state_path(target), state.get("active_effect"))
 
         if manifest is None:
             manifest = self._required_manifest()
@@ -1537,6 +1659,14 @@ class AttemptStore:
         attempt = state.get("attempt")
         if type(attempt) is not int or attempt < 1:
             raise StateIntegrityError(path, ATTEMPT_RECEIPT_SCHEMA, "attempt binding is invalid")
+        status = state.get("status")
+        if status not in _ATTEMPT_STATUSES:
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                f"attempt state has an invalid status {status!r}",
+            )
+        self._validate_active_effect(path, state.get("active_effect"))
         if state.get("status") == "running" and not self._is_owner_token(
             state.get(_TARGET_OWNER_FIELD)
         ):
@@ -1605,6 +1735,44 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "current state and attempt receipt are not identical",
             )
+
+    @staticmethod
+    def _validate_active_effect(path: Path, active_effect: Any) -> None:
+        """Validate the managed/unmanaged Prompt binding at the effect boundary."""
+        if active_effect is None:
+            return
+        if not isinstance(active_effect, dict):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "active effect must be an object",
+            )
+        managed = active_effect.get("managed")
+        if managed is not None and type(managed) is not bool:
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "active effect managed flag is invalid",
+            )
+        resolution = active_effect.get("prompt_resolution")
+        if managed is True and not isinstance(resolution, dict):
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "managed active effect is missing its prompt resolution",
+            )
+        if resolution is None:
+            return
+        from .prompt import PromptResolutionError, validate_prompt_resolution_record
+
+        try:
+            validate_prompt_resolution_record(resolution)
+        except PromptResolutionError as error:
+            raise StateIntegrityError(
+                path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                f"active effect prompt resolution is invalid: {error}",
+            ) from error
 
     def _validate_candidate_binding(
         self,
@@ -1932,6 +2100,7 @@ class AttemptStore:
                     ATTEMPT_RECEIPT_SCHEMA,
                     "durable state is missing for the manifest receipt chain",
                 )
+            self._validate_manifest_state_consistency(manifest, [])
             return []
         states: list[dict[str, Any]] = []
         target_digests: set[str] = set()
@@ -2009,6 +2178,7 @@ class AttemptStore:
                     ATTEMPT_RECEIPT_SCHEMA,
                     "durable state is missing for the manifest receipt chain",
                 )
+        self._validate_manifest_state_consistency(manifest, states)
         return states
 
     def _validate_run_materializations(
@@ -2379,12 +2549,13 @@ class AttemptStore:
 
     def _required_state(self, target: str) -> dict[str, Any]:
         """Read one target only after its complete receipt history is trusted."""
-        self._validate_attempt_receipts(target)
+        self._validate_all_attempt_receipts()
         return self._required_json(self._state_path(target))
 
 
 def validate_durable_run(run_root: Path) -> DurableRunSnapshot:
     """Validate one current schema-2 run for every read-only surface."""
+    validate_run_path(run_root)
     manifest_path = run_root / "_run.json"
     manifest, corrupted = AttemptStore._read_json_safe(manifest_path)
     if corrupted:

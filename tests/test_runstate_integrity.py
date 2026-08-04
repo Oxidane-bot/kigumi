@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from kigumi._runstate import AttemptStore, RunManifestError, StateIntegrityError
-from kigumi.artifacts import canonical_json, sha, write_artifact
+from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.failures import ProviderFailure, ProviderFailureKind, ProviderFailureStage
 from kigumi.retry import AmbiguousAttemptError, RetryPolicy
 
@@ -111,6 +111,30 @@ def test_corrupt_attempt_receipt_fails_prepare_closed(tmp_path: Path) -> None:
         store.prepare("work", policy=None, declaration_digest="decl")
 
 
+def test_attempt_store_rejects_symlinked_run_root_and_runs_root(tmp_path: Path) -> None:
+    external_run = tmp_path / "external" / "run"
+    _store(tmp_path / "external")
+
+    artifacts = tmp_path / "artifacts"
+    runs = artifacts / "runs"
+    runs.mkdir(parents=True)
+    run_link = runs / "run"
+    run_link.symlink_to(external_run, target_is_directory=True)
+
+    with pytest.raises(RunManifestError, match="symlink"):
+        AttemptStore(run_link, {}).initialize()
+
+    external_runs = tmp_path / "external-runs"
+    external_runs.mkdir()
+    _store(external_runs)
+    linked_artifacts = tmp_path / "linked-artifacts"
+    linked_artifacts.mkdir()
+    (linked_artifacts / "runs").symlink_to(external_runs, target_is_directory=True)
+
+    with pytest.raises(RunManifestError, match="symlink"):
+        AttemptStore(linked_artifacts / "runs" / "run", {}).initialize()
+
+
 def test_missing_attempt_receipt_is_not_started_case(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
@@ -136,6 +160,38 @@ def test_tampered_running_state_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(StateIntegrityError):
         store.prepare("work", policy=None, declaration_digest="decl")
+
+
+def test_active_effect_managed_requires_a_prompt_resolution(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    state_path = _state_path(tmp_path)
+    receipt_path = _receipt_path(tmp_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["active_effect"] = {
+        "active_effect_schema": 1,
+        "kind": "call",
+        "managed": True,
+        "prompt_resolution": None,
+    }
+    state["state_sha256"] = sha(
+        {key: value for key, value in state.items() if key != "state_sha256"}
+    )
+    atomic_write_json(state_path, state)
+    atomic_write_json(receipt_path, state)
+    manifest_path = tmp_path / "run" / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["attempt_receipt_chains"][sha("work")][-1]["state_sha256"] = state["state_sha256"]
+    atomic_write_json(manifest_path, manifest)
+
+    for operation in (
+        lambda: store.state_for("work"),
+        store.pending_retries,
+        store.ambiguous_attempts,
+        lambda: AttemptStore(tmp_path / "run", {}).initialize(),
+    ):
+        with pytest.raises(StateIntegrityError, match="active effect|prompt resolution"):
+            operation()
 
 
 def test_tampered_attempt_receipt_fails_closed(tmp_path: Path) -> None:

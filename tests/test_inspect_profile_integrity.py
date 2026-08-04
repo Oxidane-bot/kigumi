@@ -15,7 +15,7 @@ from kigumi._runstate import (
     StateIntegrityError,
 )
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
-from kigumi.inspect import durable_run_state, trace_run
+from kigumi.inspect import diff_components, durable_run_state, trace_run
 from kigumi.profile import WorkflowProfileError, load_run_profile
 from tests._dag_helpers import _make_dag
 
@@ -220,6 +220,102 @@ def test_trace_run_fails_closed_on_the_same_untrusted_durable_state(tmp_path: Pa
 
     with pytest.raises(WorkflowProfileError, match="historical attempt receipt"):
         trace_run(artifacts, tmp_path / "llm", "trace")
+
+
+@pytest.mark.parametrize("symlink_kind", ["run", "runs"])
+def test_all_read_surfaces_reject_symlinked_run_ownership(
+    tmp_path: Path,
+    symlink_kind: str,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    external_runs = tmp_path / "external-runs"
+    run_path, _store = _make_run(
+        tmp_path,
+        recovery=False,
+        run_path=external_runs / "owned",
+    )
+    if symlink_kind == "run":
+        runs = artifacts / "runs"
+        runs.mkdir(parents=True)
+        (runs / "owned").symlink_to(run_path, target_is_directory=True)
+    else:
+        artifacts.mkdir(parents=True)
+        (artifacts / "runs").symlink_to(external_runs, target_is_directory=True)
+
+    run_id = "owned"
+    run_view = artifacts / "runs" / run_id
+    readers = (
+        lambda: durable_run_state(run_view),
+        lambda: load_run_profile(run_view),
+        lambda: trace_run(artifacts, tmp_path / "llm", run_id),
+        lambda: diff_components(artifacts, run_id, run_id),
+    )
+    for reader in readers:
+        with pytest.raises(WorkflowProfileError, match="symlink|durable|integrity"):
+            reader()
+
+
+@pytest.mark.parametrize("symlink_kind", ["run", "runs"])
+def test_resume_rejects_symlinked_run_ownership_before_external_write(
+    tmp_path: Path,
+    symlink_kind: str,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    dag = _make_dag(tmp_path)
+    calls: list[str] = []
+
+    @dag.node("work", cache="off")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        calls.append("work")
+        return {"value": "ok"}
+
+    result = dag.run(run_id="symlink-resume")
+    run_path = artifacts / "runs" / result.run_id
+    original_manifest = (run_path / "_run.json").read_bytes()
+    external_root = tmp_path / "external-runs"
+    external_root.mkdir()
+    external_run = external_root / result.run_id
+    if symlink_kind == "run":
+        run_path.rename(external_run)
+        run_path.symlink_to(external_run, target_is_directory=True)
+    else:
+        runs_path = artifacts / "runs"
+        runs_path.rename(external_root)
+        runs_path.symlink_to(external_root, target_is_directory=True)
+
+    with pytest.raises(RunManifestError, match="symlink"):
+        dag.resume(result.run_id)
+
+    assert calls == ["work"]
+    assert (external_run / "_run.json").read_bytes() == original_manifest
+
+
+def test_manifest_completed_status_must_match_durable_attempt_state(
+    tmp_path: Path,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    run_path, store = _make_run(
+        tmp_path,
+        recovery=False,
+        run_path=artifacts / "runs" / "status-mismatch",
+    )
+    manifest_path = run_path / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "completed"
+    atomic_write_json(manifest_path, manifest)
+
+    readers = (
+        lambda: durable_run_state(run_path),
+        lambda: load_run_profile(run_path),
+        lambda: trace_run(artifacts, tmp_path / "llm", "status-mismatch"),
+        lambda: store.initialize(),
+        lambda: store.state_for("work"),
+        lambda: store.prepare("work", policy=None, declaration_digest="decl"),
+    )
+    for reader in readers:
+        with pytest.raises((WorkflowProfileError, RunManifestError), match="status|completed"):
+            reader()
 
 
 @pytest.mark.parametrize("broken", ["receipt", "candidate", "artifact", "sidecar"])
