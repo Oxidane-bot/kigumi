@@ -22,7 +22,10 @@ jobs:
         run: |
           git fetch --force origin \
             "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"
+          tag_ref="refs/tags/$GITHUB_REF_NAME"
+          test "$(git cat-file -t "$tag_ref")" = "tag"
+          tag_commit="$(git rev-parse "$tag_ref^{}")"
+          test "$tag_commit" = "$(git rev-parse HEAD)"
       - name: Verify version identity
         run: |
           VERSION="$(uv run python -c 'import kigumi; print(kigumi.__version__)')"
@@ -71,6 +74,33 @@ jobs:
       - id: version
         run: echo "version=$(uv run python -c 'import kigumi; print(kigumi.__version__)')" >> "$GITHUB_OUTPUT"
       - run: uv run python scripts/verify_dist.py --expected-version "${{ steps.version.outputs.version }}"
+      - name: Verify sdist metadata version
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          uv run python - "$EXPECTED_VERSION" <<'PY'
+          import email
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          expected = sys.argv[1]
+          path = Path("dist") / f"kigumi-{expected}.tar.gz"
+          with tarfile.open(path, "r:gz") as archive:
+              metadata_paths = [
+                  member for member in archive.getmembers() if member.name.endswith("/PKG-INFO")
+              ]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(f"expected one sdist PKG-INFO, found {len(metadata_paths)}")
+              handle = archive.extractfile(metadata_paths[0])
+              if handle is None:
+                  raise SystemExit("sdist PKG-INFO is not readable")
+              metadata = email.message_from_bytes(handle.read())
+          if metadata["Version"] != expected:
+              raise SystemExit(
+                  f"sdist metadata version {metadata['Version']!r} != {expected!r}"
+              )
+          PY
       - name: Verify source and distribution release identity
         run: KIGUMI_DIST_DIR=dist uv run pytest -q tests/test_version.py tests/test_docs.py tests/test_schema_consistency.py
       - uses: actions/upload-artifact@v4

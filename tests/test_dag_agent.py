@@ -144,6 +144,47 @@ def test_dag_agent_uses_normal_cache_and_publishes_exact_attachments(tmp_path: P
     assert description["agent"]["spec"]["digest"] == spec.digest
 
 
+def test_agent_stages_the_same_file_snapshot_used_for_its_cache_key(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.txt"
+    input_path.write_text("before", encoding="utf-8")
+    staged: list[str] = []
+
+    class SnapshotAdapter:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def cache_identity(self) -> dict[str, str]:
+            return {"adapter": "snapshot", "version": "1"}
+
+        def capabilities(self) -> AgentCapabilities:
+            self.path.write_text("after", encoding="utf-8")
+            return AgentCapabilities(filesystem=True)
+
+        def run(self, request: Any, context: Any) -> AgentRunResult:
+            del request
+            staged.append((context.workspace / "input.txt").read_text(encoding="utf-8"))
+            return AgentRunResult(AgentCompletion("completed", staged[-1]))
+
+    dag = _make_dag(tmp_path)
+    adapter = SnapshotAdapter(input_path)
+
+    @dag.agent(
+        "agent",
+        adapter=adapter,
+        spec=make_agent_spec(tmp_path / "agent"),
+        files=("input.txt",),
+        cache="off",
+    )
+    def agent(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("read the input")
+
+    result = dag.run(run_id="agent-file-snapshot")
+
+    assert staged == ["before"]
+    assert result.artifacts["agent"]["completion"]["summary"] == "before"
+
+
 def test_agent_capsule_change_misses_cache_while_hit_skips_builder(tmp_path: Path) -> None:
     builders = 0
     capsule = tmp_path / "agent"

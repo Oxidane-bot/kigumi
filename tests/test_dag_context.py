@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,40 @@ def test_context_reads_only_declared_files_with_relative_and_absolute_paths(tmp_
         }
 
     assert dag.run().artifacts == {"reader": {"text": "受控文本", "bytes": [0, 1]}}
+
+
+def test_run_file_snapshot_binds_key_and_context_to_one_immutable_value(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "input.txt"
+    data.write_text("stable", encoding="utf-8")
+
+    def mutate_after_first(name: str, artifact: dict[str, Any], hit: bool) -> None:
+        del artifact, hit
+        if name == "first":
+            data.write_text("changed", encoding="utf-8")
+
+    dag = _make_dag(tmp_path, mutate_after_first)
+
+    @dag.node("first", files=("input.txt",))
+    def first(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs
+        return {"value": ctx.read_text("input.txt")}
+
+    @dag.node("second", deps=("first",), files=("input.txt",))
+    def second(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs
+        return {"value": ctx.read_text("input.txt")}
+
+    result = dag.run(run_id="file-snapshot")
+    run_root = tmp_path / "artifacts" / "runs" / result.run_id
+    second_sidecar = json.loads((run_root / "second.json.meta.json").read_text(encoding="utf-8"))
+
+    assert result.artifacts == {
+        "first": {"value": "stable"},
+        "second": {"value": "stable"},
+    }
+    assert second_sidecar["key_components"]["files:input.txt"] == sha256(b"stable").hexdigest()
 
 
 def test_context_rejects_an_undeclared_file_with_a_declaration_hint(tmp_path: Path) -> None:

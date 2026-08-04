@@ -695,6 +695,151 @@ def test_resume_fails_closed_when_declaration_changes(tmp_path: Path) -> None:
         changed.resume("bound")
 
 
+@pytest.mark.parametrize("changed_callable", ["aggregate", "key"])
+def test_map_resume_binds_dynamic_callable_provenance(
+    tmp_path: Path,
+    changed_callable: str,
+) -> None:
+    def aggregate_v1(items: dict[str, dict[str, Any]], order: list[str]) -> dict[str, Any]:
+        return {"count": len(order)}
+
+    def aggregate_v2(items: dict[str, dict[str, Any]], order: list[str]) -> dict[str, Any]:
+        return {"ids": order, "count": len(items)}
+
+    def key_v1(item: dict[str, str]) -> str:
+        return item["id"]
+
+    def key_v2(item: dict[str, str]) -> str:
+        return item["id"].strip()
+
+    def build(
+        transport: Any,
+        *,
+        aggregate_fn: Any,
+        key_fn: Any,
+    ) -> Dag:
+        config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+        dag = Dag(config, LLMCaller(transport, tmp_path / "llm"))
+
+        @dag.node("source", cache="off")
+        def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+            return {"items": [{"id": "a"}, {"id": "b"}]}
+
+        @dag.map(
+            "mapped",
+            items_from=("source", "items"),
+            key_fn=key_fn,
+            aggregate_fn=aggregate_fn,
+            cache="off",
+        )
+        def mapped(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs
+            return {"id": item["id"], "answer": ctx.call(item["id"], model="provider/model")}
+
+        return dag
+
+    first_transport = _SequenceTransport(
+        [
+            Response("a-result", {}, "stop"),
+            Response("b-result", {}, "stop"),
+        ]
+    )
+    first = build(first_transport, aggregate_fn=aggregate_v1, key_fn=key_v1).run(
+        run_id="dynamic-callable"
+    )
+    assert first.run_status == "completed"
+
+    changed_aggregate = aggregate_v2 if changed_callable == "aggregate" else aggregate_v1
+    changed_key = key_v2 if changed_callable == "key" else key_v1
+    changed = build(
+        _SequenceTransport([]),
+        aggregate_fn=changed_aggregate,
+        key_fn=changed_key,
+    )
+
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        changed.resume("dynamic-callable")
+
+
+def test_scan_resume_binds_aggregate_callable_provenance(tmp_path: Path) -> None:
+    def aggregate_v1(items: dict[str, dict[str, Any]], order: list[str]) -> dict[str, Any]:
+        return {"count": len(order)}
+
+    def aggregate_v2(items: dict[str, dict[str, Any]], order: list[str]) -> dict[str, Any]:
+        return {"ids": order, "count": len(items)}
+
+    def build(transport: Any, aggregate_fn: Any) -> Dag:
+        config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+        dag = Dag(config, LLMCaller(transport, tmp_path / "llm"))
+
+        @dag.node("source", cache="off")
+        def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+            return {"items": [{"id": "a"}, {"id": "b"}]}
+
+        @dag.scan(
+            "scanned",
+            items_from=("source", "items"),
+            key_fn=lambda item: item["id"],
+            aggregate_fn=aggregate_fn,
+            cache="off",
+        )
+        def scanned(
+            item: dict[str, str],
+            carry: Any,
+            inputs: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, str]:
+            del carry, inputs
+            return {"id": item["id"], "answer": ctx.call(item["id"], model="provider/model")}
+
+        return dag
+
+    first = build(
+        _SequenceTransport(
+            [
+                Response("a-result", {}, "stop"),
+                Response("b-result", {}, "stop"),
+            ]
+        ),
+        aggregate_v1,
+    ).run(run_id="dynamic-scan-callable")
+    assert first.run_status == "completed"
+
+    changed = build(_SequenceTransport([]), aggregate_v2)
+    with pytest.raises(RunManifestError, match="declaration changed"):
+        changed.resume("dynamic-scan-callable")
+
+
+@pytest.mark.parametrize("entry", ["resume", "run"])
+def test_execution_entry_rejects_corrupt_workflow_profile_digest(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    dag = Dag(
+        KigumiConfig(project_root=tmp_path, source_dirs=[]),
+        LLMCaller(_SequenceTransport([]), tmp_path / "llm"),
+    )
+
+    @dag.node("work", cache="off")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ok"}
+
+    dag.run(run_id="profile-integrity")
+    manifest_path = tmp_path / "artifacts" / "runs" / "profile-integrity" / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["workflow_profile"]["graph"]["nodes"][0]["cache"] = "tampered"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RunManifestError, match="workflow_profile digest"):
+        if entry == "resume":
+            dag.resume("profile-integrity")
+        else:
+            dag.run(run_id="profile-integrity")
+
+
 def test_legacy_run_without_manifest_is_read_only_and_cannot_resume(
     tmp_path: Path,
 ) -> None:

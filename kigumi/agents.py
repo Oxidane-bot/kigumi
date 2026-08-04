@@ -635,6 +635,7 @@ def execute_agent_task(
     adapter: AgentAdapter,
     adapter_identity: Mapping[str, Any],
     spec: AgentSpec,
+    declared_file_contents: Mapping[str | Path, bytes] | None = None,
     evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
     prompt_resolution: Mapping[str, Any] | None = None,
     session_in: Mapping[str, Any] | None = None,
@@ -733,13 +734,28 @@ def execute_agent_task(
 
     try:
         for declared in declared_files:
-            source = resolve(declared)
-            if source.is_symlink() or not source.is_file():
-                raise AgentResultError(f"Declared Agent input must be a regular file: {declared}")
             relative = _workspace_pattern(declared.as_posix())
             destination = workspace / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
+            if declared_file_contents is None:
+                source = resolve(declared)
+                if source.is_symlink() or not source.is_file():
+                    raise AgentResultError(
+                        f"Declared Agent input must be a regular file: {declared}"
+                    )
+                shutil.copyfile(source, destination)
+                continue
+            try:
+                data = declared_file_contents[str(declared)]
+            except KeyError as error:
+                raise AgentResultError(
+                    f"Declared Agent input is absent from the run file snapshot: {declared}"
+                ) from error
+            if not isinstance(data, bytes):
+                raise AgentResultError(
+                    f"Declared Agent input snapshot must contain bytes: {declared}"
+                )
+            destination.write_bytes(data)
         internal = workspace / ".kigumi"
         internal.mkdir()
         (internal / "inputs.json").write_text(canonical_json(inputs), encoding="utf-8")

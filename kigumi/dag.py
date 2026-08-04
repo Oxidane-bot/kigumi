@@ -12,6 +12,7 @@ import copy
 import functools
 import getpass
 import inspect
+import io
 import json
 import os
 import struct
@@ -351,6 +352,105 @@ class _Node:
     retry: RetryPolicy | None = None
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    """Immutable bytes captured for one run's declared-file descriptors."""
+
+    project_root: Path
+    _contents: Mapping[str, bytes]
+    _resolved_contents: Mapping[Path, bytes]
+    _declared_aliases: Mapping[str, tuple[str, ...]]
+
+    @classmethod
+    def capture(
+        cls,
+        project_root: Path,
+        resolve: Callable[[str | Path], Path],
+        paths: Iterable[str | Path] = (),
+    ) -> _FileSnapshot:
+        empty = cls(
+            project_root.resolve(),
+            types.MappingProxyType({}),
+            types.MappingProxyType({}),
+            types.MappingProxyType({}),
+        )
+        return empty.extend(paths, resolve)
+
+    def extend(
+        self,
+        paths: Iterable[str | Path],
+        resolve: Callable[[str | Path], Path],
+    ) -> _FileSnapshot:
+        contents = dict(self._contents)
+        resolved_contents = dict(self._resolved_contents)
+        declared_aliases = dict(self._declared_aliases)
+        for raw_path in paths:
+            declared = Path(raw_path)
+            resolved = resolve(declared)
+            data = resolved_contents.get(resolved)
+            if data is None:
+                data = resolved.read_bytes()
+                resolved_contents[resolved] = data
+            aliases = self._aliases(declared, resolved)
+            declared_aliases.setdefault(str(declared), aliases)
+            for alias in aliases:
+                contents.setdefault(alias, data)
+        return _FileSnapshot(
+            self.project_root,
+            types.MappingProxyType(contents),
+            types.MappingProxyType(resolved_contents),
+            types.MappingProxyType(declared_aliases),
+        )
+
+    def contents(self, paths: Iterable[str | Path]) -> dict[str, bytes]:
+        return {str(path): self.read(path) for path in paths}
+
+    def is_declared(
+        self,
+        path: str | Path,
+        declared_paths: Iterable[str | Path],
+    ) -> bool:
+        requested = set(self._aliases(Path(path)))
+        return any(
+            requested.intersection(
+                self._declared_aliases.get(str(declared), self._aliases(Path(declared)))
+            )
+            for declared in declared_paths
+        )
+
+    def read(self, path: str | Path) -> bytes:
+        for alias in self._aliases(Path(path)):
+            try:
+                return self._contents[alias]
+            except KeyError:
+                continue
+        raise KeyError(str(path))
+
+    def read_declared(
+        self,
+        path: str | Path,
+        declared_paths: Iterable[str | Path],
+    ) -> bytes:
+        if not self.is_declared(path, declared_paths):
+            raise KeyError(str(path))
+        try:
+            return self.read(path)
+        except KeyError as error:
+            raise RunManifestError(
+                f"Declared file {path!r} is absent from the run file snapshot"
+            ) from error
+
+    def _aliases(self, path: Path, resolved: Path | None = None) -> tuple[str, ...]:
+        aliases = [str(path), str(self._lexical_absolute(path))]
+        if resolved is not None:
+            aliases.append(str(resolved))
+        return tuple(dict.fromkeys(aliases))
+
+    def _lexical_absolute(self, path: Path) -> Path:
+        candidate = path if path.is_absolute() else self.project_root / path
+        return Path(os.path.abspath(candidate))
+
+
 class NodeContext:
     """节点执行上下文；文件读取只能访问节点已声明的输入。"""
 
@@ -363,6 +463,7 @@ class NodeContext:
         checkpoint_suffix: str | None = None,
         item_files: tuple[Path, ...] = (),
         prompt_resolutions: Mapping[str, ResolvedPrompt] | None = None,
+        file_snapshot: _FileSnapshot,
     ) -> None:
         self._dag = dag
         self._node = node
@@ -371,6 +472,7 @@ class NodeContext:
         self._item_files = item_files
         self._checkpoint_used = False
         self._prompt_resolutions = dict(prompt_resolutions or {})
+        self._file_snapshot = file_snapshot
 
     @property
     def params(self) -> dict[str, Any]:
@@ -384,24 +486,28 @@ class NodeContext:
 
     def read_text(self, path: str | Path, encoding: str = "utf-8") -> str:
         """读取已在 ``files`` 或当前项 ``files_fn`` 中声明的文本文件。"""
-        return self._checked_path(path).read_text(encoding=encoding)
+        data = self._checked_file(path)
+        with io.TextIOWrapper(io.BytesIO(data), encoding=encoding) as handle:
+            return handle.read()
 
     def read_bytes(self, path: str | Path) -> bytes:
         """读取已在 ``files`` 或当前项 ``files_fn`` 中声明的二进制文件。"""
-        return self._checked_path(path).read_bytes()
+        return self._checked_file(path)
 
-    def _checked_path(self, path: str | Path) -> Path:
-        resolved = self._dag.config.resolve(path)
-        declared = {
-            self._dag.config.resolve(declared_path)
-            for declared_path in (*self._node.files, *self._item_files)
-        }
-        if resolved not in declared:
+    def _checked_file(self, path: str | Path) -> bytes:
+        declared_paths = (*self._node.files, *self._item_files)
+        if not self._file_snapshot.is_declared(path, declared_paths):
+            resolved = self._dag.config.resolve(path)
             raise UndeclaredInputError(
                 f"Node {self._node.name!r} attempted to read undeclared file {resolved}. "
                 "在 files= 或 files_fn 中声明该文件。"
             )
-        return resolved
+        try:
+            return self._file_snapshot.read(path)
+        except KeyError as error:
+            raise RunManifestError(
+                f"Declared file {path!r} is absent from the run file snapshot"
+            ) from error
 
     def llm(
         self,
@@ -1210,6 +1316,8 @@ class Dag:
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 candidate_manifest = None
             if isinstance(candidate_manifest, dict):
+                if candidate_manifest.get("run_manifest_schema") == RUN_MANIFEST_SCHEMA:
+                    self._validate_execution_manifest_profile(run_id, candidate_manifest)
                 existing_manifest = candidate_manifest
         selected = (
             tuple(existing_manifest.get("targets", ()))
@@ -1253,6 +1361,11 @@ class Dag:
         libs_identities = self._libs_identities(self._nodes[name] for name in order)
         libs_hashes = {name: identity.digest for name, identity in libs_identities.items()}
         prompt_snapshot = self._prompt_snapshot()
+        file_snapshot = _FileSnapshot.capture(
+            self.config.project_root,
+            self.config.resolve,
+            (path for name in order for path in self._nodes[name].files),
+        )
         attempt_store = AttemptStore(
             run_dir,
             self._run_manifest_identity(
@@ -1262,6 +1375,7 @@ class Dag:
                 order,
                 libs_hashes,
                 prompt_snapshot,
+                file_snapshot,
             ),
         )
         attempt_store.initialize()
@@ -1308,7 +1422,7 @@ class Dag:
             effective_cache_policy = node.cache if libs_cache_reusable else "off"
             if node.items_from is None:
                 function_inputs = self._function_inputs(node, inputs)
-                file_contents = self._file_contents(node)
+                file_contents = self._file_contents(node, file_snapshot=file_snapshot)
                 prompt_resolutions = self._resolve_prompt_specs(
                     node,
                     prompt_snapshot,
@@ -1409,6 +1523,7 @@ class Dag:
                             attempt_store=attempt_store,
                             prompt_snapshot=prompt_snapshot,
                             budget_abort=budget_abort,
+                            file_snapshot=file_snapshot,
                         )
                         cache_key = item_cache_keys
                         with state_lock:
@@ -1484,6 +1599,7 @@ class Dag:
                                 node,
                                 current_run_id,
                                 prompt_resolutions=prompt_resolutions,
+                                file_snapshot=file_snapshot,
                             )
                             try:
                                 function_inputs = copy.deepcopy(function_inputs)
@@ -1549,6 +1665,7 @@ class Dag:
                                                     task=task,
                                                     inputs=function_inputs,
                                                     declared_files=node.files,
+                                                    declared_file_contents=file_contents,
                                                     resolve=self.config.resolve,
                                                     artifacts_path=(self.config.artifacts_path),
                                                     blob_store=self.blob_store,
@@ -1898,6 +2015,7 @@ class Dag:
             raise RunManifestError(
                 f"Run {run_id!r} has no valid schema-2 manifest; it cannot be resumed"
             )
+        self._validate_execution_manifest_profile(run_id, manifest)
         targets = manifest.get("targets")
         force = manifest.get("force")
         if not isinstance(targets, list) or not all(isinstance(name, str) for name in targets):
@@ -1956,6 +2074,7 @@ class Dag:
             raise ValueError(f"Run {run_id!r} has an invalid manifest")
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
+        self._validate_execution_manifest_profile(run_id, manifest)
         if manifest.get("status") != "failed":
             raise ValueError(f"Run {run_id!r} is not in terminal failed state")
 
@@ -1976,6 +2095,11 @@ class Dag:
             order = self._topological_order(tuple(targets))
             libs_hashes = self._libs_hashes(self._nodes[name] for name in order)
             prompt_snapshot = self._prompt_snapshot()
+            file_snapshot = _FileSnapshot.capture(
+                self.config.project_root,
+                self.config.resolve,
+                (path for name in order for path in self._nodes[name].files),
+            )
             attempts = AttemptStore(
                 run_dir,
                 self._run_manifest_identity(
@@ -1985,6 +2109,7 @@ class Dag:
                     order,
                     libs_hashes,
                     prompt_snapshot,
+                    file_snapshot,
                 ),
             )
             attempts.initialize()
@@ -2137,6 +2262,20 @@ class Dag:
             ambiguous_attempts=ambiguous,
         )
 
+    @staticmethod
+    def _validate_execution_manifest_profile(
+        run_id: str,
+        manifest: Mapping[str, Any],
+    ) -> None:
+        """Validate the persisted profile before any resume/run state mutation."""
+        profile = manifest.get("workflow_profile")
+        if not isinstance(profile, dict):
+            raise RunManifestError(f"Run {run_id!r} is missing workflow_profile")
+        if profile.get("workflow_profile_schema") != workflow_profile.WORKFLOW_PROFILE_SCHEMA:
+            raise RunManifestError(f"Run {run_id!r} has an unsupported workflow_profile schema")
+        if manifest.get("workflow_profile_digest") != sha(profile):
+            raise RunManifestError(f"Run {run_id!r} workflow_profile digest validation failed")
+
     def _run_manifest_identity(
         self,
         run_id: str,
@@ -2145,6 +2284,7 @@ class Dag:
         order: list[str],
         libs_hashes: Mapping[str, str],
         prompt_snapshot: PromptCatalogSnapshot,
+        file_snapshot: _FileSnapshot,
     ) -> dict[str, Any]:
         declarations: dict[str, Any] = {}
         retry_digests: dict[str, str | None] = {}
@@ -2161,7 +2301,7 @@ class Dag:
                     spec.name: prompt_snapshot.declaration(spec) for spec in node.prompt_specs
                 },
                 "files": {
-                    path.as_posix(): _bytes_hash(self.config.resolve(path).read_bytes())
+                    path.as_posix(): _bytes_hash(file_snapshot.contents((path,))[str(path)])
                     for path in node.files
                 },
                 "params": sha(node.params),
@@ -2173,6 +2313,12 @@ class Dag:
                 "items_from": list(node.items_from) if node.items_from is not None else None,
                 "scan": node.scan,
                 "carry_from": list(node.carry_from) if node.carry_from is not None else None,
+                "dynamic_callables": {
+                    "key_fn": _callable_provenance(node.key_fn),
+                    "files_fn": _callable_provenance(node.files_fn),
+                    "aggregate_fn": _callable_provenance(node.aggregate_fn),
+                    "carry_fn": _callable_provenance(node.carry_fn),
+                },
                 "retry_policy_digest": retry_digests[name],
                 "evidence_policy_digest": evidence.digest,
             }
@@ -3446,6 +3592,7 @@ class Dag:
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
+        file_snapshot: _FileSnapshot,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
@@ -3456,6 +3603,15 @@ class Dag:
         if unknown_forced:
             forced_names = ", ".join(f"{node.name}@{item_id}" for item_id in unknown_forced)
             raise ValueError(f"Unknown forced map items: {forced_names}")
+
+        item_files_by_id = {
+            item_id: (tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ())
+            for item_id, item in entries
+        }
+        file_snapshot = file_snapshot.extend(
+            (path for item_files in item_files_by_id.values() for path in item_files),
+            self.config.resolve,
+        )
 
         shared_inputs = self._function_inputs(
             node,
@@ -3471,10 +3627,12 @@ class Dag:
             checkpoint_used = False
             try:
                 with observe() as calls:
-                    item_files = (
-                        tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
+                    item_files = item_files_by_id[item_id]
+                    file_contents = self._file_contents(
+                        node,
+                        item_files,
+                        file_snapshot=file_snapshot,
                     )
-                    file_contents = self._file_contents(node, item_files)
                     prompt_resolutions = self._resolve_prompt_specs(
                         node,
                         prompt_snapshot,
@@ -3594,6 +3752,7 @@ class Dag:
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
                                 prompt_resolutions=prompt_resolutions,
+                                file_snapshot=file_snapshot,
                             )
                             boundary = (
                                 durable_side_effect_boundary(
@@ -3867,6 +4026,7 @@ class Dag:
         attempt_store: AttemptStore,
         prompt_snapshot: PromptCatalogSnapshot,
         budget_abort: threading.Event,
+        file_snapshot: _FileSnapshot,
     ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
@@ -3878,6 +4038,15 @@ class Dag:
         if unknown_forced:
             forced_names = ", ".join(f"{node.name}@{item_id}" for item_id in unknown_forced)
             raise ValueError(f"Unknown forced scan items: {forced_names}")
+
+        item_files_by_id = {
+            item_id: (tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ())
+            for item_id, item in entries
+        }
+        file_snapshot = file_snapshot.extend(
+            (path for item_files in item_files_by_id.values() for path in item_files),
+            self.config.resolve,
+        )
 
         omitted_local = {node.local_items_source or source_name}
         if node.carry_from is not None:
@@ -3910,10 +4079,12 @@ class Dag:
             agent_provenance: dict[str, Any] | None = None
             try:
                 with observe() as calls:
-                    item_files = (
-                        tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
+                    item_files = item_files_by_id[item_id]
+                    file_contents = self._file_contents(
+                        node,
+                        item_files,
+                        file_snapshot=file_snapshot,
                     )
-                    file_contents = self._file_contents(node, item_files)
                     prompt_resolutions = self._resolve_prompt_specs(
                         node,
                         prompt_snapshot,
@@ -4038,6 +4209,7 @@ class Dag:
                                 checkpoint_suffix=item_id,
                                 item_files=item_files,
                                 prompt_resolutions=prompt_resolutions,
+                                file_snapshot=file_snapshot,
                             )
                             boundary = (
                                 durable_side_effect_boundary(
@@ -4130,6 +4302,7 @@ class Dag:
                                                         *node.files,
                                                         *item_files,
                                                     ),
+                                                    declared_file_contents=file_contents,
                                                     resolve=self.config.resolve,
                                                     artifacts_path=self.config.artifacts_path,
                                                     blob_store=self.blob_store,
@@ -4449,11 +4622,17 @@ class Dag:
         self,
         node: _Node,
         item_files: tuple[Path, ...] = (),
+        *,
+        file_snapshot: _FileSnapshot | None = None,
     ) -> dict[str, bytes]:
         """Capture each declared file once for prompt resolution and cache keying."""
-        return {
-            str(path): self.config.resolve(path).read_bytes() for path in (*node.files, *item_files)
-        }
+        paths = (*node.files, *item_files)
+        snapshot = file_snapshot or _FileSnapshot.capture(
+            self.config.project_root,
+            self.config.resolve,
+            paths,
+        )
+        return snapshot.contents(paths)
 
     def _libs_hash(self, node: _Node) -> str:
         """Hash the configured library files statically reachable from one node."""
@@ -8909,6 +9088,29 @@ def _source_hash(function: NodeFunction) -> str:
     parsed = ast.parse(source)
     normalized = _DocstringStripper().visit(parsed)
     return sha(ast.dump(normalized, annotate_fields=True, include_attributes=False))
+
+
+def _callable_provenance(function: Callable[..., Any] | None) -> dict[str, Any] | None:
+    """Return stable execution provenance for a dynamic map/scan callback."""
+    if function is None:
+        return None
+    module = _safe_runtime_attribute(function, "__module__")
+    qualname = _safe_runtime_attribute(function, "__qualname__")
+    if not isinstance(module, str):
+        module = None
+    if not isinstance(qualname, str):
+        qualname = None
+    state = _transactional_runtime_state_material(function, _RuntimeStateContext({}))
+    if state is _UNREPRESENTABLE_RUNTIME_STATE:
+        state = {
+            "type": "unrepresentable",
+            "class": _runtime_type_identity(type(function)),
+        }
+    return {
+        "module": module,
+        "qualname": qualname,
+        "state": state,
+    }
 
 
 def _resolve_items_from(
