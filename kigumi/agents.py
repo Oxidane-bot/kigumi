@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
 
 from ._runstate import FAILURE_SCHEMA
+from ._safe_io import _secure_directory_absolute
 from .artifacts import atomic_write_json, canonical_json, sha
 from .blobs import BlobStore
 from .evidence import EvidenceMode, EvidencePolicy, capture_evidence, scrub_evidence
@@ -384,7 +385,7 @@ class AgentSpec:
 
     @classmethod
     def load(cls, path: str | Path) -> AgentSpec:
-        root = Path(path).absolute()
+        root = _secure_directory_absolute(Path(path))
         try:
             root_fd, descriptors = _open_capsule_directory(root)
         except (OSError, ValueError) as error:

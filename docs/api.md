@@ -254,13 +254,15 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
 - `Attachment(path: str, content_hash: str, mime_type: str, size_bytes: int) -> None`：内容寻址的
   附件 manifest。只记录路径、内容摘要、MIME 与字节数，不保存文件字节本身，因此可以进
   provenance 而不把二进制内容拖进 artifacts。
-- `Message(role: str, parts: list[str | dict[str, Any]]) -> None`：类型化请求消息。`parts` 里
-  的 dict 表示非文本部件（如附件引用），provider 看到的顺序就是列表顺序。
+- `Message(role: str, parts: tuple[str | Mapping[str, Any], ...]) -> None`：类型化请求消息。
+  构造时接受 list 或 tuple，随后冻结为 tuple；`parts` 里的 mapping 表示非文本部件（如附件
+  引用），provider 看到的顺序就是原顺序。
 - `ResponseSpec(schema_sha256: str | None = None, format: str = "text") -> None`：响应格式与
   schema identity；`format` 取 `text`、`json` 或 `structured`。schema 变化会改变缓存键，
   因此换 schema 不会复用旧的结构化响应。
-- `PromptResolution(spec_name: str, structure_digest: str, base: Mapping[str, Any], layers: tuple[Mapping[str, Any], ...], axes: tuple[Mapping[str, Any], ...], materials: tuple[Mapping[str, Any], ...], rendered_sha256: str, rendered_bytes: int, schema: int = 1, messages: list[Message] = [], attachments: list[Attachment] = [], response_spec: ResponseSpec = ResponseSpec()) -> None`：
-  不含 Prompt 原文、但携带完整请求 manifest 的不可变解析 provenance。见
+- `PromptResolution(spec_name: str, structure_digest: str, base: Mapping[str, Any], layers: tuple[Mapping[str, Any], ...], axes: tuple[Mapping[str, Any], ...], materials: tuple[Mapping[str, Any], ...], rendered_sha256: str, rendered_bytes: int, schema: int = 1, messages: tuple[Message, ...] = (), attachments: tuple[Attachment, ...] = (), response_spec: ResponseSpec = ResponseSpec()) -> None`：
+  不含 Prompt 原文、但携带完整请求 manifest 的深度不可变解析 provenance。构造时接受 list 或
+  tuple，随后冻结为 tuple/mapping proxy。见
   [分层 Prompt 解析契约](contracts/prompt-resolution.md)。
 - `PreflightPolicy(max_tokens: int = 200_000, max_attachments: int = 50, max_attachment_bytes: int = 104_857_600) -> None`：
   请求预检上限。

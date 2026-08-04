@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -235,6 +236,18 @@ def test_agent_spec_hashes_only_manifest_referenced_resources(tmp_path: Path) ->
     assert AgentSpec.load(capsule).digest != first.digest
     assert first.runtime == "pi"
     assert isinstance(first.limits, AgentLimits)
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="descriptor-relative directory I/O is platform-specific"
+)
+def test_agent_spec_accepts_normal_tempfile_alias_paths() -> None:
+    system_var = Path("/var")
+    if not system_var.is_symlink() or system_var.resolve(strict=True) != Path("/private/var"):
+        pytest.skip("host does not expose the macOS /var alias")
+    with tempfile.TemporaryDirectory(prefix="kigumi-agent-") as directory:
+        capsule = _capsule(Path(directory) / "agent")
+        assert AgentSpec.load(capsule).model == "test-model"
 
 
 def test_agent_spec_digest_changes_for_every_execution_semantic(tmp_path: Path) -> None:
