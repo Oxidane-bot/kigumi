@@ -234,9 +234,11 @@ result = dag.run(workers=4)
 节点体内读文件必须走 `ctx.read_text(path)` / `ctx.read_bytes(path)`:它们按与缓存键
 相同的解析规则校验路径属于本节点的 `files` ∪ 本项 `files_fn` 声明,未声明直接抛
 `UndeclaredInputError`,把"静默陈旧"变成响亮报错。节点体里的裸 `open()`/
-`path.open()`/`.read_text()`/`.read_bytes()` 会在注册期被 AST 守卫拒绝(见守卫一节);
-守卫边界刻意只限节点函数体,helper 内的读取不扫描——所以经 helper 读文件时,请把
-文本读好后传给 helper,或让 helper 收 `ctx`。
+`path.open()`/`.read_text()`/`.read_bytes()` 会在注册期被 AST 守卫拒绝(见守卫一节)。
+守卫会从节点函数体递归跟随执行路径中可达的局部 helper/lambda；helper/lambda 的默认参数在定义时执行,
+也会被扫描；未被节点执行路径引用的普通 helper 不会产生误报。节点执行范围内的 nested class 会被硬拒绝。
+需要让 helper 读文件时,请让它接收 `ctx` 并直接使用受控的 `ctx.read_text`/`ctx.read_bytes` 入口；
+动态名称解析的 `getattr` 是硬切结构违规,不能用来绕过受控入口。
 
 `post_node` 的签名是 `(node_name, artifact, cache_hit)`；它在每个节点产物
 可用后调用，适合写日志、指标或追踪，不能用来改变 DAG 执行语义。
@@ -1161,9 +1163,11 @@ git hook 会把新增豁免摆到评审面前。
 节点体内的直接文件读取(`open()`、`path.open()`、`.read_text()`、`.read_bytes()`)
 同样在注册期被拒绝,必须改走 `ctx.read_text`/`ctx.read_bytes` 使读取过声明校验;
 豁免写 `# kigumi: raw-io-ok <理由>`,理由必填。两类豁免互不吞并。项目级 raw-I/O
-外环只扫装饰节点函数体的最外层,不递归 helper 与 lambda——helper 合法读文件的场景很多,
-扫了全是误报;代价是经 helper 的未声明读取只能靠 `ctx.read_text` 的运行期校验和 review
-兜底。raw-LLM 的 `check_source`/`check_paths` 则会递归扫描源码里的 helper 循环。
+外环以装饰节点函数体为入口,并递归跟随执行路径中可达的局部 helper/lambda；helper/lambda 的默认参数
+按定义时执行扫描,未被节点执行路径引用的普通 helper 不会产生误报；节点执行范围内的 nested class
+直接硬拒绝。节点及其可达 helper 的正常文件读取都应使用 `ctx.read_text`/`ctx.read_bytes` 这个受控入口；
+动态名称解析的 `getattr` 是硬切结构违规。raw-LLM 的 `check_source`/`check_paths` 则会递归扫描源码里的
+helper 循环。
 
 #### 直接调用 `kigumi.enforce` 时选哪个 helper
 
@@ -1174,9 +1178,9 @@ git hook 会把新增豁免摆到评审面前。
 | --- | --- | --- |
 | 一段源码中的循环裸 LLM 调用 | `check_source(text, path)` | `for`/`while`/`async for` 与四种推导式下的 `.call()`/`.llm()` |
 | 配置的整个源码目录中的循环裸 LLM 调用 | `check_paths(source_dirs)` | 递归 `*.py`；不存在的目录跳过 |
-| 一个模块中带装饰器的节点直接读文件 | `check_raw_io_node_source(text, path)` | 顶层 `node`/`map`/`scan`/`foreach`/`agent` 函数的最外层函数体 |
+| 一个模块中带装饰器的节点直接读文件 | `check_raw_io_node_source(text, path)` | 以顶层 `node`/`map`/`scan`/`foreach`/`agent` 函数为入口递归检查可达 helper/lambda 及其默认参数 |
 | 配置的整个源码目录中的节点直接读文件 | `check_raw_io_node_paths(source_dirs)` | 上一行的项目级版本 |
-| 注册环已经拿到的单个节点函数体 | `check_raw_io_source(text, path, context_name="ctx")` | 只查这个节点体；`context_name` 是实际上下文参数名 |
+| 注册环已经拿到的单个节点函数体 | `check_raw_io_source(text, path, context_name="ctx")` | 以节点体为入口递归检查可达 helper/lambda 及其默认参数；`context_name` 是实际上下文参数名 |
 
 `check_paths()` 只做 raw-LLM 扫描，不能替代 raw-I/O 检查；反过来也一样。所有结果的
 `path`、`lineno`、`snippet`、`waived` 和 `waiver_reason` 都可用于自定义报告；
@@ -1224,14 +1228,15 @@ uv run kigumi guard --changed
 pytest 插件激活后会追加 `kigumi_guard`：未豁免 finding 使该测试失败，有理由的豁免发
 `PytestWarning`；它不会做 `HEAD` 比较，所以提交审查仍用 `guard --changed`。
 
-不要把项目级 raw-I/O 扫描当成运行时沙箱：它有意不递归 helper，注册环才是已注册节点的
-精确边界；helper 内仍应通过 `ctx.read_text`/`ctx.read_bytes` 和 `files=` 声明输入。
+不要把项目级 raw-I/O 扫描当成运行时沙箱：它以装饰节点函数体为入口，递归跟随执行路径中可达的
+局部 helper/lambda；未被节点执行路径引用的普通 helper 不会产生误报。注册环仍是已注册节点的精确
+边界；helper 内仍应通过 `ctx.read_text`/`ctx.read_bytes` 和 `files=` 声明输入。
 也不要在只需要统一 `workers` 上限时额外手写守卫调用，或把两类豁免混用。
 
 ### 仓库 CI 的定时安全扫描
 
 本仓库的 `.github/workflows/security.yml` 独立于 push/pull_request CI，每周一
-04:17 UTC 自动运行，也支持 `workflow_dispatch` 手动运行。它审计 `uv sync --extra dev`
+04:17 UTC 自动运行，也支持 `workflow_dispatch` 手动运行。它审计 `uv sync --locked --extra dev`
 解析出的环境依赖，并运行只扫描 `kigumi/` 的 Bandit：pip-audit 使用固定版本，发现 CVE
 即失败；Bandit 的门槛是 medium 及以上，避免既有 low-only findings 让首日 job 失效。
 定时 workflow 失败会按默认分支 GitHub Actions 的常规失败状态和通知设置呈现，不依赖第三方

@@ -150,8 +150,8 @@ agent_slot_timeout_seconds = 300
 - dry-run 熔断:到达真调用即抛错;缓存命中时不熔断继续走(特性,非 bug:
   dry-run 的定义是"不发新请求",不是"不消费历史")。
 - 线程安全:Budget 的 reserve/commit/cancel 加锁;calls 加锁;同键 in-flight 去重(并发同键只打一次)。
-  `_key_locks` 与预算预留都是进程内协调；跨进程同 key 仍可能同时 miss、预留和请求，跨进程
-  single-flight 需 file lock 或分布式协调（TODO: consider fcntl-based lock file）。
+  `_key_locks` 与预算预留都是进程内协调；传入启用的 `FileSlots` 时，同 key 的二次 cache check、
+  provider 请求和缓存写入由共享的 fcntl 锁做跨进程 single-flight；未启用时仍只保证进程内协调。
 - seed 仅是缓存命名空间,不传给 provider,不承诺采样可复现。
 - `EvidencePolicy` digest 不进 L1/L3 内容键；request/response evidence miss 可从 L1 replay
   payload 重建，不新增 provider side effect。L1 payload 仍保留重放所需原文。
@@ -409,7 +409,8 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 
 ## 修订记录
 
-- Unreleased：managed request attachment/schema lineage 与输入预检；`CACHE_SCHEMA=7`，
+- 2026-08-04 0.13.0：managed request 的 attachment/schema lineage、输入预检、
+  `CACHE_SCHEMA=7` 与启用 `FileSlots` 时的跨进程 same-key single-flight 已落地；
   `agent_executor_schema=5`、`agent_schema=3` 保持不变。
 
 - 2026-07-24 发布 0.6.0：统一 typed failure、EvidencePolicy、默认单 slot 的全局 Agent

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -8,6 +9,7 @@ from urllib.error import HTTPError
 import pytest
 
 import kigumi._execution as execution_module
+import kigumi.dag as dag_module
 from kigumi import (
     AmbiguousAttemptError,
     EvidencePolicy,
@@ -18,6 +20,7 @@ from kigumi import (
     RetryExhausted,
     RetryPolicy,
 )
+from kigumi._runstate import RunManifestError
 from kigumi.agents import (
     AgentCapabilities,
     AgentCompletion,
@@ -189,6 +192,127 @@ def test_non_retryable_provider_failure_is_terminal_on_first_attempt(
         (tmp_path / "artifacts" / "runs" / "authentication" / "attempts").glob("*/state.json")
     )
     assert json.loads(state_path.read_text())["status"] == "failed"
+
+
+def test_recovery_receipt_is_bound_to_the_scheduled_attempt_state(tmp_path: Path) -> None:
+    transport = _SequenceTransport([_authentication_failure()])
+    dag = _retry_dag(
+        tmp_path,
+        transport,
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+
+    with pytest.raises(ProviderFailure):
+        dag.run(run_id="recovery-binding")
+
+    receipt = dag.recover(
+        "recovery-binding",
+        "ask",
+        from_attempt=1,
+        decision="retry_not_started",
+        reason="provider logs confirm the side effect never started",
+    )
+    run_dir = tmp_path / "artifacts" / "runs" / "recovery-binding"
+    receipt_path = next(run_dir.glob("recovery-*.json"))
+    receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    state_path = next((run_dir / "attempts").glob("*/state.json"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert receipt_payload["recovery_time"] == receipt.recovery_time
+    assert state["status"] == "retry_scheduled"
+    assert state["attempt"] == 2
+    assert state["recovery"] == receipt_payload
+
+
+def test_concurrent_recover_has_one_receipt_and_one_queued_attempt(tmp_path: Path) -> None:
+    first = _retry_dag(
+        tmp_path,
+        _SequenceTransport([_authentication_failure()]),
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    with pytest.raises(ProviderFailure):
+        first.run(run_id="concurrent-recovery")
+
+    dags = [
+        _retry_dag(
+            tmp_path,
+            _SequenceTransport([]),
+            RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+        )
+        for _ in range(2)
+    ]
+
+    def recover(index: int) -> tuple[str, Any]:
+        try:
+            return (
+                "ok",
+                dags[index].recover(
+                    "concurrent-recovery",
+                    "ask",
+                    from_attempt=1,
+                    decision="retry_not_started",
+                    reason=f"operator confirmation {index}",
+                ),
+            )
+        except BaseException as error:
+            return ("error", error)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(recover, index) for index in range(2)]
+        outcomes = [future.result() for future in results]
+
+    successes = [outcome for status, outcome in outcomes if status == "ok"]
+    failures = [outcome for status, outcome in outcomes if status == "error"]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], (ValueError, RunManifestError))
+
+    run_dir = tmp_path / "artifacts" / "runs" / "concurrent-recovery"
+    assert len(list(run_dir.glob("recovery-*.json"))) == 1
+    attempt_two = list((run_dir / "attempts").glob("*/attempt-0002.json"))
+    assert len(attempt_two) == 1
+
+
+def test_recovery_does_not_use_dag_level_receipt_write_after_injected_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = _SequenceTransport([_authentication_failure()])
+    dag = _retry_dag(
+        tmp_path,
+        transport,
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    with pytest.raises(ProviderFailure):
+        dag.run(run_id="recovery-crash")
+
+    def reject_dag_level_write(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("Dag.recover must not write recovery receipts directly")
+
+    monkeypatch.setattr(dag_module, "atomic_write_json", reject_dag_level_write)
+    original_write = dag_module.AttemptStore.write_recovery_receipt
+    writes = 0
+
+    def crash_after_receipt(self: Any, payload: dict[str, Any]) -> Any:
+        nonlocal writes
+        writes += 1
+        original_write(self, payload)
+        raise KeyboardInterrupt("crash after recovery receipt")
+
+    monkeypatch.setattr(dag_module.AttemptStore, "write_recovery_receipt", crash_after_receipt)
+    with pytest.raises(KeyboardInterrupt, match="crash after recovery receipt"):
+        dag.recover(
+            "recovery-crash",
+            "ask",
+            from_attempt=1,
+            decision="fail",
+            reason="operator confirmed the failure is final",
+        )
+
+    assert writes == 1
+    run_dir = tmp_path / "artifacts" / "runs" / "recovery-crash"
+    assert len(list(run_dir.glob("recovery-*.json"))) == 1
+    assert not list((run_dir / "attempts").glob("*/attempt-0002.json"))
 
 
 def test_call_node_evidence_miss_rebuilds_from_l1_without_provider_request(
@@ -417,6 +541,49 @@ def test_agent_provider_failure_retries_with_a_fresh_workspace(tmp_path: Path) -
     assert adapter.runs == 2
     assert adapter.workspaces[0] != adapter.workspaces[1]
     assert all(not path.exists() for path in adapter.workspaces)
+
+
+def test_default_agent_crash_is_ambiguous_before_resume(tmp_path: Path) -> None:
+    class Adapter:
+        def __init__(self) -> None:
+            self.runs = 0
+            self.marker = tmp_path / "agent-effect.txt"
+
+        def cache_identity(self) -> dict[str, object]:
+            return {"adapter": "default-crash-agent", "version": 1}
+
+        def capabilities(self) -> AgentCapabilities:
+            return AgentCapabilities()
+
+        def run(self, request: object, context: Any) -> AgentRunResult:
+            del request, context
+            self.runs += 1
+            self.marker.write_text("external effect", encoding="utf-8")
+            if self.runs == 1:
+                raise KeyboardInterrupt("agent process stopped")
+            return AgentRunResult(AgentCompletion("completed", "done"))
+
+    adapter = Adapter()
+    dag = Dag(
+        KigumiConfig(project_root=tmp_path, source_dirs=[]),
+        LLMCaller(_SequenceTransport([]), tmp_path / "llm"),
+    )
+
+    @dag.agent(
+        "agent",
+        adapter=adapter,
+        spec=make_agent_spec(tmp_path / "agent-spec"),
+    )
+    def agent(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("crash")
+
+    with pytest.raises(KeyboardInterrupt):
+        dag.run(run_id="agent-default-crash")
+
+    with pytest.raises(AmbiguousAttemptError):
+        dag.resume("agent-default-crash")
+    assert adapter.runs == 1
 
 
 def test_map_retries_only_failed_item_and_reuses_cache_off_sibling(

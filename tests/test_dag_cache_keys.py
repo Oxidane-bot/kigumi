@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import kigumi._execution as execution_module
 import kigumi.dag as dag_module
 import kigumi.prompt as prompt_module
 import kigumi.repair as repair_module
@@ -41,6 +42,104 @@ def _assert_registration_rejected(dag: Dag, function: Any) -> None:
         match=r"Raw file reads are not allowed in node registration",
     ):
         dag.node("work")(function)
+
+
+def _capture_sidecar_cache_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Observe the immutable cache snapshot handed to each run sidecar."""
+    captured: dict[str, Any] = {}
+    original = execution_module.ExecutionEnvelope.write_sidecar
+
+    def capture(
+        self: Any,
+        label: str,
+        artifact: dict[str, Any],
+        cache_key: str | list[str],
+        *,
+        cache_hit: bool,
+        cache_entry: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        if cache_hit:
+            captured[label] = cache_entry
+        original(
+            self,
+            label,
+            artifact,
+            cache_key,
+            cache_hit=cache_hit,
+            cache_entry=cache_entry,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(execution_module.ExecutionEnvelope, "write_sidecar", capture)
+    return captured
+
+
+def test_plain_cache_hit_passes_its_single_snapshot_to_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "cached"}
+
+    captured = _capture_sidecar_cache_entries(monkeypatch)
+    dag.run(run_id="plain-prime")
+    dag.run(run_id="plain-hit")
+
+    entry = captured["work"]
+    assert entry is not None
+    assert entry.state == "VALID"
+    assert entry.artifact == {"value": "cached"}
+
+
+@pytest.mark.parametrize("dynamic_kind", ["map", "scan"])
+def test_dynamic_cache_hits_pass_each_item_snapshot_to_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic_kind: str,
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "one"}, {"id": "two"}]}
+
+    if dynamic_kind == "map":
+
+        @dag.map("work", items_from=("source", "items"), key_fn=lambda item: item["id"])
+        def work(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs, ctx
+            return {"id": item["id"]}
+
+    else:
+
+        @dag.scan(
+            "work",
+            items_from=("source", "items"),
+            key_fn=lambda item: item["id"],
+            carry_fn=lambda artifact: artifact["id"],
+        )
+        def work(
+            item: dict[str, str],
+            carry: Any,
+            inputs: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, str]:
+            del carry, inputs, ctx
+            return {"id": item["id"]}
+
+    captured = _capture_sidecar_cache_entries(monkeypatch)
+    dag.run(run_id=f"{dynamic_kind}-prime")
+    dag.run(run_id=f"{dynamic_kind}-hit")
+
+    assert captured["work@one"].state == "VALID"
+    assert captured["work@two"].state == "VALID"
 
 
 def test_docstring_does_not_change_cache_but_code_does(tmp_path: Path) -> None:

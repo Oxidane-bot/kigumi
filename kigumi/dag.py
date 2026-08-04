@@ -1696,6 +1696,7 @@ class Dag:
                                 artifact,
                                 cache_key,
                                 cache_hit=cache_hit,
+                                cache_entry=cache_entry,
                                 seconds=elapsed,
                                 calls=calls,
                                 key_components=key_components,
@@ -2017,7 +2018,7 @@ class Dag:
         )
         receipt_payload = _recovery_payload(receipt)
         if decision == "fail":
-            _write_recovery_receipt(run_dir, receipt_payload)
+            attempts.write_recovery_receipt(receipt_payload)
             return receipt
 
         inherited_nodes = self._recovery_inherited_nodes(
@@ -2025,12 +2026,12 @@ class Dag:
             target_root,
             order,
         )
-        _write_recovery_receipt(run_dir, receipt_payload)
         attempts.schedule_recovery(
             target,
             from_attempt=from_attempt,
             to_attempt=to_attempt,
             recovery=receipt_payload,
+            recovery_receipt=receipt_payload,
             inherited_nodes=inherited_nodes,
         )
         attempts.update_manifest(
@@ -3498,6 +3499,7 @@ class Dag:
                         key_components,
                         self._caller_evidence_policy(),
                     )
+                    cache_entry: store.CacheEntry | None = None
                     resumed_completed = False
                     run_root = envelope.artifacts_path / "runs" / run_id
                     if (run_root / f"{target}.json").is_file() and (
@@ -3517,7 +3519,7 @@ class Dag:
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
                     else:
-                        artifact, cache_hit = self._lookup_cache(
+                        cache_entry = self._cache_entry_for_lookup(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
                             cache_policy=(node.cache if libs_cache_reusable else "off"),
@@ -3525,6 +3527,8 @@ class Dag:
                                 node.evidence_policy or self._caller_evidence_policy()
                             ),
                         )
+                        artifact = cache_entry.artifact if cache_entry is not None else None
+                        cache_hit = cache_entry is not None
                     if artifact is None:
                         # No receipt is created for work that was not admitted after
                         # the budget abort. Once prepare() starts, the item is in
@@ -3681,6 +3685,7 @@ class Dag:
                         "resumed_completed": resumed_completed,
                         "target": target,
                         "prompt_resolutions": prompt_resolution_records,
+                        "cache_entry": cache_entry,
                         "cache_policy": (
                             "off" if checkpoint_used or not libs_cache_reusable else node.cache
                         ),
@@ -3747,6 +3752,7 @@ class Dag:
                         artifact,
                         outcome["cache_key"],
                         cache_hit=outcome["cache"] == "hit",
+                        cache_entry=outcome["cache_entry"],
                         seconds=outcome["seconds"],
                         calls=outcome["calls"],
                         key_components=outcome["key_components"],
@@ -3928,6 +3934,7 @@ class Dag:
                         key_components,
                         evidence_policy,
                     )
+                    cache_entry: store.CacheEntry | None = None
                     resumed_completed = False
                     run_root = envelope.artifacts_path / "runs" / run_id
                     if (run_root / f"{target}.json").is_file() and (
@@ -3951,12 +3958,14 @@ class Dag:
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
                     else:
-                        artifact, cache_hit = self._lookup_cache(
+                        cache_entry = self._cache_entry_for_lookup(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
                             cache_policy=(node.cache if libs_cache_reusable else "off"),
                             evidence_policy=evidence_policy,
                         )
+                        artifact = cache_entry.artifact if cache_entry is not None else None
+                        cache_hit = cache_entry is not None
                     if artifact is None:
                         prepared = attempt_store.prepare(
                             target,
@@ -4214,6 +4223,7 @@ class Dag:
                             artifact,
                             cache_key,
                             cache_hit=cache_hit,
+                            cache_entry=cache_entry,
                             seconds=time.monotonic() - started,
                             calls=calls,
                             key_components=key_components,
@@ -4741,18 +4751,6 @@ def _recovery_payload(receipt: RecoveryReceipt) -> dict[str, Any]:
         "evidence_refs": list(receipt.evidence_refs),
         "recovered_by": receipt.recovered_by,
     }
-
-
-def _write_recovery_receipt(run_dir: Path, payload: dict[str, Any]) -> Path:
-    """Persist one recovery record without replacing an earlier record."""
-    stem = f"recovery-{payload['recovery_time']}"
-    path = run_dir / f"{stem}.json"
-    suffix = 1
-    while path.exists():
-        path = run_dir / f"{stem}-{suffix}.json"
-        suffix += 1
-    atomic_write_json(path, payload)
-    return path
 
 
 class _DocstringStripper(ast.NodeTransformer):
