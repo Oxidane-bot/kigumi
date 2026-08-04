@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ def _resolution(
     return PromptResolution(
         spec_name="managed",
         structure_digest="structure",
-        base={},
+        base={"ref": "base", "sha256": "base-digest", "bytes": 0},
         layers=(),
         axes=(),
         materials=(),
@@ -110,7 +111,10 @@ def test_preflight_rejects_oversized_request_before_cache_or_provider(tmp_path: 
 def test_durable_call_rejects_incomplete_resolution_before_provider_side_effect(
     tmp_path: Path,
 ) -> None:
-    resolution = _resolution(messages=[Message("user", ["incomplete request"])])
+    resolution = replace(
+        _resolution(messages=[Message("user", ["incomplete request"])]),
+        base={},
+    )
     transport = FakeTransport()
     caller = CallingLLMCaller(transport, tmp_path / "cache")
     effects: list[dict[str, Any]] = []
@@ -123,6 +127,23 @@ def test_durable_call_rejects_incomplete_resolution_before_provider_side_effect(
 
     assert transport.requests == []
     assert effects == []
+
+
+def test_plain_caller_rejects_incomplete_resolution_before_cache_or_provider(
+    tmp_path: Path,
+) -> None:
+    resolution = replace(
+        _resolution(messages=[Message("user", ["incomplete request"])]),
+        base={},
+    )
+    transport = FakeTransport()
+    caller = CallingLLMCaller(transport, tmp_path / "cache")
+
+    with pytest.raises(PromptResolutionError, match="managed request fields"):
+        caller.call(ResolvedPrompt("incomplete request", resolution))
+
+    assert transport.requests == []
+    assert not (tmp_path / "cache").exists()
 
 
 def test_FileRef_is_end_to_end_manifest_and_digest_input(tmp_path: Path) -> None:

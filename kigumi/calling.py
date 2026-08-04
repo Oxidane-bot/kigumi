@@ -122,6 +122,10 @@ def prompt_resolution_boundary(
         raise ValueError("prompt resolution phase must be primary or repair")
     if repair_round < 0:
         raise ValueError("repair_round must be non-negative")
+    # This is an explicit managed-request boundary.  Validate it before the
+    # context is installed so a malformed in-memory record cannot reach a
+    # cache lookup or provider through a plain ``caller.call``.
+    validate_prompt_resolution_record(resolution.canonical())
     lineage = {
         **resolution.canonical(),
         "base_resolution_digest": resolution.digest,
@@ -536,6 +540,17 @@ class LLMCaller:
         """Return a cached or live completion for normalized chat messages."""
         prompt_lineage = _prompt_lineage.get()
         base_resolution = messages.resolution if isinstance(messages, ResolvedPrompt) else None
+        if base_resolution is not None:
+            # ``PromptResolution`` is intentionally a lightweight immutable
+            # in-memory value object.  The execution boundary owns the strict
+            # persisted-schema/digest check, and it must happen before even
+            # preparing a cache key or resolving a transport.
+            validate_prompt_resolution_record(base_resolution.canonical())
+        elif isinstance(prompt_lineage, dict) and "base_resolution_digest" in prompt_lineage:
+            # A repair/explicit lineage may carry the resolution separately
+            # from the message object.  Direct-chat lineage is created below
+            # and has no base_resolution_digest, so it remains unmanaged.
+            validate_prompt_resolution_record(prompt_lineage)
         response_spec = _response_spec.get()
         if response_spec is None and base_resolution is not None:
             response_spec = base_resolution.response_spec
@@ -577,10 +592,11 @@ class LLMCaller:
                 "phase": existing_lineage.get("phase", "primary"),
                 "repair_round": existing_lineage.get("repair_round", 0),
             }
-        if _durable_side_effect.get() is not None and base_resolution is not None:
-            # Durable runs must reject an incomplete in-memory resolution before
-            # consulting cache or recording a provider side effect.
-            validate_prompt_resolution_record(base_resolution.canonical())
+        if base_resolution is not None:
+            # Rebinding messages/attachments/response schema creates the actual
+            # request record used by the cache and provider.  Validate that
+            # derived record as well, not only the caller-supplied base.
+            validate_prompt_resolution_record(request_resolution.canonical())
         report = preflight(request_resolution, self.preflight_policy)
         if not report.is_valid():
             raise RequestTooLarge(report)

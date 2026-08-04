@@ -75,6 +75,7 @@ from .calling import (
     BudgetExceeded,
     DryRunError,
     LLMCaller,
+    _is_managed_prompt_resolution,
     durable_side_effect_boundary,
     file_snapshot_boundary,
     observe,
@@ -1747,6 +1748,15 @@ class Dag:
                                             if isinstance(task.instruction, ResolvedPrompt)
                                             else None
                                         )
+                                        if instruction_resolution is not None:
+                                            try:
+                                                validate_prompt_resolution_record(
+                                                    instruction_resolution
+                                                )
+                                            except PromptResolutionError as error:
+                                                raise AgentResultError(
+                                                    f"Agent prompt resolution is invalid: {error}"
+                                                ) from error
                                         try:
                                             lease_context = self.agent_slots.acquire(
                                                 timeout_seconds=(
@@ -1765,8 +1775,8 @@ class Dag:
                                                         "instruction_sha256": sha(
                                                             str(task.instruction)
                                                         ),
-                                                        "managed": (
-                                                            instruction_resolution is not None
+                                                        "managed": _is_managed_prompt_resolution(
+                                                            instruction_resolution
                                                         ),
                                                         "prompt_resolution": (
                                                             instruction_resolution
@@ -4889,6 +4899,15 @@ class Dag:
                                             if isinstance(task.instruction, ResolvedPrompt)
                                             else None
                                         )
+                                        if instruction_resolution is not None:
+                                            try:
+                                                validate_prompt_resolution_record(
+                                                    instruction_resolution
+                                                )
+                                            except PromptResolutionError as error:
+                                                raise AgentResultError(
+                                                    f"Agent prompt resolution is invalid: {error}"
+                                                ) from error
                                         try:
                                             lease_context = self.agent_slots.acquire(
                                                 timeout_seconds=(
@@ -4907,8 +4926,8 @@ class Dag:
                                                         "instruction_sha256": sha(
                                                             str(task.instruction)
                                                         ),
-                                                        "managed": (
-                                                            instruction_resolution is not None
+                                                        "managed": _is_managed_prompt_resolution(
+                                                            instruction_resolution
                                                         ),
                                                         "prompt_resolution": (
                                                             instruction_resolution
@@ -5112,6 +5131,7 @@ class Dag:
                         RetryExhausted,
                         ProviderFailure,
                         AgentExecutionFailure,
+                        AgentResultError,
                     ),
                 ):
                     raise
