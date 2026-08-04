@@ -15,7 +15,7 @@ import mimetypes
 import os
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -49,6 +49,7 @@ from .prompt import (
     ResolvedPrompt,
     ResponseSpec,
     preflight,
+    validate_prompt_resolution_record,
 )
 from .slots import FileSlots
 from .store import CacheLookup
@@ -71,6 +72,19 @@ _response_spec: contextvars.ContextVar[ResponseSpec | None] = contextvars.Contex
 )
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 _DEFAULT_PREFLIGHT_POLICY = PreflightPolicy()
+
+
+def _is_managed_prompt_resolution(value: Any) -> bool:
+    """Return whether lineage names an explicit managed PromptSpec.
+
+    A file-bearing direct-chat gets a synthetic ``spec="unmanaged"`` record so
+    its content hash and request lineage remain observable.  The record's
+    existence is therefore not evidence of managed PromptSpec ownership.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    spec = value.get("spec")
+    return isinstance(spec, str) and bool(spec) and spec != "unmanaged"
 
 
 @contextmanager
@@ -563,6 +577,10 @@ class LLMCaller:
                 "phase": existing_lineage.get("phase", "primary"),
                 "repair_round": existing_lineage.get("repair_round", 0),
             }
+        if _durable_side_effect.get() is not None and base_resolution is not None:
+            # Durable runs must reject an incomplete in-memory resolution before
+            # consulting cache or recording a provider side effect.
+            validate_prompt_resolution_record(base_resolution.canonical())
         report = preflight(request_resolution, self.preflight_policy)
         if not report.is_valid():
             raise RequestTooLarge(report)
@@ -632,7 +650,7 @@ class LLMCaller:
                                 "model": resolved_model,
                                 "params_digest": sha(params),
                                 "prompt_sha": sha(key_messages),
-                                "managed": prompt_lineage is not None,
+                                "managed": _is_managed_prompt_resolution(prompt_lineage),
                                 "prompt_resolution": copy.deepcopy(prompt_lineage),
                             }
                         )

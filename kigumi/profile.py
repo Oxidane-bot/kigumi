@@ -18,6 +18,7 @@ from ._runstate import (
     validate_run_path,
 )
 from .artifacts import sha
+from .calling import _is_managed_prompt_resolution
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
 from .retry import AmbiguousAttemptError
 
@@ -339,8 +340,10 @@ def _runtime_nodes(
                 _validate_resolution(agent_resolution, f"{name!r} Agent")
             node_entry["agent"] = {
                 "executed": metadata.get("cache") != "hit",
-                "managed": agent_resolution is not None,
-                "resolution_status": ("managed" if agent_resolution is not None else "unmanaged"),
+                "managed": _is_managed_prompt_resolution(agent_resolution),
+                "resolution_status": (
+                    "managed" if _is_managed_prompt_resolution(agent_resolution) else "unmanaged"
+                ),
                 "prompt_resolution": copy.deepcopy(agent_resolution),
                 "instruction_sha256": agent.get("instruction_sha256"),
                 "usage": copy.deepcopy(agent.get("usage")),
@@ -381,6 +384,11 @@ def _attempts(
         active = state.get("active_effect")
         if isinstance(active, dict) and active.get("prompt_resolution") is not None:
             _validate_resolution(active["prompt_resolution"], f"{target!r} active effect")
+        projected_active = copy.deepcopy(active) if isinstance(active, dict) else active
+        if isinstance(projected_active, dict):
+            projected_active["managed"] = _is_managed_prompt_resolution(
+                projected_active.get("prompt_resolution")
+            )
         calls = _validated_calls(state.get("calls", []), f"{target!r} attempt")
         candidate_file = state.get("candidate_file")
         candidate_calls: list[dict[str, Any]] = []
@@ -423,6 +431,8 @@ def _attempts(
             )
             if key in state
         }
+        if isinstance(projected_active, dict):
+            attempt["active_effect"] = projected_active
         attempt["calls"] = _profile_calls(calls, include_content=include_content)
         attempts.append(attempt)
     attempts.sort(key=lambda item: (str(item["target"]), int(item.get("attempt", 0))))
@@ -472,8 +482,10 @@ def _failures(
             )
             if key in receipt
         }
-        entry["managed"] = resolution is not None
-        entry["resolution_status"] = "managed" if resolution is not None else "unmanaged"
+        entry["managed"] = _is_managed_prompt_resolution(resolution)
+        entry["resolution_status"] = (
+            "managed" if _is_managed_prompt_resolution(resolution) else "unmanaged"
+        )
         if include_content:
             entry["instruction_evidence"] = copy.deepcopy(receipt.get("instruction_evidence"))
         failures.append(entry)
@@ -512,8 +524,10 @@ def _profile_calls(
         resolution = call.get("prompt_resolution")
         entry = {
             "call_index": index,
-            "managed": resolution is not None,
-            "resolution_status": "managed" if resolution is not None else "unmanaged",
+            "managed": _is_managed_prompt_resolution(resolution),
+            "resolution_status": (
+                "managed" if _is_managed_prompt_resolution(resolution) else "unmanaged"
+            ),
             "prompt_resolution": copy.deepcopy(resolution),
             "prompt_sha": call.get("prompt_sha"),
             "model": call.get("model"),

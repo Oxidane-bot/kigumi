@@ -17,12 +17,14 @@ from kigumi import (
     PreflightPolicy,
     PromptRef,
     PromptResolution,
+    PromptResolutionError,
     PromptSpec,
     RequestTooLarge,
     ResolvedPrompt,
     ResponseSpec,
 )
 from kigumi.calling import LLMCaller as CallingLLMCaller
+from kigumi.calling import durable_side_effect_boundary
 from kigumi.prompt import PromptCatalogSnapshot, PromptMaterial
 from kigumi.testing import FakeTransport
 
@@ -103,6 +105,24 @@ def test_preflight_rejects_oversized_request_before_cache_or_provider(tmp_path: 
     assert report.estimated_tokens > 200_000
     assert transport.requests == []
     assert not (tmp_path / "cache").exists()
+
+
+def test_durable_call_rejects_incomplete_resolution_before_provider_side_effect(
+    tmp_path: Path,
+) -> None:
+    resolution = _resolution(messages=[Message("user", ["incomplete request"])])
+    transport = FakeTransport()
+    caller = CallingLLMCaller(transport, tmp_path / "cache")
+    effects: list[dict[str, Any]] = []
+
+    with (
+        durable_side_effect_boundary(effects.append),
+        pytest.raises(PromptResolutionError, match="managed request fields"),
+    ):
+        caller.call(ResolvedPrompt("incomplete request", resolution))
+
+    assert transport.requests == []
+    assert effects == []
 
 
 def test_FileRef_is_end_to_end_manifest_and_digest_input(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +150,33 @@ def test_runtime_profile_uses_persisted_current_and_origin_prompt_lineage(
     assert prompt["runtime"][0]["target"] == "work"
     assert prompt["runtime"][0]["current"]["axes"][0]["selected"] == "concise"
     assert prompt["runtime"][0]["origin"]["axes"][0]["selected"] == "concise"
+
+
+def test_runtime_profile_keeps_file_direct_chat_unmanaged_with_lineage(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.png"
+    contents = b"profile direct-chat attachment"
+    source.write_bytes(contents)
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work", files=(source,))
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs
+        return {"answer": ctx.call([{"role": "user", "content": {"kigumi_file": str(source)}}])}
+
+    result = dag.run(run_id="unmanaged-file-chat")
+    profile = dag.profile(result.run_id)
+    attempt = profile["run"]["attempts"][0]
+    call = attempt["calls"][0]
+    resolution = call["prompt_resolution"]
+
+    assert attempt["active_effect"]["managed"] is False
+    assert call["managed"] is False
+    assert call["resolution_status"] == "unmanaged"
+    assert resolution["spec"] == "unmanaged"
+    assert resolution["attachments"][0]["content_hash"] == sha256(contents).hexdigest()
+    assert attempt["active_effect"]["key"]
 
 
 def test_runtime_profile_fails_closed_for_corrupt_resolution_digest(tmp_path: Path) -> None:

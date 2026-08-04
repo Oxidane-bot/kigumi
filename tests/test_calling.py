@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,14 @@ import pytest
 import kigumi.calling as calling_module
 from kigumi import EvidencePolicy, ProviderFailure, ProviderFailureKind, observe
 from kigumi.artifacts import sha
-from kigumi.calling import Budget, BudgetExceeded, CacheIntegrityError, DryRunError, LLMCaller
+from kigumi.calling import (
+    Budget,
+    BudgetExceeded,
+    CacheIntegrityError,
+    DryRunError,
+    LLMCaller,
+    durable_side_effect_boundary,
+)
 from kigumi.prompt import PreflightPolicy, RequestTooLarge
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
@@ -628,6 +636,26 @@ def test_kigumi_file_cache_key_uses_content_hash(tmp_path: Path) -> None:
 
     assert len(transport.requests) == 2
     assert [call["cache"] for call in caller.calls] == ["miss", "hit", "miss"]
+
+
+def test_direct_file_chat_is_unmanaged_but_keeps_secure_lineage(tmp_path: Path) -> None:
+    """附件不应把无 PromptSpec 的 direct-chat 伪装成 managed request。"""
+    source = tmp_path / "source.png"
+    contents = b"direct-chat attachment"
+    source.write_bytes(contents)
+    transport = FakeTransport()
+    caller = LLMCaller(transport, tmp_path / "cache")
+    active_effect: dict[str, Any] = {}
+
+    with durable_side_effect_boundary(active_effect.update):
+        assert caller.call([{"role": "user", "content": {"kigumi_file": str(source)}}]) == "answer"
+
+    resolution = active_effect["prompt_resolution"]
+    assert active_effect["managed"] is False
+    assert resolution["spec"] == "unmanaged"
+    assert resolution["attachments"][0]["content_hash"] == sha256(contents).hexdigest()
+    assert active_effect["key"] == caller.calls[0]["key"]
+    assert caller.calls[0]["prompt_resolution"]["attachments"] == resolution["attachments"]
 
 
 def test_kigumi_file_cache_keeps_reference_without_bytes(tmp_path: Path) -> None:
