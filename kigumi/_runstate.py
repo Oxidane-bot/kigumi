@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import threading
 import uuid
 from collections.abc import Iterator
@@ -34,6 +35,7 @@ _RECOVERY_RECEIPT_DIGEST_FIELD = "recovery_receipt_sha256"
 _RECOVERY_DECISION_LEDGER_FIELD = "recovery_decisions"
 _RECOVERY_DECISION_LEDGER_DIGEST_FIELD = "recovery_decisions_sha256"
 _MANIFEST_GENERATION_FIELD = "manifest_generation"
+_SIDECAR_DIGEST_FIELD = "sidecar_sha256"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
 _PROCESS_TARGET_LEASES_LOCK = threading.RLock()
 
@@ -243,7 +245,13 @@ class AttemptStore:
 
     @staticmethod
     def _manifest_generation_value(manifest: dict[str, Any]) -> int:
-        value = manifest.get(_MANIFEST_GENERATION_FIELD, 0)
+        value = manifest.get(_MANIFEST_GENERATION_FIELD)
+        if value is None:
+            raise StateIntegrityError(
+                Path("_run.json"),
+                RUN_MANIFEST_SCHEMA,
+                "manifest generation is missing",
+            )
         if type(value) is not int or value < 0:
             raise StateIntegrityError(
                 Path("_run.json"),
@@ -364,7 +372,8 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Run {self.run_root.name!r} declaration changed: {', '.join(changed)}"
                 )
-            self._validate_all_attempt_receipts()
+            states = self._validate_all_attempt_receipts()
+            self._validate_run_materializations(states, manifest=existing)
             return existing
 
     def mark_resumed(self) -> None:
@@ -433,12 +442,6 @@ class AttemptStore:
             self._state_mutated_since_status = False
             return
         if current == "completed" and status != "completed":
-            if (
-                status == "failed"
-                and self._terminal_status_admission_generation
-                == self._manifest_generation_value(manifest)
-            ):
-                return
             raise RunManifestError(
                 f"Run {self.run_root.name!r} is terminally completed; "
                 "a stale status update is fenced"
@@ -497,7 +500,8 @@ class AttemptStore:
     ) -> dict[str, Any]:
         """Return run, pending, candidate, or completed state for one target."""
         with self._run_locked():
-            self._validate_attempt_receipts(target)
+            states = self._validate_all_attempt_receipts()
+            self._validate_run_materializations(states, reject_orphan_target=target)
             state_path = self._state_path(target)
             state, corrupted = self._read_json_safe(state_path)
             if corrupted:
@@ -921,6 +925,34 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Cannot complete {target!r} in state {state.get('status')!r}"
                 )
+            candidate = self._validate_candidate_binding(target, state)
+            if candidate is None:
+                raise StateIntegrityError(
+                    self._state_path(target),
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "completed state is missing its success candidate",
+                )
+            sidecar_path = Path(f"{self._target_artifact_path(target)}.meta.json")
+            metadata, corrupted = self._read_json_safe(sidecar_path)
+            if corrupted:
+                raise self._integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
+            if metadata is None:
+                raise StateIntegrityError(
+                    sidecar_path,
+                    RUN_SIDECAR_SCHEMA,
+                    "completed state is missing its run sidecar",
+                )
+            artifact, metadata = self._validate_materialization_pair(target, sidecar_path)
+            if sha(artifact) != artifact_sha256:
+                raise RunManifestError(
+                    f"Completed artifact for {target!r} does not match its run artifact"
+                )
+            self._validate_sidecar_candidate_binding(
+                target,
+                state,
+                candidate,
+                metadata,
+            )
             state.update(
                 {
                     "status": "completed",
@@ -929,6 +961,7 @@ class AttemptStore:
                     "updated_at": iso_now(),
                 }
             )
+            state[_SIDECAR_DIGEST_FIELD] = sha(metadata)
             self._clear_target_owner(target, state)
             self._write_state(target, state)
 
@@ -1070,7 +1103,8 @@ class AttemptStore:
 
     def state_for(self, target: str) -> dict[str, Any] | None:
         with self._run_locked():
-            self._validate_attempt_receipts(target)
+            states = self._validate_all_attempt_receipts()
+            self._validate_run_materializations(states, reject_orphan_target=target)
             path = self._state_path(target)
             state, corrupted = self._read_json_safe(path)
             if corrupted:
@@ -1143,6 +1177,7 @@ class AttemptStore:
 
     def _states_with(self, status: str) -> list[dict[str, Any]]:
         states = self._validate_all_attempt_receipts()
+        self._validate_run_materializations(states)
         return [state for state in states if state.get("status") == status]
 
     def _target_root(self, target: str) -> Path:
@@ -1621,11 +1656,24 @@ class AttemptStore:
                 "success candidate artifact is invalid",
             )
         prompt_resolutions = candidate.get("prompt_resolutions")
-        if prompt_resolutions is not None and not isinstance(prompt_resolutions, dict):
+        if not isinstance(prompt_resolutions, dict):
             raise StateIntegrityError(
                 candidate_path,
                 SUCCESS_CANDIDATE_SCHEMA,
                 "success candidate Prompt resolutions are invalid",
+            )
+        state_prompt_resolutions = state.get("prompt_resolutions")
+        if not isinstance(state_prompt_resolutions, dict):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "attempt Prompt resolutions are invalid",
+            )
+        if prompt_resolutions != state_prompt_resolutions:
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate Prompt resolutions do not match the state",
             )
         if (
             state.get("status") == "completed"
@@ -1855,6 +1903,28 @@ class AttemptStore:
         """Validate every target and return the one trusted state per target."""
         manifest = self._required_manifest()
         attempts_root = self.run_root / "attempts"
+        try:
+            attempts_info = attempts_root.lstat()
+        except FileNotFoundError:
+            attempts_info = None
+        except OSError as error:
+            raise StateIntegrityError(
+                attempts_root,
+                ATTEMPT_RECEIPT_SCHEMA,
+                f"attempts directory stat failed: {error}",
+            ) from error
+        if attempts_info is not None and stat.S_ISLNK(attempts_info.st_mode):
+            raise StateIntegrityError(
+                attempts_root,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "attempts directory must not be a symlink",
+            )
+        if attempts_info is not None and not stat.S_ISDIR(attempts_info.st_mode):
+            raise StateIntegrityError(
+                attempts_root,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "attempts path must be a directory",
+            )
         if not attempts_root.is_dir():
             if manifest[_RECEIPT_CHAIN_FIELD]:
                 raise StateIntegrityError(
@@ -1865,7 +1935,31 @@ class AttemptStore:
             return []
         states: list[dict[str, Any]] = []
         target_digests: set[str] = set()
-        for target_root in sorted(path for path in attempts_root.iterdir() if path.is_dir()):
+        target_roots: list[Path] = []
+        for path in attempts_root.iterdir():
+            try:
+                info = path.lstat()
+            except OSError as error:
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    f"attempt target stat failed: {error}",
+                ) from error
+            if stat.S_ISLNK(info.st_mode):
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "attempt target directory must not be a symlink",
+                )
+            if stat.S_ISDIR(info.st_mode):
+                target_roots.append(path)
+            else:
+                raise StateIntegrityError(
+                    path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "attempt target entry must be a directory",
+                )
+        for target_root in sorted(target_roots):
             target_digests.add(target_root.name)
             state_path = target_root / "state.json"
             state, corrupted = self._read_json_safe(state_path)
@@ -1920,17 +2014,38 @@ class AttemptStore:
     def _validate_run_materializations(
         self,
         states: list[dict[str, Any]],
+        *,
+        manifest: dict[str, Any] | None = None,
+        reject_orphan_target: str | None = None,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
-        """Validate candidate and run artifact/sidecar bindings in one pass."""
+        """Validate one run's candidates and materializations as a bound set.
+
+        A sidecar is evidence for a durable target, not an independent success
+        record.  The only read-only compatibility case is a declared warm-cache
+        sidecar: cache hits historically did not create an attempt because no
+        provider side effect occurred.  Unknown sidecars are deliberately
+        ignored as rogue evidence and can never become runtime nodes.
+        """
+        if manifest is None:
+            manifest = self._required_manifest()
         candidates: dict[str, dict[str, Any]] = {}
         materializations: dict[str, dict[str, dict[str, Any]]] = {}
+        states_by_target = {state["target"]: state for state in states}
+        paired_targets: set[str] = set()
 
         for state in states:
             target = state["target"]
             candidate = self._validate_candidate_binding(target, state)
+            if state.get("status") == "completed" and candidate is None:
+                raise StateIntegrityError(
+                    self._state_path(target),
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "completed state is missing its success candidate",
+                )
             if candidate is not None:
                 candidates[target] = candidate
 
+        ignored_targets: set[str] = set()
         for sidecar_path in sorted(self.run_root.glob("*.json.meta.json")):
             target = sidecar_path.name.removesuffix(".json.meta.json")
             if not target:
@@ -1939,11 +2054,61 @@ class AttemptStore:
                     RUN_SIDECAR_SCHEMA,
                     "run sidecar has an invalid target name",
                 )
+            state = states_by_target.get(target)
+            declared = self._is_declared_runtime_target(target, manifest)
+            if state is None and target != reject_orphan_target and not declared:
+                ignored_targets.add(target)
+                continue
+
             artifact, metadata = self._validate_materialization_pair(target, sidecar_path)
-            materializations[target] = {
-                "artifact": artifact,
-                "metadata": metadata,
-            }
+            if state is None:
+                if target == reject_orphan_target or metadata.get("cache") != "hit":
+                    raise StateIntegrityError(
+                        sidecar_path,
+                        RUN_SIDECAR_SCHEMA,
+                        "run sidecar has no durable state or success candidate",
+                    )
+            else:
+                status = state.get("status")
+                if status not in {"running", "success_candidate", "completed"}:
+                    raise StateIntegrityError(
+                        sidecar_path,
+                        RUN_SIDECAR_SCHEMA,
+                        f"run sidecar is bound to non-success state {status!r}",
+                    )
+                candidate = candidates.get(target)
+                if candidate is not None:
+                    self._validate_sidecar_candidate_binding(
+                        target,
+                        state,
+                        candidate,
+                        metadata,
+                    )
+                if status == "completed":
+                    self._validate_completed_materialization(
+                        target,
+                        state,
+                        candidate,
+                        artifact,
+                        metadata,
+                    )
+            paired_targets.add(target)
+            if state is None or state.get("status") == "completed":
+                materializations[target] = {
+                    "artifact": artifact,
+                    "metadata": metadata,
+                }
+
+        for state in states:
+            if state.get("status") != "completed":
+                continue
+            target = state["target"]
+            if target not in materializations:
+                raise StateIntegrityError(
+                    self._target_artifact_path(target),
+                    RUN_SIDECAR_SCHEMA,
+                    "completed target run sidecar is missing",
+                )
 
         for artifact_path in sorted(self.run_root.glob("*.json")):
             if (
@@ -1953,33 +2118,97 @@ class AttemptStore:
             ):
                 continue
             target = artifact_path.stem
-            if target not in materializations:
+            if target in ignored_targets:
+                continue
+            if target not in paired_targets:
                 raise StateIntegrityError(
                     artifact_path,
                     RUN_SIDECAR_SCHEMA,
                     "artifact has no matching run sidecar",
                 )
 
-        for state in states:
-            if state.get("status") != "completed":
-                continue
-            target = state["target"]
-            pair = materializations.get(target)
-            if pair is None:
-                raise StateIntegrityError(
-                    self._target_artifact_path(target),
-                    RUN_SIDECAR_SCHEMA,
-                    "completed target artifact or sidecar is missing",
-                )
-            artifact_digest = sha(pair["artifact"])
-            if state.get("artifact_sha256") != artifact_digest:
-                raise StateIntegrityError(
-                    self._state_path(target),
-                    ATTEMPT_RECEIPT_SCHEMA,
-                    "completed state does not match its run artifact",
-                )
-
         return candidates, materializations
+
+    @staticmethod
+    def _is_declared_runtime_target(target: str, manifest: dict[str, Any]) -> bool:
+        profile = manifest.get("workflow_profile")
+        graph = profile.get("graph") if isinstance(profile, dict) else None
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if not isinstance(nodes, list):
+            return False
+        for node in nodes:
+            if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                continue
+            name = node["name"]
+            if target == name:
+                return True
+            if target.startswith(f"{name}@"):
+                item_id = target.removeprefix(f"{name}@")
+                ledger = manifest.get("dynamic_files_ledger")
+                ledger_digest = manifest.get("dynamic_files_ledger_sha256")
+                if not isinstance(ledger, dict) or ledger_digest != sha(ledger):
+                    return False
+                items = ledger.get(name)
+                return isinstance(items, dict) and item_id in items
+        return False
+
+    def _validate_completed_materialization(
+        self,
+        target: str,
+        state: dict[str, Any],
+        candidate: dict[str, Any] | None,
+        artifact: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        if candidate is None:
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "completed state is missing its success candidate",
+            )
+        artifact_digest = sha(artifact)
+        if state.get("artifact_sha256") != artifact_digest:
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "completed state does not match its run artifact",
+            )
+        sidecar_digest = state.get(_SIDECAR_DIGEST_FIELD)
+        if not self._is_sha256(sidecar_digest) or sidecar_digest != sha(metadata):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "completed state does not match its run sidecar digest",
+            )
+        self._validate_sidecar_candidate_binding(target, state, candidate, metadata)
+
+    def _validate_sidecar_candidate_binding(
+        self,
+        target: str,
+        state: dict[str, Any],
+        candidate: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        if metadata.get("prompt_resolutions") != state.get("prompt_resolutions"):
+            raise StateIntegrityError(
+                self._target_artifact_path(target).with_suffix(".json.meta.json"),
+                RUN_SIDECAR_SCHEMA,
+                "run sidecar Prompt resolutions do not match the attempt",
+            )
+        required = ("cache_key", "key_components", "calls", "prompt_resolutions")
+        if any(field not in candidate for field in required):
+            raise StateIntegrityError(
+                self._state_path(target),
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate is missing sidecar binding fields",
+            )
+        for field in ("cache_key", "key_components", "calls"):
+            if metadata.get(field) != candidate.get(field):
+                raise StateIntegrityError(
+                    self._target_artifact_path(target).with_suffix(".json.meta.json"),
+                    RUN_SIDECAR_SCHEMA,
+                    f"run sidecar {field} does not match its success candidate",
+                )
 
     def _target_artifact_path(self, target: str) -> Path:
         return self.run_root / f"{target}.json"
@@ -2010,9 +2239,26 @@ class AttemptStore:
             )
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")
+        cache_key = metadata.get("cache_key")
+        key_components = metadata.get("key_components")
+        outputs = metadata.get("outputs")
+        calls = metadata.get("calls")
+        execution_calls = metadata.get("execution_calls")
+        cache_policy = metadata.get("cache_policy")
         if (
             metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
             or metadata.get("node") != target
+            or not isinstance(cache_key, (str, list))
+            or (isinstance(cache_key, list) and not all(isinstance(key, str) for key in cache_key))
+            or (key_components is not None and not isinstance(key_components, dict))
+            or not isinstance(metadata.get("cache", "unknown"), str)
+            or not isinstance(cache_policy, str)
+            or not isinstance(outputs, list)
+            or not all(isinstance(output, str) for output in outputs)
+            or not isinstance(calls, list)
+            or not all(isinstance(call, dict) for call in calls)
+            or not isinstance(execution_calls, list)
+            or not all(isinstance(call, dict) for call in execution_calls)
             or not self._is_sha256(metadata.get("artifact_sha256"))
             or metadata.get("artifact_sha256") != artifact_digest
             or not isinstance(origin, dict)
@@ -2027,15 +2273,66 @@ class AttemptStore:
                 RUN_SIDECAR_SCHEMA,
                 "run artifact or sidecar digest binding is invalid",
             )
+        self._validate_prompt_lineage(sidecar_path, metadata)
         return artifact, metadata
+
+    @staticmethod
+    def _validate_prompt_lineage(path: Path, metadata: dict[str, Any]) -> None:
+        """Validate every persisted Prompt resolution reachable from a sidecar."""
+        from .prompt import PromptResolutionError, validate_prompt_resolution_record
+
+        def resolution(value: Any, label: str) -> None:
+            if value is None:
+                return
+            try:
+                validate_prompt_resolution_record(value)
+            except PromptResolutionError as error:
+                raise StateIntegrityError(
+                    path,
+                    RUN_SIDECAR_SCHEMA,
+                    f"{label} is invalid: {error}",
+                ) from error
+
+        def resolutions(value: Any, label: str) -> None:
+            if not isinstance(value, dict):
+                raise StateIntegrityError(path, RUN_SIDECAR_SCHEMA, f"{label} are invalid")
+            for record in value.values():
+                resolution(record, label)
+
+        def calls(value: Any, label: str) -> None:
+            if not isinstance(value, list) or not all(isinstance(call, dict) for call in value):
+                raise StateIntegrityError(path, RUN_SIDECAR_SCHEMA, f"{label} are invalid")
+            for index, call in enumerate(value):
+                resolution(call.get("prompt_resolution"), f"{label} [{index}] Prompt resolution")
+
+        resolutions(metadata.get("prompt_resolutions"), "current Prompt resolutions")
+        calls(metadata.get("calls"), "current CALL lineage")
+        calls(metadata.get("execution_calls"), "execution CALL lineage")
+
+        origin = metadata.get("origin_provenance")
+        if not isinstance(origin, dict):
+            raise StateIntegrityError(path, RUN_SIDECAR_SCHEMA, "origin provenance is invalid")
+        resolutions(origin.get("prompt_resolutions"), "origin Prompt resolutions")
+        calls(origin.get("calls"), "origin CALL lineage")
+        agent = origin.get("agent")
+        if isinstance(agent, dict):
+            resolution(agent.get("prompt_resolution"), "origin Agent Prompt resolution")
 
     @staticmethod
     def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
         """Return ``(data, corrupted)`` while keeping missing distinct from torn JSON."""
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            info = path.lstat()
         except FileNotFoundError:
             return None, False
+        except OSError:
+            return None, True
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return None, True
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, True
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None, True
         return (value, False) if isinstance(value, dict) else (None, True)
@@ -2043,6 +2340,16 @@ class AttemptStore:
     @staticmethod
     def _parse_error(path: Path) -> BaseException | str:
         """Recover a useful parse explanation for a failed safe read."""
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return FileNotFoundError(str(path))
+        except OSError as error:
+            return error
+        if stat.S_ISLNK(info.st_mode):
+            return ValueError("durable JSON path must not be a symlink")
+        if not stat.S_ISREG(info.st_mode):
+            return ValueError("durable JSON path must be a regular file")
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -2077,12 +2384,7 @@ class AttemptStore:
 
 
 def validate_durable_run(run_root: Path) -> DurableRunSnapshot:
-    """Validate one current run and return the evidence used by read surfaces.
-
-    Schema-2 receipt-chain runs are strict.  The small legacy exception keeps
-    the historical read-only trace projection usable for pre-chain directories
-    that have no current receipt markers at all; such runs remain non-resumable.
-    """
+    """Validate one current schema-2 run for every read-only surface."""
     manifest_path = run_root / "_run.json"
     manifest, corrupted = AttemptStore._read_json_safe(manifest_path)
     if corrupted:
@@ -2091,35 +2393,13 @@ def validate_durable_run(run_root: Path) -> DurableRunSnapshot:
         raise RunManifestError(f"Missing or invalid run manifest: {manifest_path}")
     if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
         raise RunManifestError(f"Run {run_root.name!r} has an unsupported manifest schema")
-
-    has_anchors = (
-        _RECEIPT_CHAIN_FIELD in manifest
-        or _RECOVERY_DECISION_LEDGER_FIELD in manifest
-        or _RECOVERY_DECISION_LEDGER_DIGEST_FIELD in manifest
-    )
-    chain_fields = {
-        _RECEIPT_SEQUENCE_FIELD,
-        _PREVIOUS_RECEIPT_DIGEST_FIELD,
-        _STATE_DIGEST_FIELD,
-    }
-    has_chain_state = False
-    if not has_anchors:
-        for path in (
-            *run_root.glob("attempts/*/state.json"),
-            *run_root.glob("attempts/*/attempt-*.json"),
-        ):
-            value, _corrupt = AttemptStore._read_json_safe(path)
-            if isinstance(value, dict) and chain_fields.intersection(value):
-                has_chain_state = True
-                break
-    strict = has_anchors or has_chain_state
-    if not strict:
-        return DurableRunSnapshot(manifest, (), {}, {}, False)
-
     store = AttemptStore(run_root, {})
     validated_manifest = store._required_manifest()
     states = store._validate_all_attempt_receipts()
-    candidates, materializations = store._validate_run_materializations(states)
+    candidates, materializations = store._validate_run_materializations(
+        states,
+        manifest=validated_manifest,
+    )
     return DurableRunSnapshot(
         validated_manifest,
         tuple(states),

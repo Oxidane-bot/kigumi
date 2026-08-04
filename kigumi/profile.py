@@ -29,13 +29,7 @@ class WorkflowProfileError(RuntimeError):
 
 
 def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
-    """Validate the same durable receipt invariants used by resume/recover.
-
-    Runs written before the receipt-chain format may still be inspected through
-    the existing read-only projection.  Once a manifest advertises a receipt
-    chain or recovery ledger, however, the run must pass AttemptStore's complete
-    validation before any state is projected.
-    """
+    """Validate the one shared durable snapshot used by all read surfaces."""
     try:
         return validate_durable_run(run_path)
     except (AmbiguousAttemptError, RunManifestError) as error:
@@ -51,13 +45,15 @@ def load_run_profile(
     _snapshot: DurableRunSnapshot | None = None,
 ) -> dict[str, Any]:
     """Load a runtime profile without importing or executing the registered DAG."""
-    manifest = _read_object(run_path / "_run.json")
+    snapshot = _snapshot or _validate_run_integrity(run_path)
+    if not snapshot.strict:
+        raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
+    manifest = snapshot.manifest
     schema = manifest.get("run_manifest_schema")
     if schema != RUN_MANIFEST_SCHEMA:
         raise WorkflowProfileError(
             f"Run {run_path.name!r} has no supported manifest for WorkflowProfile"
         )
-    snapshot = _snapshot or _validate_run_integrity(run_path)
     static = manifest.get("workflow_profile")
     if not isinstance(static, dict):
         raise WorkflowProfileError("0.7 run manifest is missing workflow_profile")
@@ -223,19 +219,11 @@ def _runtime_nodes(
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     if materializations is None:
-        entries = (
-            (
-                sidecar.name.removesuffix(".json.meta.json"),
-                _read_object(sidecar),
-                _read_object(run_path / f"{sidecar.name.removesuffix('.json.meta.json')}.json"),
-            )
-            for sidecar in sorted(run_path.glob("*.json.meta.json"))
-        )
-    else:
-        entries = (
-            (name, pair["metadata"], pair["artifact"])
-            for name, pair in sorted(materializations.items())
-        )
+        raise WorkflowProfileError("Runtime nodes require a validated durable snapshot")
+    entries = (
+        (name, pair["metadata"], pair["artifact"])
+        for name, pair in sorted(materializations.items())
+    )
     for name, metadata, artifact in entries:
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")

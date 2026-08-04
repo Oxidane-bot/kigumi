@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from kigumi._runstate import AttemptStore, RunManifestError, StateIntegrityError
-from kigumi.artifacts import sha
+from kigumi.artifacts import canonical_json, sha, write_artifact
 from kigumi.failures import ProviderFailure, ProviderFailureKind, ProviderFailureStage
 from kigumi.retry import AmbiguousAttemptError, RetryPolicy
 
@@ -26,6 +26,49 @@ def _store(tmp_path: Path) -> AttemptStore:
 
 def _receipt_path(tmp_path: Path) -> Path:
     return tmp_path / "run" / "attempts" / sha("work") / "attempt-0001.json"
+
+
+def _write_completed_materialization(store: AttemptStore) -> None:
+    artifact = {"value": "ok"}
+    artifact_digest = sha(artifact)
+    store.save_candidate(
+        "work",
+        {
+            "candidate_schema": 2,
+            "artifact": artifact,
+            "cache_key": "test-cache",
+            "key_components": {"source": "test"},
+            "prompt_resolutions": {},
+            "calls": [],
+        },
+    )
+    origin = {
+        "artifact_sha256": artifact_digest,
+        "prompt_resolutions": {},
+        "calls": [],
+        "agent": None,
+    }
+    write_artifact(
+        store.run_root / "work.json",
+        canonical_json(artifact),
+        {
+            "run_sidecar_schema": 2,
+            "node": "work",
+            "cache": "miss",
+            "cache_policy": "off",
+            "cache_key": "test-cache",
+            "key_components": {"source": "test"},
+            "outputs": [],
+            "calls": [],
+            "execution_calls": [],
+            "prompt_resolutions": {},
+            "prompt_resolutions_digest": sha({}),
+            "origin_provenance": origin,
+            "origin_provenance_digest": sha(origin),
+            "artifact_sha256": artifact_digest,
+        },
+    )
+    store.mark_completed("work", artifact_sha256=artifact_digest)
 
 
 def _state_path(tmp_path: Path) -> Path:
@@ -302,7 +345,7 @@ def test_missing_current_receipt_after_side_effect_is_not_trusted_by_readers(
 def test_completed_attempt_receipt_is_required_by_every_state_reader(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
-    store.mark_completed("work", artifact_sha256="a" * 64)
+    _write_completed_materialization(store)
     _receipt_path(tmp_path).unlink()
 
     for operation in (
@@ -370,7 +413,46 @@ def test_manifest_status_updates_are_generation_and_terminal_fenced(tmp_path: Pa
     terminal_root = tmp_path / "terminal"
     winner = _store(terminal_root)
     winner.prepare("work", policy=None, declaration_digest="decl")
-    winner.mark_completed("work", artifact_sha256="a" * 64)
+    artifact = {"value": "ok"}
+    artifact_digest = sha(artifact)
+    winner.save_candidate(
+        "work",
+        {
+            "candidate_schema": 2,
+            "artifact": artifact,
+            "cache_key": "terminal-cache",
+            "key_components": {"source": "terminal"},
+            "prompt_resolutions": {},
+            "calls": [],
+        },
+    )
+    origin = {
+        "artifact_sha256": artifact_digest,
+        "prompt_resolutions": {},
+        "calls": [],
+        "agent": None,
+    }
+    write_artifact(
+        terminal_root / "run" / "work.json",
+        canonical_json(artifact),
+        {
+            "run_sidecar_schema": 2,
+            "node": "work",
+            "cache": "miss",
+            "cache_policy": "off",
+            "cache_key": "terminal-cache",
+            "key_components": {"source": "terminal"},
+            "outputs": [],
+            "calls": [],
+            "execution_calls": [],
+            "prompt_resolutions": {},
+            "prompt_resolutions_digest": sha({}),
+            "origin_provenance": origin,
+            "origin_provenance_digest": sha(origin),
+            "artifact_sha256": artifact_digest,
+        },
+    )
+    winner.mark_completed("work", artifact_sha256=artifact_digest)
     winner.update_manifest("completed")
     fresh = AttemptStore(terminal_root / "run", {})
     fresh.initialize()
@@ -405,7 +487,7 @@ def test_loser_failure_cannot_publish_after_winner_commits_completed_state(
     loser = AttemptStore(tmp_path / "run", {})
     loser.initialize()
     loser.update_manifest("running")
-    winner.mark_completed("work", artifact_sha256="a" * 64)
+    _write_completed_materialization(winner)
 
     with pytest.raises(RunManifestError, match="terminal failure|completed"):
         loser.update_manifest("failed", failure={"failure_type": "runtime"})

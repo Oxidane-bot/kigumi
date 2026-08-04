@@ -1,31 +1,85 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from kigumi.artifacts import atomic_write_json, canonical_json, write_artifact
+from kigumi._runstate import AttemptStore
+from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.inspect import diff_components, load_call, trace_run
+from kigumi.profile import WorkflowProfileError
 
 
 def _sidecar(
     root: Path,
     name: str,
     *,
-    cache: str = "miss",
+    cache: str = "hit",
     components: dict[str, str] | None = None,
     calls: list[dict[str, object]] | None = None,
 ) -> None:
+    artifact = {"name": name}
+    artifact_digest = sha(artifact)
+    origin = {
+        "kind": "code",
+        "artifact_sha256": artifact_digest,
+        "calls": [],
+        "agent": None,
+        "prompt_resolutions": {},
+        "prompt_sha256": None,
+        "model": None,
+        "params": {},
+        "provider_response_id": None,
+        "usage": None,
+        "evidence_policy": {},
+        "evidence_policy_digest": sha({}),
+    }
     metadata: dict[str, object] = {
+        "run_sidecar_schema": 2,
         "node": name,
         "cache_key": f"node-{name}",
         "cache": cache,
+        "cache_policy": "auto",
+        "outputs": [],
         "seconds": 1.25,
         "calls": calls or [],
+        "execution_calls": calls or [],
+        "prompt_resolutions": {},
+        "prompt_resolutions_digest": sha({}),
+        "origin_provenance": origin,
+        "origin_provenance_digest": sha(origin),
+        "artifact_sha256": artifact_digest,
     }
     if components is not None:
         metadata["key_components"] = components
-    write_artifact(root / f"{name}.json", canonical_json({"name": name}), metadata)
+    write_artifact(root / f"{name}.json", canonical_json(artifact), metadata)
+
+
+def _trace_manifest(run_root: Path, nodes: list[str]) -> None:
+    store = AttemptStore(run_root, {})
+    store.initialize()
+    profile = {
+        "workflow_profile_schema": 2,
+        "mode": "static",
+        "resolution_status": "unresolved",
+        "graph": {
+            "nodes": [{"name": name} for name in nodes],
+            "edges": [],
+            "mounts": [],
+            "models": {},
+        },
+        "prompts": {"specs": []},
+        "run": None,
+    }
+    manifest_path = run_root / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["workflow_profile"] = profile
+    manifest["workflow_profile_digest"] = sha(profile)
+    dynamic_ledger = {"chapters": {"one": [], "two": []}}
+    manifest["dynamic_files_ledger"] = dynamic_ledger
+    manifest["dynamic_files_ledger_sha256"] = sha(dynamic_ledger)
+    atomic_write_json(manifest_path, manifest)
 
 
 def test_trace_run_groups_map_items_and_links_llm_payloads(tmp_path: Path) -> None:
@@ -33,6 +87,7 @@ def test_trace_run_groups_map_items_and_links_llm_payloads(tmp_path: Path) -> No
     artifacts = tmp_path / "artifacts"
     llm_cache = tmp_path / "caller-cache"
     run_root = artifacts / "runs" / "run-7"
+    _trace_manifest(run_root, ["outline", "chapters"])
     call = {
         "key": "call-key-123",
         "model_alias": "fast",
@@ -71,6 +126,7 @@ def test_trace_run_groups_map_items_and_links_llm_payloads(tmp_path: Path) -> No
 
 def test_trace_run_warns_for_missing_payload_and_filters_node(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
+    _trace_manifest(artifacts / "runs" / "run-8", ["node"])
     _sidecar(
         artifacts / "runs" / "run-8",
         "node",
@@ -84,6 +140,14 @@ def test_trace_run_warns_for_missing_payload_and_filters_node(tmp_path: Path) ->
     assert "llm_cache_dir" in traced["warnings"][0]
     with pytest.raises(FileNotFoundError, match="run not found: missing"):
         trace_run(artifacts, tmp_path / "caller-cache", "missing")
+
+
+def test_trace_run_rejects_a_manifestless_legacy_entry(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    _sidecar(artifacts / "runs" / "legacy", "node")
+
+    with pytest.raises(WorkflowProfileError, match="manifest"):
+        trace_run(artifacts, tmp_path / "caller-cache", "legacy")
 
 
 def test_load_call_resolves_prefix_and_fails_visibly_for_missing_or_ambiguous(
