@@ -7,38 +7,61 @@ completed runs without reconstructing a caller or graph.
 
 from __future__ import annotations
 
+import copy
 import json
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from ._runstate import (
     ATTEMPT_RECEIPT_SCHEMA,
+    RUN_MANIFEST_SCHEMA,
+    AttemptStore,
     DurableRunSnapshot,
     RunManifestError,
-    validate_run_path,
 )
-from ._safe_io import SecureDirectory, read_regular_bytes
+from ._safe_io import SecureDirectory
+from .artifacts import sha
 from .calling import read_call_cache
 from .errors import CacheIntegrityError
-from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
+from .profile import (
+    WORKFLOW_PROFILE_SCHEMA,
+    WorkflowProfileError,
+    _attach_runtime_prompt_resolutions,
+    _attempts,
+    _failures,
+    _runtime_nodes,
+)
+from .retry import AmbiguousAttemptError
 from .store import run_directory
 
 
 def trace_run(
-    artifacts_path: Path, llm_cache_path: Path, run_id: str, node: str | None = None
+    artifacts_path: Path,
+    llm_cache_path: Path,
+    run_id: str,
+    node: str | None = None,
+    *,
+    _store: AttemptStore | None = None,
 ) -> dict[str, Any]:
     """Join one run's sidecars to the corresponding L1 payload paths."""
     run_path = run_directory(artifacts_path, run_id)
-    try:
-        validate_run_path(run_path)
-    except RunManifestError as error:
-        raise WorkflowProfileError(
-            f"Run {run_id!r} durable path ownership validation failed: {error}"
-        ) from error
-    if not run_path.is_dir():
-        raise FileNotFoundError(f"run not found: {run_id}")
+    if _store is None:
+        with _owned_run(run_path) as store:
+            return _trace_run_owned(run_path, llm_cache_path, run_id, node, store)
+    return _trace_run_owned(run_path, llm_cache_path, run_id, node, _store)
 
-    snapshot = _validate_run_integrity(run_path)
+
+def _trace_run_owned(
+    run_path: Path,
+    llm_cache_path: Path,
+    run_id: str,
+    node: str | None,
+    store: AttemptStore,
+) -> dict[str, Any]:
+    _require_run(store, run_id)
+    snapshot = _snapshot_from_store(run_path, store)
 
     warnings: list[str] = []
     entries: dict[str, dict[str, Any]] = {}
@@ -81,10 +104,10 @@ def trace_run(
         "run_id": run_id,
         "nodes": [entries[name] for name in sorted(entries)],
     }
-    durable = durable_run_state(run_path, _snapshot=snapshot)
+    durable = _durable_run_state_owned(run_path, snapshot)
     if durable:
         result.update(durable)
-    result["workflow_profile"] = load_run_profile(run_path, _snapshot=snapshot)
+    result["workflow_profile"] = _load_run_profile_owned(run_path, store, snapshot=snapshot)
     if warnings:
         result["warnings"] = warnings
     return result
@@ -94,15 +117,23 @@ def durable_run_state(
     run_path: Path,
     *,
     _snapshot: DurableRunSnapshot | None = None,
+    _store: AttemptStore | None = None,
 ) -> dict[str, Any]:
     """Read supported durable run/attempt state without importing an executable DAG."""
-    try:
-        validate_run_path(run_path)
-    except RunManifestError as error:
-        raise WorkflowProfileError(
-            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
-        ) from error
-    snapshot = _snapshot or _validate_run_integrity(run_path)
+    if _store is None:
+        with _owned_run(run_path) as store:
+            _require_run(store, run_path.name)
+            snapshot = _snapshot or _snapshot_from_store(run_path, store)
+            return _durable_run_state_owned(run_path, snapshot)
+    _require_run(_store, run_path.name)
+    snapshot = _snapshot or _snapshot_from_store(run_path, _store)
+    return _durable_run_state_owned(run_path, snapshot)
+
+
+def _durable_run_state_owned(
+    run_path: Path,
+    snapshot: DurableRunSnapshot,
+) -> dict[str, Any]:
     if not snapshot.strict:
         raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
     manifest = snapshot.manifest
@@ -144,6 +175,134 @@ def durable_run_state(
     }
 
 
+@contextmanager
+def _owned_run(run_path: Path):
+    """Keep one run's descriptor-bound ownership boundary for inspect reads."""
+    try:
+        store = AttemptStore(run_path, {})
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Unable to inspect run {run_path.name!r} safely: {error}"
+        ) from error
+    try:
+        yield store
+    finally:
+        for directory in (
+            store._run_directory,  # noqa: SLF001
+            store._runs_directory,  # noqa: SLF001
+        ):
+            if directory is not None:
+                directory.close()
+
+
+def _require_run(store: AttemptStore, run_id: str) -> None:
+    if store._run_directory is None:  # noqa: SLF001
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+
+def _snapshot_from_store(run_path: Path, store: AttemptStore) -> DurableRunSnapshot:
+    """Validate all durable evidence through one already-bound run store."""
+    manifest_path = run_path / "_run.json"
+    try:
+        manifest, corrupted = store._read_owned_json(manifest_path)  # noqa: SLF001
+        if corrupted:
+            raise store._owned_integrity_error(  # noqa: SLF001
+                manifest_path,
+                RUN_MANIFEST_SCHEMA,
+            )
+        if manifest is None:
+            raise RunManifestError(f"Missing or invalid run manifest: {manifest_path}")
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise RunManifestError(f"Run {run_path.name!r} has an unsupported manifest schema")
+        validated_manifest = store._required_manifest()  # noqa: SLF001
+        states = store._validate_all_attempt_receipts()  # noqa: SLF001
+        candidates, materializations = store._validate_run_materializations(  # noqa: SLF001
+            states,
+            manifest=validated_manifest,
+        )
+    except (AmbiguousAttemptError, OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} durable receipt integrity validation failed: {error}"
+        ) from error
+    return DurableRunSnapshot(
+        validated_manifest,
+        tuple(states),
+        candidates,
+        materializations,
+        True,
+    )
+
+
+def _load_run_profile_owned(
+    run_path: Path,
+    store: AttemptStore,
+    *,
+    snapshot: DurableRunSnapshot | None = None,
+    include_content: bool = False,
+) -> dict[str, Any]:
+    """Project a profile from one validated snapshot and its still-open store."""
+    _require_run(store, run_path.name)
+    snapshot = snapshot or _snapshot_from_store(run_path, store)
+    if not snapshot.strict:
+        raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
+    manifest = snapshot.manifest
+    if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} has no supported manifest for WorkflowProfile"
+        )
+    static = manifest.get("workflow_profile")
+    if not isinstance(static, dict):
+        raise WorkflowProfileError("0.7 run manifest is missing workflow_profile")
+    if manifest.get("workflow_profile_digest") != sha(static):
+        raise WorkflowProfileError("0.7 workflow_profile digest validation failed")
+    if static.get("workflow_profile_schema") != WORKFLOW_PROFILE_SCHEMA:
+        raise WorkflowProfileError("unsupported workflow_profile schema")
+    runtime_nodes = _runtime_nodes(
+        run_path,
+        include_content=include_content,
+        materializations=snapshot.materializations,
+    )
+    attempt_entries = _attempts(
+        run_path,
+        include_content=include_content,
+        states=snapshot.states,
+        candidates=snapshot.candidates,
+    )
+    failures = _failures(
+        run_path,
+        include_content=include_content,
+        attempts=store,
+    )
+    result = copy.deepcopy(static)
+    result["mode"] = "run"
+    result["resolution_status"] = "available"
+    _attach_runtime_prompt_resolutions(
+        result.get("prompts"),
+        runtime_nodes,
+        attempt_entries,
+    )
+    result["run"] = {
+        "run_id": run_path.name,
+        "status": manifest.get("status", "unknown"),
+        "resume_count": manifest.get("resume_count", 0),
+        "last_resumed_at": manifest.get("last_resumed_at"),
+        "nodes": runtime_nodes,
+        "attempts": attempt_entries,
+        "failures": failures,
+        "pending_retries": [
+            copy.deepcopy(attempt)
+            for attempt in attempt_entries
+            if attempt.get("status") == "retry_scheduled"
+        ],
+        "ambiguous_attempts": [
+            copy.deepcopy(attempt)
+            for attempt in attempt_entries
+            if attempt.get("status") == "ambiguous"
+        ],
+    }
+    return result
+
+
 def load_call(llm_cache_path: Path, key_prefix: str) -> tuple[str, dict[str, Any]]:
     """Load exactly one L1 payload selected by a cache-key prefix."""
     root = llm_cache_path / "llm"
@@ -175,8 +334,51 @@ def load_call(llm_cache_path: Path, key_prefix: str) -> tuple[str, dict[str, Any
 
 def diff_components(artifacts_path: Path, run_a: str, run_b: str) -> dict[str, Any]:
     """Compare persisted key-component evidence without recomputing any keys."""
-    components_a = _key_components_by_node(run_directory(artifacts_path, run_a))
-    components_b = _key_components_by_node(run_directory(artifacts_path, run_b))
+    with (
+        _owned_run(run_directory(artifacts_path, run_a)) as store_a,
+        _owned_run(run_directory(artifacts_path, run_b)) as store_b,
+    ):
+        components_a = _key_components_owned(
+            run_directory(artifacts_path, run_a),
+            store_a,
+        )
+        components_b = _key_components_owned(
+            run_directory(artifacts_path, run_b),
+            store_b,
+        )
+    return _component_diff(components_a, components_b)
+
+
+def diff_run_views(
+    artifacts_path: Path,
+    run_a: str,
+    run_b: str,
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Read artifact and key-component diffs from two bound run snapshots."""
+    run_path_a = run_directory(artifacts_path, run_a)
+    run_path_b = run_directory(artifacts_path, run_b)
+    with _owned_run(run_path_a) as store_a, _owned_run(run_path_b) as store_b:
+        _require_run(store_a, run_a)
+        _require_run(store_b, run_b)
+        artifacts_a = _run_artifacts_owned(run_path_a, store_a)
+        artifacts_b = _run_artifacts_owned(run_path_b, store_b)
+        components_a = _key_components_owned(run_path_a, store_a)
+        components_b = _key_components_owned(run_path_b, store_b)
+    artifact_names_a = set(artifacts_a)
+    artifact_names_b = set(artifacts_b)
+    shared = sorted(artifact_names_a & artifact_names_b)
+    result = {
+        "changed": [name for name in shared if sha(artifacts_a[name]) != sha(artifacts_b[name])],
+        "only_a": sorted(artifact_names_a - artifact_names_b),
+        "only_b": sorted(artifact_names_b - artifact_names_a),
+    }
+    return result, _component_diff(components_a, components_b)
+
+
+def _component_diff(
+    components_a: dict[str, dict[str, Any] | None],
+    components_b: dict[str, dict[str, Any] | None],
+) -> dict[str, Any]:
     shared = sorted(set(components_a) & set(components_b))
     result: dict[str, Any] = {}
     for name in shared:
@@ -259,35 +461,97 @@ def _trace_entry(
 
 
 def _key_components_by_node(run_path: Path) -> dict[str, dict[str, Any] | None]:
-    try:
-        validate_run_path(run_path)
-    except RunManifestError as error:
-        raise WorkflowProfileError(
-            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
-        ) from error
+    """Compatibility wrapper that owns the run for the full component read."""
+    with _owned_run(run_path) as store:
+        return _key_components_owned(run_path, store)
+
+
+def _key_components_owned(
+    run_path: Path,
+    store: AttemptStore,
+) -> dict[str, dict[str, Any] | None]:
     result: dict[str, dict[str, Any] | None] = {}
     try:
-        with SecureDirectory(run_path, create=False) as directory:
-            names = sorted(name for name in directory.names() if name.endswith(".json.meta.json"))
+        names = sorted(
+            name for name in store._owned_names(run_path) if name.endswith(".json.meta.json")
+        )  # noqa: SLF001
     except FileNotFoundError:
         return result
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} sidecar directory is not owned: {error}"
+        ) from error
     for name in names:
         sidecar = run_path / name
-        key_components = _read_json(sidecar).get("key_components")
+        try:
+            info = store._owned_stat(sidecar)  # noqa: SLF001
+        except FileNotFoundError:
+            continue
+        except (OSError, RunManifestError, ValueError) as error:
+            raise WorkflowProfileError(
+                f"Unable to inspect sidecar path {sidecar}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            raise WorkflowProfileError(f"Run sidecar must not be a symlink: {sidecar}")
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkflowProfileError(f"Run sidecar must reference a regular file: {sidecar}")
+        raw, read_error = store._read_owned_bytes(sidecar)  # noqa: SLF001
+        if read_error is not None:
+            raise WorkflowProfileError(f"Unable to read run sidecar {sidecar}: {read_error}")
+        if raw is None:
+            continue
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            value = {}
+        key_components = value.get("key_components") if isinstance(value, dict) else None
         result[name.removesuffix(".json.meta.json")] = (
             key_components if isinstance(key_components, dict) else None
         )
     return result
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _run_artifacts_owned(
+    run_path: Path,
+    store: AttemptStore,
+) -> dict[str, dict[str, Any]]:
+    """Read artifact JSON while the owning run descriptor remains open."""
+    artifacts: dict[str, dict[str, Any]] = {}
     try:
-        raw = read_regular_bytes(
-            path,
-            phase="reading inspect JSON",
-            error=lambda message, target: ValueError(f"Inspect JSON {message}: {target}"),
-        )
-        payload = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        names = sorted(store._owned_names(run_path))  # noqa: SLF001
+    except FileNotFoundError:
+        return artifacts
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} artifact directory is not owned: {error}"
+        ) from error
+    for name in names:
+        if name.startswith("_") or not name.endswith(".json"):
+            continue
+        if name.endswith(".json.meta.json"):
+            continue
+        path = run_path / name
+        try:
+            info = store._owned_stat(path)  # noqa: SLF001
+        except FileNotFoundError:
+            continue
+        except (OSError, RunManifestError, ValueError) as error:
+            raise WorkflowProfileError(
+                f"Unable to inspect artifact path {path}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            raise WorkflowProfileError(f"Run artifact must not be a symlink: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkflowProfileError(f"Run artifact must reference a regular file: {path}")
+        raw, read_error = store._read_owned_bytes(path)  # noqa: SLF001
+        if read_error is not None:
+            raise WorkflowProfileError(f"Unable to read run artifact {path}: {read_error}")
+        if raw is None:
+            continue
+        try:
+            artifact = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(artifact, dict):
+            artifacts[Path(name).stem] = artifact
+    return artifacts

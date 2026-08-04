@@ -36,10 +36,16 @@ from .enforce import (
     waiver_reasons,
 )
 from .errors import CacheIntegrityError
-from .inspect import diff_components, durable_run_state, load_call, trace_run
-from .profile import WorkflowProfileError, load_run_profile
+from .inspect import (
+    _load_run_profile_owned,
+    diff_run_views,
+    durable_run_state,
+    load_call,
+    trace_run,
+)
+from .profile import WorkflowProfileError
 from .prompt import TemplateSlotError, load_template, render_template, slot_names
-from .store import approve_checkpoint, diff_runs, gc_artifacts, run_directory, run_sort_key
+from .store import approve_checkpoint, gc_artifacts, run_directory, run_sort_key
 
 DAG_ENTRY_MODULE = "nodes.graph"
 """Module `kigumi init` scaffolds, matching the default ``source_dirs`` entry."""
@@ -965,7 +971,7 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                     hits = sum(1 for item in metadata if item.get("cache") == "hit")
                     misses = sum(1 for item in metadata if item.get("cache") == "miss")
                     pending = _pending_names(run_path, store=store)
-                durable = durable_run_state(run_path)
+                    durable = durable_run_state(run_path, _store=store)
             except (FileNotFoundError, WorkflowProfileError) as error:
                 _error(str(error))
                 return 1
@@ -1008,20 +1014,17 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
             sidecar_metadata = [_read_owned_json(store, path) for path in sidecar_paths]
             pending = _pending_names(run_path, store=store)
             approved_paths = _approval_paths(run_path, store=store)
+            if manifest_info is not None:
+                if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+                    raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
+                workflow = _load_run_profile_owned(run_path, store)
+            durable = durable_run_state(run_path, _store=store)
     except FileNotFoundError:
         _error(f"run not found: {run_id}")
         return 1
     except WorkflowProfileError as error:
         _error(str(error))
         return 1
-    if manifest_info is not None:
-        try:
-            if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
-                raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
-            workflow = load_run_profile(run_path)
-        except WorkflowProfileError as error:
-            _error(str(error))
-            return 1
     nodes: list[dict[str, Any]] = []
     runtime_nodes = (
         workflow["run"]["nodes"]
@@ -1050,11 +1053,6 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                 "calls": call_count,
             }
         )
-    try:
-        durable = durable_run_state(run_path)
-    except WorkflowProfileError as error:
-        _error(str(error))
-        return 1
     approved = [
         approval.name.removesuffix(".json")
         for approval in approved_paths
@@ -1315,17 +1313,11 @@ def _approve(config: KigumiConfig, run_id: str, name: str, data_text: str) -> in
 
 
 def _diff(config: KigumiConfig, run_a: str, run_b: str, *, json_output: bool) -> int:
-    for run_id in (run_a, run_b):
-        try:
-            run_path = run_directory(config.artifacts_path, run_id)
-        except ValueError as error:
-            _error(str(error))
-            return 1
-        if not run_path.is_dir():
-            _error(f"run not found: {run_id}")
-            return 1
-    result = diff_runs(config.artifacts_path / "runs", run_a, run_b)
-    components = diff_components(config.artifacts_path, run_a, run_b)
+    try:
+        result, components = diff_run_views(config.artifacts_path, run_a, run_b)
+    except (FileNotFoundError, ValueError, WorkflowProfileError) as error:
+        _error(str(error))
+        return 1
     if json_output:
         _print_json({**result, "components": components})
         return 0

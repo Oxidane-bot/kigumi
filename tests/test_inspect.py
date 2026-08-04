@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
+import kigumi.inspect as inspect_module
 from kigumi._runstate import AttemptStore
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.errors import CacheIntegrityError
-from kigumi.inspect import diff_components, load_call, trace_run
+from kigumi.inspect import diff_components, diff_run_views, load_call, trace_run
 from kigumi.profile import WorkflowProfileError
 
 
@@ -217,3 +218,60 @@ def test_diff_components_reports_changes_unavailable_and_one_sided_nodes(tmp_pat
     assert result["unavailable"] == "unavailable"
     assert result["only_in_a"] == ["only-a"]
     assert result["only_in_b"] == ["only-b"]
+
+
+def test_trace_fails_closed_after_directory_replacement(tmp_path: Path, monkeypatch) -> None:
+    artifacts = tmp_path / "artifacts"
+    run_path = artifacts / "runs" / "run-1"
+    _trace_manifest(run_path, ["original"])
+    _sidecar(run_path, "original", components={"source": "original"})
+    replacement = tmp_path / "replacement" / "run-1"
+    _trace_manifest(replacement, ["external"])
+    _sidecar(replacement, "external", components={"source": "external"})
+    moved = tmp_path / "original-run"
+    original_profile = inspect_module._load_run_profile_owned
+    swapped = False
+
+    def replace_before_profile(path: Path, store: AttemptStore, **kwargs: object) -> dict:
+        nonlocal swapped
+        if not swapped:
+            run_path.rename(moved)
+            replacement.rename(run_path)
+            swapped = True
+        return original_profile(path, store, **kwargs)
+
+    monkeypatch.setattr(inspect_module, "_load_run_profile_owned", replace_before_profile)
+
+    with pytest.raises(WorkflowProfileError, match="no longer owned|changed"):
+        trace_run(artifacts, tmp_path / "llm", "run-1")
+
+
+def test_diff_run_views_fails_closed_after_directory_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    run_a = artifacts / "runs" / "run-a"
+    run_b = artifacts / "runs" / "run-b"
+    _sidecar(run_a, "node", components={"source": "original"})
+    _sidecar(run_b, "node", components={"source": "other"})
+    (run_a / "node.json").write_text('{"value": "original"}', encoding="utf-8")
+    (run_b / "node.json").write_text('{"value": "other"}', encoding="utf-8")
+    replacement = tmp_path / "replacement" / "run-a"
+    _sidecar(replacement, "node", components={"source": "external"})
+    (replacement / "node.json").write_text('{"value": "external"}', encoding="utf-8")
+    moved = tmp_path / "original-run-a"
+    original_components = inspect_module._key_components_owned
+    swapped = False
+
+    def replace_before_components(path: Path, store: AttemptStore) -> dict:
+        nonlocal swapped
+        if path == run_a and not swapped:
+            run_a.rename(moved)
+            replacement.rename(run_a)
+            swapped = True
+        return original_components(path, store)
+
+    monkeypatch.setattr(inspect_module, "_key_components_owned", replace_before_components)
+
+    with pytest.raises(WorkflowProfileError, match="no longer owned|changed"):
+        diff_run_views(artifacts, "run-a", "run-b")

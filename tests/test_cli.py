@@ -1053,6 +1053,92 @@ def test_runs_show_rejects_fifo_sidecar_without_blocking(tmp_path: Path) -> None
     assert "regular file" in result.stderr
 
 
+def test_runs_list_fails_closed_after_directory_replacement(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    run_path = root / "artifacts" / "runs" / "run-1"
+    _write_pending_retry_cli_run(run_path)
+    replacement = tmp_path / "replacement" / "run-1"
+    _write_completed_cli_run(
+        replacement,
+        target="external",
+        artifact={"value": "external"},
+        cache="hit",
+        cache_key="external-cache",
+        key_components={},
+        seconds=0.0,
+        calls=[],
+    )
+    moved = tmp_path / "original-run"
+    original_durable = cli_module.durable_run_state
+    swapped = False
+
+    def replace_before_durable(path: Path, *, _store=None, **kwargs: Any) -> dict[str, Any]:
+        nonlocal swapped
+        if not swapped:
+            run_path.rename(moved)
+            replacement.rename(run_path)
+            swapped = True
+        assert _store is not None
+        return original_durable(path, _store=_store, **kwargs)
+
+    monkeypatch.setattr(cli_module, "durable_run_state", replace_before_durable)
+    monkeypatch.chdir(root)
+
+    assert main(["runs", "list", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert "no longer owned" in captured.err
+    assert "external" not in captured.out + captured.err
+
+
+def test_runs_show_fails_closed_after_directory_replacement(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    run_path = root / "artifacts" / "runs" / "run-1"
+    _write_completed_cli_run(
+        run_path,
+        target="original",
+        artifact={"value": "original"},
+        cache="miss",
+        cache_key="original-cache",
+        key_components={"source": "original"},
+        seconds=1.0,
+        calls=[],
+    )
+    replacement = tmp_path / "replacement" / "run-1"
+    _write_completed_cli_run(
+        replacement,
+        target="external",
+        artifact={"value": "external"},
+        cache="hit",
+        cache_key="external-cache",
+        key_components={"source": "external"},
+        seconds=0.0,
+        calls=[],
+    )
+    moved = tmp_path / "original-run"
+    original_profile = cli_module._load_run_profile_owned
+    swapped = False
+
+    def replace_before_profile(path: Path, store: AttemptStore, **kwargs: Any) -> dict[str, Any]:
+        nonlocal swapped
+        if not swapped:
+            run_path.rename(moved)
+            replacement.rename(run_path)
+            swapped = True
+        return original_profile(path, store, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_load_run_profile_owned", replace_before_profile)
+    monkeypatch.chdir(root)
+
+    assert main(["runs", "show", "run-1", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert "no longer owned" in captured.err
+    assert "external" not in captured.out + captured.err
+
+
 def test_cli_check_reports_clean_dag(tmp_path: Path, capsys) -> None:
     dag = _cli_dag(tmp_path)
     (tmp_path / "input.txt").write_text("fixture", encoding="utf-8")
