@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
 from typing import Any
 from urllib.error import HTTPError
 
@@ -28,6 +27,7 @@ from kigumi.agents import (
     AgentRunResult,
     AgentTask,
 )
+from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
 from kigumi.transport import Response
@@ -225,6 +225,74 @@ def test_recovery_receipt_is_bound_to_the_scheduled_attempt_state(tmp_path: Path
     assert state["recovery"] == receipt_payload
 
 
+def test_recover_wires_atomic_api_payload_and_inherited_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+    dag = Dag(config, LLMCaller(_SequenceTransport([]), tmp_path / "llm"))
+
+    @dag.node("source", cache="off")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "source"}
+
+    @dag.node(
+        "ask",
+        deps=("source",),
+        cache="off",
+        retry=RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    def ask(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        raise RuntimeError("failed")
+
+    with pytest.raises(RuntimeError, match="failed"):
+        dag.run(run_id="atomic-api-wiring")
+
+    calls: list[dict[str, Any]] = []
+    original_record = dag_module.AttemptStore.record_recovery_decision
+
+    def capture_record(self: Any, target: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"target": target, **kwargs})
+        return original_record(self, target, **kwargs)
+
+    monkeypatch.setattr(dag_module.AttemptStore, "record_recovery_decision", capture_record)
+
+    receipt = dag.recover(
+        "atomic-api-wiring",
+        "ask",
+        from_attempt=1,
+        decision="retry_not_started",
+        reason="the provider side effect was ruled out",
+        evidence=["operator-log.txt"],
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["target"] == "ask"
+    assert call["from_attempt"] == 1
+    assert call["decision"] == "retry_not_started"
+    expected_payload = {
+        "recovery_time": receipt.recovery_time,
+        "from_attempt": 1,
+        "to_attempt": 2,
+        "decision": "retry_not_started",
+        "reason": "the provider side effect was ruled out",
+        "evidence_refs": ["operator-log.txt"],
+        "recovered_by": receipt.recovered_by,
+    }
+    assert call["recovery"] == expected_payload
+    assert call["recovery_receipt"] == expected_payload
+    assert call["inherited_nodes"] == {
+        "source": {
+            "status": "inherited",
+            "source": "source.json",
+            "source_attempt": 1,
+            "artifact_sha256": sha({"value": "source"}),
+        }
+    }
+
+
 def test_concurrent_recover_has_one_receipt_and_one_queued_attempt(tmp_path: Path) -> None:
     first = _retry_dag(
         tmp_path,
@@ -286,17 +354,25 @@ def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
     with pytest.raises(ProviderFailure):
         first.run(run_id="mixed-recovery")
 
-    fail_entered = Event()
-    retry_started = Event()
-    original_write = dag_module.AttemptStore.write_recovery_receipt
+    calls: list[dict[str, Any]] = []
+    original_record = dag_module.AttemptStore.record_recovery_decision
 
-    def delay_fail_receipt(self: Any, payload: dict[str, Any]) -> Any:
-        if payload.get("decision") == "fail":
-            fail_entered.set()
-            assert retry_started.wait(timeout=5)
-        return original_write(self, payload)
+    def capture_record(self: Any, target: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"target": target, **kwargs})
+        return original_record(self, target, **kwargs)
 
-    monkeypatch.setattr(dag_module.AttemptStore, "write_recovery_receipt", delay_fail_receipt)
+    def reject_legacy_path(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("Dag.recover must use record_recovery_decision")
+
+    def reject_preflight_state_for(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("Dag.recover must not preflight the target with state_for")
+
+    monkeypatch.setattr(dag_module.AttemptStore, "record_recovery_decision", capture_record)
+    monkeypatch.setattr(dag_module.AttemptStore, "write_recovery_receipt", reject_legacy_path)
+    monkeypatch.setattr(dag_module.AttemptStore, "schedule_recovery", reject_legacy_path)
+    monkeypatch.setattr(dag_module.AttemptStore, "state_for", reject_preflight_state_for)
     retry_dag = _retry_dag(
         tmp_path,
         _SequenceTransport([]),
@@ -319,7 +395,6 @@ def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
             return ("error", error)
 
     def run_retry() -> tuple[str, Any]:
-        retry_started.set()
         try:
             return (
                 "ok",
@@ -336,7 +411,6 @@ def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         fail_future = executor.submit(run_fail)
-        assert fail_entered.wait(timeout=5)
         retry_future = executor.submit(run_retry)
         outcomes = [fail_future.result(timeout=5), retry_future.result(timeout=5)]
 
@@ -345,12 +419,14 @@ def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
     assert len(successes) == 1
     assert len(failures) == 1
     assert isinstance(failures[0], (ValueError, RunManifestError))
+    assert len(calls) == 2
+    assert {call["decision"] for call in calls} == {"fail", "retry_not_started"}
 
     run_dir = tmp_path / "artifacts" / "runs" / "mixed-recovery"
     assert len(list(run_dir.glob("recovery-*.json"))) == 1
 
 
-def test_recovery_does_not_use_dag_level_receipt_write_after_injected_crash(
+def test_recovery_uses_atomic_api_after_injected_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     transport = _SequenceTransport([_authentication_failure()])
@@ -367,17 +443,21 @@ def test_recovery_does_not_use_dag_level_receipt_write_after_injected_crash(
         raise AssertionError("Dag.recover must not write recovery receipts directly")
 
     monkeypatch.setattr(dag_module, "atomic_write_json", reject_dag_level_write)
-    original_write = dag_module.AttemptStore.write_recovery_receipt
-    writes = 0
+    original_record = dag_module.AttemptStore.record_recovery_decision
+    calls = 0
 
-    def crash_after_receipt(self: Any, payload: dict[str, Any]) -> Any:
-        nonlocal writes
-        writes += 1
-        original_write(self, payload)
-        raise KeyboardInterrupt("crash after recovery receipt")
+    def crash_after_decision(self: Any, target: str, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        original_record(self, target, **kwargs)
+        raise KeyboardInterrupt("crash after recovery decision")
 
-    monkeypatch.setattr(dag_module.AttemptStore, "write_recovery_receipt", crash_after_receipt)
-    with pytest.raises(KeyboardInterrupt, match="crash after recovery receipt"):
+    monkeypatch.setattr(
+        dag_module.AttemptStore,
+        "record_recovery_decision",
+        crash_after_decision,
+    )
+    with pytest.raises(KeyboardInterrupt, match="crash after recovery decision"):
         dag.recover(
             "recovery-crash",
             "ask",
@@ -386,7 +466,7 @@ def test_recovery_does_not_use_dag_level_receipt_write_after_injected_crash(
             reason="operator confirmed the failure is final",
         )
 
-    assert writes == 1
+    assert calls == 1
     run_dir = tmp_path / "artifacts" / "runs" / "recovery-crash"
     assert len(list(run_dir.glob("recovery-*.json"))) == 1
     assert not list((run_dir / "attempts").glob("*/attempt-0002.json"))

@@ -1991,75 +1991,60 @@ class Dag:
         except (OSError, RunManifestError, ValueError) as error:
             raise ValueError(f"Run {run_id!r} declaration cannot be recovered: {error}") from error
 
-        # The runstate recovery mutations are individually atomic, but a fail
-        # decision has no target state transition of its own.  Keep the
-        # decision check and the matching public runstate mutation inside the
-        # same run lock so a fail/retry pair cannot both observe the same
-        # failed attempt and commit two decisions.
-        with attempts._run_locked():  # type: ignore[attr-defined]  # noqa: SLF001
-            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(current_manifest, dict)
-                or current_manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
-            ):
-                raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
-            if current_manifest.get("status") != "failed":
-                raise ValueError(f"Run {run_id!r} is not in terminal failed state")
-
-            state = attempts.state_for(target)
-            if state is None:
-                raise ValueError(f"Recovery target {target!r} has no durable attempt state")
-            if state.get("status") != "failed":
-                raise ValueError(f"Recovery target {target!r} is not terminally failed")
-            if state.get("attempt") != from_attempt:
-                raise ValueError(
-                    f"Recovery target {target!r} is at attempt {state.get('attempt')}, "
-                    f"not {from_attempt}"
-                )
-            if _recovery_decision_exists(run_dir, from_attempt):
-                raise ValueError(
-                    f"Recovery target {target!r} attempt {from_attempt} already has a decision"
-                )
-
-            recovery_time = _recovery_time()
-            recovered_by = _recovered_by()
-            evidence_refs = list(evidence)
-            normalized_reason = reason.strip()
-            to_attempt = from_attempt if decision == "fail" else from_attempt + 1
-            receipt = RecoveryReceipt(
-                recovery_time=recovery_time,
-                from_attempt=from_attempt,
-                to_attempt=to_attempt,
-                decision=decision,
-                reason=normalized_reason,
-                evidence_refs=evidence_refs,
-                recovered_by=recovered_by,
-            )
-            receipt_payload = _recovery_payload(receipt)
-            if decision == "fail":
-                attempts.write_recovery_receipt(receipt_payload)
-                return receipt
-
+        recovery_time = _recovery_time()
+        recovered_by = _recovered_by()
+        evidence_refs = list(evidence)
+        normalized_reason = reason.strip()
+        to_attempt = from_attempt if decision == "fail" else from_attempt + 1
+        receipt = RecoveryReceipt(
+            recovery_time=recovery_time,
+            from_attempt=from_attempt,
+            to_attempt=to_attempt,
+            decision=decision,
+            reason=normalized_reason,
+            evidence_refs=evidence_refs,
+            recovered_by=recovered_by,
+        )
+        receipt_payload = _recovery_payload(receipt)
+        inherited_nodes = None
+        if decision != "fail":
             inherited_nodes = self._recovery_inherited_nodes(
                 run_dir,
                 target_root,
                 order,
                 attempts=attempts,
             )
-            attempts.schedule_recovery(
+
+        # The runstate API owns the failed-state check, recovery decision
+        # exclusion, receipt creation, target transition, and lease fencing.
+        # Do not preflight with state_for() or compose the decision from the
+        # separate receipt/scheduling APIs: those combinations can race with a
+        # different operator choosing the opposite decision.
+        try:
+            attempts.record_recovery_decision(
                 target,
                 from_attempt=from_attempt,
-                to_attempt=to_attempt,
+                decision=decision,
                 recovery=receipt_payload,
-                recovery_receipt=receipt_payload,
                 inherited_nodes=inherited_nodes,
+                recovery_receipt=receipt_payload,
             )
+        except ValueError as error:
+            # Keep the recover/CLI diagnostic that callers received before the
+            # atomic API existed, while leaving the decision validation itself
+            # owned by AttemptStore.
+            if "is not the active terminal failure" in str(error):
+                raise ValueError(
+                    f"Recovery target {target!r} is at an unavailable attempt, not {from_attempt}"
+                ) from error
+            raise
+        if decision != "fail":
             attempts.update_manifest(
                 "pending_retry",
                 pending_retries=attempts.pending_retries(),
                 ambiguous_attempts=attempts.ambiguous_attempts(),
             )
-            return receipt
+        return receipt
 
     def _recovery_inherited_nodes(
         self,
