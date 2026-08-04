@@ -20,6 +20,7 @@ from secrets import token_hex
 from ._safe_io import (
     FileError,
     FileIdentity,
+    _secure_directory_absolute,
     digest_open_file,
     iter_file_chunks,
     lstat_regular_file,
@@ -66,12 +67,13 @@ class _SecureDirectory:
         self.fd = -1
         self._fds: list[int] = []
         self._created: list[tuple[int, str]] = []
+        self._absolute = _secure_directory_absolute(self.path)
 
     def __enter__(self) -> _SecureDirectory:
         if not _secure_directory_supported():
             raise _secure_materialization_error(self.path)
 
-        absolute = self.path.absolute()
+        absolute = self._absolute
         if any(part == ".." for part in absolute.parts):
             raise ValueError(f"Materialization destination must not contain '..': {self.path}")
 
@@ -131,7 +133,7 @@ class _SecureDirectory:
         if self.fd < 0:
             raise RuntimeError("Secure directory is not open")
         try:
-            named = self.path.lstat()
+            named = self._absolute.lstat()
         except FileNotFoundError as caught:
             raise ValueError(
                 f"Materialization destination directory changed: {self.path}"
@@ -264,7 +266,7 @@ def _validated_blob_source(root: Path, digest: str) -> tuple[Path, FileIdentity]
 
 def _reject_symlink_components(path: Path) -> None:
     """Reject a destination containing a symlink before creating anything."""
-    path = Path(path)
+    path = _secure_directory_absolute(Path(path))
     if path.is_absolute():
         current = Path(path.anchor)
         components = path.parts[1:]

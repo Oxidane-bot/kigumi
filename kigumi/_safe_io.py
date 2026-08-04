@@ -18,6 +18,50 @@ FileError: TypeAlias = Callable[[str, Path], BaseException]
 IdentityFactory: TypeAlias = Callable[[os.stat_result], FileIdentity]
 _ORIGINAL_OS_LINK = os.link
 
+# macOS exposes these directories as root-level symlinks.  They are stable
+# system aliases, unlike a symlink introduced anywhere inside a project path.
+# Keep the allowlist explicit: resolving arbitrary path components here would
+# undo the no-follow boundary this module is intended to provide.
+_SYSTEM_DIRECTORY_ALIASES = (
+    (Path("/etc"), Path("/private/etc")),
+    (Path("/tmp"), Path("/private/tmp")),
+    (Path("/var"), Path("/private/var")),
+)
+
+
+def _secure_directory_absolute(path: Path) -> Path:
+    """Return a lexical absolute path with only trusted macOS aliases normalized."""
+    absolute = Path(path).absolute()
+    if os.name != "posix":
+        return absolute
+
+    for alias, canonical in _SYSTEM_DIRECTORY_ALIASES:
+        try:
+            suffix = absolute.relative_to(alias)
+        except ValueError:
+            continue
+
+        try:
+            alias_info = alias.lstat()
+        except FileNotFoundError:
+            return absolute
+        if not stat.S_ISLNK(alias_info.st_mode):
+            return absolute
+
+        try:
+            resolved = alias.resolve(strict=True)
+        except OSError as caught:
+            raise ValueError(
+                f"Secure directory must not contain an untrusted system alias: {alias}"
+            ) from caught
+        if resolved != canonical:
+            raise ValueError(
+                f"Secure directory must not contain an untrusted system alias: {alias}"
+            )
+        return canonical.joinpath(*suffix.parts)
+
+    return absolute
+
 
 def _secure_directory_supported() -> bool:
     """Return whether descriptor-relative no-follow directory I/O is available."""
@@ -67,7 +111,7 @@ class SecureDirectory:
         self.fd = -1
         self._fds: list[int] = []
         self._created: list[tuple[int, str]] = []
-        self._absolute = self.path.absolute()
+        self._absolute = _secure_directory_absolute(self.path)
 
     def __enter__(self) -> SecureDirectory:
         if not _secure_directory_supported():
