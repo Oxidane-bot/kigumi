@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import re
+import textwrap
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -17,7 +19,7 @@ UNDOCUMENTED_EXPORT_ALLOWLIST: set[str] = set()
 
 
 def test_readme_status_versions_match_package_version() -> None:
-    """教训 version_drift:两份入口文档的状态版本必须跟随唯一包版本源。"""
+    """两份入口文档的状态版本必须跟随唯一包版本源，不能静默落后。"""
     version_source = (ROOT / "kigumi" / "_version.py").read_text(encoding="utf-8")
     source_match = re.search(r'^__version__ = "(\d+\.\d+\.\d+)"$', version_source, re.MULTILINE)
     assert source_match is not None
@@ -147,6 +149,87 @@ def test_capability_index_points_only_at_real_symbols() -> None:
         if not hasattr(holder, attribute):
             unresolved.append(token)
     assert not unresolved, "Capability index points at missing symbols:\n" + "\n".join(unresolved)
+
+
+def test_release_workflows_gate_security_and_both_distribution_formats() -> None:
+    """PRs and releases must exercise the same security and artifact contracts."""
+    security = (ROOT / ".github" / "workflows" / "security.yml").read_text(encoding="utf-8")
+    assert re.search(r"^  pull_request:\s*$", security, re.MULTILINE)
+    assert re.search(r"^  workflow_call:\s*$", security, re.MULTILINE)
+
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert re.search(
+        r"^  security:\n    uses: \.\/\.github\/workflows\/security\.yml\s*$",
+        release,
+        re.MULTILINE,
+    )
+    assert re.search(r"^  build:\n    needs: \[quality, test, security\]", release, re.MULTILINE)
+
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
+        assert "uv sync --locked --extra dev" in workflow
+        assert "uv sync --extra dev" not in workflow
+        assert "KIGUMI_DIST_DIR=dist" in workflow
+        assert "dist/*.whl" in workflow
+        assert "dist/*.tar.gz" in workflow
+        assert "scripts/smoke_installed.py" in workflow
+        assert "uv pip check --python" in workflow
+
+    security = (ROOT / ".github" / "workflows" / "security.yml").read_text(encoding="utf-8")
+    assert "uv sync --locked --extra dev" in security
+    assert "uv sync --extra dev" not in security
+
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (ROOT / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8")
+        assert "distribution-smoke:" in workflow
+        assert 'python-version: ["3.11", "3.13"]' in workflow
+        assert 'format: ["wheel", "sdist"]' in workflow
+
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert 'wheel_paths = sorted(Path("dist").glob("kigumi-*.whl"))' in release
+    assert 'sdist_paths = sorted(Path("dist").glob("kigumi-*.tar.gz"))' in release
+    assert "len(wheel_paths) != 1 or len(sdist_paths) != 1" in release
+    assert "len(published) != 2" in release
+    assert "local_paths = wheel_paths + sdist_paths" in release
+
+
+def test_verify_dist_covers_every_shipped_doc() -> None:
+    """发行物校验必须覆盖 ``kigumi docs`` 实际声明的全部页面。"""
+    from kigumi.docs import SHIPPED_DOCS
+
+    spec = importlib.util.spec_from_file_location(
+        "verify_dist_for_test", ROOT / "scripts/verify_dist.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    wheel_docs = set(module.REQUIRED_WHEEL_DOCS)
+    sdist_docs = set(module.REQUIRED_SDIST_DOCS)
+    for doc in SHIPPED_DOCS:
+        assert f"kigumi/{doc.packaged}" in wheel_docs
+        assert doc.source in sdist_docs
+
+
+def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
+    """干净安装 smoke 必须检查所有 shipped docs 和关键 CLI 拒绝路径。"""
+    smoke = (ROOT / "scripts" / "smoke_installed.py").read_text(encoding="utf-8")
+    assert "sysconfig.get_paths()" in smoke
+    assert "for doc in SHIPPED_DOCS" in smoke
+    assert 'run_cli(root, "docs", doc.name)' in smoke
+    assert "def run_cli_failure" in smoke
+    assert 'run_cli_failure(root, "init")' in smoke
+    assert 'run_cli_failure(root, "docs", "not-a-shipped-doc")' in smoke
+    assert 'run_cli_failure(root, "init")' in smoke
+    assert "pyproject_before_repeat" in smoke
+
+
+def test_release_hash_check_is_valid_python() -> None:
+    """release workflow 内嵌的 PyPI hash 校验脚本必须能被标准库编译。"""
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    match = re.search(r"if python - <<'PY'\n(?P<script>.*?)\n          PY", release, re.DOTALL)
+    assert match is not None, "release workflow must contain one inline hash-check script"
+    compile(textwrap.dedent(match.group("script")), "<release hash check>", "exec")
 
 
 def _markdown_link_target(raw_target: str) -> str:

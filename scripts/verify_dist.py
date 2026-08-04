@@ -30,6 +30,7 @@ REQUIRED_WHEEL_DOCS = frozenset(
         "kigumi/docs/adoption.md",
         "kigumi/docs/api.md",
         "kigumi/docs/cli.md",
+        "kigumi/docs/recovery.md",
         "kigumi/docs/contracts/README.md",
     }
 )
@@ -42,6 +43,7 @@ REQUIRED_SDIST_DOCS = frozenset(
         "docs/adoption.md",
         "docs/api.md",
         "docs/cli.md",
+        "docs/recovery.md",
         "docs/contracts/README.md",
     }
 )

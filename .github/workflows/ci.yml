@@ -15,7 +15,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      - run: uv sync --extra dev --python 3.13
+      - run: uv sync --locked --extra dev --python 3.13
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
@@ -33,24 +33,62 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
       - run: uv run pytest -q
 
   build:
     needs: [quality, test]
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
+      - run: uv sync --locked --extra dev --python 3.13
       - run: uv build
       - id: version
         run: echo "version=$(uv run python -c 'import kigumi; print(kigumi.__version__)')" >> "$GITHUB_OUTPUT"
       - run: uv run python scripts/verify_dist.py --expected-version "${{ steps.version.outputs.version }}"
-      - name: Smoke wheel in a fresh environment
+      - name: Verify source and distribution release identity
+        run: KIGUMI_DIST_DIR=dist uv run pytest -q tests/test_version.py tests/test_docs.py tests/test_schema_consistency.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/kigumi-*.whl
+            dist/kigumi-*.tar.gz
+          if-no-files-found: error
+
+  distribution-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+        format: ["wheel", "sdist"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install and smoke ${{ matrix.format }}
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
         run: |
-          uv venv --python 3.13 .dist-venv
-          uv pip install --python .dist-venv/bin/python dist/*.whl
-          KIGUMI_EXPECTED_VERSION="${{ steps.version.outputs.version }}" \
-            .dist-venv/bin/python scripts/smoke_installed.py
+          venv_dir=".dist-${{ matrix.python-version }}-${{ matrix.format }}-venv"
+          uv venv --python "${{ matrix.python-version }}" "$venv_dir"
+          if [ "${{ matrix.format }}" = "wheel" ]; then
+            uv pip install --python "$venv_dir/bin/python" dist/*.whl
+          else
+            uv pip install --python "$venv_dir/bin/python" dist/*.tar.gz
+          fi
+          uv pip check --python "$venv_dir/bin/python"
+          KIGUMI_EXPECTED_VERSION="$EXPECTED_VERSION" \
+            "$venv_dir/bin/python" scripts/smoke_installed.py

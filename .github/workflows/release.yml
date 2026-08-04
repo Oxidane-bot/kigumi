@@ -17,7 +17,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
-      - run: uv sync --extra dev --python 3.13
+      - run: uv sync --locked --extra dev --python 3.13
       - name: Verify annotated tag
         run: |
           git fetch --force origin \
@@ -48,11 +48,16 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
       - run: uv run pytest -q
 
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+
   build:
-    needs: [quality, test]
+    needs: [quality, test, security]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -61,24 +66,55 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.13"
+      - run: uv sync --locked --extra dev --python 3.13
       - run: uv build
       - id: version
         run: echo "version=$(uv run python -c 'import kigumi; print(kigumi.__version__)')" >> "$GITHUB_OUTPUT"
       - run: uv run python scripts/verify_dist.py --expected-version "${{ steps.version.outputs.version }}"
-      - name: Smoke wheel in a fresh environment
-        run: |
-          uv venv --python 3.13 .dist-venv
-          uv pip install --python .dist-venv/bin/python dist/*.whl
-          KIGUMI_EXPECTED_VERSION="${{ steps.version.outputs.version }}" \
-            .dist-venv/bin/python scripts/smoke_installed.py
+      - name: Verify source and distribution release identity
+        run: KIGUMI_DIST_DIR=dist uv run pytest -q tests/test_version.py tests/test_docs.py tests/test_schema_consistency.py
       - uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/
+          path: |
+            dist/kigumi-*.whl
+            dist/kigumi-*.tar.gz
           if-no-files-found: error
 
+  distribution-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+        format: ["wheel", "sdist"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install and smoke ${{ matrix.format }}
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          venv_dir=".dist-${{ matrix.python-version }}-${{ matrix.format }}-venv"
+          uv venv --python "${{ matrix.python-version }}" "$venv_dir"
+          if [ "${{ matrix.format }}" = "wheel" ]; then
+            uv pip install --python "$venv_dir/bin/python" dist/*.whl
+          else
+            uv pip install --python "$venv_dir/bin/python" dist/*.tar.gz
+          fi
+          uv pip check --python "$venv_dir/bin/python"
+          KIGUMI_EXPECTED_VERSION="$EXPECTED_VERSION" \
+            "$venv_dir/bin/python" scripts/smoke_installed.py
+
   publish:
-    needs: [quality, test, build]
+    needs: [quality, test, build, distribution-smoke]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -117,11 +153,26 @@ jobs:
           version = os.environ["VERSION"]
           with urllib.request.urlopen(f"https://pypi.org/pypi/kigumi/{version}/json", timeout=30) as response:
               payload = json.load(response)
-          published = {item["filename"]: item["digests"]["sha256"] for item in payload["urls"]}
+          wheel_paths = sorted(Path("dist").glob("kigumi-*.whl"))
+          sdist_paths = sorted(Path("dist").glob("kigumi-*.tar.gz"))
+          if len(wheel_paths) != 1 or len(sdist_paths) != 1:
+              raise SystemExit(
+                  "local dist must contain exactly one kigumi wheel and one sdist: "
+                  f"wheels={wheel_paths} sdists={sdist_paths}"
+              )
+          local_paths = wheel_paths + sdist_paths
+          local_names = {path.name for path in local_paths}
+          published = {
+              item["filename"]: item["digests"]["sha256"]
+              for item in payload["urls"]
+          }
+          if len(published) != 2 or set(published) != local_names:
+              raise SystemExit(
+                  "PyPI release must expose exactly one wheel and one sdist: "
+                  f"published={sorted(published)}"
+              )
           local = {
-              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in Path("dist").iterdir()
-              if path.is_file()
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in local_paths
           }
           if published != local:
               raise SystemExit(f"PyPI/local hash mismatch: published={published} local={local}")
@@ -134,6 +185,7 @@ jobs:
         run: |
           uv venv --python 3.13 .pypi-venv
           uv pip install --python .pypi-venv/bin/python "kigumi==$VERSION"
+          uv pip check --python .pypi-venv/bin/python
           KIGUMI_EXPECTED_VERSION="$VERSION" .pypi-venv/bin/python scripts/smoke_installed.py
 
   github-release:
@@ -159,7 +211,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" dist/kigumi-*.whl dist/kigumi-*.tar.gz \
             --title "Kigumi $VERSION" \
             --notes-file /tmp/release-notes.md \
             --verify-tag
