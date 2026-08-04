@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import email
+import re
 import sys
 import tarfile
 import zipfile
 from pathlib import Path
 
-EXPECTED_RUNTIME_DEPENDENCIES = frozenset({"pydantic", "litellm", "pytest", "ruff"})
+EXPECTED_RUNTIME_DEPENDENCIES = frozenset({"pydantic"})
+EXPECTED_OPTIONAL_DEPENDENCIES = frozenset({"litellm", "pytest", "ruff"})
+EXPECTED_DEPENDENCIES = EXPECTED_RUNTIME_DEPENDENCIES | EXPECTED_OPTIONAL_DEPENDENCIES
 EXPECTED_EXTRAS = frozenset({"dev", "litellm"})
+EXTRA_MARKER = re.compile(r"\bextra\s*(?:==|!=|in\b|not\s+in\b)", re.IGNORECASE)
 REQUIRED_RESOURCES = frozenset(
     {
         "kigumi/_pi_bridge.ts",
@@ -56,6 +60,11 @@ def _dependency_name(requirement: str) -> str:
     return requirement.strip().lower().replace("_", "-")
 
 
+def _is_extra_dependency(requirement: str) -> bool:
+    marker = requirement.partition(";")[2]
+    return bool(EXTRA_MARKER.search(marker))
+
+
 def verify(dist: Path, expected_version: str) -> None:
     wheels = sorted(dist.glob("kigumi-*.whl"))
     sdists = sorted(dist.glob("kigumi-*.tar.gz"))
@@ -69,19 +78,12 @@ def verify(dist: Path, expected_version: str) -> None:
         if missing:
             raise RuntimeError(f"wheel is missing resources: {sorted(missing)}")
         _reject_acp(wheel_names, "wheel")
-        metadata_name = next(name for name in wheel_names if name.endswith(".dist-info/METADATA"))
+        metadata_names = [name for name in wheel_names if name.endswith(".dist-info/METADATA")]
+        if len(metadata_names) != 1:
+            raise RuntimeError(f"expected one wheel METADATA, found {len(metadata_names)}")
+        metadata_name = metadata_names[0]
         metadata = email.message_from_bytes(archive.read(metadata_name))
-        if metadata["Version"] != expected_version:
-            raise RuntimeError(f"wheel version {metadata['Version']!r} != {expected_version!r}")
-        dependencies = {
-            _dependency_name(requirement) for requirement in metadata.get_all("Requires-Dist", [])
-        }
-        unexpected_dependencies = dependencies - EXPECTED_RUNTIME_DEPENDENCIES
-        if unexpected_dependencies:
-            raise RuntimeError(f"unexpected Python dependencies: {sorted(unexpected_dependencies)}")
-        extras = set(metadata.get_all("Provides-Extra", []))
-        if not extras <= EXPECTED_EXTRAS or any("acp" in extra.lower() for extra in extras):
-            raise RuntimeError(f"unexpected extras: {sorted(extras)}")
+        _verify_metadata(metadata, expected_version, "wheel")
 
     with tarfile.open(sdists[0], "r:gz") as archive:
         members = archive.getmembers()
@@ -100,13 +102,38 @@ def verify(dist: Path, expected_version: str) -> None:
         if metadata_file is None:
             raise RuntimeError("sdist PKG-INFO is not readable")
         metadata = email.message_from_binary_file(metadata_file)
-        if metadata["Name"] != "kigumi" or metadata["Version"] != expected_version:
-            raise RuntimeError(
-                "sdist metadata identity mismatch: "
-                f"Name={metadata['Name']!r}, Version={metadata['Version']!r}, "
-                f"expected Name='kigumi', Version={expected_version!r}"
-            )
+        _verify_metadata(metadata, expected_version, "sdist")
         _reject_acp(sdist_names, "sdist")
+
+
+def _verify_metadata(metadata: email.message.Message, expected_version: str, kind: str) -> None:
+    name = metadata["Name"]
+    if name != "kigumi":
+        raise RuntimeError(f"{kind} metadata Name {name!r} != 'kigumi'")
+    version = metadata["Version"]
+    if version != expected_version:
+        raise RuntimeError(f"{kind} metadata Version {version!r} != {expected_version!r}")
+
+    requirements = metadata.get_all("Requires-Dist", [])
+    runtime_dependencies = {
+        _dependency_name(requirement)
+        for requirement in requirements
+        if not _is_extra_dependency(requirement)
+    }
+    if runtime_dependencies != EXPECTED_RUNTIME_DEPENDENCIES:
+        raise RuntimeError(
+            f"{kind} runtime dependencies {sorted(runtime_dependencies)} != "
+            f"{sorted(EXPECTED_RUNTIME_DEPENDENCIES)}"
+        )
+    dependencies = {_dependency_name(requirement) for requirement in requirements}
+    if dependencies != EXPECTED_DEPENDENCIES:
+        raise RuntimeError(
+            f"{kind} Python dependencies {sorted(dependencies)} != {sorted(EXPECTED_DEPENDENCIES)}"
+        )
+
+    extras = set(metadata.get_all("Provides-Extra", []))
+    if extras != EXPECTED_EXTRAS:
+        raise RuntimeError(f"{kind} extras {sorted(extras)} != {sorted(EXPECTED_EXTRAS)}")
 
 
 def _verify_artifact_names(wheel: Path, sdist: Path, expected_version: str) -> None:

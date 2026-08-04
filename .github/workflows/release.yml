@@ -227,6 +227,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: dist
@@ -237,6 +240,15 @@ jobs:
             'index($0, heading) == 1 {emit=1; next} /^## \[/{emit=0} emit' \
             CHANGELOG.md > /tmp/release-notes.md
           test -s /tmp/release-notes.md
+      - name: Re-verify release tag points at event commit
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --force origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          tag_ref="refs/tags/$GITHUB_REF_NAME"
+          test "$(git cat-file -t "$tag_ref")" = "tag"
+          tag_commit="$(git rev-parse "$tag_ref^{}")"
+          test "$tag_commit" = "$GITHUB_SHA"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import email
 import importlib.util
 import re
 import subprocess
@@ -196,6 +197,17 @@ def test_release_workflows_gate_security_and_both_distribution_formats() -> None
     assert "local_paths = wheel_paths + sdist_paths" in release
 
 
+def test_github_release_rechecks_event_sha_against_peeled_tag() -> None:
+    """The final release job must close the mutable-tag window left by quality."""
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    github_release = release.split("\n  github-release:\n", 1)[1]
+
+    assert "ref: ${{ github.sha }}" in github_release
+    assert "git fetch --force origin" in github_release
+    assert 'tag_commit="$(git rev-parse "$tag_ref^{}")"' in github_release
+    assert 'test "$tag_commit" = "$GITHUB_SHA"' in github_release
+
+
 def test_locked_uv_workflows_require_a_tracked_lockfile() -> None:
     """干净 git archive 也必须能执行所有 ``--locked`` workflow 步骤。"""
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
@@ -272,6 +284,50 @@ def test_verify_dist_rejects_wrong_unique_artifact_names() -> None:
             ROOT / "kigumi-0.12.0.tar.gz",
             "0.13.0",
         )
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_verify_dist_requires_exact_package_metadata_contract(kind: str) -> None:
+    """Both artifact metadata forms must carry the package's complete identity contract."""
+    spec = importlib.util.spec_from_file_location(
+        f"verify_dist_metadata_for_{kind}_test", ROOT / "scripts/verify_dist.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    metadata = email.message_from_string(
+        "\n".join(
+            [
+                "Name: kigumi",
+                "Version: 0.13.0",
+                "Requires-Dist: pydantic>=2.7",
+                "Provides-Extra: dev",
+                "Requires-Dist: pytest>=8.0; extra == 'dev'",
+                "Requires-Dist: ruff==0.16.0; extra == 'dev'",
+                "Provides-Extra: litellm",
+                "Requires-Dist: litellm>=1.60; extra == 'litellm'",
+                "",
+            ]
+        )
+    )
+    module._verify_metadata(metadata, "0.13.0", kind)
+
+    missing_name = email.message_from_string(metadata.as_string().replace("Name: kigumi", ""))
+    with pytest.raises(RuntimeError, match=rf"{kind} metadata Name"):
+        module._verify_metadata(missing_name, "0.13.0", kind)
+
+    missing_runtime = email.message_from_string(
+        metadata.as_string().replace("Requires-Dist: pydantic>=2.7\n", "")
+    )
+    with pytest.raises(RuntimeError, match=rf"{kind} runtime dependencies"):
+        module._verify_metadata(missing_runtime, "0.13.0", kind)
+
+    missing_extra = email.message_from_string(
+        metadata.as_string().replace("Provides-Extra: litellm\n", "")
+    )
+    with pytest.raises(RuntimeError, match=rf"{kind} extras"):
+        module._verify_metadata(missing_extra, "0.13.0", kind)
 
 
 def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
