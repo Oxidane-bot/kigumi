@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 import shutil
 import stat
@@ -23,6 +25,7 @@ from .errors import OutputOwnershipError
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
 _NODE_CACHE_ENVELOPE_SCHEMA = 3
+_ROLLBACK_MARKER_NAME = "rollback.json"
 _ORIGIN_PROVENANCE_FIELDS = (
     "artifact_sha256",
     "kind",
@@ -221,13 +224,57 @@ def _read_node_cache_envelope(
         return CacheLookup(
             "CORRUPT", None, None, None, "node cache file must reference a regular file"
         )
+
     try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
+        nofollow = os.O_NOFOLLOW
+    except AttributeError:
+        return CacheLookup(
+            "CORRUPT", None, None, None, "node cache requires no-follow descriptor I/O"
+        )
+
+    descriptor = -1
+    try:
+        with _SecureDirectory(path.parent, create=False) as cache_directory:
+            cache_directory.verify_bound()
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | nofollow
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                descriptor = os.open(path.name, flags, dir_fd=cache_directory.fd)
+            except FileNotFoundError:
+                return CacheLookup(
+                    "CORRUPT", None, None, None, "node cache file changed during read"
+                )
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    return CacheLookup("CORRUPT", None, None, None, "node cache file is a symlink")
+                return CacheLookup(
+                    "CORRUPT", None, None, None, f"node cache file open failed: {error}"
+                )
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                return CacheLookup(
+                    "CORRUPT", None, None, None, "node cache file must reference a regular file"
+                )
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                return CacheLookup(
+                    "CORRUPT", None, None, None, "node cache file changed during read"
+                )
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
+                descriptor = -1
+                payload = json.load(handle)
     except FileNotFoundError:
         return CacheLookup("CORRUPT", None, None, None, "node cache file changed during read")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         return CacheLookup("CORRUPT", None, None, None, f"node cache JSON read failed: {error}")
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
     if not isinstance(payload, dict):
         return CacheLookup("CORRUPT", None, None, None, "node cache JSON is not an object")
     if payload.get("cache_schema") != _NODE_CACHE_ENVELOPE_SCHEMA:
@@ -237,6 +284,10 @@ def _read_node_cache_envelope(
             None,
             None,
             f"node cache schema is not {_NODE_CACHE_ENVELOPE_SCHEMA}",
+        )
+    if payload.get("cache_key") != cache_key:
+        return CacheLookup(
+            "CORRUPT", None, None, None, "node cache envelope is bound to a different cache key"
         )
     artifact = payload.get("artifact")
     origin = payload.get("origin_provenance")
@@ -283,6 +334,7 @@ def write_node_cache(
         node_cache_path(artifacts_path, cache_key),
         {
             "cache_schema": _NODE_CACHE_ENVELOPE_SCHEMA,
+            "cache_key": cache_key,
             "artifact_sha256": artifact_sha256,
             "origin_sha256": sha(origin_provenance),
             "artifact": artifact,
@@ -422,7 +474,8 @@ def materialize_artifact(
 
 def _commit_staged_outputs(staged_outputs: list[tuple[Path, Path]], staging_root: Path) -> None:
     """Replace all staged outputs through bound directories, restoring prior paths on failure."""
-    rollback_root = Path(tempfile.mkdtemp(prefix=".kigumi-rollback-", dir=staging_root))
+    rollback_root = Path(tempfile.mkdtemp(prefix=".kigumi-rollback-", dir=staging_root.parent))
+    keep_rollback_root = False
     changes: list[tuple[_SecureDirectory, str, str | None, bool]] = []
     try:
         with ExitStack() as directories:
@@ -472,10 +525,15 @@ def _commit_staged_outputs(staged_outputs: list[tuple[Path, Path]], staging_root
                     )
                     changes[-1] = (destination_directory, destination_name, backup_name, True)
             except BaseException:
-                _rollback_staged_outputs(changes, rollback_directory, destination_directories)
+                try:
+                    _rollback_staged_outputs(changes, rollback_directory, destination_directories)
+                except BaseException:
+                    keep_rollback_root = True
+                    raise
                 raise
     finally:
-        shutil.rmtree(rollback_root, ignore_errors=True)
+        if not keep_rollback_root:
+            shutil.rmtree(rollback_root)
 
 
 def _rollback_staged_outputs(
@@ -484,19 +542,26 @@ def _rollback_staged_outputs(
     destination_directories: list[_SecureDirectory],
 ) -> None:
     """Undo committed replacements and remove directories created for staging targets."""
+    failures: list[BaseException] = []
     try:
         for destination_directory, destination_name, backup_name, installed in reversed(changes):
             if installed:
-                with suppress(FileNotFoundError):
+                try:
                     destination_directory.unlink(destination_name)
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    failures.append(error)
             if backup_name is not None:
-                with suppress(FileNotFoundError):
+                try:
                     _rename_at(
                         backup_name,
                         destination_name,
                         source_directory=rollback_directory,
                         destination_directory=destination_directory,
                     )
+                except BaseException as error:
+                    failures.append(error)
     finally:
         # A failed materialization must not leave directories that it created solely for outputs.
         seen: set[int] = set()
@@ -505,6 +570,30 @@ def _rollback_staged_outputs(
             if identity not in seen:
                 destination_directory.remove_created()
                 seen.add(identity)
+    if failures:
+        marker = rollback_directory.path / _ROLLBACK_MARKER_NAME
+        marker_payload = {
+            "state": "recovery_required",
+            "rollback_root": str(rollback_directory.path),
+            "changes": [
+                {
+                    "destination": str(destination_directory.path / destination_name),
+                    "backup": backup_name,
+                    "installed": installed,
+                }
+                for destination_directory, destination_name, backup_name, installed in changes
+            ],
+            "errors": [str(error) for error in failures],
+        }
+        try:
+            atomic_write_json(marker, marker_payload)
+        except BaseException as marker_error:
+            failures.append(marker_error)
+        detail = "; ".join(str(error) for error in failures)
+        raise OSError(
+            "Materialization rollback failed "
+            f"({detail}); recovery required at {rollback_directory.path}"
+        )
 
 
 def _output_destination(
