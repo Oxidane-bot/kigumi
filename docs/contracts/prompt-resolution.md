@@ -35,7 +35,7 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
    或未知值在 L3 lookup、CALL、Agent spawn、文件物化和其他副作用前失败。
 6. material 必须经 `inject()` 定界；没有 raw material、隐式 override、默认 variant、嵌套
    fragment、宏、Jinja 或模型生成 variant。首版只组合单个文本 Prompt；chat message list
-   保持 legacy/unmanaged。
+   保持 unmanaged direct-chat 语义，不把它当作 PromptSpec 的兼容层。
 7. 节点只能通过 `prompt_specs=()` 声明 Prompt；节点内 `ctx.resolve_prompt()` 返回 managed
    `ResolvedPrompt`。字符串直接传给 `ctx.call()` 或作为 Agent instruction 标记为 unmanaged，
    应当豁免或迁移到 `PromptSpec`。
