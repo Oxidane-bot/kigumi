@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -264,6 +265,40 @@ def test_runtime_profile_rejects_unsupported_receipt_schema(
     path.write_text(json.dumps(value), encoding="utf-8")
 
     with pytest.raises(WorkflowProfileError, match="schema|receipt|corrupt"):
+        dag.profile(result.run_id)
+
+
+@pytest.mark.parametrize("kind", ["symlink_dir", "fifo", "invalid_json"])
+def test_runtime_profile_failure_receipts_are_owned_nonblocking_and_fail_closed(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Failure profiles must not follow external trees or block on special files."""
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO is not supported on this platform")
+
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ok"}
+
+    result = dag.run(run_id=f"profile-failures-{kind}")
+    run = tmp_path / "artifacts" / "runs" / result.run_id
+    failures = run / "failures"
+    failures.mkdir()
+    if kind == "symlink_dir":
+        external = tmp_path / "external-failures"
+        external.mkdir()
+        failures.rmdir()
+        failures.symlink_to(external, target_is_directory=True)
+    elif kind == "fifo":
+        os.mkfifo(failures / "work.json")
+    else:
+        (failures / "work.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(WorkflowProfileError, match="failure|owned|invalid"):
         dag.profile(result.run_id)
 
 

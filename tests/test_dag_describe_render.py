@@ -264,6 +264,28 @@ def test_render_mermaid_uses_run_sidecars_for_item_counts(tmp_path: Path) -> Non
         dag.render_mermaid("missing")
 
 
+def test_check_rejects_symlinked_declared_file_like_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Static check must reject the same symlinked input that plan rejects."""
+    dag = _make_dag(tmp_path)
+    outside = tmp_path / "outside-input.txt"
+    outside.write_text("external", encoding="utf-8")
+    declared = tmp_path / "input.txt"
+    declared.symlink_to(outside)
+
+    @dag.node("reader", files=("input.txt",))
+    def reader(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "unused"}
+
+    assert dag._cli_check(None) == 1
+    assert "invalid declared file input.txt" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        dag.plan()
+
+
 def test_render_mermaid_rejects_a_symlinked_run_root(tmp_path: Path) -> None:
     dag = _make_dag(tmp_path)
 
@@ -376,7 +398,11 @@ def test_render_mermaid_rejects_symlinked_attempt_state(tmp_path: Path, scope: s
         dag.render_mermaid(result.run_id)
 
 
-def test_render_mermaid_marks_pending_checkpoint_and_skipped_descendants(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pending_file_state", ["present", "missing", "corrupt"])
+def test_render_mermaid_marks_pending_checkpoint_and_skipped_descendants(
+    tmp_path: Path,
+    pending_file_state: str,
+) -> None:
     """教训 graph_pending: 挂起与被跳过节点也必须在运行图中可见。"""
     dag = _make_dag(tmp_path)
 
@@ -396,6 +422,13 @@ def test_render_mermaid_marks_pending_checkpoint_and_skipped_descendants(tmp_pat
         return {"published": 1}
 
     result = dag.run(run_id="pending-graph")
+    pending_path = (
+        tmp_path / "artifacts" / "runs" / result.run_id / "approvals" / "editor.pending.json"
+    )
+    if pending_file_state == "missing":
+        pending_path.unlink()
+    elif pending_file_state == "corrupt":
+        pending_path.write_text("{", encoding="utf-8")
     rendered = dag.render_mermaid(result.run_id)
 
     assert result.pending_checkpoints == ["editor"]

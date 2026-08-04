@@ -3656,6 +3656,21 @@ class Dag:
             pending_names = set()
         except (OSError, RunManifestError, ValueError) as error:
             raise ValueError(f"Run {run_id!r} has an unowned approvals directory") from error
+        checkpoint_pending_nodes = {
+            str(state["target"]).partition("@")[0]
+            for state in states
+            if state.get("status") == "checkpoint_pending" and isinstance(state.get("target"), str)
+        }
+        # The attempt receipt is the durable source of truth for a pending
+        # checkpoint. The approval payload is useful for naming, but a
+        # missing or corrupt payload must not make a durable pending node
+        # disappear from a read-only graph rendering.
+        pending_names.update(
+            str(state["checkpoint"])
+            for state in states
+            if state.get("status") == "checkpoint_pending"
+            and isinstance(state.get("checkpoint"), str)
+        )
         pending_nodes = {
             name
             for name, node in self._nodes.items()
@@ -3665,6 +3680,7 @@ class Dag:
                 for pending_name in pending_names
             )
         }
+        pending_nodes.update(checkpoint_pending_nodes)
         attempt_states: dict[str, list[dict[str, Any]]] = {}
         for state in states:
             target_name = state.get("target")
@@ -3746,8 +3762,26 @@ class Dag:
         ]
         for name, node in self._nodes.items():
             for declared_path in node.files:
-                if not self.config.resolve(declared_path).is_file():
+                lexical_path = Path(
+                    os.path.abspath(
+                        declared_path
+                        if Path(declared_path).is_absolute()
+                        else self.config.project_root / declared_path
+                    )
+                )
+                try:
+                    with open_regular_file(
+                        lexical_path,
+                        identity=_dag_file_identity,
+                        expected_identity=None,
+                        phase="during check",
+                        error=_dag_file_error,
+                    ):
+                        pass
+                except FileNotFoundError:
                     errors.append(f"{name}: missing declared file {declared_path}")
+                except (OSError, ValueError) as error:
+                    errors.append(f"{name}: invalid declared file {declared_path}: {error}")
         if guard_error is not None:
             errors.append(f"source: {guard_error}")
         try:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +12,9 @@ from ._runstate import (
     RUN_MANIFEST_SCHEMA,
     RUN_SIDECAR_SCHEMA,
     SUCCESS_CANDIDATE_SCHEMA,
+    AttemptStore,
     DurableRunSnapshot,
     RunManifestError,
-    validate_durable_run,
     validate_run_path,
 )
 from .artifacts import sha
@@ -29,12 +28,42 @@ class WorkflowProfileError(RuntimeError):
     """Raised when a WorkflowProfile or durable receipt fails closed."""
 
 
-def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
+def _validate_run_integrity(run_path: Path) -> tuple[DurableRunSnapshot, AttemptStore]:
     """Validate the one shared durable snapshot used by all read surfaces."""
     try:
         validate_run_path(run_path)
-        return validate_durable_run(run_path)
-    except (AmbiguousAttemptError, RunManifestError) as error:
+        # Keep the descriptor-bound store alive for the rest of this profile
+        # read.  Re-opening ``failures`` by path after validation would let a
+        # concurrent run-directory replacement select a different tree.
+        attempts = AttemptStore(run_path, {})
+        manifest_path = run_path / "_run.json"
+        manifest, corrupted = attempts._read_owned_json(manifest_path)  # noqa: SLF001
+        if corrupted:
+            raise attempts._owned_integrity_error(  # noqa: SLF001
+                manifest_path,
+                RUN_MANIFEST_SCHEMA,
+            )
+        if manifest is None:
+            raise RunManifestError(f"Missing or invalid run manifest: {manifest_path}")
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise RunManifestError(f"Run {run_path.name!r} has an unsupported manifest schema")
+        validated_manifest = attempts._required_manifest()  # noqa: SLF001
+        states = attempts._validate_all_attempt_receipts()  # noqa: SLF001
+        candidates, materializations = attempts._validate_run_materializations(  # noqa: SLF001
+            states,
+            manifest=validated_manifest,
+        )
+        return (
+            DurableRunSnapshot(
+                validated_manifest,
+                tuple(states),
+                candidates,
+                materializations,
+                True,
+            ),
+            attempts,
+        )
+    except (AmbiguousAttemptError, OSError, RunManifestError, ValueError) as error:
         raise WorkflowProfileError(
             f"Run {run_path.name!r} durable receipt integrity validation failed: {error}"
         ) from error
@@ -53,7 +82,11 @@ def load_run_profile(
         raise WorkflowProfileError(
             f"Run {run_path.name!r} durable path ownership validation failed: {error}"
         ) from error
-    snapshot = _snapshot or _validate_run_integrity(run_path)
+    if _snapshot is not None:
+        snapshot = _snapshot
+        attempts = AttemptStore(run_path, {})
+    else:
+        snapshot, attempts = _validate_run_integrity(run_path)
     if not snapshot.strict:
         raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
     manifest = snapshot.manifest
@@ -74,20 +107,24 @@ def load_run_profile(
         include_content=include_content,
         materializations=snapshot.materializations if snapshot.strict else None,
     )
-    attempts = _attempts(
+    attempt_entries = _attempts(
         run_path,
         include_content=include_content,
         states=snapshot.states if snapshot.strict else None,
         candidates=snapshot.candidates if snapshot.strict else None,
     )
-    failures = _failures(run_path, include_content=include_content)
+    failures = _failures(
+        run_path,
+        include_content=include_content,
+        attempts=attempts,
+    )
     result = copy.deepcopy(static)
     result["mode"] = "run"
     result["resolution_status"] = "available"
     _attach_runtime_prompt_resolutions(
         result.get("prompts"),
         runtime_nodes,
-        attempts,
+        attempt_entries,
     )
     result["run"] = {
         "run_id": run_path.name,
@@ -95,15 +132,17 @@ def load_run_profile(
         "resume_count": manifest.get("resume_count", 0),
         "last_resumed_at": manifest.get("last_resumed_at"),
         "nodes": runtime_nodes,
-        "attempts": attempts,
+        "attempts": attempt_entries,
         "failures": failures,
         "pending_retries": [
             copy.deepcopy(attempt)
-            for attempt in attempts
+            for attempt in attempt_entries
             if attempt.get("status") == "retry_scheduled"
         ],
         "ambiguous_attempts": [
-            copy.deepcopy(attempt) for attempt in attempts if attempt.get("status") == "ambiguous"
+            copy.deepcopy(attempt)
+            for attempt in attempt_entries
+            if attempt.get("status") == "ambiguous"
         ],
     }
     return result
@@ -304,19 +343,14 @@ def _attempts(
     candidates: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
+    if states is None or candidates is None:
+        raise WorkflowProfileError("Runtime attempts require a validated durable snapshot")
     state_entries = (
         (
-            (
-                run_path / "attempts" / sha(str(state["target"])) / "state.json",
-                state,
-            )
-            for state in states
+            run_path / "attempts" / sha(str(state["target"])) / "state.json",
+            state,
         )
-        if states is not None
-        else (
-            (path, _read_object(path))
-            for path in sorted((run_path / "attempts").glob("*/state.json"))
-        )
+        for state in states
     )
     for path, state in state_entries:
         if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
@@ -332,11 +366,7 @@ def _attempts(
         candidate_file = state.get("candidate_file")
         candidate_calls: list[dict[str, Any]] = []
         if candidate_file is not None:
-            candidate = (
-                candidates.get(target)
-                if candidates is not None
-                else _read_object(path.parent / str(candidate_file))
-            )
+            candidate = candidates.get(target)
             if candidate is None:
                 raise WorkflowProfileError(f"Success candidate for {target!r} is missing")
             if (
@@ -380,10 +410,28 @@ def _attempts(
     return attempts
 
 
-def _failures(run_path: Path, *, include_content: bool) -> list[dict[str, Any]]:
+def _failures(
+    run_path: Path,
+    *,
+    include_content: bool,
+    attempts: AttemptStore,
+) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
-    for path in sorted((run_path / "failures").glob("*.json")):
-        receipt = _read_object(path)
+    failures_root = run_path / "failures"
+    try:
+        names = attempts._owned_names(failures_root)  # noqa: SLF001
+    except FileNotFoundError:
+        return failures
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} failures directory is not an owned durable path: {error}"
+        ) from error
+
+    for name in sorted(name for name in names if name.endswith(".json")):
+        path = failures_root / name
+        receipt, corrupted = attempts._read_owned_json(path)  # noqa: SLF001
+        if corrupted or receipt is None:
+            raise WorkflowProfileError(f"Missing or invalid JSON failure receipt: {path}")
         if receipt.get("failure_schema") != FAILURE_SCHEMA:
             raise WorkflowProfileError(f"Failure receipt {path} has unsupported schema")
         resolution = receipt.get("prompt_resolution")
@@ -526,16 +574,6 @@ def _validate_resolution(value: Any, context: str) -> None:
         validate_prompt_resolution_record(value)
     except PromptResolutionError as error:
         raise WorkflowProfileError(f"Prompt resolution for {context}: {error}") from error
-
-
-def _read_object(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
-        raise WorkflowProfileError(f"Missing or invalid JSON receipt: {path}") from error
-    if not isinstance(value, dict):
-        raise WorkflowProfileError(f"JSON receipt must be an object: {path}")
-    return value
 
 
 def _markdown_text(value: Any) -> str:
