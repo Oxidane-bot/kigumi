@@ -61,6 +61,7 @@ def verify(dist: Path, expected_version: str) -> None:
     sdists = sorted(dist.glob("kigumi-*.tar.gz"))
     if len(wheels) != 1 or len(sdists) != 1:
         raise RuntimeError(_dist_layout_error(dist, expected_version, wheels, sdists))
+    _verify_artifact_names(wheels[0], sdists[0], expected_version)
 
     with zipfile.ZipFile(wheels[0]) as archive:
         wheel_names = set(archive.namelist())
@@ -83,7 +84,8 @@ def verify(dist: Path, expected_version: str) -> None:
             raise RuntimeError(f"unexpected extras: {sorted(extras)}")
 
     with tarfile.open(sdists[0], "r:gz") as archive:
-        sdist_names = {member.name for member in archive.getmembers()}
+        members = archive.getmembers()
+        sdist_names = {member.name for member in members}
         missing = {
             resource
             for resource in REQUIRED_RESOURCES | REQUIRED_SDIST_DOCS
@@ -91,7 +93,33 @@ def verify(dist: Path, expected_version: str) -> None:
         }
         if missing:
             raise RuntimeError(f"sdist is missing resources: {sorted(missing)}")
+        metadata_members = [member for member in members if member.name.endswith("/PKG-INFO")]
+        if len(metadata_members) != 1:
+            raise RuntimeError(f"expected one sdist PKG-INFO, found {len(metadata_members)}")
+        metadata_file = archive.extractfile(metadata_members[0])
+        if metadata_file is None:
+            raise RuntimeError("sdist PKG-INFO is not readable")
+        metadata = email.message_from_binary_file(metadata_file)
+        if metadata["Name"] != "kigumi" or metadata["Version"] != expected_version:
+            raise RuntimeError(
+                "sdist metadata identity mismatch: "
+                f"Name={metadata['Name']!r}, Version={metadata['Version']!r}, "
+                f"expected Name='kigumi', Version={expected_version!r}"
+            )
         _reject_acp(sdist_names, "sdist")
+
+
+def _verify_artifact_names(wheel: Path, sdist: Path, expected_version: str) -> None:
+    expected_wheel_prefix = f"kigumi-{expected_version}-"
+    expected_sdist_name = f"kigumi-{expected_version}.tar.gz"
+    if not wheel.name.startswith(expected_wheel_prefix) or not wheel.name.endswith(".whl"):
+        raise RuntimeError(
+            f"unexpected wheel filename {wheel.name!r}; expected prefix {expected_wheel_prefix!r}"
+        )
+    if sdist.name != expected_sdist_name:
+        raise RuntimeError(
+            f"unexpected sdist filename {sdist.name!r}; expected {expected_sdist_name!r}"
+        )
 
 
 def _reject_acp(names: set[str], kind: str) -> None:

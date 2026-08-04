@@ -7,6 +7,8 @@ import textwrap
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import pytest
+
 import kigumi
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -253,6 +255,23 @@ def test_verify_dist_covers_every_shipped_doc() -> None:
     for doc in SHIPPED_DOCS:
         assert f"kigumi/{doc.packaged}" in wheel_docs
         assert doc.source in sdist_docs
+
+
+def test_verify_dist_rejects_wrong_unique_artifact_names() -> None:
+    """A single stale artifact must not pass the standalone release verifier."""
+    spec = importlib.util.spec_from_file_location(
+        "verify_dist_names_for_test", ROOT / "scripts/verify_dist.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises(RuntimeError, match="unexpected sdist filename"):
+        module._verify_artifact_names(
+            ROOT / "kigumi-0.13.0-py3-none-any.whl",
+            ROOT / "kigumi-0.12.0.tar.gz",
+            "0.13.0",
+        )
 
 
 def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
