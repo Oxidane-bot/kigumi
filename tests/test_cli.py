@@ -10,7 +10,15 @@ from typing import Any
 
 import pytest
 
-from kigumi import PromptRef, PromptSpec
+from kigumi import (
+    PromptRef,
+    PromptSpec,
+    ProviderFailure,
+    ProviderFailureKind,
+    ProviderFailureStage,
+    RetryPolicy,
+)
+from kigumi._runstate import RUN_SIDECAR_SCHEMA, SUCCESS_CANDIDATE_SCHEMA, AttemptStore
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.cli import _demote_brief_headings, _parser, _recovery_advice, main
 from kigumi.config import KigumiConfig
@@ -46,6 +54,148 @@ def _run_dag_cli(dag: Dag, argv: list[str]) -> int:
     with pytest.raises(SystemExit) as exited:
         dag.cli(argv)
     return int(exited.value.code)
+
+
+def _cli_profile(nodes: list[str]) -> dict[str, Any]:
+    return {
+        "workflow_profile_schema": 2,
+        "mode": "static",
+        "resolution_status": "unresolved",
+        "graph": {
+            "nodes": [{"name": name} for name in nodes],
+            "edges": [],
+            "mounts": [],
+            "models": {},
+        },
+        "prompts": {"specs": []},
+        "run": None,
+    }
+
+
+def _write_completed_cli_run(
+    run_path: Path,
+    *,
+    target: str,
+    artifact: dict[str, Any],
+    cache: str,
+    cache_key: str,
+    key_components: dict[str, str],
+    seconds: float,
+    calls: list[dict[str, Any]],
+) -> None:
+    """Create a complete schema-2 run fixture owned by durable runstate."""
+    profile = _cli_profile([target])
+    store = AttemptStore(
+        run_path,
+        {
+            "workflow_profile": profile,
+            "workflow_profile_digest": sha(profile),
+        },
+    )
+    store.initialize()
+    store.prepare(
+        target,
+        policy=None,
+        declaration_digest=sha({"target": target}),
+    )
+    prompt_resolutions: dict[str, Any] = {}
+    store.save_candidate(
+        target,
+        {
+            "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
+            "artifact": artifact,
+            "cache_key": cache_key,
+            "key_components": key_components,
+            "prompt_resolutions": prompt_resolutions,
+            "calls": calls,
+        },
+    )
+
+    artifact_digest = sha(artifact)
+    primary_call = calls[0] if len(calls) == 1 else {}
+    origin = {
+        "kind": "call" if calls else "code",
+        "artifact_sha256": artifact_digest,
+        "calls": calls,
+        "agent": None,
+        "prompt_resolutions": prompt_resolutions,
+        "prompt_sha256": primary_call.get("prompt_sha"),
+        "model": primary_call.get("model"),
+        "params": primary_call.get("params") or {},
+        "provider_response_id": primary_call.get("provider_response_id"),
+        "usage": primary_call.get("usage"),
+        "evidence_policy": {},
+        "evidence_policy_digest": sha({}),
+    }
+    metadata = {
+        "run_sidecar_schema": RUN_SIDECAR_SCHEMA,
+        "node": target,
+        "cache_key": cache_key,
+        "cache": cache,
+        "cache_policy": "auto",
+        "key_components": key_components,
+        "outputs": [],
+        "seconds": seconds,
+        "calls": calls,
+        "execution_calls": calls,
+        "prompt_resolutions": prompt_resolutions,
+        "prompt_resolutions_digest": sha(prompt_resolutions),
+        "origin_provenance": origin,
+        "origin_provenance_digest": sha(origin),
+        "artifact_sha256": artifact_digest,
+        "prompt_sha256": origin["prompt_sha256"],
+        "model": origin["model"],
+        "params": origin["params"],
+        "provider_response_id": origin["provider_response_id"],
+        "usage": origin["usage"],
+    }
+    write_artifact(run_path / f"{target}.json", canonical_json(artifact), metadata)
+    store.mark_completed(target, artifact_sha256=artifact_digest)
+    store.update_manifest("completed")
+
+
+def _write_pending_retry_cli_run(run_path: Path) -> str:
+    """Create a valid pending retry with its state and attempt receipt bound."""
+    profile = _cli_profile([])
+    policy = RetryPolicy(
+        max_attempts=2,
+        initial_delay_seconds=3600,
+        max_delay_seconds=3600,
+        jitter="none",
+    )
+    evidence_digest = sha({"fixture": "evidence-policy"})
+    store = AttemptStore(
+        run_path,
+        {
+            "workflow_profile": profile,
+            "workflow_profile_digest": sha(profile),
+            "evidence_policy_digests": {"ask": evidence_digest},
+            "retry_policy_digests": {"ask": policy.digest},
+        },
+    )
+    store.initialize()
+    store.prepare(
+        "ask",
+        policy=policy,
+        declaration_digest=sha({"target": "ask"}),
+    )
+    failure = ProviderFailure(
+        provider="fixture-provider",
+        stage=ProviderFailureStage.PROVIDER,
+        kind=ProviderFailureKind.RATE_LIMIT,
+        status_code=429,
+        retry_after_ms=0,
+        provider_request_id=None,
+        message_digest="a" * 64,
+        retryable_hint=None,
+    )
+    state = store.record_failure("ask", failure, policy=policy)["state"]
+    store.update_manifest(
+        "pending_retry",
+        pending_retries=[{"target": "ask", "due_at": state["due_at"]}],
+        ambiguous_attempts=[],
+    )
+    return str(state["due_at"])
 
 
 def _markdown_headings(text: str) -> list[tuple[int, str]]:
@@ -537,27 +687,25 @@ def test_trace_call_diff_and_json_run_views_use_persisted_evidence(
         "seconds": 0.5,
         "usage": {"total_tokens": 3},
     }
-    write_artifact(
-        run_a / "node.json",
-        canonical_json({"value": "a"}),
-        {
-            "cache_key": "node-key",
-            "cache": "miss",
-            "seconds": 1.5,
-            "calls": [call],
-            "key_components": {"prompt": "a"},
-        },
+    _write_completed_cli_run(
+        run_a,
+        target="node",
+        artifact={"value": "a"},
+        cache="miss",
+        cache_key="node-key",
+        key_components={"prompt": "a"},
+        seconds=1.5,
+        calls=[call],
     )
-    write_artifact(
-        run_b / "node.json",
-        canonical_json({"value": "b"}),
-        {
-            "cache_key": "node-key",
-            "cache": "hit",
-            "seconds": 0,
-            "calls": [],
-            "key_components": {"prompt": "b"},
-        },
+    _write_completed_cli_run(
+        run_b,
+        target="node",
+        artifact={"value": "b"},
+        cache="hit",
+        cache_key="node-key",
+        key_components={"prompt": "b"},
+        seconds=0.0,
+        calls=[],
     )
     atomic_write_json(
         root / "artifacts" / "_llm" / "llm" / "call-key-123.json",
@@ -600,56 +748,20 @@ def test_runs_show_and_trace_include_durable_attempt_state(
 ) -> None:
     root = _project(tmp_path)
     run = root / "artifacts" / "runs" / "durable"
-    workflow_profile = {
-        "workflow_profile_schema": 2,
-        "mode": "static",
-        "resolution_status": "unresolved",
-        "graph": {"nodes": [], "edges": [], "mounts": [], "models": {}},
-        "prompts": {"specs": []},
-        "run": None,
-    }
-    atomic_write_json(
-        run / "_run.json",
-        {
-            "run_manifest_schema": 2,
-            "status": "pending_retry",
-            "workflow_profile": workflow_profile,
-            "workflow_profile_digest": sha(workflow_profile),
-            "evidence_policy_digests": {"ask": "evidence-digest"},
-            "retry_policy_digests": {"ask": "retry-digest"},
-            "pending_retries": [{"target": "ask", "due_at": "2030-01-01T00:00:00+00:00"}],
-            "ambiguous_attempts": [],
-        },
-    )
-    atomic_write_json(
-        run / "attempts" / "digest" / "state.json",
-        {
-            "attempt_receipt_schema": 2,
-            "target": "ask",
-            "target_digest": sha("ask"),
-            "attempt": 1,
-            "status": "retry_scheduled",
-            "side_effect_started": True,
-            "due_at": "2030-01-01T00:00:00+00:00",
-            "failure": {
-                "failure_type": "provider",
-                "kind": "rate_limit",
-            },
-            "prompt_resolutions": {},
-        },
-    )
+    due_at = _write_pending_retry_cli_run(run)
     monkeypatch.chdir(root)
 
     assert main(["runs", "show", "durable", "--json"]) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["status"] == "pending_retry"
-    assert shown["attempts"][0]["failure"]["kind"] == "rate_limit"
-    assert shown["evidence_policy_digests"]["ask"] == "evidence-digest"
+    assert shown["attempts"][0]["failure"]["provider_failure"]["kind"] == "rate_limit"
+    assert shown["attempts"][0]["due_at"] == due_at
+    assert shown["evidence_policy_digests"]["ask"] == sha({"fixture": "evidence-policy"})
     assert shown["workflow_profile"]["resolution_status"] == "available"
 
     assert main(["trace", "durable", "--json"]) == 0
     traced = json.loads(capsys.readouterr().out)
-    assert traced["attempts"][0]["due_at"] == "2030-01-01T00:00:00+00:00"
+    assert traced["attempts"][0]["due_at"] == due_at
     assert traced["run_status"] == "pending_retry"
 
 
@@ -663,27 +775,36 @@ def test_runs_approve_diff_and_gc_commands_use_persisted_artifacts(
     artifacts = root / "artifacts"
     run_a = artifacts / "runs" / "run-a"
     run_b = artifacts / "runs" / "run-b"
-    write_artifact(
-        run_a / "node.json",
-        canonical_json({"value": "one"}),
-        {"cache_key": "keep", "cache": "miss", "seconds": 1.5, "calls": [{}]},
+    retained_blob = "retained"
+    stale_blob = "stale"
+    _write_completed_cli_run(
+        run_a,
+        target="node",
+        artifact={"value": "one"},
+        cache="miss",
+        cache_key="keep",
+        key_components={},
+        seconds=1.5,
+        calls=[{}],
     )
-    write_artifact(
-        run_b / "node.json",
-        canonical_json({"value": "two"}),
-        {"cache_key": "keep", "cache": "hit", "seconds": 0.0, "calls": []},
+    _write_completed_cli_run(
+        run_b,
+        target="node",
+        artifact={"value": "two", "file": {"kigumi_blob": retained_blob}},
+        cache="hit",
+        cache_key="keep",
+        key_components={},
+        seconds=0.0,
+        calls=[],
     )
     atomic_write_json(run_a / "approvals" / "editor.pending.json", {"question": "approve"})
     cache_root = artifacts / "_cache" / "nodes"
     atomic_write_json(cache_root / "keep.json", {"artifact": {}})
     atomic_write_json(cache_root / "old.json", {"artifact": {}})
     blobs_root = artifacts / "_cache" / "blobs"
-    retained_blob = "retained"
-    stale_blob = "stale"
     blobs_root.mkdir(parents=True)
     (blobs_root / retained_blob).write_bytes(b"keep")
     (blobs_root / stale_blob).write_bytes(b"remove")
-    atomic_write_json(run_b / "blob.json", {"file": {"kigumi_blob": retained_blob}})
     monkeypatch.chdir(root)
 
     assert main(["runs", "list"]) == 0
