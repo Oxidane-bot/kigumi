@@ -13,15 +13,52 @@ from ._runstate import (
     RUN_MANIFEST_SCHEMA,
     RUN_SIDECAR_SCHEMA,
     SUCCESS_CANDIDATE_SCHEMA,
+    AttemptStore,
+    RunManifestError,
 )
 from .artifacts import sha
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
+from .retry import AmbiguousAttemptError
 
 WORKFLOW_PROFILE_SCHEMA = 2
 
 
 class WorkflowProfileError(RuntimeError):
     """Raised when a WorkflowProfile or durable receipt fails closed."""
+
+
+def _validate_run_integrity(run_path: Path) -> None:
+    """Validate the same durable receipt invariants used by resume/recover.
+
+    Runs written before the receipt-chain format may still be inspected through
+    the existing read-only projection.  Once a manifest advertises a receipt
+    chain or recovery ledger, however, the run must pass AttemptStore's complete
+    validation before any state is projected.
+    """
+    manifest = _read_object(run_path / "_run.json")
+    has_anchors = (
+        "attempt_receipt_chains" in manifest
+        or "recovery_decisions" in manifest
+        or "recovery_decisions_sha256" in manifest
+    )
+    if not has_anchors and not _has_receipt_chain_state(run_path):
+        return
+
+    store = AttemptStore(run_path, {})
+    try:
+        store._required_manifest()
+        store._validate_all_attempt_receipts()
+    except (AmbiguousAttemptError, RunManifestError) as error:
+        raise WorkflowProfileError(
+            f"Run {run_path.name!r} durable receipt integrity validation failed: {error}"
+        ) from error
+
+
+def _has_receipt_chain_state(run_path: Path) -> bool:
+    """Distinguish an old shallow-inspection run from a stripped current run."""
+    paths = (*run_path.glob("attempts/*/state.json"), *run_path.glob("attempts/*/attempt-*.json"))
+    chain_fields = {"receipt_sequence", "previous_receipt_sha256", "state_sha256"}
+    return any(chain_fields.intersection(_read_object(path)) for path in paths)
 
 
 def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[str, Any]:
@@ -32,6 +69,7 @@ def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[s
         raise WorkflowProfileError(
             f"Run {run_path.name!r} has no supported manifest for WorkflowProfile"
         )
+    _validate_run_integrity(run_path)
     static = manifest.get("workflow_profile")
     if not isinstance(static, dict):
         raise WorkflowProfileError("0.7 run manifest is missing workflow_profile")

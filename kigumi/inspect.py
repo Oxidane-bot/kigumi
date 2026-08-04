@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ._runstate import ATTEMPT_RECEIPT_SCHEMA, RUN_MANIFEST_SCHEMA
-from .profile import WorkflowProfileError, load_run_profile
+from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
 from .store import run_directory
 
 
@@ -86,6 +86,7 @@ def durable_run_state(run_path: Path) -> dict[str, Any]:
         return {}
     if manifest_schema != RUN_MANIFEST_SCHEMA:
         raise WorkflowProfileError(f"Run {run_path.name!r} has an unsupported manifest schema")
+    _validate_run_integrity(run_path)
     attempts: list[dict[str, Any]] = []
     for state_path in sorted((run_path / "attempts").glob("*/state.json")):
         state = _read_json(state_path)
