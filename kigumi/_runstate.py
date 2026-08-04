@@ -9,6 +9,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -32,8 +33,20 @@ _RECOVERY_RECEIPT_FILE_FIELD = "recovery_receipt_file"
 _RECOVERY_RECEIPT_DIGEST_FIELD = "recovery_receipt_sha256"
 _RECOVERY_DECISION_LEDGER_FIELD = "recovery_decisions"
 _RECOVERY_DECISION_LEDGER_DIGEST_FIELD = "recovery_decisions_sha256"
+_MANIFEST_GENERATION_FIELD = "manifest_generation"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
 _PROCESS_TARGET_LEASES_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True)
+class DurableRunSnapshot:
+    """One validated read of a current run's durable evidence."""
+
+    manifest: dict[str, Any]
+    states: tuple[dict[str, Any], ...]
+    candidates: dict[str, dict[str, Any]]
+    materializations: dict[str, dict[str, dict[str, Any]]]
+    strict: bool
 
 
 def utc_now() -> datetime:
@@ -80,6 +93,10 @@ class AttemptStore:
         lock_name = f".kigumi-run-{sha(str(resolved_root))}.lock"
         self._run_lock_path = resolved_root.parent / lock_name
         self._target_leases: dict[str, tuple[str, Any]] = {}
+        self._manifest_generation: int | None = None
+        self._fence_manifest_generation = False
+        self._terminal_status_admission_generation: int | None = None
+        self._state_mutated_since_status = False
 
     def __del__(self) -> None:
         """Release process-local target descriptors when a store is discarded."""
@@ -224,6 +241,55 @@ class AttemptStore:
         state.pop(_TARGET_OWNER_FIELD, None)
         self._release_target_lease(target)
 
+    @staticmethod
+    def _manifest_generation_value(manifest: dict[str, Any]) -> int:
+        value = manifest.get(_MANIFEST_GENERATION_FIELD, 0)
+        if type(value) is not int or value < 0:
+            raise StateIntegrityError(
+                Path("_run.json"),
+                RUN_MANIFEST_SCHEMA,
+                "manifest generation is invalid",
+            )
+        return value
+
+    def _commit_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        advance_generation: bool = True,
+    ) -> None:
+        """Commit one manifest mutation with optional status-generation fencing."""
+        current = self._manifest_generation_value(manifest)
+        if (
+            advance_generation
+            and self._fence_manifest_generation
+            and self._manifest_generation is not None
+            and current != self._manifest_generation
+        ):
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has a stale manifest generation "
+                f"(expected {self._manifest_generation}, found {current})"
+            )
+        next_generation = current + 1 if advance_generation else current
+        manifest[_MANIFEST_GENERATION_FIELD] = next_generation
+        atomic_write_json(self.manifest_path, manifest)
+        self._manifest_generation = next_generation
+        if advance_generation:
+            self._terminal_status_admission_generation = None
+            self._state_mutated_since_status = False
+
+    def _assert_manifest_generation(self, manifest: dict[str, Any]) -> None:
+        current = self._manifest_generation_value(manifest)
+        if (
+            self._fence_manifest_generation
+            and self._manifest_generation is not None
+            and current != self._manifest_generation
+        ):
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has a stale manifest generation "
+                f"(expected {self._manifest_generation}, found {current})"
+            )
+
     def initialize(self) -> dict[str, Any]:
         """Create a new manifest or fail closed against an existing run."""
         with self._run_locked():
@@ -242,6 +308,7 @@ class AttemptStore:
                     "run_manifest_schema": RUN_MANIFEST_SCHEMA,
                     **self.identity,
                     "status": "running",
+                    _MANIFEST_GENERATION_FIELD: 0,
                     "created_at": now,
                     "updated_at": now,
                     _RECEIPT_CHAIN_FIELD: {},
@@ -249,12 +316,16 @@ class AttemptStore:
                     _RECOVERY_DECISION_LEDGER_DIGEST_FIELD: sha({}),
                 }
                 atomic_write_json(self.manifest_path, manifest)
+                self._manifest_generation = 0
+                self._fence_manifest_generation = True
                 return manifest
             if existing.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
                 raise RunManifestError(
                     f"Run {self.run_root.name!r} has an unsupported manifest schema"
                 )
             self._validate_manifest(existing)
+            self._manifest_generation = self._manifest_generation_value(existing)
+            self._fence_manifest_generation = True
             expected = {
                 key: value
                 for key, value in existing.items()
@@ -270,6 +341,7 @@ class AttemptStore:
                     "last_resumed_at",
                     "workflow_profile",
                     "workflow_profile_digest",
+                    _MANIFEST_GENERATION_FIELD,
                     _RECEIPT_CHAIN_FIELD,
                     _RECOVERY_DECISION_LEDGER_FIELD,
                     _RECOVERY_DECISION_LEDGER_DIGEST_FIELD,
@@ -303,7 +375,7 @@ class AttemptStore:
             manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
             manifest["last_resumed_at"] = iso_now()
             manifest["updated_at"] = manifest["last_resumed_at"]
-            atomic_write_json(self.manifest_path, manifest)
+            self._commit_manifest(manifest, advance_generation=False)
 
     def update_manifest(
         self,
@@ -315,7 +387,14 @@ class AttemptStore:
     ) -> None:
         with self._run_locked():
             manifest = self._required_manifest()
-            self._validate_all_attempt_receipts()
+            self._assert_manifest_generation(manifest)
+            states = self._validate_all_attempt_receipts()
+            self._validate_manifest_status_update(manifest, status, states)
+            if manifest.get("status") == "running" and status == "running":
+                self._state_mutated_since_status = False
+                return
+            if manifest.get("status") == "completed" and status == "running":
+                return
             manifest["status"] = status
             manifest["updated_at"] = iso_now()
             manifest["pending_retries"] = pending_retries or []
@@ -324,7 +403,89 @@ class AttemptStore:
                 manifest["failure"] = failure
             elif status != "failed":
                 manifest.pop("failure", None)
-            atomic_write_json(self.manifest_path, manifest)
+            self._commit_manifest(manifest)
+
+    def _validate_manifest_status_update(
+        self,
+        manifest: dict[str, Any],
+        status: str,
+        states: list[dict[str, Any]],
+    ) -> None:
+        valid_statuses = {
+            "running",
+            "pending_retry",
+            "ambiguous",
+            "checkpoint_pending",
+            "completed",
+            "failed",
+        }
+        if status not in valid_statuses:
+            raise ValueError(f"Unknown run status: {status!r}")
+
+        current = manifest.get("status")
+        state_statuses = [state.get("status") for state in states]
+        if current == "completed" and status == "running":
+            # ``Dag.resume`` still enters through the historical running update
+            # before discovering that every target is already materialized.  A
+            # completed terminal record remains authoritative during that no-op
+            # admission; it must never be reopened by a stale executor.
+            self._terminal_status_admission_generation = self._manifest_generation_value(manifest)
+            self._state_mutated_since_status = False
+            return
+        if current == "completed" and status != "completed":
+            if (
+                status == "failed"
+                and self._terminal_status_admission_generation
+                == self._manifest_generation_value(manifest)
+            ):
+                return
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} is terminally completed; "
+                "a stale status update is fenced"
+            )
+
+        if status == "completed" and any(
+            value
+            in {
+                "running",
+                "success_candidate",
+                "retry_scheduled",
+                "ambiguous",
+                "failed",
+                "checkpoint_pending",
+            }
+            for value in state_statuses
+        ):
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} cannot be marked completed with active attempts"
+            )
+        if status == "pending_retry" and "retry_scheduled" not in state_statuses:
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has no durable pending retry to publish"
+            )
+        if (
+            status == "failed"
+            and state_statuses
+            and all(value == "completed" for value in state_statuses)
+            and not self._state_mutated_since_status
+            and self._terminal_status_admission_generation
+            != self._manifest_generation_value(manifest)
+        ):
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has no durable terminal failure to publish"
+            )
+        if status == "failed" and "running" in state_statuses and "failed" not in state_statuses:
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has no durable terminal failure to publish"
+            )
+        if status == "ambiguous" and "ambiguous" not in state_statuses:
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has no durable ambiguous attempt to publish"
+            )
+        if status == "checkpoint_pending" and "checkpoint_pending" not in state_statuses:
+            raise RunManifestError(
+                f"Run {self.run_root.name!r} has no durable checkpoint to publish"
+            )
 
     def prepare(
         self,
@@ -430,6 +591,11 @@ class AttemptStore:
                     "candidate": candidate,
                 }
             if status == "completed":
+                artifact_path = self._target_artifact_path(target)
+                self._validate_materialization_pair(
+                    target,
+                    Path(f"{artifact_path}.meta.json"),
+                )
                 return {"action": "completed", "state": state}
             if status == "ambiguous":
                 raise AmbiguousAttemptError(
@@ -630,7 +796,7 @@ class AttemptStore:
             if decision == "fail":
                 self._clear_target_owner(target, state)
                 manifest["updated_at"] = now
-                atomic_write_json(self.manifest_path, manifest)
+                self._commit_manifest(manifest, advance_generation=False)
                 return state
             else:
                 canonical_inherited = json.loads(canonical_json(inherited_nodes or {}))
@@ -976,28 +1142,8 @@ class AttemptStore:
             raise RunManifestError(f"Attempt state declaration changed for {target!r}")
 
     def _states_with(self, status: str) -> list[dict[str, Any]]:
-        attempts_root = self.run_root / "attempts"
-        if not attempts_root.is_dir():
-            return []
-        found: list[dict[str, Any]] = []
-        for path in sorted(attempts_root.glob("*/state.json")):
-            state, corrupted = self._read_json_safe(path)
-            if corrupted:
-                raise self._integrity_error(path, ATTEMPT_RECEIPT_SCHEMA)
-            if state is None:
-                continue
-            target = state.get("target")
-            if not isinstance(target, str) or path.parent.name != sha(target):
-                raise StateIntegrityError(
-                    path,
-                    ATTEMPT_RECEIPT_SCHEMA,
-                    "state target path binding mismatch",
-                )
-            self._validate_attempt_receipts(target)
-            self._validate_state_binding(target, state)
-            if state.get("status") == status:
-                found.append(state)
-        return found
+        states = self._validate_all_attempt_receipts()
+        return [state for state in states if state.get("status") == status]
 
     def _target_root(self, target: str) -> Path:
         return self.run_root / "attempts" / sha(target)
@@ -1072,6 +1218,7 @@ class AttemptStore:
     def _validate_manifest(self, manifest: dict[str, Any]) -> None:
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
+        self._manifest_generation_value(manifest)
         self._validate_receipt_chain_map(manifest)
         self._validate_recovery_decision_ledger(manifest)
 
@@ -1227,6 +1374,9 @@ class AttemptStore:
         if manifest is None:
             raise RunManifestError(f"Missing or invalid run manifest: {self.manifest_path}")
         self._validate_manifest(manifest)
+        if not self._fence_manifest_generation:
+            self._manifest_generation = self._manifest_generation_value(manifest)
+            self._fence_manifest_generation = True
         return manifest
 
     def _required_failed_manifest(self) -> dict[str, Any]:
@@ -1331,7 +1481,8 @@ class AttemptStore:
         atomic_write_json(self._state_path(target), state)
         self._write_receipt(target, attempt, state)
         chains[target_digest] = [*chain, entry]
-        atomic_write_json(self.manifest_path, manifest)
+        self._commit_manifest(manifest, advance_generation=False)
+        self._state_mutated_since_status = True
 
     def _write_receipt(self, target: str, attempt: int, state: dict[str, Any]) -> None:
         if state.get(_STATE_DIGEST_FIELD) != self._state_digest(state):
@@ -1384,6 +1535,7 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "state does not match the manifest receipt-chain head",
             )
+        self._validate_candidate_binding(target, state)
         receipt_path = self._target_root(target) / f"attempt-{attempt:04d}.json"
         receipt, corrupted = self._read_json_safe(receipt_path)
         if corrupted:
@@ -1397,6 +1549,19 @@ class AttemptStore:
                     target,
                     attempt,
                 )
+            if state.get("status") in {
+                "success_candidate",
+                "checkpoint_pending",
+                "retry_scheduled",
+                "failed",
+                "ambiguous",
+                "completed",
+            }:
+                raise StateIntegrityError(
+                    receipt_path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "current attempt receipt is missing",
+                )
             return
         self._validate_receipt_record(receipt_path, receipt, target, attempt)
         if receipt != state:
@@ -1405,6 +1570,74 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "current state and attempt receipt are not identical",
             )
+
+    def _validate_candidate_binding(
+        self,
+        target: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        filename = state.get("candidate_file")
+        if filename is None:
+            if state.get("status") == "success_candidate":
+                raise StateIntegrityError(
+                    self._state_path(target),
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "success candidate binding is missing",
+                )
+            return None
+        if (
+            not isinstance(filename, str)
+            or Path(filename).is_absolute()
+            or Path(filename).parent != Path(".")
+            or filename != f"candidate-{state.get('attempt', 0):04d}.json"
+        ):
+            raise StateIntegrityError(
+                self._state_path(target),
+                ATTEMPT_RECEIPT_SCHEMA,
+                "success candidate path is invalid",
+            )
+        candidate_path = self._target_root(target) / filename
+        candidate, corrupted = self._read_json_safe(candidate_path)
+        if corrupted:
+            raise self._integrity_error(candidate_path, SUCCESS_CANDIDATE_SCHEMA)
+        if candidate is None:
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate is missing",
+            )
+        if candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA:
+            raise RunManifestError(f"Success candidate for {target!r} has unsupported schema")
+        if state.get("candidate_sha256") != sha(candidate):
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate digest does not match the state",
+            )
+        if not isinstance(candidate.get("artifact"), dict):
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate artifact is invalid",
+            )
+        prompt_resolutions = candidate.get("prompt_resolutions")
+        if prompt_resolutions is not None and not isinstance(prompt_resolutions, dict):
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "success candidate Prompt resolutions are invalid",
+            )
+        if (
+            state.get("status") == "completed"
+            and state.get("artifact_sha256") is not None
+            and state.get("artifact_sha256") != sha(candidate["artifact"])
+        ):
+            raise StateIntegrityError(
+                candidate_path,
+                SUCCESS_CANDIDATE_SCHEMA,
+                "completed artifact does not match its success candidate",
+            )
+        return candidate
 
     def _validate_receipt_record(
         self,
@@ -1618,12 +1851,22 @@ class AttemptStore:
                         "historical attempt receipt is missing from the receipt chain",
                     )
 
-    def _validate_all_attempt_receipts(self) -> None:
-        """Validate every target before mutating run-level durable state."""
+    def _validate_all_attempt_receipts(self) -> list[dict[str, Any]]:
+        """Validate every target and return the one trusted state per target."""
+        manifest = self._required_manifest()
         attempts_root = self.run_root / "attempts"
         if not attempts_root.is_dir():
-            return
+            if manifest[_RECEIPT_CHAIN_FIELD]:
+                raise StateIntegrityError(
+                    attempts_root,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "durable state is missing for the manifest receipt chain",
+                )
+            return []
+        states: list[dict[str, Any]] = []
+        target_digests: set[str] = set()
         for target_root in sorted(path for path in attempts_root.iterdir() if path.is_dir()):
+            target_digests.add(target_root.name)
             state_path = target_root / "state.json"
             state, corrupted = self._read_json_safe(state_path)
             if corrupted:
@@ -1638,11 +1881,16 @@ class AttemptStore:
                     )
                 self._validate_attempt_receipts(target)
                 self._validate_state_binding(target, state)
+                states.append(state)
                 continue
 
             receipt_paths = sorted(target_root.glob("attempt-*.json"))
             if not receipt_paths:
-                continue
+                raise StateIntegrityError(
+                    state_path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "durable state is missing",
+                )
             receipt, receipt_corrupted = self._read_json_safe(receipt_paths[0])
             if receipt_corrupted or receipt is None:
                 raise self._integrity_error(receipt_paths[0], ATTEMPT_RECEIPT_SCHEMA)
@@ -1654,7 +1902,132 @@ class AttemptStore:
                     "attempt receipt target path binding mismatch",
                 )
             self._validate_attempt_receipts(target)
-            raise RunManifestError(f"Attempt receipts for {target!r} exist without a durable state")
+            raise StateIntegrityError(
+                state_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "durable state is missing",
+            )
+
+        for target_digest in manifest[_RECEIPT_CHAIN_FIELD]:
+            if target_digest not in target_digests:
+                raise StateIntegrityError(
+                    attempts_root / target_digest / "state.json",
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "durable state is missing for the manifest receipt chain",
+                )
+        return states
+
+    def _validate_run_materializations(
+        self,
+        states: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
+        """Validate candidate and run artifact/sidecar bindings in one pass."""
+        candidates: dict[str, dict[str, Any]] = {}
+        materializations: dict[str, dict[str, dict[str, Any]]] = {}
+
+        for state in states:
+            target = state["target"]
+            candidate = self._validate_candidate_binding(target, state)
+            if candidate is not None:
+                candidates[target] = candidate
+
+        for sidecar_path in sorted(self.run_root.glob("*.json.meta.json")):
+            target = sidecar_path.name.removesuffix(".json.meta.json")
+            if not target:
+                raise StateIntegrityError(
+                    sidecar_path,
+                    RUN_SIDECAR_SCHEMA,
+                    "run sidecar has an invalid target name",
+                )
+            artifact, metadata = self._validate_materialization_pair(target, sidecar_path)
+            materializations[target] = {
+                "artifact": artifact,
+                "metadata": metadata,
+            }
+
+        for artifact_path in sorted(self.run_root.glob("*.json")):
+            if (
+                artifact_path.name == "_run.json"
+                or artifact_path.name.startswith("recovery-")
+                or artifact_path.name.endswith(".json.meta.json")
+            ):
+                continue
+            target = artifact_path.stem
+            if target not in materializations:
+                raise StateIntegrityError(
+                    artifact_path,
+                    RUN_SIDECAR_SCHEMA,
+                    "artifact has no matching run sidecar",
+                )
+
+        for state in states:
+            if state.get("status") != "completed":
+                continue
+            target = state["target"]
+            pair = materializations.get(target)
+            if pair is None:
+                raise StateIntegrityError(
+                    self._target_artifact_path(target),
+                    RUN_SIDECAR_SCHEMA,
+                    "completed target artifact or sidecar is missing",
+                )
+            artifact_digest = sha(pair["artifact"])
+            if state.get("artifact_sha256") != artifact_digest:
+                raise StateIntegrityError(
+                    self._state_path(target),
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "completed state does not match its run artifact",
+                )
+
+        return candidates, materializations
+
+    def _target_artifact_path(self, target: str) -> Path:
+        return self.run_root / f"{target}.json"
+
+    def _validate_materialization_pair(
+        self,
+        target: str,
+        sidecar_path: Path,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        artifact_path = self._target_artifact_path(target)
+        artifact, corrupted = self._read_json_safe(artifact_path)
+        if corrupted:
+            raise self._integrity_error(artifact_path, RUN_SIDECAR_SCHEMA)
+        if artifact is None:
+            raise StateIntegrityError(
+                artifact_path,
+                RUN_SIDECAR_SCHEMA,
+                "run artifact is missing",
+            )
+        metadata, corrupted = self._read_json_safe(sidecar_path)
+        if corrupted:
+            raise self._integrity_error(sidecar_path, RUN_SIDECAR_SCHEMA)
+        if metadata is None:
+            raise StateIntegrityError(
+                sidecar_path,
+                RUN_SIDECAR_SCHEMA,
+                "run sidecar is missing",
+            )
+        artifact_digest = sha(artifact)
+        origin = metadata.get("origin_provenance")
+        if (
+            metadata.get("run_sidecar_schema") != RUN_SIDECAR_SCHEMA
+            or metadata.get("node") != target
+            or not self._is_sha256(metadata.get("artifact_sha256"))
+            or metadata.get("artifact_sha256") != artifact_digest
+            or not isinstance(origin, dict)
+            or origin.get("artifact_sha256") != artifact_digest
+            or metadata.get("origin_provenance_digest") != sha(origin)
+            or not isinstance(metadata.get("prompt_resolutions", {}), dict)
+            or metadata.get("prompt_resolutions_digest")
+            != sha(metadata.get("prompt_resolutions", {}))
+        ):
+            raise StateIntegrityError(
+                sidecar_path,
+                RUN_SIDECAR_SCHEMA,
+                "run artifact or sidecar digest binding is invalid",
+            )
+        return artifact, metadata
 
     @staticmethod
     def _read_json_safe(path: Path) -> tuple[dict[str, Any] | None, bool]:
@@ -1701,3 +2074,56 @@ class AttemptStore:
         """Read one target only after its complete receipt history is trusted."""
         self._validate_attempt_receipts(target)
         return self._required_json(self._state_path(target))
+
+
+def validate_durable_run(run_root: Path) -> DurableRunSnapshot:
+    """Validate one current run and return the evidence used by read surfaces.
+
+    Schema-2 receipt-chain runs are strict.  The small legacy exception keeps
+    the historical read-only trace projection usable for pre-chain directories
+    that have no current receipt markers at all; such runs remain non-resumable.
+    """
+    manifest_path = run_root / "_run.json"
+    manifest, corrupted = AttemptStore._read_json_safe(manifest_path)
+    if corrupted:
+        raise AttemptStore._integrity_error(manifest_path, RUN_MANIFEST_SCHEMA)
+    if manifest is None:
+        raise RunManifestError(f"Missing or invalid run manifest: {manifest_path}")
+    if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+        raise RunManifestError(f"Run {run_root.name!r} has an unsupported manifest schema")
+
+    has_anchors = (
+        _RECEIPT_CHAIN_FIELD in manifest
+        or _RECOVERY_DECISION_LEDGER_FIELD in manifest
+        or _RECOVERY_DECISION_LEDGER_DIGEST_FIELD in manifest
+    )
+    chain_fields = {
+        _RECEIPT_SEQUENCE_FIELD,
+        _PREVIOUS_RECEIPT_DIGEST_FIELD,
+        _STATE_DIGEST_FIELD,
+    }
+    has_chain_state = False
+    if not has_anchors:
+        for path in (
+            *run_root.glob("attempts/*/state.json"),
+            *run_root.glob("attempts/*/attempt-*.json"),
+        ):
+            value, _corrupt = AttemptStore._read_json_safe(path)
+            if isinstance(value, dict) and chain_fields.intersection(value):
+                has_chain_state = True
+                break
+    strict = has_anchors or has_chain_state
+    if not strict:
+        return DurableRunSnapshot(manifest, (), {}, {}, False)
+
+    store = AttemptStore(run_root, {})
+    validated_manifest = store._required_manifest()
+    states = store._validate_all_attempt_receipts()
+    candidates, materializations = store._validate_run_materializations(states)
+    return DurableRunSnapshot(
+        validated_manifest,
+        tuple(states),
+        candidates,
+        materializations,
+        True,
+    )

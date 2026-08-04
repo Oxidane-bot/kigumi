@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ._runstate import ATTEMPT_RECEIPT_SCHEMA, RUN_MANIFEST_SCHEMA
+from ._runstate import ATTEMPT_RECEIPT_SCHEMA, RUN_MANIFEST_SCHEMA, DurableRunSnapshot
 from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
 from .store import run_directory
 
@@ -24,14 +24,36 @@ def trace_run(
     if not run_path.is_dir():
         raise FileNotFoundError(f"run not found: {run_id}")
 
+    manifest_path = run_path / "_run.json"
+    manifest = _read_json(manifest_path)
+    snapshot = None
+    if manifest_path.is_file() and manifest.get("run_manifest_schema") == RUN_MANIFEST_SCHEMA:
+        snapshot = _validate_run_integrity(run_path)
+
     warnings: list[str] = []
     entries: dict[str, dict[str, Any]] = {}
     items_by_parent: dict[str, list[dict[str, Any]]] = {}
-    for sidecar in sorted(run_path.glob("*.json.meta.json")):
-        name = sidecar.name.removesuffix(".json.meta.json")
+    sidecar_entries = (
+        (
+            (
+                name,
+                pair["metadata"],
+            )
+            for name, pair in sorted(snapshot.materializations.items())
+        )
+        if snapshot is not None and snapshot.strict
+        else (
+            (
+                sidecar.name.removesuffix(".json.meta.json"),
+                _read_json(sidecar),
+            )
+            for sidecar in sorted(run_path.glob("*.json.meta.json"))
+        )
+    )
+    for name, metadata in sidecar_entries:
         if node is not None and name != node and not name.startswith(f"{node}@"):
             continue
-        entry = _trace_entry(name, _read_json(sidecar), llm_cache_path, warnings)
+        entry = _trace_entry(name, metadata, llm_cache_path, warnings)
         parent, separator, _item_id = name.partition("@")
         if separator:
             items_by_parent.setdefault(parent, []).append(entry)
@@ -63,21 +85,23 @@ def trace_run(
         "run_id": run_id,
         "nodes": [entries[name] for name in sorted(entries)],
     }
-    durable = durable_run_state(run_path)
+    durable = durable_run_state(run_path, _snapshot=snapshot)
     if durable:
         result.update(durable)
-    manifest_path = run_path / "_run.json"
-    manifest = _read_json(manifest_path)
     if manifest_path.is_file():
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
             raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
-        result["workflow_profile"] = load_run_profile(run_path)
+        result["workflow_profile"] = load_run_profile(run_path, _snapshot=snapshot)
     if warnings:
         result["warnings"] = warnings
     return result
 
 
-def durable_run_state(run_path: Path) -> dict[str, Any]:
+def durable_run_state(
+    run_path: Path,
+    *,
+    _snapshot: DurableRunSnapshot | None = None,
+) -> dict[str, Any]:
     """Read supported durable run/attempt state without importing an executable DAG."""
     manifest_path = run_path / "_run.json"
     manifest = _read_json(manifest_path)
@@ -86,10 +110,20 @@ def durable_run_state(run_path: Path) -> dict[str, Any]:
         return {}
     if manifest_schema != RUN_MANIFEST_SCHEMA:
         raise WorkflowProfileError(f"Run {run_path.name!r} has an unsupported manifest schema")
-    _validate_run_integrity(run_path)
+    snapshot = _snapshot or _validate_run_integrity(run_path)
     attempts: list[dict[str, Any]] = []
-    for state_path in sorted((run_path / "attempts").glob("*/state.json")):
-        state = _read_json(state_path)
+    state_entries = (
+        (
+            ((run_path / "attempts" / state["target_digest"] / "state.json"), state)
+            for state in snapshot.states
+        )
+        if snapshot.strict
+        else (
+            (state_path, _read_json(state_path))
+            for state_path in sorted((run_path / "attempts").glob("*/state.json"))
+        )
+    )
+    for state_path, state in state_entries:
         if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
             raise WorkflowProfileError(f"Attempt receipt {state_path} has unsupported schema")
         attempts.append(

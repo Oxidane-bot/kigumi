@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from kigumi._runstate import AttemptStore
-from kigumi.artifacts import atomic_write_json, sha
+from kigumi._runstate import SUCCESS_CANDIDATE_SCHEMA, AttemptStore, RunManifestError
+from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
 from kigumi.inspect import durable_run_state, trace_run
 from kigumi.profile import WorkflowProfileError, load_run_profile
 
@@ -67,6 +67,46 @@ def _make_run(
             recovery_receipt=payload,
             inherited_nodes={},
         )
+    _add_profile(run_path)
+    return run_path, store
+
+
+def _make_completed_run(
+    tmp_path: Path, *, run_path: Path | None = None
+) -> tuple[Path, AttemptStore]:
+    run_path = run_path or (tmp_path / "run")
+    store = AttemptStore(run_path, {})
+    store.initialize()
+    store.prepare("work", policy=None, declaration_digest="decl")
+    artifact = {"value": "ok"}
+    store.save_candidate(
+        "work",
+        {
+            "candidate_schema": SUCCESS_CANDIDATE_SCHEMA,
+            "artifact": artifact,
+            "prompt_resolutions": {},
+            "calls": [],
+        },
+    )
+    artifact_digest = sha(artifact)
+    origin = {"artifact_sha256": artifact_digest}
+    write_artifact(
+        run_path / "work.json",
+        canonical_json(artifact),
+        {
+            "run_sidecar_schema": 2,
+            "node": "work",
+            "cache": "miss",
+            "cache_key": "cache-key",
+            "calls": [],
+            "prompt_resolutions": {},
+            "prompt_resolutions_digest": sha({}),
+            "origin_provenance": origin,
+            "origin_provenance_digest": sha(origin),
+            "artifact_sha256": artifact_digest,
+        },
+    )
+    store.mark_completed("work", artifact_sha256=artifact_digest)
     _add_profile(run_path)
     return run_path, store
 
@@ -154,3 +194,43 @@ def test_trace_run_fails_closed_on_the_same_untrusted_durable_state(tmp_path: Pa
 
     with pytest.raises(WorkflowProfileError, match="historical attempt receipt"):
         trace_run(artifacts, tmp_path / "llm", "trace")
+
+
+@pytest.mark.parametrize("broken", ["receipt", "candidate", "artifact", "sidecar"])
+def test_durable_readers_share_fail_closed_materialization_validation(
+    tmp_path: Path,
+    broken: str,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    run_path, _store = _make_completed_run(
+        tmp_path,
+        run_path=artifacts / "runs" / "integrity",
+    )
+    attempt_root = run_path / "attempts" / sha("work")
+    if broken == "receipt":
+        (attempt_root / "attempt-0001.json").unlink()
+    elif broken == "candidate":
+        (attempt_root / "candidate-0001.json").unlink()
+    elif broken == "artifact":
+        (run_path / "work.json").write_text('{"value":"tampered"}', encoding="utf-8")
+    else:
+        (run_path / "work.json.meta.json").unlink()
+
+    readers = (
+        lambda: durable_run_state(run_path),
+        lambda: load_run_profile(run_path),
+        lambda: trace_run(artifacts, tmp_path / "llm", "integrity"),
+    )
+    for reader in readers:
+        with pytest.raises(WorkflowProfileError):
+            reader()
+
+
+def test_resume_prepare_fails_closed_when_completed_sidecar_is_missing(
+    tmp_path: Path,
+) -> None:
+    run_path, store = _make_completed_run(tmp_path)
+    (run_path / "work.json.meta.json").unlink()
+
+    with pytest.raises(RunManifestError, match="run sidecar is missing"):
+        store.prepare("work", policy=None, declaration_digest="decl")

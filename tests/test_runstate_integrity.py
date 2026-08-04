@@ -14,7 +14,8 @@ import pytest
 
 from kigumi._runstate import AttemptStore, RunManifestError, StateIntegrityError
 from kigumi.artifacts import sha
-from kigumi.retry import AmbiguousAttemptError
+from kigumi.failures import ProviderFailure, ProviderFailureKind, ProviderFailureStage
+from kigumi.retry import AmbiguousAttemptError, RetryPolicy
 
 
 def _store(tmp_path: Path) -> AttemptStore:
@@ -296,6 +297,122 @@ def test_missing_current_receipt_after_side_effect_is_not_trusted_by_readers(
         store.pending_retries()
     with pytest.raises(AmbiguousAttemptError):
         store.ambiguous_attempts()
+
+
+def test_completed_attempt_receipt_is_required_by_every_state_reader(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.mark_completed("work", artifact_sha256="a" * 64)
+    _receipt_path(tmp_path).unlink()
+
+    for operation in (
+        lambda: store.state_for("work"),
+        store.pending_retries,
+        store.ambiguous_attempts,
+        lambda: store.prepare("work", policy=None, declaration_digest="decl"),
+    ):
+        with pytest.raises(StateIntegrityError, match="current attempt receipt"):
+            operation()
+
+
+def test_missing_state_does_not_look_like_no_pending_or_ambiguous_attempts(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    failure = ProviderFailure(
+        provider="test",
+        stage=ProviderFailureStage.PROVIDER,
+        kind=ProviderFailureKind.RATE_LIMIT,
+        status_code=429,
+        retry_after_ms=0,
+        provider_request_id=None,
+        message_digest="a" * 64,
+        retryable_hint=None,
+    )
+    store.record_failure(
+        "work",
+        failure,
+        policy=RetryPolicy(initial_delay_seconds=0, jitter="none"),
+    )
+    _state_path(tmp_path).unlink()
+
+    with pytest.raises(StateIntegrityError, match="durable state is missing"):
+        store.pending_retries()
+
+
+def test_missing_state_does_not_look_like_no_ambiguous_attempts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.mark_side_effect("work", {"kind": "provider"})
+    store._release_target_lease("work")
+    with pytest.raises(AmbiguousAttemptError):
+        store.prepare("work", policy=None, declaration_digest="decl")
+    _state_path(tmp_path).unlink()
+
+    with pytest.raises(StateIntegrityError, match="durable state is missing"):
+        store.ambiguous_attempts()
+
+
+def test_manifest_status_updates_are_generation_and_terminal_fenced(tmp_path: Path) -> None:
+    generation_root = tmp_path / "generation"
+    winner = _store(generation_root)
+    winner.prepare("work", policy=None, declaration_digest="decl")
+    stale = AttemptStore(generation_root / "run", {})
+    stale.initialize()
+
+    winner.record_failure("work", RuntimeError("terminal"), policy=None)
+    winner.update_manifest("failed")
+    with pytest.raises(RunManifestError, match="generation"):
+        stale.update_manifest("failed", failure={"failure_type": "runtime"})
+    assert json.loads((generation_root / "run" / "_run.json").read_text())["status"] == "failed"
+
+    terminal_root = tmp_path / "terminal"
+    winner = _store(terminal_root)
+    winner.prepare("work", policy=None, declaration_digest="decl")
+    winner.mark_completed("work", artifact_sha256="a" * 64)
+    winner.update_manifest("completed")
+    fresh = AttemptStore(terminal_root / "run", {})
+    fresh.initialize()
+    with pytest.raises(RunManifestError, match="terminal|completed"):
+        fresh.update_manifest("failed", failure={"failure_type": "runtime"})
+    assert json.loads((terminal_root / "run" / "_run.json").read_text())["status"] == "completed"
+
+
+def test_manifest_generation_is_bound_by_a_read_only_store_entrypoint(
+    tmp_path: Path,
+) -> None:
+    winner = _store(tmp_path)
+    winner.prepare("work", policy=None, declaration_digest="decl")
+
+    observer = AttemptStore(tmp_path / "run", {})
+    observer.update_manifest("running")
+
+    winner.record_failure("work", RuntimeError("terminal"), policy=None)
+    winner.update_manifest("failed")
+
+    with pytest.raises(RunManifestError, match="generation"):
+        observer.update_manifest("failed", failure={"failure_type": "runtime"})
+
+
+def test_loser_failure_cannot_publish_after_winner_commits_completed_state(
+    tmp_path: Path,
+) -> None:
+    winner = _store(tmp_path)
+    winner.prepare("work", policy=None, declaration_digest="decl")
+    winner.update_manifest("running")
+
+    loser = AttemptStore(tmp_path / "run", {})
+    loser.initialize()
+    loser.update_manifest("running")
+    winner.mark_completed("work", artifact_sha256="a" * 64)
+
+    with pytest.raises(RunManifestError, match="terminal failure|completed"):
+        loser.update_manifest("failed", failure={"failure_type": "runtime"})
+    winner.update_manifest("completed")
+
+    manifest = json.loads((tmp_path / "run" / "_run.json").read_text())
+    assert manifest["status"] == "completed"
 
 
 def test_missing_historical_receipt_fails_closed_at_every_state_entrypoint(

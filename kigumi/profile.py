@@ -13,8 +13,9 @@ from ._runstate import (
     RUN_MANIFEST_SCHEMA,
     RUN_SIDECAR_SCHEMA,
     SUCCESS_CANDIDATE_SCHEMA,
-    AttemptStore,
+    DurableRunSnapshot,
     RunManifestError,
+    validate_durable_run,
 )
 from .artifacts import sha
 from .prompt import PromptResolutionError, validate_prompt_resolution_record
@@ -27,7 +28,7 @@ class WorkflowProfileError(RuntimeError):
     """Raised when a WorkflowProfile or durable receipt fails closed."""
 
 
-def _validate_run_integrity(run_path: Path) -> None:
+def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
     """Validate the same durable receipt invariants used by resume/recover.
 
     Runs written before the receipt-chain format may still be inspected through
@@ -35,33 +36,20 @@ def _validate_run_integrity(run_path: Path) -> None:
     chain or recovery ledger, however, the run must pass AttemptStore's complete
     validation before any state is projected.
     """
-    manifest = _read_object(run_path / "_run.json")
-    has_anchors = (
-        "attempt_receipt_chains" in manifest
-        or "recovery_decisions" in manifest
-        or "recovery_decisions_sha256" in manifest
-    )
-    if not has_anchors and not _has_receipt_chain_state(run_path):
-        return
-
-    store = AttemptStore(run_path, {})
     try:
-        store._required_manifest()
-        store._validate_all_attempt_receipts()
+        return validate_durable_run(run_path)
     except (AmbiguousAttemptError, RunManifestError) as error:
         raise WorkflowProfileError(
             f"Run {run_path.name!r} durable receipt integrity validation failed: {error}"
         ) from error
 
 
-def _has_receipt_chain_state(run_path: Path) -> bool:
-    """Distinguish an old shallow-inspection run from a stripped current run."""
-    paths = (*run_path.glob("attempts/*/state.json"), *run_path.glob("attempts/*/attempt-*.json"))
-    chain_fields = {"receipt_sequence", "previous_receipt_sha256", "state_sha256"}
-    return any(chain_fields.intersection(_read_object(path)) for path in paths)
-
-
-def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[str, Any]:
+def load_run_profile(
+    run_path: Path,
+    *,
+    include_content: bool = False,
+    _snapshot: DurableRunSnapshot | None = None,
+) -> dict[str, Any]:
     """Load a runtime profile without importing or executing the registered DAG."""
     manifest = _read_object(run_path / "_run.json")
     schema = manifest.get("run_manifest_schema")
@@ -69,7 +57,7 @@ def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[s
         raise WorkflowProfileError(
             f"Run {run_path.name!r} has no supported manifest for WorkflowProfile"
         )
-    _validate_run_integrity(run_path)
+    snapshot = _snapshot or _validate_run_integrity(run_path)
     static = manifest.get("workflow_profile")
     if not isinstance(static, dict):
         raise WorkflowProfileError("0.7 run manifest is missing workflow_profile")
@@ -77,8 +65,17 @@ def load_run_profile(run_path: Path, *, include_content: bool = False) -> dict[s
         raise WorkflowProfileError("0.7 workflow_profile digest validation failed")
     if static.get("workflow_profile_schema") != WORKFLOW_PROFILE_SCHEMA:
         raise WorkflowProfileError("unsupported workflow_profile schema")
-    runtime_nodes = _runtime_nodes(run_path, include_content=include_content)
-    attempts = _attempts(run_path, include_content=include_content)
+    runtime_nodes = _runtime_nodes(
+        run_path,
+        include_content=include_content,
+        materializations=snapshot.materializations if snapshot.strict else None,
+    )
+    attempts = _attempts(
+        run_path,
+        include_content=include_content,
+        states=snapshot.states if snapshot.strict else None,
+        candidates=snapshot.candidates if snapshot.strict else None,
+    )
     failures = _failures(run_path, include_content=include_content)
     result = copy.deepcopy(static)
     result["mode"] = "run"
@@ -218,12 +215,28 @@ def render_profile_markdown(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _runtime_nodes(run_path: Path, *, include_content: bool) -> list[dict[str, Any]]:
+def _runtime_nodes(
+    run_path: Path,
+    *,
+    include_content: bool,
+    materializations: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
-    for sidecar in sorted(run_path.glob("*.json.meta.json")):
-        name = sidecar.name.removesuffix(".json.meta.json")
-        metadata = _read_object(sidecar)
-        artifact = _read_object(run_path / f"{name}.json")
+    if materializations is None:
+        entries = (
+            (
+                sidecar.name.removesuffix(".json.meta.json"),
+                _read_object(sidecar),
+                _read_object(run_path / f"{sidecar.name.removesuffix('.json.meta.json')}.json"),
+            )
+            for sidecar in sorted(run_path.glob("*.json.meta.json"))
+        )
+    else:
+        entries = (
+            (name, pair["metadata"], pair["artifact"])
+            for name, pair in sorted(materializations.items())
+        )
+    for name, metadata, artifact in entries:
         artifact_digest = sha(artifact)
         origin = metadata.get("origin_provenance")
         if (
@@ -291,10 +304,25 @@ def _attempts(
     run_path: Path,
     *,
     include_content: bool,
+    states: tuple[dict[str, Any], ...] | None = None,
+    candidates: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
-    for path in sorted((run_path / "attempts").glob("*/state.json")):
-        state = _read_object(path)
+    state_entries = (
+        (
+            (
+                run_path / "attempts" / sha(str(state["target"])) / "state.json",
+                state,
+            )
+            for state in states
+        )
+        if states is not None
+        else (
+            (path, _read_object(path))
+            for path in sorted((run_path / "attempts").glob("*/state.json"))
+        )
+    )
+    for path, state in state_entries:
         if state.get("attempt_receipt_schema") != ATTEMPT_RECEIPT_SCHEMA:
             raise WorkflowProfileError(f"Attempt receipt {path} has unsupported schema")
         target = state.get("target")
@@ -308,7 +336,13 @@ def _attempts(
         candidate_file = state.get("candidate_file")
         candidate_calls: list[dict[str, Any]] = []
         if candidate_file is not None:
-            candidate = _read_object(path.parent / str(candidate_file))
+            candidate = (
+                candidates.get(target)
+                if candidates is not None
+                else _read_object(path.parent / str(candidate_file))
+            )
+            if candidate is None:
+                raise WorkflowProfileError(f"Success candidate for {target!r} is missing")
             if (
                 candidate.get("candidate_schema") != SUCCESS_CANDIDATE_SCHEMA
                 or state.get("candidate_sha256") != sha(candidate)
