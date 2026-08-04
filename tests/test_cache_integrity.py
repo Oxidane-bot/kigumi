@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from kigumi import EvidencePolicy
+from kigumi._execution import ExecutionEnvelope
 from kigumi.artifacts import sha
 from kigumi.calling import CacheIntegrityError, LLMCaller, read_call_cache
 from kigumi.store import (
@@ -65,6 +66,35 @@ def test_missing_l3_node_cache_reports_missing(tmp_path: Path) -> None:
 
     assert lookup.state == "MISSING"
     assert lookup.data is None
+
+
+def test_dangling_node_cache_symlink_is_corrupt_not_missing(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    path = node_cache_path(artifacts, "dangling")
+    path.parent.mkdir(parents=True)
+    try:
+        path.symlink_to("does-not-exist.json")
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support symlinks: {error}")
+
+    lookup = read_node_cache(artifacts, "dangling")
+
+    assert lookup.state == "CORRUPT"
+    assert lookup.data is None
+    assert lookup.reason is not None
+    assert "symlink" in lookup.reason
+
+    envelope = ExecutionEnvelope(
+        artifacts_path=artifacts,
+        run_id="run-0001",
+        resolve=lambda value: tmp_path / value,
+        blob_store=object(),
+        ensure_archive_id=lambda: "0001",
+        approval_path=lambda name: tmp_path / "approvals" / name,
+    )
+    with pytest.raises(CacheIntegrityError) as error:
+        envelope.lookup("dangling", forced=False)
+    assert error.value.lookup.state == "CORRUPT"
 
 
 def test_cache_entry_returns_artifact_origin_and_state_as_one_snapshot(tmp_path: Path) -> None:

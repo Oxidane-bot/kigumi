@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import kigumi.blobs as blobs_module
+import kigumi.store as store_module
 from kigumi.blobs import BlobStore
 from kigumi.store import materialize_artifact
 
@@ -86,6 +87,44 @@ def test_blob_materialize_does_not_follow_parent_symlink_installed_at_temp_creat
     assert raced is False
     assert (parent / "result.bin").read_bytes() == b"safe blob"
     assert not (outside / "result.bin").exists()
+
+
+def test_materialize_artifact_stages_on_the_project_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = BlobStore(tmp_path / "blobs")
+    calls: list[Path | None] = []
+    rename_sources: list[Path] = []
+    original_mkdtemp = store_module.tempfile.mkdtemp
+    original_rename_at = store_module._rename_at
+
+    def tracking_mkdtemp(*args: object, **kwargs: object) -> str:
+        directory = kwargs.get("dir")
+        calls.append(None if directory is None else Path(directory))
+        return original_mkdtemp(*args, **kwargs)
+
+    def tracking_rename_at(source, destination, **kwargs):
+        if kwargs.get("source_directory") is None:
+            rename_sources.append(Path(source))
+        return original_rename_at(source, destination, **kwargs)
+
+    monkeypatch.setattr(store_module.tempfile, "mkdtemp", tracking_mkdtemp)
+    monkeypatch.setattr(store_module, "_rename_at", tracking_rename_at)
+
+    materialize_artifact(
+        {"files": {"output/result.txt": "same filesystem"}},
+        "project-staging",
+        lambda path: project / path,
+        store,
+    )
+
+    assert calls
+    assert calls[0] == project
+    assert rename_sources
+    assert all(source.is_relative_to(project) for source in rename_sources)
+    assert (project / "output/result.txt").read_text(encoding="utf-8") == "same filesystem"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory symlink setup is privilege-dependent")

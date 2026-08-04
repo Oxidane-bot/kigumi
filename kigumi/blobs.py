@@ -411,11 +411,8 @@ class BlobStore:
             _verify_existing_blob(destination, digest)
 
     def materialize(self, digest: str, destination: Path) -> None:
-        """Verify stored content, then atomically copy it to its project destination."""
+        """Copy and verify stored content through one descriptor, then publish atomically."""
         source, identity = _validated_blob_source(self.root, digest)
-        actual_digest, size = _file_digest_and_size(source, expected_identity=identity)
-        if actual_digest != digest:
-            raise ValueError(f"Blob digest mismatch for {digest}: store content is {actual_digest}")
         target = Path(destination)
         _reject_symlink_components(target)
         with _SecureDirectory(target.parent, create=True) as parent:
@@ -426,16 +423,9 @@ class BlobStore:
                 target_info = None
             if target_info is not None and stat.S_ISLNK(target_info.st_mode):
                 raise ValueError(f"Materialization target must not be a symlink: {target}")
-            if target_info is not None and stat.S_ISREG(target_info.st_mode):
-                target_digest, target_size = _file_digest_and_size_at(
-                    parent,
-                    target.name,
-                    expected_identity=_file_identity(target_info),
-                )
-                if target_size == size and target_digest == digest:
-                    same_inode = (target_info.st_dev, target_info.st_ino) == identity[:2]
-                    if not same_inode:
-                        return
+            if target_info is not None and stat.S_ISDIR(target_info.st_mode):
+                raise IsADirectoryError(f"Cannot replace output directory: {target}")
+
             descriptor, temporary_name = parent.temporary(f".{target.name}.")
             try:
                 with (
@@ -447,25 +437,36 @@ class BlobStore:
                     os.fdopen(descriptor, "wb", closefd=True) as output_handle,
                 ):
                     descriptor = -1
-                    verify_regular_descriptor(
+                    actual_digest, size = _copy_open_file_verified(
                         input_handle,
+                        output_handle,
                         source,
-                        identity=_file_identity,
                         expected_identity=identity,
-                        phase="during materialization",
                         error=_blob_source_error,
                     )
-                    for chunk in iter_file_chunks(input_handle, _CHUNK_SIZE):
-                        output_handle.write(chunk)
-                    verify_regular_descriptor(
-                        input_handle,
-                        source,
-                        identity=_file_identity,
-                        expected_identity=identity,
-                        phase="during materialization",
-                        error=_blob_source_error,
+                if actual_digest != digest:
+                    raise ValueError(
+                        f"Blob digest mismatch for {digest}: materialized source is {actual_digest}"
                     )
                 parent.verify_bound()
+                try:
+                    target_info = parent.stat(target.name)
+                except FileNotFoundError:
+                    target_info = None
+                if target_info is not None and stat.S_ISLNK(target_info.st_mode):
+                    raise ValueError(f"Materialization target must not be a symlink: {target}")
+                if target_info is not None and stat.S_ISDIR(target_info.st_mode):
+                    raise IsADirectoryError(f"Cannot replace output directory: {target}")
+                if target_info is not None and stat.S_ISREG(target_info.st_mode):
+                    target_digest, target_size = _file_digest_and_size_at(
+                        parent,
+                        target.name,
+                        expected_identity=_file_identity(target_info),
+                    )
+                    if target_size == size and target_digest == digest:
+                        same_inode = (target_info.st_dev, target_info.st_ino) == identity[:2]
+                        if not same_inode:
+                            return
                 _rename_at(
                     temporary_name,
                     target.name,
@@ -525,6 +526,41 @@ def _file_digest_and_size(
             error=_blob_file_error,
         )
     return digest, size
+
+
+def _copy_open_file_verified(
+    input_handle,
+    output_handle,
+    path: Path,
+    *,
+    expected_identity: FileIdentity,
+    error: FileError,
+) -> tuple[str, int]:
+    """Copy an already-open source while hashing exactly the bytes written."""
+    initial = verify_regular_descriptor(
+        input_handle,
+        path,
+        identity=_file_identity,
+        expected_identity=expected_identity,
+        phase="before materialization",
+        error=error,
+    )
+    initial_identity = _file_identity(initial)
+    digestor = sha256()
+    size = 0
+    for chunk in iter_file_chunks(input_handle, _CHUNK_SIZE):
+        digestor.update(chunk)
+        output_handle.write(chunk)
+        size += len(chunk)
+    verify_regular_descriptor(
+        input_handle,
+        path,
+        identity=_file_identity,
+        expected_identity=initial_identity,
+        phase="during materialization",
+        error=error,
+    )
+    return digestor.hexdigest(), size
 
 
 def _open_regular_file_at(

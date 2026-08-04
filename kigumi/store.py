@@ -210,10 +210,22 @@ def _read_node_cache_envelope(
 ) -> CacheLookup:
     path = node_cache_path(artifacts_path, cache_key)
     try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return CacheLookup("MISSING", None, None, None, "node cache file is missing")
+    except OSError as error:
+        return CacheLookup("CORRUPT", None, None, None, f"node cache file stat failed: {error}")
+    if stat.S_ISLNK(info.st_mode):
+        return CacheLookup("CORRUPT", None, None, None, "node cache file is a symlink")
+    if not stat.S_ISREG(info.st_mode):
+        return CacheLookup(
+            "CORRUPT", None, None, None, "node cache file must reference a regular file"
+        )
+    try:
         with path.open(encoding="utf-8") as handle:
             payload = json.load(handle)
     except FileNotFoundError:
-        return CacheLookup("MISSING", None, None, None, "node cache file is missing")
+        return CacheLookup("CORRUPT", None, None, None, "node cache file changed during read")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         return CacheLookup("CORRUPT", None, None, None, f"node cache JSON read failed: {error}")
     if not isinstance(payload, dict):
@@ -381,9 +393,9 @@ def materialize_artifact(
             f"Artifact for {node_name!r} contains duplicate output path(s): "
             + ", ".join(sorted(duplicates))
         )
-    # Keep staging private and independent of the project path.  The final commit below is
-    # descriptor-relative, so no project-side temporary pathname is ever used as a write target.
-    staging_root = Path(tempfile.mkdtemp(prefix=".kigumi-materialize-")).resolve()
+    # Keep staging private while anchoring it to the project filesystem so the final rename
+    # remains atomic even when the system temporary directory is on another mount.
+    staging_root = Path(tempfile.mkdtemp(prefix=".kigumi-materialize-", dir=project_root)).resolve()
     try:
         staged_outputs: list[tuple[Path, Path]] = []
         for relative_path, _destination, contents in resolved_text:

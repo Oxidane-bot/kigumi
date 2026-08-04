@@ -154,6 +154,135 @@ def test_materialize_rejects_a_tampered_store_file(tmp_path: Path) -> None:
         store.materialize(digest, tmp_path / "output.bin")
 
 
+def test_materialize_binds_hash_and_copy_to_one_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """哈希后不能按路径重开 blob，让硬链接别名替换物化内容。"""
+    data = b"original payload"
+    tampered = b"tampered payload"
+    store = BlobStore(tmp_path / "blobs")
+    digest = store.put(data)
+    alias = tmp_path / "blob-alias"
+    try:
+        alias.hardlink_to(store.root / digest)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support hardlinks: {error}")
+
+    original_info = os.stat(alias, follow_symlinks=False)
+    source_path = store.root / digest
+    original_open = blobs._open_regular_file
+    source_opens = 0
+
+    def mutate_hardlink() -> None:
+        with alias.open("r+b") as handle:
+            handle.write(tampered)
+        os.utime(
+            alias,
+            ns=(original_info.st_atime_ns, original_info.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    def open_with_replacement(path, *args, **kwargs):
+        nonlocal source_opens
+        handle = original_open(path, *args, **kwargs)
+        if Path(path) != source_path:
+            return handle
+        source_opens += 1
+        if source_opens != 1:
+            return handle
+
+        class MutateAfterClose:
+            def __enter__(self):
+                return handle.__enter__()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                result = handle.__exit__(exc_type, exc_value, traceback)
+                mutate_hardlink()
+                return result
+
+        return MutateAfterClose()
+
+    monkeypatch.setattr(blobs, "_open_regular_file", open_with_replacement)
+    destination = tmp_path / "output.bin"
+    try:
+        store.materialize(digest, destination)
+    finally:
+        alias.write_bytes(data)
+        os.utime(
+            alias,
+            ns=(original_info.st_atime_ns, original_info.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    assert source_opens == 1
+    assert destination.read_bytes() == data
+
+
+def test_materialize_rejects_a_digest_mismatch_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一 descriptor 读取期间内容被硬链接改写时，未发布的 staging 必须丢弃。"""
+    chunk_size = 1024 * 1024
+    data = b"a" * (chunk_size * 2)
+    tampered = b"a" * chunk_size + b"W" * chunk_size
+    store = BlobStore(tmp_path / "blobs")
+    digest = store.put(data)
+    alias = tmp_path / "blob-alias"
+    try:
+        alias.hardlink_to(store.root / digest)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support hardlinks: {error}")
+
+    original_info = os.stat(alias, follow_symlinks=False)
+    original_digest_and_size = blobs._file_digest_and_size
+    original_iter = blobs.iter_file_chunks
+    phase = "copy"
+    mutated = False
+
+    def mutate_hardlink() -> None:
+        with alias.open("r+b") as handle:
+            handle.seek(chunk_size)
+            handle.write(tampered[chunk_size:])
+        os.utime(
+            alias,
+            ns=(original_info.st_atime_ns, original_info.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    def tracking_digest_and_size(*args, **kwargs):
+        nonlocal phase
+        phase = "hash"
+        result = original_digest_and_size(*args, **kwargs)
+        phase = "copy"
+        return result
+
+    def iter_with_replacement(handle, chunk_size):
+        nonlocal mutated
+        for chunk in original_iter(handle, chunk_size):
+            yield chunk
+            if phase == "copy" and not mutated:
+                mutate_hardlink()
+                mutated = True
+
+    monkeypatch.setattr(blobs, "_CHUNK_SIZE", chunk_size)
+    monkeypatch.setattr(blobs, "_file_digest_and_size", tracking_digest_and_size)
+    monkeypatch.setattr(blobs, "iter_file_chunks", iter_with_replacement)
+    destination = tmp_path / "output.bin"
+    try:
+        with pytest.raises(ValueError, match=digest):
+            store.materialize(digest, destination)
+    finally:
+        alias.write_bytes(data)
+        os.utime(
+            alias,
+            ns=(original_info.st_atime_ns, original_info.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+    assert mutated
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("target_kind", ["parent", "target"])
 def test_materialize_rejects_symlink_destination_components(
     tmp_path: Path, target_kind: str
