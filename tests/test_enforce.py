@@ -1230,6 +1230,46 @@ def node(inputs, ctx):
     ]
 
 
+def test_raw_io_rejects_builtin_dict_copy_and_walrus_importlib_lookup() -> None:
+    """copy/walrus 不能把 builtin open lookup 退化成普通数据下标。"""
+    source = """
+import builtins
+import importlib
+
+def node(inputs, ctx):
+    direct = builtins.__dict__.copy()["open"]
+    indirect = (namespace := importlib.import_module("builtins").__dict__.copy())["open"]
+    return direct("direct-secret.txt").read(), indirect("indirect-secret.txt").read()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/builtin-dict-copy.py"))
+
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'direct = builtins.__dict__.copy()["open"]',
+        'indirect = (namespace := importlib.import_module("builtins").__dict__.copy())["open"]',
+        'return direct("direct-secret.txt").read(), indirect("indirect-secret.txt").read()',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_rejects_imported_map_alias_open_callback() -> None:
+    """from builtins import map as mapper 仍须检查 raw open callback。"""
+    source = """
+from builtins import map as mapper
+
+def node(inputs, ctx):
+    return [reader.read() for reader in mapper(open, inputs)]
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/imported-map-open.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "return [reader.read() for reader in mapper(open, inputs)]",
+    ]
+    assert findings[0].waived is False
+
+
 def test_loop_guard_uses_scope_local_facts_and_finite_opaque_boundaries() -> None:
     """Aliases are local; unknown aliases and higher-order callbacks need review."""
     source = """
@@ -1274,6 +1314,8 @@ def second(items, ctx):
 def test_loop_guard_keeps_safe_direct_and_proven_simple_callbacks_allowed() -> None:
     """The finite boundary does not turn ordinary direct code into findings."""
     source = """
+import builtins
+
 def increment(item):
     return item + 1
 
@@ -1282,10 +1324,53 @@ def node(items, ctx):
         print(item)
     list(map(increment, items))
     list(map(str, items))
+    list(builtins.__dict__["map"](increment, items))
     return ctx.call(items[0])
 """
 
     assert check_source(source, Path("nodes/safe-loop-code.py")) == []
+
+
+def test_loop_guard_follows_helper_and_static_callback_container() -> None:
+    """每次 loop 迭代触发的 helper/静态 callback 都不能藏 raw LLM。"""
+    source = """
+def helper(item, ctx):
+    return ctx.call(item)
+
+def node(items, ctx):
+    callbacks = [ctx.call]
+    for item in items:
+        helper(item, ctx)
+        callbacks[0](item)
+"""
+
+    findings = check_source(source, Path("nodes/indirect-loop-callbacks.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "helper(item, ctx)",
+        "callbacks[0](item)",
+    ]
+    assert all(not finding.waived for finding in findings)
+
+
+def test_loop_guard_follows_dynamic_builtin_map_callbacks() -> None:
+    """builtin 字典里的 map 仍按高阶循环处理，而不是 unknown call。"""
+    source = """
+import builtins
+
+def node(items, ctx):
+    for item in items:
+        list(builtins.__dict__["map"](ctx.call, items))
+        list(builtins.__dict__.copy()["map"](ctx.call, items))
+"""
+
+    findings = check_source(source, Path("nodes/dynamic-builtin-map.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'list(builtins.__dict__["map"](ctx.call, items))',
+        'list(builtins.__dict__.copy()["map"](ctx.call, items))',
+    ]
+    assert all(not finding.waived for finding in findings)
 
 
 def test_loop_guard_rejects_imported_and_qualified_builtin_map_filter_callbacks() -> None:

@@ -28,7 +28,13 @@ class WorkflowProfileError(RuntimeError):
     """Raised when a WorkflowProfile or durable receipt fails closed."""
 
 
-def _validate_run_integrity(run_path: Path) -> tuple[DurableRunSnapshot, AttemptStore]:
+def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
+    """Validate a durable run while preserving the historical helper contract."""
+    snapshot, _attempts = _validate_run_integrity_bound(run_path)
+    return snapshot
+
+
+def _validate_run_integrity_bound(run_path: Path) -> tuple[DurableRunSnapshot, AttemptStore]:
     """Validate the one shared durable snapshot used by all read surfaces."""
     try:
         validate_run_path(run_path)
@@ -86,7 +92,7 @@ def load_run_profile(
         snapshot = _snapshot
         attempts = AttemptStore(run_path, {})
     else:
-        snapshot, attempts = _validate_run_integrity(run_path)
+        snapshot, attempts = _validate_run_integrity_bound(run_path)
     if not snapshot.strict:
         raise WorkflowProfileError(f"Run {run_path.name!r} has no strict durable snapshot")
     manifest = snapshot.manifest

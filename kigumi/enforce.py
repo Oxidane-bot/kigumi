@@ -26,7 +26,7 @@ _DYNAMIC_CALLABLE_NAMES = _DYNAMIC_BUILTIN_NAMES | {"getattr"}
 _LOOP_MODEL_METHOD_NAMES = frozenset({"call", "llm"})
 _LOOP_HIGHER_ORDER_NAMES = frozenset({"map", "filter"})
 _RAW_METHOD_NAMES = frozenset({"open", "read_text", "read_bytes"})
-_DYNAMIC_DICT_METHOD_NAMES = frozenset({"get", "__getitem__"})
+_DYNAMIC_DICT_METHOD_NAMES = frozenset({"copy", "get", "__getitem__"})
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,7 @@ class _ScopeState:
     classes: dict[str, ast.ClassDef] = field(default_factory=dict)
     raw_aliases: set[str] = field(default_factory=set)
     dynamic_aliases: set[str] = field(default_factory=set)
+    higher_order_aliases: set[str] = field(default_factory=set)
     builtin_module_aliases: set[str] = field(default_factory=lambda: {"builtins", "__builtins__"})
     instance_aliases: dict[str, str] = field(default_factory=dict)
     method_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -318,6 +319,7 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
         context_name=None,
         inherited_raw_aliases=None,
         inherited_dynamic_aliases=None,
+        inherited_higher_order_aliases=None,
         inherited_builtin_module_aliases=None,
         parameter_names=set(),
     )
@@ -338,6 +340,7 @@ def check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]:
             state=_ScopeState(
                 raw_aliases=module_aliases.raw,
                 dynamic_aliases=module_aliases.dynamic,
+                higher_order_aliases=module_aliases.higher_order,
                 builtin_module_aliases=module_aliases.builtin_modules,
                 sequence_aliases=module_aliases.sequence_aliases,
                 import_aliases=module_aliases.import_aliases,
@@ -404,6 +407,7 @@ class _LoopScope:
     safe_aliases: frozenset[str]
     builtin_module_aliases: frozenset[str]
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+    sequence_aliases: dict[str, _StaticContainer]
 
     def classify(self, expression: ast.AST) -> _LoopCallableKind:
         if isinstance(expression, ast.NamedExpr):
@@ -425,9 +429,26 @@ class _LoopScope:
             ):
                 return _LoopCallableKind.HIGHER_ORDER
             return _LoopCallableKind.UNKNOWN
+        if isinstance(expression, ast.Subscript):
+            dynamic_kind = _classify_dynamic_builtin_lookup(
+                expression,
+                self.builtin_module_aliases,
+            )
+            if dynamic_kind is not None:
+                return dynamic_kind
+            element = _resolve_static_container_element(expression, self.sequence_aliases)
+            if element is not None:
+                return self.classify(element)
+            return _LoopCallableKind.UNKNOWN
         if isinstance(expression, ast.Call):
             if isinstance(expression.func, ast.Name) and expression.func.id == "getattr":
                 return _LoopCallableKind.MODEL
+            dynamic_kind = _classify_dynamic_builtin_lookup(
+                expression,
+                self.builtin_module_aliases,
+            )
+            if dynamic_kind is not None:
+                return dynamic_kind
             return _LoopCallableKind.UNKNOWN
         if not isinstance(expression, ast.Name):
             return _LoopCallableKind.UNKNOWN
@@ -465,7 +486,9 @@ def _build_loop_scope(
     inherited_higher = set(parent.higher_order_aliases if parent else ()) - local_names
     inherited_opaque = set(parent.opaque_aliases if parent else ()) - local_names
     inherited_safe = set(parent.safe_aliases if parent else ()) - local_names
-    builtin_module_aliases = set(parent.builtin_module_aliases if parent else ()) - local_names
+    builtin_module_aliases = (
+        set(parent.builtin_module_aliases if parent else {"builtins", "__builtins__"}) - local_names
+    )
     builtin_module_aliases.update(facts.imported_builtin_module_aliases)
     for _ in range(max(1, len(facts.assignments) + 1)):
         changed = False
@@ -483,8 +506,12 @@ def _build_loop_scope(
     for name in local_names:
         functions.pop(name, None)
     functions.update(facts.functions)
+    assignments, sequence_aliases = _expanded_callable_bindings(
+        facts,
+        inherited_sequence_aliases=parent.sequence_aliases if parent else None,
+    )
     bindings: dict[str, list[ast.expr]] = {}
-    for name, expression in facts.assignments:
+    for name, expression in assignments:
         bindings.setdefault(name, []).append(expression)
 
     local_kinds = {name: _LoopCallableKind.UNKNOWN for name in bindings}
@@ -514,6 +541,7 @@ def _build_loop_scope(
             ),
             builtin_module_aliases=frozenset(builtin_module_aliases),
             functions=functions,
+            sequence_aliases=sequence_aliases,
         )
         for name, expressions in bindings.items():
             kind = _join_loop_callable_kinds([provisional.classify(expr) for expr in expressions])
@@ -549,6 +577,71 @@ def _build_loop_scope(
         ),
         builtin_module_aliases=frozenset(builtin_module_aliases),
         functions=functions,
+        sequence_aliases=sequence_aliases,
+    )
+
+
+def _classify_dynamic_builtin_lookup(
+    expression: ast.AST,
+    builtin_module_aliases: frozenset[str],
+) -> _LoopCallableKind | None:
+    """Classify callable lookups through a builtin namespace boundary.
+
+    The guard only gives special treatment to the two known higher-order
+    builtins. Other dictionary lookups remain opaque, so an indirect callable
+    inside a repeated region cannot silently become an unreviewed execution
+    path. This is deliberately syntactic; it does not evaluate arbitrary
+    Python expressions.
+    """
+    lookup = _dynamic_builtin_lookup_key(expression, builtin_module_aliases)
+    if lookup is None:
+        return None
+    is_static, key = lookup
+    if is_static and key in _LOOP_HIGHER_ORDER_NAMES:
+        return _LoopCallableKind.HIGHER_ORDER
+    return _LoopCallableKind.OPAQUE
+
+
+def _dynamic_builtin_lookup_key(
+    expression: ast.AST,
+    builtin_module_aliases: frozenset[str],
+) -> tuple[bool, object] | None:
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Subscript) and _is_loop_builtin_dict_value(
+        expression.value,
+        builtin_module_aliases,
+    ):
+        return _static_subscript_key(expression.slice)
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr in {"get", "__getitem__"}
+        and _is_loop_builtin_dict_value(expression.func.value, builtin_module_aliases)
+    ):
+        if not expression.args:
+            return False, None
+        return _static_subscript_key(_unwrap_starred(expression.args[0]))
+    return None
+
+
+def _is_loop_builtin_dict_value(
+    expression: ast.AST,
+    builtin_module_aliases: frozenset[str],
+) -> bool:
+    expression = _unwrap_named_expr(expression)
+    if isinstance(expression, ast.Name):
+        return expression.id == "__builtins__" and expression.id in builtin_module_aliases
+    if (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == "__dict__"
+        and isinstance(expression.value, ast.Name)
+    ):
+        return expression.value.id in builtin_module_aliases
+    return (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "copy"
+        and _is_loop_builtin_dict_value(expression.func.value, builtin_module_aliases)
     )
 
 
@@ -693,7 +786,15 @@ class _LoopCallVisitor(ast.NodeVisitor):
         return scope
 
     def _is_model_call(self, node: ast.Call, scope: _LoopScope | None = None) -> bool:
-        kind = (scope or self.scope).classify(node.func)
+        current_scope = scope or self.scope
+        kind = current_scope.classify(node.func)
+        if kind is _LoopCallableKind.UNKNOWN and isinstance(node.func, ast.Name):
+            function = current_scope.functions.get(node.func.id)
+            if function is not None:
+                return self._contains_loop_risk(
+                    function.body,
+                    self._scope_for(function, current_scope),
+                )
         return kind in {_LoopCallableKind.MODEL, _LoopCallableKind.OPAQUE}
 
     def _is_model_higher_order_callback(
@@ -856,6 +957,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             context_name=self.context_name,
             inherited_raw_aliases=None,
             inherited_dynamic_aliases=None,
+            inherited_higher_order_aliases=None,
             inherited_builtin_module_aliases=None,
             parameter_names=set(),
         )
@@ -866,6 +968,7 @@ class _RawIOVisitor(ast.NodeVisitor):
                     state=_ScopeState(
                         raw_aliases=aliases.raw,
                         dynamic_aliases=aliases.dynamic,
+                        higher_order_aliases=aliases.higher_order,
                         builtin_module_aliases=aliases.builtin_modules,
                         sequence_aliases=aliases.sequence_aliases,
                         import_aliases=aliases.import_aliases,
@@ -951,6 +1054,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             context_name=context_name,
             inherited_raw_aliases=state.raw_aliases,
             inherited_dynamic_aliases=state.dynamic_aliases,
+            inherited_higher_order_aliases=state.higher_order_aliases,
             inherited_builtin_module_aliases=state.builtin_module_aliases,
             parameter_names=parameter_names,
             parameter_kinds=state.parameter_kinds,
@@ -964,6 +1068,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             self.comments,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
+            higher_order_aliases=aliases.higher_order,
             builtin_module_aliases=aliases.builtin_modules,
             instance_aliases=instance_aliases,
             method_aliases=method_aliases,
@@ -1006,6 +1111,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             classes=classes,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
+            higher_order_aliases=aliases.higher_order,
             builtin_module_aliases=aliases.builtin_modules,
             instance_aliases=direct.instance_aliases,
             method_aliases=direct.method_aliases,
@@ -1023,6 +1129,7 @@ class _RawIOVisitor(ast.NodeVisitor):
                     classes=child_state.classes,
                     raw_aliases=child_state.raw_aliases,
                     dynamic_aliases=child_state.dynamic_aliases,
+                    higher_order_aliases=child_state.higher_order_aliases,
                     builtin_module_aliases=child_state.builtin_module_aliases,
                     instance_aliases=child_state.instance_aliases,
                     method_aliases=child_state.method_aliases,
@@ -1071,6 +1178,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             context_name=self.context_name,
             inherited_raw_aliases=state.raw_aliases,
             inherited_dynamic_aliases=state.dynamic_aliases,
+            inherited_higher_order_aliases=state.higher_order_aliases,
             inherited_builtin_module_aliases=state.builtin_module_aliases,
             parameter_names=set(),
             parameter_kinds={},
@@ -1084,6 +1192,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             self.comments,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
+            higher_order_aliases=aliases.higher_order,
             builtin_module_aliases=aliases.builtin_modules,
             instance_aliases=state.instance_aliases,
             method_aliases=state.method_aliases,
@@ -1100,6 +1209,7 @@ class _RawIOVisitor(ast.NodeVisitor):
             classes=classes,
             raw_aliases=aliases.raw,
             dynamic_aliases=aliases.dynamic,
+            higher_order_aliases=aliases.higher_order,
             builtin_module_aliases=aliases.builtin_modules,
             instance_aliases=direct.instance_aliases,
             method_aliases=direct.method_aliases,
@@ -1134,6 +1244,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         *,
         raw_aliases: set[str],
         dynamic_aliases: set[str],
+        higher_order_aliases: set[str],
         builtin_module_aliases: set[str],
         instance_aliases: dict[str, str] | None = None,
         method_aliases: dict[str, tuple[str, str]] | None = None,
@@ -1146,6 +1257,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
         self.comments = comments
         self.raw_aliases = raw_aliases
         self.dynamic_aliases = dynamic_aliases
+        self.higher_order_aliases = higher_order_aliases
         self.builtin_module_aliases = builtin_module_aliases
         self.findings: list[RawIOFinding] = []
         self.referenced_names: set[str] = set()
@@ -1474,7 +1586,9 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
     def _callback_arguments(self, node: ast.Call) -> list[ast.expr]:
         """Return callback positions whose bodies execute during this call."""
         function = node.func
-        if isinstance(function, ast.Name) and function.id in {"map", "filter"}:
+        if isinstance(function, ast.Name) and (
+            function.id in {"map", "filter"} or function.id in self.higher_order_aliases
+        ):
             return self._expanded_positional_arguments(node.args)[:1]
         if isinstance(function, ast.Attribute) and function.attr in {"map", "filter"}:
             return self._expanded_positional_arguments(node.args)[:1]
@@ -1621,6 +1735,7 @@ class _DirectRawIOVisitor(ast.NodeVisitor):
 class _CallableAliases:
     raw: set[str]
     dynamic: set[str]
+    higher_order: set[str]
     builtin_modules: set[str]
     sequence_aliases: dict[str, _StaticContainer]
     import_aliases: set[str]
@@ -1770,6 +1885,7 @@ def _collect_callable_aliases(
     context_name: str | None,
     inherited_raw_aliases: set[str] | None,
     inherited_dynamic_aliases: set[str] | None,
+    inherited_higher_order_aliases: set[str] | None,
     inherited_builtin_module_aliases: set[str] | None,
     parameter_names: set[str],
     parameter_kinds: dict[str, _CallableKind] | None = None,
@@ -1779,6 +1895,8 @@ def _collect_callable_aliases(
     raw = set(inherited_raw_aliases or ()) - facts.bound_names - parameter_names
     raw.update(facts.imported_raw_aliases)
     dynamic = set(inherited_dynamic_aliases or ()) - facts.bound_names - parameter_names
+    higher_order = set(inherited_higher_order_aliases or ()) - facts.bound_names - parameter_names
+    higher_order.update(facts.imported_higher_order_aliases)
     import_aliases = set(inherited_import_aliases or ()) - facts.bound_names - parameter_names
     import_aliases.update(facts.imported_import_aliases)
     dynamic.update(import_aliases)
@@ -1854,6 +1972,7 @@ def _collect_callable_aliases(
     return _CallableAliases(
         raw=raw,
         dynamic=dynamic,
+        higher_order=higher_order,
         builtin_modules=builtin_modules,
         sequence_aliases=sequence_aliases,
         import_aliases=import_aliases,
