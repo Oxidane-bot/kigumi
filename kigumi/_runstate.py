@@ -30,6 +30,8 @@ _TARGET_OWNER_FIELD = "target_owner_token"
 _RECOVERY_DECISION_FIELD = "recovery_decision"
 _RECOVERY_RECEIPT_FILE_FIELD = "recovery_receipt_file"
 _RECOVERY_RECEIPT_DIGEST_FIELD = "recovery_receipt_sha256"
+_RECOVERY_DECISION_LEDGER_FIELD = "recovery_decisions"
+_RECOVERY_DECISION_LEDGER_DIGEST_FIELD = "recovery_decisions_sha256"
 _PROCESS_TARGET_LEASES: dict[Path, tuple[str, Any]] = {}
 _PROCESS_TARGET_LEASES_LOCK = threading.RLock()
 
@@ -243,6 +245,8 @@ class AttemptStore:
                     "created_at": now,
                     "updated_at": now,
                     _RECEIPT_CHAIN_FIELD: {},
+                    _RECOVERY_DECISION_LEDGER_FIELD: {},
+                    _RECOVERY_DECISION_LEDGER_DIGEST_FIELD: sha({}),
                 }
                 atomic_write_json(self.manifest_path, manifest)
                 return manifest
@@ -250,7 +254,7 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Run {self.run_root.name!r} has an unsupported manifest schema"
                 )
-            self._validate_receipt_chain_map(existing)
+            self._validate_manifest(existing)
             expected = {
                 key: value
                 for key, value in existing.items()
@@ -267,6 +271,8 @@ class AttemptStore:
                     "workflow_profile",
                     "workflow_profile_digest",
                     _RECEIPT_CHAIN_FIELD,
+                    _RECOVERY_DECISION_LEDGER_FIELD,
+                    _RECOVERY_DECISION_LEDGER_DIGEST_FIELD,
                 }
             }
             actual = {
@@ -465,6 +471,14 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Target {target!r} attempt {from_attempt} already has a recovery decision"
                 )
+            manifest = self._required_manifest()
+            if any(
+                entry.get("from_attempt") == from_attempt
+                for entry in self._recovery_decisions_for(target, manifest=manifest)
+            ):
+                raise RunManifestError(
+                    f"Target {target!r} attempt {from_attempt} already has a recovery decision"
+                )
             if to_attempt != from_attempt + 1:
                 raise ValueError("Recovery attempts must advance by exactly one")
             self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
@@ -482,8 +496,26 @@ class AttemptStore:
                     recovery_receipt,
                     label="recovery receipt",
                 )
+                decision = canonical_recovery_receipt.get("decision")
+                if decision not in {"retry_not_started", "retry_after_external_check"}:
+                    raise RunManifestError(
+                        "scheduled recovery receipt must contain a retry decision"
+                    )
+                if canonical_recovery.get("decision") not in {None, decision}:
+                    raise ValueError(
+                        "Recovery payload decision does not match the requested decision"
+                    )
                 recovery_receipt_path = self._write_recovery_receipt_locked(
                     canonical_recovery_receipt
+                )
+                self._append_recovery_decision_locked(
+                    manifest,
+                    target=target,
+                    from_attempt=from_attempt,
+                    to_attempt=to_attempt,
+                    decision=decision,
+                    receipt_path=recovery_receipt_path,
+                    receipt_digest=sha(canonical_recovery_receipt),
                 )
             now = iso_now()
             state.update(
@@ -499,12 +531,17 @@ class AttemptStore:
                 }
             )
             if recovery_receipt_path is not None and canonical_recovery_receipt is not None:
+                state[_RECOVERY_DECISION_FIELD] = decision
                 state[_RECOVERY_RECEIPT_FILE_FIELD] = recovery_receipt_path.relative_to(
                     self.run_root
                 ).as_posix()
                 state[_RECOVERY_RECEIPT_DIGEST_FIELD] = sha(canonical_recovery_receipt)
             self._clear_target_owner(target, state)
-            self._write_state(target, state)
+            self._write_state(
+                target,
+                state,
+                manifest=manifest if recovery_receipt_path is not None else None,
+            )
             return state
 
     def record_recovery_decision(
@@ -550,6 +587,15 @@ class AttemptStore:
                     f"Target {target!r} attempt {from_attempt} already has a recovery decision"
                 )
 
+            manifest = self._required_manifest()
+            if any(
+                entry.get("from_attempt") == from_attempt
+                for entry in self._recovery_decisions_for(target, manifest=manifest)
+            ):
+                raise RunManifestError(
+                    f"Target {target!r} attempt {from_attempt} already has a recovery decision"
+                )
+
             canonical_recovery = self._canonical_object(recovery, label="recovery decision")
             if canonical_recovery.get("decision") not in {None, decision}:
                 raise ValueError("Recovery payload decision does not match the requested decision")
@@ -570,19 +616,32 @@ class AttemptStore:
 
             self._acquire_target_lease(target, state.get(_TARGET_OWNER_FIELD))
             recovery_receipt_path = self._write_recovery_receipt_locked(canonical_receipt)
-            state[_RECOVERY_DECISION_FIELD] = decision
-            state["recovery"] = canonical_recovery
-            state[_RECOVERY_RECEIPT_FILE_FIELD] = recovery_receipt_path.relative_to(
-                self.run_root
-            ).as_posix()
-            state[_RECOVERY_RECEIPT_DIGEST_FIELD] = sha(canonical_receipt)
+            recovery_receipt_digest = sha(canonical_receipt)
+            self._append_recovery_decision_locked(
+                manifest,
+                target=target,
+                from_attempt=from_attempt,
+                to_attempt=to_attempt,
+                decision=decision,
+                receipt_path=recovery_receipt_path,
+                receipt_digest=recovery_receipt_digest,
+            )
             now = iso_now()
             if decision == "fail":
-                state["updated_at"] = now
+                self._clear_target_owner(target, state)
+                manifest["updated_at"] = now
+                atomic_write_json(self.manifest_path, manifest)
+                return state
             else:
                 canonical_inherited = json.loads(canonical_json(inherited_nodes or {}))
                 state.update(
                     {
+                        _RECOVERY_DECISION_FIELD: decision,
+                        "recovery": canonical_recovery,
+                        _RECOVERY_RECEIPT_FILE_FIELD: recovery_receipt_path.relative_to(
+                            self.run_root
+                        ).as_posix(),
+                        _RECOVERY_RECEIPT_DIGEST_FIELD: recovery_receipt_digest,
                         "attempt": to_attempt,
                         "status": "retry_scheduled",
                         "next_attempt": to_attempt,
@@ -593,7 +652,7 @@ class AttemptStore:
                     }
                 )
             self._clear_target_owner(target, state)
-            self._write_state(target, state)
+            self._write_state(target, state, manifest=manifest)
             return state
 
     def write_recovery_receipt(self, payload: dict[str, Any]) -> Path:
@@ -1010,15 +1069,164 @@ class AttemptStore:
         for target_digest, chain in chains.items():
             cls._validate_receipt_chain(target_digest, chain, manifest_path)
 
+    def _validate_manifest(self, manifest: dict[str, Any]) -> None:
+        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
+            raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
+        self._validate_receipt_chain_map(manifest)
+        self._validate_recovery_decision_ledger(manifest)
+
+    def _validate_recovery_decision_ledger(self, manifest: dict[str, Any]) -> None:
+        """Validate the append-only recovery ledger and every bound receipt."""
+        ledger = manifest.get(_RECOVERY_DECISION_LEDGER_FIELD)
+        ledger_digest = manifest.get(_RECOVERY_DECISION_LEDGER_DIGEST_FIELD)
+        if not isinstance(ledger, dict) or not self._is_sha256(ledger_digest):
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "recovery decision ledger is missing or malformed",
+            )
+        if sha(ledger) != ledger_digest:
+            raise StateIntegrityError(
+                self.manifest_path,
+                RUN_MANIFEST_SCHEMA,
+                "recovery decision ledger digest does not match the manifest",
+            )
+
+        valid_decisions = {
+            "retry_not_started",
+            "retry_after_external_check",
+            "fail",
+        }
+        for target_digest, entries in ledger.items():
+            if not self._is_sha256(target_digest):
+                raise RunManifestError("Recovery decision ledger contains an invalid target digest")
+            if not isinstance(entries, list):
+                raise RunManifestError(
+                    f"Recovery decision ledger for {target_digest!r} must be a JSON list"
+                )
+            seen_attempts: set[int] = set()
+            for index, entry in enumerate(entries, start=1):
+                if not isinstance(entry, dict):
+                    raise RunManifestError(
+                        f"Recovery decision ledger entry {index} for {target_digest!r} "
+                        "must be a JSON object"
+                    )
+                if entry.get("target_digest") != target_digest:
+                    raise RunManifestError(
+                        f"Recovery decision ledger entry {index} has a target mismatch"
+                    )
+                from_attempt = entry.get("from_attempt")
+                to_attempt = entry.get("to_attempt")
+                decision = entry.get("decision")
+                if (
+                    type(from_attempt) is not int
+                    or from_attempt < 1
+                    or type(to_attempt) is not int
+                    or to_attempt < 1
+                    or decision not in valid_decisions
+                ):
+                    raise RunManifestError(
+                        f"Recovery decision ledger entry {index} has invalid decision fields"
+                    )
+                expected_to_attempt = from_attempt if decision == "fail" else from_attempt + 1
+                if to_attempt != expected_to_attempt:
+                    raise RunManifestError(
+                        f"Recovery decision ledger entry {index} has an invalid attempt range"
+                    )
+                if from_attempt in seen_attempts:
+                    raise RunManifestError(
+                        f"Recovery decision ledger has multiple decisions for attempt "
+                        f"{from_attempt}"
+                    )
+                seen_attempts.add(from_attempt)
+
+                file_name = entry.get(_RECOVERY_RECEIPT_FILE_FIELD)
+                receipt_digest = entry.get(_RECOVERY_RECEIPT_DIGEST_FIELD)
+                receipt_path = self._recovery_receipt_path(
+                    file_name,
+                    error_path=self.manifest_path,
+                )
+                if not self._is_sha256(receipt_digest):
+                    raise StateIntegrityError(
+                        self.manifest_path,
+                        RUN_MANIFEST_SCHEMA,
+                        "recovery decision ledger receipt digest is invalid",
+                    )
+                receipt, corrupted = self._read_json_safe(receipt_path)
+                if corrupted:
+                    raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
+                if receipt is None:
+                    raise StateIntegrityError(
+                        receipt_path,
+                        ATTEMPT_RECEIPT_SCHEMA,
+                        "recovery receipt referenced by the recovery decision ledger is missing",
+                    )
+                if sha(receipt) != receipt_digest:
+                    raise StateIntegrityError(
+                        receipt_path,
+                        ATTEMPT_RECEIPT_SCHEMA,
+                        "recovery decision ledger receipt digest does not match",
+                    )
+                if (
+                    receipt.get("from_attempt") != from_attempt
+                    or receipt.get("to_attempt") != to_attempt
+                    or receipt.get("decision") != decision
+                ):
+                    raise StateIntegrityError(
+                        receipt_path,
+                        ATTEMPT_RECEIPT_SCHEMA,
+                        "recovery decision ledger does not match its receipt",
+                    )
+
+    def _recovery_decisions_for(
+        self,
+        target: str,
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if manifest is None:
+            manifest = self._required_manifest()
+        ledger = manifest[_RECOVERY_DECISION_LEDGER_FIELD]
+        return list(ledger.get(sha(target), []))
+
+    def _append_recovery_decision_locked(
+        self,
+        manifest: dict[str, Any],
+        *,
+        target: str,
+        from_attempt: int,
+        to_attempt: int,
+        decision: str,
+        receipt_path: Path,
+        receipt_digest: str,
+    ) -> dict[str, Any]:
+        entries = manifest[_RECOVERY_DECISION_LEDGER_FIELD].setdefault(sha(target), [])
+        if any(entry.get("from_attempt") == from_attempt for entry in entries):
+            raise RunManifestError(
+                f"Target {target!r} attempt {from_attempt} already has a recovery decision"
+            )
+        entry = {
+            "target_digest": sha(target),
+            "from_attempt": from_attempt,
+            "to_attempt": to_attempt,
+            "decision": decision,
+            _RECOVERY_RECEIPT_FILE_FIELD: receipt_path.relative_to(self.run_root).as_posix(),
+            _RECOVERY_RECEIPT_DIGEST_FIELD: receipt_digest,
+        }
+        entries.append(entry)
+        manifest[_RECOVERY_DECISION_LEDGER_DIGEST_FIELD] = sha(
+            manifest[_RECOVERY_DECISION_LEDGER_FIELD]
+        )
+        self._validate_recovery_decision_ledger(manifest)
+        return entry
+
     def _required_manifest(self) -> dict[str, Any]:
         manifest, corrupted = self._read_json_safe(self.manifest_path)
         if corrupted:
             raise self._integrity_error(self.manifest_path, RUN_MANIFEST_SCHEMA)
         if manifest is None:
             raise RunManifestError(f"Missing or invalid run manifest: {self.manifest_path}")
-        if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
-            raise RunManifestError(f"Run {self.run_root.name!r} has an unsupported manifest schema")
-        self._validate_receipt_chain_map(manifest)
+        self._validate_manifest(manifest)
         return manifest
 
     def _receipt_chain(
@@ -1039,11 +1247,23 @@ class AttemptStore:
         payload = {key: value for key, value in state.items() if key != _STATE_DIGEST_FIELD}
         return sha(payload)
 
-    def _write_state(self, target: str, state: dict[str, Any]) -> None:
+    def _write_state(
+        self,
+        target: str,
+        state: dict[str, Any],
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> None:
         with self._run_locked():
-            self._write_state_locked(target, state)
+            self._write_state_locked(target, state, manifest=manifest)
 
-    def _write_state_locked(self, target: str, state: dict[str, Any]) -> None:
+    def _write_state_locked(
+        self,
+        target: str,
+        state: dict[str, Any],
+        *,
+        manifest: dict[str, Any] | None = None,
+    ) -> None:
         """Append a state snapshot and bind it to the run-manifest receipt chain."""
         target_digest = sha(target)
         if state.get("target") != target or state.get("target_digest") != target_digest:
@@ -1052,7 +1272,10 @@ class AttemptStore:
         if type(attempt) is not int or attempt < 1:
             raise RunManifestError(f"Attempt state for {target!r} has invalid attempt")
 
-        manifest = self._required_manifest()
+        if manifest is None:
+            manifest = self._required_manifest()
+        else:
+            self._validate_manifest(manifest)
         chains = manifest[_RECEIPT_CHAIN_FIELD]
         chain = list(self._receipt_chain(target, manifest=manifest))
         current_fields = {
@@ -1158,7 +1381,8 @@ class AttemptStore:
         receipt, corrupted = self._read_json_safe(receipt_path)
         if corrupted:
             raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
-        self._validate_recovery_receipt_binding(state, path)
+        self._validate_recovery_receipt_binding(state, path, target)
+        self._validate_recovery_decision_state(target, state)
         if receipt is None:
             if state.get("side_effect_started") is True:
                 raise AmbiguousAttemptError(
@@ -1217,20 +1441,12 @@ class AttemptStore:
             raise RunManifestError(f"{label} must be a canonical object")
         return canonical
 
-    def _validate_recovery_receipt_binding(
-        self,
-        state: dict[str, Any],
-        state_path: Path,
-    ) -> None:
-        file_name = state.get(_RECOVERY_RECEIPT_FILE_FIELD)
-        digest = state.get(_RECOVERY_RECEIPT_DIGEST_FIELD)
-        if file_name is None and digest is None:
-            return
-        if not isinstance(file_name, str) or not file_name or not self._is_sha256(digest):
+    def _recovery_receipt_path(self, file_name: Any, *, error_path: Path) -> Path:
+        if not isinstance(file_name, str) or not file_name:
             raise StateIntegrityError(
-                state_path,
+                error_path,
                 ATTEMPT_RECEIPT_SCHEMA,
-                "recovery receipt binding is incomplete or invalid",
+                "recovery receipt path is missing or invalid",
             )
         relative = Path(file_name)
         if (
@@ -1241,11 +1457,35 @@ class AttemptStore:
             or relative.suffix != ".json"
         ):
             raise StateIntegrityError(
-                state_path,
+                error_path,
                 ATTEMPT_RECEIPT_SCHEMA,
                 "recovery receipt path escapes the run directory",
             )
-        receipt_path = self.run_root / relative
+        return self.run_root / relative
+
+    def _validate_recovery_receipt_binding(
+        self,
+        state: dict[str, Any],
+        state_path: Path,
+        target: str,
+    ) -> None:
+        decision = state.get(_RECOVERY_DECISION_FIELD)
+        file_name = state.get(_RECOVERY_RECEIPT_FILE_FIELD)
+        digest = state.get(_RECOVERY_RECEIPT_DIGEST_FIELD)
+        if decision is None and file_name is None and digest is None:
+            return
+        if (
+            decision not in {"retry_not_started", "retry_after_external_check", "fail"}
+            or file_name is None
+            or digest is None
+            or not self._is_sha256(digest)
+        ):
+            raise StateIntegrityError(
+                state_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "recovery receipt binding is incomplete or invalid",
+            )
+        receipt_path = self._recovery_receipt_path(file_name, error_path=state_path)
         receipt, corrupted = self._read_json_safe(receipt_path)
         if corrupted:
             raise self._integrity_error(receipt_path, ATTEMPT_RECEIPT_SCHEMA)
@@ -1261,6 +1501,46 @@ class AttemptStore:
                 ATTEMPT_RECEIPT_SCHEMA,
                 "bound recovery receipt digest does not match the state",
             )
+        if receipt.get("decision") != decision:
+            raise StateIntegrityError(
+                receipt_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "bound recovery receipt decision does not match the state",
+            )
+        if not any(
+            entry.get(_RECOVERY_RECEIPT_FILE_FIELD) == file_name
+            and entry.get(_RECOVERY_RECEIPT_DIGEST_FIELD) == digest
+            and entry.get("decision") == decision
+            for entry in self._recovery_decisions_for(target)
+        ):
+            raise StateIntegrityError(
+                state_path,
+                ATTEMPT_RECEIPT_SCHEMA,
+                "recovery receipt is not bound in the recovery decision ledger",
+            )
+
+    def _validate_recovery_decision_state(
+        self,
+        target: str,
+        state: dict[str, Any],
+    ) -> None:
+        """Ensure the current state reflects every durable recovery decision."""
+        state_path = self._state_path(target)
+        current_attempt = state.get("attempt")
+        for entry in self._recovery_decisions_for(target):
+            from_attempt = entry["from_attempt"]
+            decision = entry["decision"]
+            to_attempt = entry["to_attempt"]
+            if decision == "fail":
+                valid = current_attempt == from_attempt and state.get("status") == "failed"
+            else:
+                valid = isinstance(current_attempt, int) and current_attempt >= to_attempt
+            if not valid:
+                raise StateIntegrityError(
+                    state_path,
+                    ATTEMPT_RECEIPT_SCHEMA,
+                    "current state does not reflect the recovery decision ledger",
+                )
 
     def _write_recovery_receipt_locked(self, payload: dict[str, Any]) -> Path:
         recovery_time = payload.get("recovery_time")

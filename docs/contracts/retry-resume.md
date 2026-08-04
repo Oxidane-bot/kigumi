@@ -14,8 +14,15 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 
 底层 `AttemptStore` 为需要原子记录恢复决定的调用方提供
 `schedule_recovery(..., recovery_receipt=payload)` 与
-`write_recovery_receipt(payload)`；前者在同一 run lock 内排他创建
-`recovery-*.json`，并把相对文件名及 canonical digest 绑定到新的 state。
+`write_recovery_receipt(payload)`，以及用于 fail/retry 互斥裁决的
+`record_recovery_decision(...)`。恢复 receipt 始终保持原有 public JSON shape；
+`record_recovery_decision` 在同一 run lock 内排他创建 `recovery-*.json`，并把
+target、from/to attempt、decision、相对文件名及 canonical digest 追加到
+`_run.json` 的 `recovery_decisions` ledger（同时由
+`recovery_decisions_sha256` 锚定）。retry decision 可以把同一绑定复制到新的
+current state；fail decision 只更新 manifest ledger，不重写已经 terminal 的
+current state 或 `attempt-NNNN.json`。`write_recovery_receipt(payload)` 仍是
+兼容的独立 receipt writer，不声称完成 decision binding。
 
 终态 `failed` run 使用 `Dag.recover()` 记录显式 decision、reason 与 evidence，再由
 `Dag.resume()` 执行新 attempt；恢复不删除 run 目录，也不改动缓存键族。
@@ -59,8 +66,12 @@ dag retry-resolve RUN_ID TARGET --attempt N --action retry|fail --reason TEXT
 9. 同 run completed artifact（含 `cache="off"`）恢复时必须重验 Prompt snapshot/selection/
    resolution digest、candidate、artifact、origin、sidecar、输出/blob 字节，并且不重新执行。
    manifest 记录 `resume_count` 与 `last_resumed_at`，但它们不改变 immutable run identity。
-10. terminal `failed` recovery 只能匹配当前失败 attempt；retry decision 追加新 attempt 并
-    记录继承的成功节点，旧 attempt receipt 与 recovery receipt 保留不删不覆写。
+10. terminal `failed` recovery 只能匹配当前失败 attempt。每个 recovery decision 都必须
+    追加到 `_run.json` 的 `recovery_decisions` ledger，并由 ledger digest、receipt
+    filename 和 receipt digest 共同绑定；ledger 或绑定 receipt 缺失、损坏、重复或
+    不匹配时必须 fail closed。retry decision 追加新 attempt 并记录继承的成功节点，
+    旧 attempt receipt 与 recovery receipt 保留不删不覆写；fail decision 只更新 ledger，
+    当前 failed state 和对应的 `attempt-NNNN.json` 必须保持字节不变。
 11. 已存在但 JSON、schema 或 digest 不可信的 durable manifest、attempt receipt、candidate、
     artifact 或 Prompt lineage 是完整性错误，不是缺失状态；`StateIntegrityError` 或
     `RunManifestError` 必须 fail closed，不能把它当成未开始 attempt 创建新执行。只有真正缺失

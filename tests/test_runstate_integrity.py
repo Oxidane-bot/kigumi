@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -385,10 +386,159 @@ def test_record_recovery_decision_makes_fail_and_retry_mutually_exclusive(
         assert successes[0]["status"] == "failed"
         assert state["attempt"] == 1
         assert not (tmp_path / "run" / "attempts" / sha("work") / "attempt-0002.json").exists()
-    assert state["recovery_receipt_file"]
-    assert state["recovery_receipt_sha256"] == sha(
-        json.loads((tmp_path / "run" / state["recovery_receipt_file"]).read_text(encoding="utf-8"))
+    manifest = json.loads((tmp_path / "run" / "_run.json").read_text(encoding="utf-8"))
+    ledger = manifest["recovery_decisions"][sha("work")]
+    assert len(ledger) == 1
+    entry = ledger[0]
+    receipt_path = tmp_path / "run" / entry["recovery_receipt_file"]
+    assert entry["recovery_receipt_sha256"] == sha(
+        json.loads(receipt_path.read_text(encoding="utf-8"))
     )
+    if successes[0]["status"] == "retry_scheduled":
+        assert state["recovery_receipt_file"] == entry["recovery_receipt_file"]
+        assert state["recovery_receipt_sha256"] == entry["recovery_receipt_sha256"]
+    else:
+        assert "recovery_receipt_file" not in state
+        assert "recovery_receipt_sha256" not in state
+
+
+def test_fail_recovery_decision_uses_manifest_ledger_without_rewriting_attempt_receipt(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    attempt_path = _receipt_path(tmp_path)
+    state_path = _state_path(tmp_path)
+    attempt_before = attempt_path.read_bytes()
+    attempt_digest_before = hashlib.sha256(attempt_before).hexdigest()
+    state_before = state_path.read_bytes()
+
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    returned = store.record_recovery_decision(
+        "work",
+        from_attempt=1,
+        decision="fail",
+        recovery=payload,
+        recovery_receipt=payload,
+    )
+
+    assert returned["status"] == "failed"
+    assert attempt_path.read_bytes() == attempt_before
+    assert hashlib.sha256(attempt_path.read_bytes()).hexdigest() == attempt_digest_before
+    assert state_path.read_bytes() == state_before
+
+    manifest = json.loads((tmp_path / "run" / "_run.json").read_text(encoding="utf-8"))
+    entry = manifest["recovery_decisions"][sha("work")][0]
+    recovery_path = tmp_path / "run" / entry["recovery_receipt_file"]
+    assert json.loads(recovery_path.read_text(encoding="utf-8")) == payload
+    assert entry["recovery_receipt_sha256"] == sha(payload)
+    assert manifest["recovery_decisions_sha256"] == sha(manifest["recovery_decisions"])
+
+    with pytest.raises(RunManifestError, match="already has a recovery decision"):
+        store.record_recovery_decision(
+            "work",
+            from_attempt=1,
+            decision="fail",
+            recovery=payload,
+            recovery_receipt=payload,
+        )
+
+
+def test_missing_recovery_decision_ledger_fails_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    store.record_recovery_decision(
+        "work",
+        from_attempt=1,
+        decision="fail",
+        recovery=payload,
+        recovery_receipt=payload,
+    )
+    manifest_path = tmp_path / "run" / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("recovery_decisions")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(StateIntegrityError, match="recovery decision ledger"):
+        store.state_for("work")
+
+
+def test_missing_recovery_decision_receipt_fails_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    store.record_recovery_decision(
+        "work",
+        from_attempt=1,
+        decision="fail",
+        recovery=payload,
+        recovery_receipt=payload,
+    )
+    manifest = json.loads((tmp_path / "run" / "_run.json").read_text(encoding="utf-8"))
+    receipt_path = (
+        tmp_path / "run" / manifest["recovery_decisions"][sha("work")][0]["recovery_receipt_file"]
+    )
+    receipt_path.unlink()
+
+    with pytest.raises(StateIntegrityError, match="recovery receipt"):
+        store.state_for("work")
+
+
+def test_corrupt_recovery_decision_ledger_fails_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 1,
+        "decision": "fail",
+        "reason": "operator rejected retry",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+    store.record_recovery_decision(
+        "work",
+        from_attempt=1,
+        decision="fail",
+        recovery=payload,
+        recovery_receipt=payload,
+    )
+    manifest_path = tmp_path / "run" / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["recovery_decisions"][sha("work")][0]["decision"] = "retry_not_started"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(StateIntegrityError, match="ledger digest"):
+        store.state_for("work")
 
 
 def test_recovery_receipt_is_bound_inside_schedule_recovery_transaction(
@@ -421,6 +571,7 @@ def test_recovery_receipt_is_bound_inside_schedule_recovery_transaction(
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == payload
     assert state["recovery_receipt_sha256"] == sha(payload)
     assert state["status"] == "retry_scheduled"
+    assert store.state_for("work")["recovery_decision"] == "retry_not_started"
     receipt_path.unlink()
     with pytest.raises(StateIntegrityError, match="recovery receipt"):
         store.state_for("work")
