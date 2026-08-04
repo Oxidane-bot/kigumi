@@ -318,6 +318,7 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
             identity=_file_identity,
             phase="reading L1 cache",
             error=lambda message, path: ValueError(f"call cache file {message}: {path}"),
+            snapshot=True,
         )
     except FileNotFoundError:
         return CacheLookup("MISSING", None, None, None, "call cache file is missing")

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from kigumi._runstate import RunManifestError
+from kigumi.artifacts import atomic_write_json, sha
 from kigumi.calling import DryRunError, LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import CheckpointPending, Dag
@@ -57,6 +58,68 @@ def test_multiple_processes_leave_a_valid_shared_cache(tmp_path: Path) -> None:
     cache_files = list((cache_dir / "llm").glob("*.json"))
     assert len(cache_files) == 1
     assert json.loads(cache_files[0].read_text(encoding="utf-8"))["response"] == "stable response"
+
+
+def test_l1_reader_accepts_a_legitimate_atomic_replacement(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A cache inode swap between parent bind and open must not become CORRUPT."""
+    import kigumi._safe_io as safe_io
+
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = sha(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    path = tmp_path / "llm" / f"{key}.json"
+    old_payload = {
+        "meta": {"key": key},
+        "response": "old complete response",
+        "response_sha256": sha("old complete response"),
+    }
+    new_payload = {
+        "meta": {"key": key},
+        "response": "new complete response",
+        "response_sha256": sha("new complete response"),
+    }
+    atomic_write_json(path, old_payload)
+
+    open_attempt = threading.Event()
+    replacement_done = threading.Event()
+    original_open = safe_io._open_regular_file_at
+
+    def delayed_open(directory, name, **kwargs):
+        if name == path.name:
+            open_attempt.set()
+            if not replacement_done.wait(timeout=5):
+                raise AssertionError("timed out waiting for atomic cache replacement")
+        return original_open(directory, name, **kwargs)
+
+    monkeypatch.setattr(safe_io, "_open_regular_file_at", delayed_open)
+    result: list[str] = []
+    failures: list[BaseException] = []
+
+    def read_cache() -> None:
+        try:
+            result.append(caller.call("hello"))
+        except BaseException as error:
+            failures.append(error)
+
+    reader = threading.Thread(target=read_cache)
+    reader.start()
+    assert open_attempt.wait(timeout=5)
+    atomic_write_json(path, new_payload)
+    replacement_done.set()
+    reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert failures == []
+    assert result in ([old_payload["response"]], [new_payload["response"]])
+    assert caller.transport.requests == []
 
 
 def _make_dag(tmp_path: Path) -> Dag:

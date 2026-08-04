@@ -451,8 +451,29 @@ def open_regular_file(
     expected_identity: FileIdentity | None,
     phase: str,
     error: FileError,
+    snapshot: bool = False,
 ) -> BinaryIO:
-    """Open a regular file through a non-blocking, no-follow descriptor."""
+    """Open a regular file through a non-blocking, no-follow descriptor.
+
+    The default mode binds the final entry to its lexical preflight identity.
+    ``snapshot`` instead binds the parent directory first and opens whichever
+    regular entry the directory contains at that instant.  This is needed for
+    atomically published cache files: a legitimate writer may replace the
+    final inode between a path preflight and the open, while the descriptor
+    itself still provides one complete, no-follow snapshot.
+    """
+    path = Path(path)
+    if snapshot:
+        with SecureDirectory(path.parent, create=False) as directory:
+            return _open_regular_file_at(
+                directory,
+                path.name,
+                identity=identity,
+                expected_identity=expected_identity,
+                phase=phase,
+                error=error,
+            )
+
     initial = lstat_regular_file(path, error=error)
     with SecureDirectory(Path(path).parent, create=False) as directory:
         return _open_regular_file_at(
@@ -472,6 +493,7 @@ def read_regular_bytes(
     expected_identity: FileIdentity | None = None,
     phase: str,
     error: FileError = _default_file_error,
+    snapshot: bool = False,
 ) -> bytes:
     """Read one regular file through the shared descriptor-relative boundary."""
     with open_regular_file(
@@ -480,8 +502,28 @@ def read_regular_bytes(
         expected_identity=expected_identity,
         phase=phase,
         error=error,
+        snapshot=snapshot,
     ) as handle:
-        return handle.read()
+        if not snapshot:
+            return handle.read()
+        initial = verify_regular_descriptor(
+            handle,
+            Path(path),
+            identity=identity,
+            expected_identity=expected_identity,
+            phase=phase,
+            error=error,
+        )
+        raw = handle.read()
+        verify_regular_descriptor(
+            handle,
+            Path(path),
+            identity=identity,
+            expected_identity=identity(initial),
+            phase=phase,
+            error=error,
+        )
+        return raw
 
 
 def verify_regular_descriptor(
