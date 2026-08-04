@@ -471,7 +471,7 @@ class AttemptStore:
                 raise RunManifestError(
                     f"Target {target!r} attempt {from_attempt} already has a recovery decision"
                 )
-            manifest = self._required_manifest()
+            manifest = self._required_failed_manifest()
             if any(
                 entry.get("from_attempt") == from_attempt
                 for entry in self._recovery_decisions_for(target, manifest=manifest)
@@ -587,7 +587,7 @@ class AttemptStore:
                     f"Target {target!r} attempt {from_attempt} already has a recovery decision"
                 )
 
-            manifest = self._required_manifest()
+            manifest = self._required_failed_manifest()
             if any(
                 entry.get("from_attempt") == from_attempt
                 for entry in self._recovery_decisions_for(target, manifest=manifest)
@@ -1227,6 +1227,13 @@ class AttemptStore:
         if manifest is None:
             raise RunManifestError(f"Missing or invalid run manifest: {self.manifest_path}")
         self._validate_manifest(manifest)
+        return manifest
+
+    def _required_failed_manifest(self) -> dict[str, Any]:
+        """Require the run to still be terminally failed in the current lock."""
+        manifest = self._required_manifest()
+        if manifest.get("status") != "failed":
+            raise ValueError(f"Run {self.run_root.name!r} is not in terminal failed state")
         return manifest
 
     def _receipt_chain(

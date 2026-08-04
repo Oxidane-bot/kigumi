@@ -35,6 +35,7 @@ def _store_with_missing_historical_receipt(tmp_path: Path) -> AttemptStore:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     recovery = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,
@@ -341,6 +342,7 @@ def test_record_recovery_decision_makes_fail_and_retry_mutually_exclusive(
     initial = _store(tmp_path)
     initial.prepare("work", policy=None, declaration_digest="decl")
     initial.record_failure("work", RuntimeError("terminal"), policy=None)
+    initial.update_manifest("failed")
     barrier = threading.Barrier(2)
 
     def decide(decision: str) -> tuple[str, Any]:
@@ -402,12 +404,61 @@ def test_record_recovery_decision_makes_fail_and_retry_mutually_exclusive(
         assert "recovery_receipt_sha256" not in state
 
 
+@pytest.mark.parametrize("operation", ["record", "schedule"])
+def test_recovery_requires_failed_manifest_status_without_mutation(
+    tmp_path: Path, operation: str
+) -> None:
+    store = _store(tmp_path)
+    store.prepare("work", policy=None, declaration_digest="decl")
+    store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
+    state_before = _state_path(tmp_path).read_bytes()
+    payload = {
+        "recovery_time": "2026-08-04T12:00:00.000000Z",
+        "from_attempt": 1,
+        "to_attempt": 2,
+        "decision": "retry_not_started",
+        "reason": "the side effect never started",
+        "evidence_refs": [],
+        "recovered_by": "test",
+    }
+
+    store.update_manifest("running")
+    with pytest.raises(ValueError, match="not in terminal failed state"):
+        if operation == "record":
+            store.record_recovery_decision(
+                "work",
+                from_attempt=1,
+                decision="retry_not_started",
+                recovery=payload,
+                inherited_nodes={},
+                recovery_receipt=payload,
+            )
+        else:
+            store.schedule_recovery(
+                "work",
+                from_attempt=1,
+                to_attempt=2,
+                recovery=payload,
+                inherited_nodes={},
+                recovery_receipt=payload,
+            )
+
+    assert _state_path(tmp_path).read_bytes() == state_before
+    run_dir = tmp_path / "run"
+    assert not list(run_dir.glob("recovery-*.json"))
+    manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "running"
+    assert manifest["recovery_decisions"] == {}
+
+
 def test_fail_recovery_decision_uses_manifest_ledger_without_rewriting_attempt_receipt(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     attempt_path = _receipt_path(tmp_path)
     state_path = _state_path(tmp_path)
     attempt_before = attempt_path.read_bytes()
@@ -457,6 +508,7 @@ def test_missing_recovery_decision_ledger_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     payload = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,
@@ -486,6 +538,7 @@ def test_missing_recovery_decision_receipt_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     payload = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,
@@ -516,6 +569,7 @@ def test_corrupt_recovery_decision_ledger_fails_closed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     payload = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,
@@ -547,6 +601,7 @@ def test_recovery_receipt_is_bound_inside_schedule_recovery_transaction(
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     payload = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,
@@ -646,6 +701,7 @@ def test_schedule_recovery_receipt_is_not_claimed_if_state_commit_crashes(
     store = _store(tmp_path)
     store.prepare("work", policy=None, declaration_digest="decl")
     store.record_failure("work", RuntimeError("terminal"), policy=None)
+    store.update_manifest("failed")
     payload = {
         "recovery_time": "2026-08-04T12:00:00.000000Z",
         "from_attempt": 1,

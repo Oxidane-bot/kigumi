@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -340,6 +341,62 @@ def test_concurrent_recover_has_one_receipt_and_one_queued_attempt(tmp_path: Pat
     assert len(list(run_dir.glob("recovery-*.json"))) == 1
     attempt_two = list((run_dir / "attempts").glob("*/attempt-0002.json"))
     assert len(attempt_two) == 1
+
+
+def test_recover_rechecks_failed_manifest_inside_atomic_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _retry_dag(
+        tmp_path,
+        _SequenceTransport([_authentication_failure()]),
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    with pytest.raises(ProviderFailure):
+        first.run(run_id="manifest-status-race")
+
+    entered_atomic_decision = threading.Event()
+    release_atomic_decision = threading.Event()
+    original_record = dag_module.AttemptStore.record_recovery_decision
+
+    def pause_before_atomic_decision(self: Any, target: str, **kwargs: Any) -> dict[str, Any]:
+        entered_atomic_decision.set()
+        release_atomic_decision.wait(timeout=5)
+        return original_record(self, target, **kwargs)
+
+    monkeypatch.setattr(
+        dag_module.AttemptStore,
+        "record_recovery_decision",
+        pause_before_atomic_decision,
+    )
+
+    run_dir = tmp_path / "artifacts" / "runs" / "manifest-status-race"
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            first.recover,
+            "manifest-status-race",
+            "ask",
+            1,
+            "retry_not_started",
+            "the side effect never started",
+        )
+        try:
+            assert entered_atomic_decision.wait(timeout=5)
+            dag_module.AttemptStore(run_dir, {}).update_manifest("running")
+        finally:
+            release_atomic_decision.set()
+
+        with pytest.raises(ValueError, match="not in terminal failed state"):
+            future.result(timeout=5)
+
+    assert not list(run_dir.glob("recovery-*.json"))
+    assert not list((run_dir / "attempts").glob("*/attempt-0002.json"))
+    state_path = next((run_dir / "attempts").glob("*/state.json"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["attempt"] == 1
+    manifest = json.loads((run_dir / "_run.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "running"
+    assert manifest["recovery_decisions"] == {}
 
 
 def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
