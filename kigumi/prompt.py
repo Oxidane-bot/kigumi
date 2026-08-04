@@ -39,15 +39,25 @@ PROMPT_RESOLUTION_SCHEMA = 1
 _ORIGINAL_OS_OPEN = os.open
 
 
-def _read_regular_file_no_follow(root: Path, relative: str) -> bytes:
-    """Read one root-relative regular file through bound no-follow descriptors.
+def _verify_prompt_catalog_root(directory: SecureDirectory) -> None:
+    """Verify the bound catalog path still has no user-controlled symlinks."""
+    directory.verify_bound()
+    try:
+        _safe_configured_path(directory.path)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Prompt catalog root changed unsafely: {directory.path}") from error
 
-    Prompt files are part of a run's input identity.  A path check followed by
-    ``Path.read_bytes`` leaves a replacement window in which a regular file can
-    become a symlink, FIFO, or another special file.  Open every directory and
-    the final file relative to descriptors so a parent replacement cannot
-    redirect the read, and use a non-blocking no-follow final descriptor so a
-    raced FIFO fails closed instead of blocking.
+
+def _read_regular_file_no_follow(root: SecureDirectory, relative: str) -> bytes:
+    """Read one root-relative regular file from an already-bound catalog.
+
+    Prompt files are part of a run's input identity.  Keep the catalog's
+    ``SecureDirectory`` open for the whole capture and resolve every component
+    relative to its descriptor; reopening ``root`` by path would allow an
+    ordinary directory replacement to redirect a later file read.  The final
+    descriptor is non-blocking and no-follow, and its identity is checked both
+    before and after reading so symlinks, FIFOs, special files, and same-inode
+    content races fail closed.
     """
     supported = getattr(os, "supports_dir_fd", ())
     if (
@@ -57,7 +67,6 @@ def _read_regular_file_no_follow(root: Path, relative: str) -> bytes:
     ):
         raise OSError(errno.ENOTSUP, "Prompt snapshot requires descriptor-relative no-follow I/O")
 
-    absolute_root = root.absolute()
     parts = tuple(part for part in relative.split("/") if part)
     if not parts or any(part in {".", ".."} for part in parts):
         raise ValueError(f"Unsafe prompt snapshot path: {relative!r}")
@@ -73,13 +82,8 @@ def _read_regular_file_no_follow(root: Path, relative: str) -> bytes:
     descriptors: list[int] = []
     file_descriptor = -1
     try:
-        current = os.open(absolute_root.anchor, directory_flags)
-        descriptors.append(current)
-        for component in absolute_root.parts[1:]:
-            if component in {"", "."}:
-                continue
-            current = os.open(component, directory_flags, dir_fd=current)
-            descriptors.append(current)
+        _verify_prompt_catalog_root(root)
+        current = root.fd
         for component in parts[:-1]:
             current = os.open(component, directory_flags, dir_fd=current)
             descriptors.append(current)
@@ -95,6 +99,7 @@ def _read_regular_file_no_follow(root: Path, relative: str) -> bytes:
             file_descriptor = -1
             data = handle.read()
             after = os.fstat(handle.fileno())
+        _verify_prompt_catalog_root(root)
         if len(data) != before.st_size or (
             before.st_dev,
             before.st_ino,
@@ -1177,35 +1182,46 @@ class PromptCatalogSnapshot:
             raise PromptDefinitionError(
                 f"Prompt catalog root is not safely readable: {root}"
             ) from error
-        if root_info is not None:
-            if not stat.S_ISDIR(root_info.st_mode):
-                raise PromptDefinitionError(
-                    f"Prompt catalog root must be a regular directory: {resolved_root}"
-                )
-            try:
-                # Bind the existing root once before reading entries.  The
-                # per-file reader below still performs its own descriptor-
-                # relative no-follow open and race check.
-                with SecureDirectory(resolved_root, create=False):
-                    pass
-            except (OSError, ValueError) as error:
-                raise PromptDefinitionError(
-                    f"Prompt catalog root must not contain a user symlink: {root}"
-                ) from error
+        if root_info is not None and not stat.S_ISDIR(root_info.st_mode):
+            raise PromptDefinitionError(
+                f"Prompt catalog root must be a regular directory: {resolved_root}"
+            )
         names: set[str] = set()
         for spec in prompt_specs:
             names.update(reference.name for reference in spec.references())
         entries: dict[str, _CatalogEntry] = {}
-        for name in sorted(names):
-            checked = _validate_prompt_path(name)
+        if names:
             try:
-                raw = _read_regular_file_no_follow(resolved_root, f"{checked}.md")
-                text = raw.decode("utf-8")
-            except (OSError, UnicodeDecodeError) as error:
+                with SecureDirectory(resolved_root, create=False) as bound_root:
+                    if root_info is not None:
+                        bound_info = os.fstat(bound_root.fd)
+                        if (bound_info.st_dev, bound_info.st_ino) != (
+                            root_info.st_dev,
+                            root_info.st_ino,
+                        ):
+                            raise ValueError(f"Prompt catalog root changed: {resolved_root}")
+                    _verify_prompt_catalog_root(bound_root)
+                    for name in sorted(names):
+                        checked = _validate_prompt_path(name)
+                        try:
+                            raw = _read_regular_file_no_follow(bound_root, f"{checked}.md")
+                            text = raw.decode("utf-8")
+                        except (OSError, UnicodeDecodeError) as error:
+                            raise PromptDefinitionError(
+                                f"PromptRef {checked!r} must be a regular, readable UTF-8 .md file"
+                            ) from error
+                        entries[checked] = _CatalogEntry(checked, text, sha(text), len(raw))
+            except PromptDefinitionError:
+                raise
+            except FileNotFoundError as error:
+                checked = _validate_prompt_path(sorted(names)[0])
                 raise PromptDefinitionError(
                     f"PromptRef {checked!r} must be a regular, readable UTF-8 .md file"
                 ) from error
-            entries[checked] = _CatalogEntry(checked, text, sha(text), len(raw))
+            except (OSError, ValueError) as error:
+                raise PromptDefinitionError(
+                    f"Prompt catalog root is not safely readable or changed: {resolved_root}"
+                ) from error
         snapshot = cls(resolved_root, entries)
         for spec in prompt_specs:
             snapshot.validate(spec)

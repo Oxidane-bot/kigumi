@@ -589,6 +589,35 @@ def test_prompt_snapshot_rejects_symlinked_catalog_root(tmp_path: Path, link_roo
         PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
 
 
+def test_prompt_snapshot_rejects_catalog_root_replacement_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "base.md").write_text("original", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "base.md").write_text("replacement", encoding="utf-8")
+    moved = tmp_path / "original-prompts"
+    spec = PromptSpec("managed", PromptRef("base"))
+    original_reader = prompt_module._read_regular_file_no_follow
+    replaced = False
+
+    def replace_before_read(root: prompt_module.SecureDirectory, relative: str) -> bytes:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            prompts.rename(moved)
+            replacement.rename(prompts)
+        return original_reader(root, relative)
+
+    monkeypatch.setattr(prompt_module, "_read_regular_file_no_follow", replace_before_read)
+
+    with pytest.raises(PromptDefinitionError, match="changed|replacement|safely"):
+        PromptCatalogSnapshot.capture(prompts, prompt_specs=(spec,))
+    assert replaced is True
+
+
 def test_prompt_snapshot_rejects_symlink_installed_at_descriptor_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
