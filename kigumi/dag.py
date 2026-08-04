@@ -75,7 +75,7 @@ from .calling import (
 )
 from .config import KigumiConfig
 from .enforce import check_paths, check_raw_io_node_paths, check_raw_io_source, check_source
-from .errors import OutputOwnershipError
+from .errors import CacheIntegrityError, OutputOwnershipError
 from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
     AgentExecutionFailure,
@@ -93,7 +93,7 @@ from .prompt import (
     validate_prompt_resolution_record,
     validate_prompt_specs,
 )
-from .retry import RetryExhausted, RetryPolicy
+from .retry import AmbiguousAttemptError, RetryExhausted, RetryPolicy
 from .slots import FileSlots, SlotTimeoutError
 from .subgraph import Subgraph
 
@@ -1199,8 +1199,8 @@ class Dag:
         resource_limits: Mapping[str | None, int] | None = None,
     ) -> RunResult:
         """Run a topological target closure and persist every completed node artifact."""
-        if workers < 1:
-            raise ValueError("workers must be at least 1")
+        if type(workers) is not int or workers < 1:
+            raise ValueError("workers must be a positive integer")
         requested_force = tuple(force)
         existing_manifest: dict[str, Any] | None = None
         if run_id is not None:
@@ -1304,6 +1304,7 @@ class Dag:
             prompt_resolutions: dict[str, ResolvedPrompt] = {}
             prompt_resolution_records: dict[str, Any] = {}
             function_inputs: dict[str, dict[str, Any]] = {}
+            cache_entry: store.CacheEntry | None = None
             effective_cache_policy = node.cache if libs_cache_reusable else "off"
             if node.items_from is None:
                 function_inputs = self._function_inputs(node, inputs)
@@ -1356,12 +1357,14 @@ class Dag:
                 elif prior_state is not None:
                     artifact, cache_hit = None, False
                 else:
-                    artifact, cache_hit = envelope.lookup(
+                    cache_entry = self._cache_entry_for_lookup(
                         cache_key,
                         forced=node.name in forced_nodes,
                         cache_policy=(node.cache if libs_cache_reusable else "off"),
-                        evidence_policy_digest=evidence_policy.digest,
+                        evidence_policy=evidence_policy,
                     )
+                    artifact = cache_entry.artifact if cache_entry is not None else None
+                    cache_hit = cache_entry is not None
             else:
                 artifact = None
                 cache_hit = False
@@ -1373,10 +1376,7 @@ class Dag:
                 and isinstance(cache_key, str)
                 and agent_provenance is None
             ):
-                origin = store.read_node_cache_origin(
-                    self.config.artifacts_path,
-                    cache_key,
-                )
+                origin = cache_entry.origin if cache_entry is not None else None
                 retained_agent = origin.get("agent") if isinstance(origin, dict) else None
                 if not isinstance(retained_agent, dict):
                     raise ValueError(
@@ -1527,23 +1527,22 @@ class Dag:
                                                 assert node.agent_adapter is not None
                                                 assert node.agent_spec is not None
                                                 assert node.agent_identity is not None
-                                                if node.retry is not None:
-                                                    attempt_store.mark_side_effect(
-                                                        node.name,
-                                                        {
-                                                            "active_effect_schema": 1,
-                                                            "kind": "agent",
-                                                            "instruction_sha256": sha(
-                                                                str(task.instruction)
-                                                            ),
-                                                            "managed": (
-                                                                instruction_resolution is not None
-                                                            ),
-                                                            "prompt_resolution": (
-                                                                instruction_resolution
-                                                            ),
-                                                        },
-                                                    )
+                                                attempt_store.mark_side_effect(
+                                                    node.name,
+                                                    {
+                                                        "active_effect_schema": 1,
+                                                        "kind": "agent",
+                                                        "instruction_sha256": sha(
+                                                            str(task.instruction)
+                                                        ),
+                                                        "managed": (
+                                                            instruction_resolution is not None
+                                                        ),
+                                                        "prompt_resolution": (
+                                                            instruction_resolution
+                                                        ),
+                                                    },
+                                                )
                                                 outcome = execute_agent_task(
                                                     node_name=node.name,
                                                     run_id=current_run_id,
@@ -2254,6 +2253,49 @@ class Dag:
         _validate_persisted_prompt_lineage(metadata, label)
         return artifact, metadata
 
+    def _cache_entry_for_lookup(
+        self,
+        cache_key: str,
+        *,
+        forced: bool,
+        cache_policy: CachePolicy,
+        evidence_policy: EvidencePolicy,
+    ) -> store.CacheEntry | None:
+        """Return one accepted cache snapshot for plan and execution."""
+        if forced or cache_policy != "auto":
+            return None
+        entry = store.read_cache_entry(self.config.artifacts_path, cache_key)
+        if entry.state == "CORRUPT":
+            raise CacheIntegrityError(
+                store.node_cache_path(self.config.artifacts_path, cache_key),
+                entry.lookup,
+            )
+        if (
+            entry.state != "VALID"
+            or entry.artifact is None
+            or entry.origin is None
+            or entry.origin.get("evidence_policy_digest") != evidence_policy.digest
+        ):
+            return None
+        return entry
+
+    def _lookup_cache(
+        self,
+        cache_key: str,
+        *,
+        forced: bool,
+        cache_policy: CachePolicy,
+        evidence_policy: EvidencePolicy,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Preserve the historical artifact/hit API over one cache snapshot."""
+        entry = self._cache_entry_for_lookup(
+            cache_key,
+            forced=forced,
+            cache_policy=cache_policy,
+            evidence_policy=evidence_policy,
+        )
+        return (entry.artifact, True) if entry is not None else (None, False)
+
     def plan(
         self,
         run_id: str | None = None,
@@ -2286,6 +2328,7 @@ class Dag:
         for node_name in order:
             node = self._nodes[node_name]
             libs_cache_reusable = libs_identities[node.name].cache_reusable
+            evidence_policy = node.evidence_policy or self._caller_evidence_policy()
             if any(dependency not in artifact_shas for dependency in node.deps):
                 waiting_on = tuple(
                     dependency
@@ -2317,12 +2360,12 @@ class Dag:
                 )
                 artifact = None
                 if node.cache == "auto" and libs_cache_reusable and node_name not in forced_nodes:
-                    cache_lookup = store.read_node_cache(
-                        self.config.artifacts_path,
+                    artifact, _ = self._lookup_cache(
                         cache_key,
+                        forced=False,
+                        cache_policy=node.cache,
+                        evidence_policy=evidence_policy,
                     )
-                    if cache_lookup.state == "VALID":
-                        artifact = cache_lookup.data
                 if artifact is None:
                     nodes[node_name] = "miss"
                     continue
@@ -2393,12 +2436,12 @@ class Dag:
                         and node_name not in forced_nodes
                         and item_id not in forced_items.get(node_name, set())
                     ):
-                        cache_lookup = store.read_node_cache(
-                            self.config.artifacts_path,
+                        artifact, _ = self._lookup_cache(
                             cache_key,
+                            forced=False,
+                            cache_policy=node.cache,
+                            evidence_policy=evidence_policy,
                         )
-                        if cache_lookup.state == "VALID":
-                            artifact = cache_lookup.data
                     if artifact is None:
                         nodes[expanded_name] = "miss"
                         previous_pending = expanded_name
@@ -2446,12 +2489,12 @@ class Dag:
                     and node_name not in forced_nodes
                     and item_id not in forced_items.get(node_name, set())
                 ):
-                    cache_lookup = store.read_node_cache(
-                        self.config.artifacts_path,
+                    artifact, _ = self._lookup_cache(
                         cache_key,
+                        forced=False,
+                        cache_policy=node.cache,
+                        evidence_policy=evidence_policy,
                     )
-                    if cache_lookup.state == "VALID":
-                        artifact = cache_lookup.data
                 status = "hit" if artifact is not None else "miss"
                 nodes[f"{node_name}@{item_id}"] = status
                 item_statuses.append(status)
@@ -2598,8 +2641,12 @@ class Dag:
                     upstream_artifacts=inputs,
                     prompt_snapshot=prompt_snapshot,
                 )
-                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
-                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
+                artifact, _ = self._lookup_cache(
+                    sha(component),
+                    forced=False,
+                    cache_policy="auto",
+                    evidence_policy=node.evidence_policy or self._caller_evidence_policy(),
+                )
                 if artifact is None:
                     raise RuntimeError(f"Cannot read current cached artifact for node {name!r}")
                 components[name] = component
@@ -2635,8 +2682,12 @@ class Dag:
                     carry=carry,
                     prompt_snapshot=prompt_snapshot,
                 )
-                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
-                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
+                artifact, _ = self._lookup_cache(
+                    sha(component),
+                    forced=False,
+                    cache_policy="auto",
+                    evidence_policy=node.evidence_policy or self._caller_evidence_policy(),
+                )
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for map item "
@@ -2700,8 +2751,12 @@ class Dag:
             if current_item_id == item_id:
                 return component
             if target_node.scan:
-                cache_lookup = store.read_node_cache(self.config.artifacts_path, sha(component))
-                artifact = cache_lookup.data if cache_lookup.state == "VALID" else None
+                artifact, _ = self._lookup_cache(
+                    sha(component),
+                    forced=False,
+                    cache_policy="auto",
+                    evidence_policy=target_node.evidence_policy or self._caller_evidence_policy(),
+                )
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for earlier scan item "
@@ -3462,11 +3517,13 @@ class Dag:
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
                     else:
-                        artifact, cache_hit = envelope.lookup(
+                        artifact, cache_hit = self._lookup_cache(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
                             cache_policy=(node.cache if libs_cache_reusable else "off"),
-                            evidence_policy_digest=self._caller_evidence_policy().digest,
+                            evidence_policy=(
+                                node.evidence_policy or self._caller_evidence_policy()
+                            ),
                         )
                     if artifact is None:
                         # No receipt is created for work that was not admitted after
@@ -3721,7 +3778,10 @@ class Dag:
             first = budget_failures[0]["error"] if budget_failures else failures[0]["error"]
             if isinstance(first, DryRunError):
                 raise first
-            if isinstance(first, (RetryExhausted, ProviderFailure, BudgetExceeded)):
+            if isinstance(
+                first,
+                (AmbiguousAttemptError, RetryExhausted, ProviderFailure, BudgetExceeded),
+            ):
                 raise first
             details = ", ".join(
                 f"{outcome['id']} ({type(outcome['error']).__name__}: {outcome['error']})"
@@ -3891,11 +3951,11 @@ class Dag:
                     elif attempt_store.state_for(target) is not None:
                         artifact, cache_hit = None, False
                     else:
-                        artifact, cache_hit = envelope.lookup(
+                        artifact, cache_hit = self._lookup_cache(
                             cache_key,
                             forced=forced_all or item_id in forced_items,
                             cache_policy=(node.cache if libs_cache_reusable else "off"),
-                            evidence_policy_digest=evidence_policy.digest,
+                            evidence_policy=evidence_policy,
                         )
                     if artifact is None:
                         prepared = attempt_store.prepare(
@@ -4002,23 +4062,22 @@ class Dag:
                                                 assert node.agent_adapter is not None
                                                 assert node.agent_spec is not None
                                                 assert node.agent_identity is not None
-                                                if node.retry is not None:
-                                                    attempt_store.mark_side_effect(
-                                                        target,
-                                                        {
-                                                            "active_effect_schema": 1,
-                                                            "kind": "agent",
-                                                            "instruction_sha256": sha(
-                                                                str(task.instruction)
-                                                            ),
-                                                            "managed": (
-                                                                instruction_resolution is not None
-                                                            ),
-                                                            "prompt_resolution": (
-                                                                instruction_resolution
-                                                            ),
-                                                        },
-                                                    )
+                                                attempt_store.mark_side_effect(
+                                                    target,
+                                                    {
+                                                        "active_effect_schema": 1,
+                                                        "kind": "agent",
+                                                        "instruction_sha256": sha(
+                                                            str(task.instruction)
+                                                        ),
+                                                        "managed": (
+                                                            instruction_resolution is not None
+                                                        ),
+                                                        "prompt_resolution": (
+                                                            instruction_resolution
+                                                        ),
+                                                    },
+                                                )
                                                 session_in = None
                                                 if getattr(
                                                     node.agent_adapter,
@@ -4174,13 +4233,23 @@ class Dag:
                     carry = node.carry_fn(artifact) if node.carry_fn is not None else artifact
             except (_MapCheckpointPending, _MapRetryPending):
                 raise
+            except CacheIntegrityError:
+                raise
             except OutputOwnershipError:
                 raise
             except Exception as error:
                 if isinstance(error, BudgetExceeded):
                     budget_abort.set()
                     raise
-                if isinstance(error, (RetryExhausted, ProviderFailure, AgentExecutionFailure)):
+                if isinstance(
+                    error,
+                    (
+                        AmbiguousAttemptError,
+                        RetryExhausted,
+                        ProviderFailure,
+                        AgentExecutionFailure,
+                    ),
+                ):
                     raise
                 raise RuntimeError(
                     f"Scan node {node.name!r} failed item {item_id!r}: "

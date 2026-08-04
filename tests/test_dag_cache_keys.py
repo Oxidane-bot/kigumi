@@ -34,6 +34,15 @@ from kigumi.transport import Response
 from tests._dag_helpers import _load_work, _make_dag
 
 
+def _assert_registration_rejected(dag: Dag, function: Any) -> None:
+    """动态/opaque 节点构造必须在注册期以明确的 raw-I/O 错误硬失败。"""
+    with pytest.raises(
+        ValueError,
+        match=r"Raw file reads are not allowed in node registration",
+    ):
+        dag.node("work")(function)
+
+
 def test_docstring_does_not_change_cache_but_code_does(tmp_path: Path) -> None:
     """教训 code_version: 注释文档不换缓存族，逻辑变更必须换。"""
     first = _load_work(tmp_path / "first.py", "first documentation", 1)
@@ -1206,17 +1215,13 @@ def test_libs_hash_fails_closed_for_inconsistent_detached_owner_facts(
 @pytest.mark.parametrize(
     ("prelude", "expression"),
     [
-        pytest.param("", 'globals()["__name__"]', id="direct-globals"),
-        pytest.param("import builtins\n", 'builtins.globals()["__name__"]', id="builtins-globals"),
         pytest.param(
             "import builtins\nidentity_globals = builtins.globals\n",
             'identity_globals()["__name__"]',
             id="aliased-globals",
         ),
-        pytest.param("", 'eval("__name__")', id="eval"),
         pytest.param("", "run.__module__", id="function-module"),
         pytest.param("", 'run.__globals__["__name__"]', id="function-globals"),
-        pytest.param("", 'getattr(run, "__globals__")["__name__"]', id="getattr-function-globals"),
         pytest.param(
             "",
             'object.__getattribute__(run, "__globals__")["__name__"]',
@@ -1227,17 +1232,12 @@ def test_libs_hash_fails_closed_for_inconsistent_detached_owner_facts(
             'lookup(run, "__globals__")["__name__"]',
             id="aliased-getattr-function-globals",
         ),
-        pytest.param(
-            "import sys\nOWNER = sys.modules[__name__]\nlookup_name = '__name__'\n",
-            "getattr(OWNER, lookup_name)",
-            id="dynamic-owner-lookup",
-        ),
     ],
 )
 def test_libs_hash_binds_reflective_owner_identity(
     tmp_path: Path, prelude: str, expression: str
 ) -> None:
-    """教训 libs_owner_dynamic_identity: attribute reflection/eval 也能观察 owner。"""
+    """仍可证明的 owner reflection 继续覆盖 L3 identity 绑定。"""
     source = tmp_path / "src"
     source.mkdir()
     (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
@@ -1286,6 +1286,88 @@ def test_libs_hash_binds_reflective_owner_identity(
         sys.path[:] = original_sys_path
         for name in ("helper", first_name, second_name):
             sys.modules.pop(name, None)
+
+
+def test_registration_rejects_builtins_globals(tmp_path: Path) -> None:
+    """0.13 hard cut: builtins.globals() is opaque at registration time."""
+    node_name = "libs_builtins_globals_rejected"
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "import builtins\n\n"
+        "def run(inputs, ctx):\n"
+        "    return {'value': builtins.globals()['__name__']}\n",
+        encoding="utf-8",
+    )
+    try:
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.modules.pop(node_name, None)
+
+
+def test_registration_rejects_getattr_function_globals(tmp_path: Path) -> None:
+    """0.13 hard cut: getattr(run, "__globals__") 必须注册期拒绝。"""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "import helper\n\n"
+        "def run(inputs, ctx):\n"
+        "    return {'value': getattr(run, '__globals__')['__name__']}\n",
+        encoding="utf-8",
+    )
+    node_name = "libs_owner_getattr_globals_rejected"
+    original_sys_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(source))
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop("helper", None)
+        sys.modules.pop(node_name, None)
+
+
+@pytest.mark.parametrize(
+    ("prelude", "expression"),
+    [
+        pytest.param("", 'globals()["__name__"]', id="direct-globals"),
+        pytest.param("", 'eval("__name__")', id="eval"),
+        pytest.param(
+            "import sys\nOWNER = sys.modules[__name__]\nlookup_name = '__name__'\n",
+            "getattr(OWNER, lookup_name)",
+            id="dynamic-owner-lookup",
+        ),
+    ],
+)
+def test_registration_rejects_opaque_owner_reflection(
+    tmp_path: Path, prelude: str, expression: str
+) -> None:
+    """opaque namespace/eval/dynamic getattr 不再进入 L3 owner 分析。"""
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        prelude + "\ndef run(inputs, ctx):\n" + f"    return {{'value': {expression}}}\n",
+        encoding="utf-8",
+    )
+    node_name = "libs_owner_dynamic_rejected"
+    try:
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.modules.pop(node_name, None)
 
 
 def test_libs_hash_ignores_identity_sensitive_sibling_function(tmp_path: Path) -> None:
@@ -1411,8 +1493,8 @@ def test_libs_hash_ignores_module_identity_name_in_docstring(tmp_path: Path) -> 
             sys.modules.pop(name, None)
 
 
-def test_libs_hash_ignores_non_identity_reflection_for_owner_name(tmp_path: Path) -> None:
-    """教训 libs_owner_reflection: unrelated getattr 不应绑定 owner 模块名。"""
+def test_registration_rejects_getattr_helper_value(tmp_path: Path) -> None:
+    """0.13 hard cut: getattr(helper, "VALUE") 必须注册期拒绝。"""
     source = tmp_path / "src"
     source.mkdir()
     (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
@@ -1443,13 +1525,8 @@ def test_libs_hash_ignores_non_identity_reflection_for_owner_name(tmp_path: Path
         sys.modules.pop("helper", None)
         config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
 
-        first_dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        first_dag.node("work")(load_node(first_name))
-        assert first_dag.run().cache_hits == []
-
-        second_dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        second_dag.node("work")(load_node(second_name))
-        assert second_dag.run().cache_hits == ["work"]
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        _assert_registration_rejected(dag, load_node(first_name))
     finally:
         sys.path[:] = original_sys_path
         for name in ("helper", first_name, second_name):
@@ -1459,14 +1536,6 @@ def test_libs_hash_ignores_non_identity_reflection_for_owner_name(tmp_path: Path
 @pytest.mark.parametrize(
     ("helper_source", "node_source", "expected"),
     [
-        pytest.param(
-            "VALUE = 'configured'\n",
-            "import helper\n\n"
-            "def run(inputs, ctx):\n"
-            "    return {'value': getattr(helper, '__name__')}\n",
-            "helper",
-            id="helper-name",
-        ),
         pytest.param(
             "VALUE = 'configured'\n",
             "import helper\n\n"
@@ -1543,6 +1612,34 @@ def test_libs_hash_owner_reflection_is_receiver_and_scope_aware(
         sys.path[:] = original_sys_path
         for name in (*module_names, "helper"):
             sys.modules.pop(name, None)
+
+
+def test_registration_rejects_getattr_helper_name(tmp_path: Path) -> None:
+    """0.13 hard cut: getattr(helper, "__name__") 必须注册期拒绝。"""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "import helper\n\n"
+        "def run(inputs, ctx):\n"
+        "    return {'value': getattr(helper, '__name__')}\n",
+        encoding="utf-8",
+    )
+    node_name = "libs_owner_getattr_name_rejected"
+    original_sys_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(source))
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop("helper", None)
+        sys.modules.pop(node_name, None)
 
 
 def test_libs_hash_selected_closure_binds_identity_sensitive_owner_path(
@@ -2038,26 +2135,17 @@ def test_libs_hash_fallback_ignores_unreferenced_callable_global(tmp_path: Path)
 @pytest.mark.parametrize(
     ("prelude", "body"),
     [
-        pytest.param("", "return {'value': eval('VALUE')}", id="eval"),
-        pytest.param("", "return {'value': globals()['VALUE']}", id="globals"),
         pytest.param(
             "import builtins\nget_globals = builtins.globals\n",
             "return {'value': get_globals()['VALUE']}",
             id="aliased-builtins-globals",
         ),
-        pytest.param(
-            "",
-            "namespace = {}\n"
-            "    exec('result = VALUE', globals(), namespace)\n"
-            "    return {'value': namespace['result']}",
-            id="exec",
-        ),
     ],
 )
-def test_libs_hash_fallback_binds_dynamically_observable_globals(
+def test_libs_hash_fallback_binds_allowed_global_alias(
     tmp_path: Path, prelude: str, body: str
 ) -> None:
-    """教训 libs_dynamic_globals: 动态命名空间访问必须保留完整 globals 事实。"""
+    """保留可证明的全局 alias cache-key 覆盖。"""
     source = tmp_path / "src"
     source.mkdir()
     node_name = "libs_dynamic_globals_node"
@@ -2097,6 +2185,41 @@ def test_libs_hash_fallback_binds_dynamically_observable_globals(
         assert second.artifacts["work"] == {"value": "B"}
     finally:
         sys.path[:] = original_sys_path
+        sys.modules.pop(node_name, None)
+
+
+@pytest.mark.parametrize(
+    ("prelude", "body"),
+    [
+        pytest.param("", "return {'value': eval('VALUE')}", id="eval"),
+        pytest.param("", "return {'value': globals()['VALUE']}", id="globals"),
+        pytest.param(
+            "",
+            "namespace = {}\n"
+            "    exec('result = VALUE', globals(), namespace)\n"
+            "    return {'value': namespace['result']}",
+            id="exec",
+        ),
+    ],
+)
+def test_registration_rejects_dynamic_global_introspection(
+    tmp_path: Path, prelude: str, body: str
+) -> None:
+    """globals/eval/exec 的不透明命名空间观察必须在注册期硬失败。"""
+    node_name = "libs_dynamic_globals_rejected"
+    node_path = tmp_path / f"{node_name}.py"
+    node_path.write_text(
+        "VALUE = 'A'\n\n" + prelude + "\ndef run(inputs, ctx):\n" + "    " + body + "\n",
+        encoding="utf-8",
+    )
+    try:
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
         sys.modules.pop(node_name, None)
 
 
@@ -2170,8 +2293,8 @@ def test_libs_hash_fallback_binds_retained_imported_value(tmp_path: Path) -> Non
         sys.modules.pop(node_name, None)
 
 
-def test_libs_hash_fallback_binds_package_parent_sys_path_order(tmp_path: Path) -> None:
-    """教训 libs_package_parent_order: package root 的 parent 顺序也是运行时选择。"""
+def test_registration_rejects_node_dynamic_import(tmp_path: Path) -> None:
+    """节点内 __import__ 不再绕过注册期 raw-I/O 硬切。"""
     package_name = "libs_package_parent_order_case"
     root_a = tmp_path / "root_a"
     root_b = tmp_path / "root_b"
@@ -2194,36 +2317,12 @@ def test_libs_hash_fallback_binds_package_parent_sys_path_order(tmp_path: Path) 
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    original_sys_path = list(sys.path)
-    runtime_paths = {str(root_a), str(root_b)}
     config = KigumiConfig(
         project_root=tmp_path,
         source_dirs=[f"root_a/{package_name}", f"root_b/{package_name}"],
     )
-
-    def run_with_order(first_root: Path, second_root: Path) -> Any:
-        sys.path[:] = [
-            str(first_root),
-            str(second_root),
-            *(entry for entry in original_sys_path if entry not in runtime_paths),
-        ]
-        sys.modules.pop(package_name, None)
-        importlib.invalidate_caches()
-        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        dag.node("work")(module.run)
-        return dag.run()
-
-    try:
-        first = run_with_order(root_a, root_b)
-        assert first.cache_hits == []
-        assert first.artifacts["work"] == {"value": "A"}
-
-        second = run_with_order(root_b, root_a)
-        assert second.cache_hits == []
-        assert second.artifacts["work"] == {"value": "B"}
-    finally:
-        sys.path[:] = original_sys_path
-        sys.modules.pop(package_name, None)
+    dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+    _assert_registration_rejected(dag, module.run)
 
 
 def test_libs_hash_selected_closure_binds_qualified_module_name(tmp_path: Path) -> None:
@@ -2598,12 +2697,6 @@ def test_libs_hash_falls_back_for_loaded_runtime_module_mismatch(
             "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
         ),
         (
-            "builtins_getattr_direct",
-            "import builtins\n",
-            "    helper = getattr(builtins, '__import__')('"
-            "{package_name}.helper', fromlist=['VALUE'])\n",
-        ),
-        (
             "builtins_dict_direct",
             "import builtins\n",
             "    helper = builtins.__dict__['__import__']('"
@@ -2641,11 +2734,6 @@ def test_libs_hash_falls_back_for_loaded_runtime_module_mismatch(
             "    helper = load('{package_name}.helper', fromlist=['VALUE'])\n",
         ),
         (
-            "builtins_getattr_computed_direct",
-            'import builtins\nname = "__" + "import__"\n',
-            "    helper = getattr(builtins, name)('{package_name}.helper', fromlist=['VALUE'])\n",
-        ),
-        (
             "builtins_getattribute_computed_direct",
             'import builtins\nname = "__" + "import__"\n',
             "    helper = builtins.__getattribute__(name)('"
@@ -2660,18 +2748,6 @@ def test_libs_hash_falls_back_for_loaded_runtime_module_mismatch(
             "walrus_target",
             "",
             '    helper = (load := __import__)("{package_name}.helper", fromlist=["VALUE"])\n',
-        ),
-        (
-            "attribute_target",
-            "class Box:\n    pass\n\nbox = Box()\n",
-            "    box.load = __import__\n"
-            '    helper = box.load("{package_name}.helper", fromlist=["VALUE"])\n',
-        ),
-        (
-            "container_target",
-            "loaders = {}\n",
-            '    loaders["x"] = __import__\n'
-            '    helper = loaders["x"]("{package_name}.helper", fromlist=["VALUE"])\n',
         ),
     ],
 )
@@ -2725,6 +2801,132 @@ def test_libs_hash_falls_back_for_aliased_dynamic_imports(
         second = dag.run()
         assert second.cache_hits == []
         assert second.artifacts["work"] == {"value": 222}
+    finally:
+        sys.path[:] = original_sys_path
+        for name in module_names:
+            sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "dynamic_import", "dynamic_call"),
+    [
+        pytest.param(
+            "attribute_target",
+            "class Box:\n    pass\n\nbox = Box()\n",
+            "    box.load = __import__\n"
+            '    helper = box.load("{package_name}.helper", fromlist=["VALUE"])\n',
+            id="attribute-target",
+        ),
+        pytest.param(
+            "container_target",
+            "loaders = {}\n",
+            '    loaders["x"] = __import__\n'
+            '    helper = loaders["x"]("{package_name}.helper", fromlist=["VALUE"])\n',
+            id="container-target",
+        ),
+    ],
+)
+def test_registration_rejects_dynamic_import_alias_containers(
+    tmp_path: Path,
+    case_name: str,
+    dynamic_import: str,
+    dynamic_call: str,
+) -> None:
+    """0.13 hard cut: opaque __import__ aliases cannot enter a node."""
+    package_name = f"libs_dynamic_alias_rejected_{case_name}"
+    source = tmp_path / "src" / package_name
+    source.mkdir(parents=True)
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    node_path = source / "node.py"
+    node_path.write_text(
+        dynamic_import
+        + "\n"
+        + "def run(inputs, ctx):\n"
+        + dynamic_call.format(package_name=package_name)
+        + "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+    original_sys_path = list(sys.path)
+    module_names = (package_name, f"{package_name}.node")
+    try:
+        sys.path.insert(0, str(tmp_path / "src"))
+        for name in module_names:
+            sys.modules.pop(name, None)
+        module = importlib.import_module(f"{package_name}.node")
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.path[:] = original_sys_path
+        for name in module_names:
+            sys.modules.pop(name, None)
+
+
+def test_registration_rejects_direct_builtin_getattr_import(tmp_path: Path) -> None:
+    """0.13 hard cut: getattr(builtins, "__import__") 必须注册期拒绝。"""
+    package_name = "libs_direct_getattr_import_rejected"
+    source = tmp_path / "src" / package_name
+    source.mkdir(parents=True)
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    node_path = source / "node.py"
+    node_path.write_text(
+        "import builtins\n\n"
+        "def run(inputs, ctx):\n"
+        f"    helper = getattr(builtins, '__import__')({package_name + '.helper'!r}, "
+        "fromlist=['VALUE'])\n"
+        "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+    original_sys_path = list(sys.path)
+    module_names = (package_name, f"{package_name}.node")
+    try:
+        sys.path.insert(0, str(tmp_path / "src"))
+        for name in module_names:
+            sys.modules.pop(name, None)
+        module = importlib.import_module(f"{package_name}.node")
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.path[:] = original_sys_path
+        for name in module_names:
+            sys.modules.pop(name, None)
+
+
+def test_registration_rejects_computed_dynamic_import_lookup(tmp_path: Path) -> None:
+    """通过动态 getattr 取得 __import__ 的节点必须注册期失败。"""
+    package_name = "libs_dynamic_import_rejected"
+    source = tmp_path / "src" / package_name
+    source.mkdir(parents=True)
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    node_path = source / "node.py"
+    node_path.write_text(
+        "import builtins\n"
+        'name = "__" + "import__"\n\n'
+        "def run(inputs, ctx):\n"
+        f"    helper = getattr(builtins, name)({package_name + '.helper'!r}, fromlist=['VALUE'])\n"
+        "    return {'value': helper.VALUE}\n",
+        encoding="utf-8",
+    )
+    original_sys_path = list(sys.path)
+    module_names = (package_name, f"{package_name}.node")
+    try:
+        sys.path.insert(0, str(tmp_path / "src"))
+        for name in module_names:
+            sys.modules.pop(name, None)
+        module = importlib.import_module(f"{package_name}.node")
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
     finally:
         sys.path[:] = original_sys_path
         for name in module_names:
@@ -3531,10 +3733,8 @@ def test_libs_hash_comprehension_target_does_not_shadow_owner_load(
             sys.modules.pop(name, None)
 
 
-def test_libs_hash_ignores_unexecuted_nested_identity_bodies(
-    tmp_path: Path,
-) -> None:
-    """教训 libs_nested_scope: 不相关 nested body 不属于 registered function 的 loads。"""
+def test_registration_rejects_nested_class_even_when_unreached(tmp_path: Path) -> None:
+    """nested class 即使不执行也不能作为节点的可分析执行边界。"""
     source = tmp_path / "src"
     source.mkdir()
     node_path = tmp_path / "node.py"
@@ -3549,29 +3749,40 @@ def test_libs_hash_ignores_unexecuted_nested_identity_bodies(
         "    return {'value': 'stable'}\n",
         encoding="utf-8",
     )
-    module_names = ("libs_nested_scope_a", "libs_nested_scope_b")
-
-    def load_node(module_name: str) -> Any:
-        sys.modules.pop(module_name, None)
-        spec = importlib.util.spec_from_file_location(module_name, node_path)
-        assert spec is not None
-        assert spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        return module
-
+    node_name = "libs_nested_scope_rejected"
     try:
         config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.modules.pop(node_name, None)
+
+
+def test_libs_hash_ignores_unexecuted_nested_helper_identity_body(
+    tmp_path: Path,
+) -> None:
+    """未到达的普通 nested helper 仍不污染合法节点的 owner identity。"""
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "def run(inputs, ctx):\n"
+        "    def unrelated():\n"
+        "        return __name__\n\n"
+        "    return {'value': 'stable'}\n",
+        encoding="utf-8",
+    )
+    module_names = ("libs_nested_helper_a", "libs_nested_helper_b")
+    try:
+        config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+        first = _load_libs_runtime_module(node_path, module_names[0])
         first_dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        first_dag.node("work")(load_node(module_names[0]).run)
+        first_dag.node("work")(first.run)
         assert first_dag.run().cache_hits == []
 
+        second = _load_libs_runtime_module(node_path, module_names[1])
         second_dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        second_dag.node("work")(load_node(module_names[1]).run)
-        second = second_dag.run()
-        assert second.cache_hits == ["work"]
-        assert second.artifacts["work"] == {"value": "stable"}
+        second_dag.node("work")(second.run)
+        assert second_dag.run().cache_hits == ["work"]
     finally:
         for name in module_names:
             sys.modules.pop(name, None)
@@ -4249,14 +4460,14 @@ def test_non_reusable_map_plan_skips_item_cache_reads(
 
     monkeypatch.setattr(dag, "_libs_identities", non_reusable)
     reads = 0
-    original_read = dag_module.store.read_node_cache
+    original_read = dag_module.store.read_cache_entry
 
     def counting_read(*args: Any, **kwargs: Any) -> Any:
         nonlocal reads
         reads += 1
         return original_read(*args, **kwargs)
 
-    monkeypatch.setattr(dag_module.store, "read_node_cache", counting_read)
+    monkeypatch.setattr(dag_module.store, "read_cache_entry", counting_read)
     plan = dag.plan()
     assert plan.nodes["work"] == "miss"
     assert plan.nodes["work@one"] == "miss"
@@ -4286,13 +4497,6 @@ def test_empty_map_never_reports_vacuous_cache_hit(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "node_source",
     [
-        pytest.param(
-            "def run(inputs, ctx):\n"
-            "    class Box:\n"
-            "        owner = __name__\n\n"
-            "    return {'value': Box.owner}\n",
-            id="reached-class-body",
-        ),
         pytest.param(
             "import sys\n\n"
             "OWNER = sys.modules[__name__]\n\n"
@@ -4327,7 +4531,7 @@ def test_owner_identity_tracks_reached_reflection_forms(
     tmp_path: Path,
     node_source: str,
 ) -> None:
-    """教训 libs_reached_reflection: 实际到达的 owner lookup 都须绑定别名。"""
+    """仍允许的静态 receiver reflection 继续覆盖 owner provenance。"""
     source = tmp_path / "src"
     source.mkdir()
     node_path = tmp_path / "node.py"
@@ -4349,6 +4553,28 @@ def test_owner_identity_tracks_reached_reflection_forms(
     finally:
         for name in module_names:
             sys.modules.pop(name, None)
+
+
+def test_registration_rejects_reached_nested_class_reflection(tmp_path: Path) -> None:
+    """到达的 nested class 直接触发注册期 hard cut。"""
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "def run(inputs, ctx):\n"
+        "    class Box:\n"
+        "        owner = __name__\n\n"
+        "    return {'value': Box.owner}\n",
+        encoding="utf-8",
+    )
+    node_name = "libs_reached_reflection_class_rejected"
+    try:
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.modules.pop(node_name, None)
 
 
 def test_callable_state_binds_mutable_metaclass_call_state(tmp_path: Path) -> None:
@@ -4598,8 +4824,8 @@ def test_detached_configured_native_container_provenance_is_non_reusable(
             sys.modules.pop(name, None)
 
 
-def test_complete_globals_observation_disables_l3_reuse(tmp_path: Path) -> None:
-    """教训 libs_all_globals_off: 任意 namespace 观察无法安全证明等价。"""
+def test_registration_rejects_complete_globals_observation(tmp_path: Path) -> None:
+    """任意 globals namespace 观察在注册期硬失败，不进入 L3 分析。"""
     source = tmp_path / "src"
     source.mkdir()
     node_name = "libs_all_globals_off_node"
@@ -4615,10 +4841,7 @@ def test_complete_globals_observation_disables_l3_reuse(tmp_path: Path) -> None:
         module = _load_libs_runtime_module(node_path, node_name)
         config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        dag.node("work")(module.run)
-        assert dag.run().cache_hits == []
-        assert dag.run().cache_hits == []
-        assert dag.plan().nodes["work"] == "miss"
+        _assert_registration_rejected(dag, module.run)
     finally:
         sys.modules.pop(node_name, None)
 
@@ -4733,18 +4956,13 @@ def test_empty_scan_never_reports_vacuous_cache_hit(tmp_path: Path) -> None:
         "    alias = inner\n"
         "    return {'value': alias()}\n",
         "    callback = lambda: __name__\n    return {'value': callback()}\n",
-        "    class Box:\n"
-        "        @staticmethod\n"
-        "        def inner():\n"
-        "            return __name__\n\n"
-        "    return {'value': Box.inner()}\n",
     ],
 )
 def test_libs_hash_binds_owner_for_reached_local_callable_forms(
     tmp_path: Path,
     body: str,
 ) -> None:
-    """实际到达的局部 alias/lambda/class member 不能复用另一个模块 owner。"""
+    """实际到达的普通局部 alias/lambda 继续覆盖 owner provenance。"""
     source = tmp_path / "src"
     source.mkdir()
     node_path = tmp_path / "node.py"
@@ -4766,6 +4984,30 @@ def test_libs_hash_binds_owner_for_reached_local_callable_forms(
     finally:
         for name in module_names:
             sys.modules.pop(name, None)
+
+
+def test_registration_rejects_reached_local_nested_class(tmp_path: Path) -> None:
+    """局部 nested class 即使只为 owner identity 服务也必须拒绝。"""
+    node_path = tmp_path / "node.py"
+    node_path.write_text(
+        "def run(inputs, ctx):\n"
+        "    class Box:\n"
+        "        @staticmethod\n"
+        "        def inner():\n"
+        "            return __name__\n\n"
+        "    return {'value': Box.inner()}\n",
+        encoding="utf-8",
+    )
+    node_name = "libs_reached_local_class_rejected"
+    try:
+        module = _load_libs_runtime_module(node_path, node_name)
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(FakeTransport(), tmp_path / "llm"),
+        )
+        _assert_registration_rejected(dag, module.run)
+    finally:
+        sys.modules.pop(node_name, None)
 
 
 def test_libs_hash_fails_closed_for_unresolved_attribute_call(tmp_path: Path) -> None:
@@ -4801,10 +5043,10 @@ def test_libs_hash_fails_closed_for_unresolved_attribute_call(tmp_path: Path) ->
             sys.modules.pop(name, None)
 
 
-def test_libs_hash_propagates_complete_globals_observation_from_reached_nested_function(
+def test_registration_rejects_globals_in_reached_nested_function(
     tmp_path: Path,
 ) -> None:
-    """被调用 nested function 的完整 globals 观察也必须关闭 L3 复用。"""
+    """被调用 nested function 的 globals 观察也必须注册期硬失败。"""
     node_path = tmp_path / "node.py"
     node_path.write_text(
         "VALUE = 'A'\n"
@@ -4823,8 +5065,7 @@ def test_libs_hash_propagates_complete_globals_observation_from_reached_nested_f
             KigumiConfig(project_root=tmp_path, source_dirs=[]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        dag.node("work")(module.run)
-        assert dag._libs_identities((dag._nodes["work"],))["work"].cache_reusable is False
+        _assert_registration_rejected(dag, module.run)
     finally:
         sys.modules.pop("libs_nested_all_globals", None)
 
@@ -5153,8 +5394,8 @@ def test_registry_overflow_remains_non_reusable_on_repeated_identity_query(
     sys.modules.pop("libs_registry_overflow_node", None)
 
 
-def test_complete_globals_propagates_through_reached_class_body(tmp_path: Path) -> None:
-    """到达的 class body 中的 globals() 观察必须关闭 L3 复用。"""
+def test_registration_rejects_globals_in_reached_class_body(tmp_path: Path) -> None:
+    """到达的 class body 同时触发 nested-class/globals 注册期硬切。"""
     node_name = "libs_reached_class_globals_node"
     node_path = tmp_path / f"{node_name}.py"
     node_path.write_text(
@@ -5169,14 +5410,15 @@ def test_complete_globals_propagates_through_reached_class_body(tmp_path: Path) 
     try:
         config = KigumiConfig(project_root=tmp_path, source_dirs=[])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        dag.node("work")(module.run)
-        assert dag._libs_identities((dag._nodes["work"],))["work"].cache_reusable is False
+        _assert_registration_rejected(dag, module.run)
     finally:
         sys.modules.pop(node_name, None)
 
 
-def test_complete_globals_propagates_through_multi_level_nested_calls(tmp_path: Path) -> None:
-    """outer -> inner -> deep 的传递调用不能丢失 deep 的完整 globals 观察。"""
+def test_registration_rejects_globals_in_multi_level_nested_calls(
+    tmp_path: Path,
+) -> None:
+    """outer -> inner -> deep 的 globals 观察必须注册期硬失败。"""
     node_name = "libs_multi_level_globals_node"
     node_path = tmp_path / f"{node_name}.py"
     node_path.write_text(
@@ -5195,8 +5437,7 @@ def test_complete_globals_propagates_through_multi_level_nested_calls(tmp_path: 
     try:
         config = KigumiConfig(project_root=tmp_path, source_dirs=[])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        dag.node("work")(module.run)
-        assert dag._libs_identities((dag._nodes["work"],))["work"].cache_reusable is False
+        _assert_registration_rejected(dag, module.run)
     finally:
         sys.modules.pop(node_name, None)
 

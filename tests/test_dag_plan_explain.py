@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from itertools import repeat
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from kigumi import CacheIntegrityError, EvidencePolicy, LLMCaller
+from kigumi.artifacts import sha
+from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.testing import FakeTransport
+from kigumi.transport import Response
 from tests._dag_helpers import _build_scan_dag, _make_dag
 
 
@@ -192,6 +198,85 @@ def test_plan_forecasts_cache_without_calling_nodes_and_matches_run(tmp_path: Pa
     actual_misses = [name for name in ("source", "leaf") if name not in result.cache_hits]
 
     assert forecast.misses == actual_misses == ["source", "leaf"]
+
+
+def test_plan_fails_closed_on_corrupt_cache(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    result = dag.run()
+    sidecar = json.loads(
+        (tmp_path / "artifacts" / "runs" / result.run_id / "work.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    cache_path = tmp_path / "artifacts" / "_cache" / "nodes" / f"{sidecar['cache_key']}.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(CacheIntegrityError):
+        dag.plan()
+
+
+def test_plan_keeps_one_cache_snapshot_when_entry_is_replaced_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    dag.run()
+    cache_path = next((tmp_path / "artifacts" / "_cache" / "nodes").glob("*.json"))
+    replacement = tmp_path / "replacement-cache.json"
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload["origin_provenance"]["evidence_policy_digest"] = "replacement-policy"
+    payload["origin_sha256"] = sha(payload["origin_provenance"])
+    replacement.write_text(json.dumps(payload), encoding="utf-8")
+
+    original_open = Path.open
+    replaced = False
+
+    def open_then_replace(path: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal replaced
+        handle = original_open(path, *args, **kwargs)
+        if path == cache_path and not replaced:
+            replaced = True
+            replacement.replace(path)
+        return handle
+
+    monkeypatch.setattr(Path, "open", open_then_replace)
+
+    assert dag.plan().nodes == {"work": "hit"}
+
+
+def test_plan_respects_evidence_policy_provenance_like_run(tmp_path: Path) -> None:
+    def build(policy: EvidencePolicy) -> Dag:
+        dag = Dag(
+            KigumiConfig(project_root=tmp_path, source_dirs=[]),
+            LLMCaller(
+                FakeTransport(repeat(Response("answer", {"total_tokens": 1}, "stop"))),
+                tmp_path / "llm",
+                evidence_policy=policy,
+            ),
+        )
+
+        @dag.node("ask")
+        def ask(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            del inputs
+            return {"answer": ctx.call("hello")}
+
+        return dag
+
+    build(EvidencePolicy()).run()
+    changed = build(EvidencePolicy(request="redacted", response="hash_only"))
+
+    assert changed.plan().nodes == {"ask": "miss"}
 
 
 def test_plan_reports_unknown_reason_chains_and_cost_bounds(tmp_path: Path) -> None:

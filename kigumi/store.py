@@ -11,6 +11,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -33,6 +34,28 @@ class CacheLookup(NamedTuple):
     expected_sha256: str | None
     actual_sha256: str | None
     reason: str | None
+
+
+class CacheEntry(NamedTuple):
+    """One immutable snapshot of a node cache artifact and its provenance."""
+
+    state: CacheState
+    artifact: dict[str, Any] | None
+    origin: dict[str, Any] | None
+    expected_sha256: str | None
+    actual_sha256: str | None
+    reason: str | None
+
+    @property
+    def lookup(self) -> CacheLookup:
+        """Return the historical artifact-only view of this same snapshot."""
+        return CacheLookup(
+            self.state,
+            self.artifact,
+            self.expected_sha256,
+            self.actual_sha256,
+            self.reason,
+        )
 
 
 def runs_root(artifacts_path: Path) -> Path:
@@ -58,28 +81,50 @@ def node_cache_path(artifacts_path: Path, cache_key: str) -> Path:
 
 def read_node_cache(artifacts_path: Path, cache_key: str) -> CacheLookup:
     """Read one node cache entry without collapsing corruption into a miss."""
+    return read_cache_entry(artifacts_path, cache_key).lookup
+
+
+def read_cache_entry(artifacts_path: Path, cache_key: str) -> CacheEntry:
+    """Read artifact, origin and integrity state from one cache-file snapshot."""
     payload = _read_node_cache_envelope(artifacts_path, cache_key)
     if payload.state != "VALID":
-        return payload
+        return CacheEntry(
+            payload.state,
+            None,
+            None,
+            payload.expected_sha256,
+            payload.actual_sha256,
+            payload.reason,
+        )
     envelope = payload.data
     if not isinstance(envelope, dict):
-        return CacheLookup(
+        return CacheEntry(
             "CORRUPT",
+            None,
             None,
             payload.expected_sha256,
             payload.actual_sha256,
             "node cache envelope is not an object",
         )
     artifact = envelope.get("artifact")
-    if not isinstance(artifact, dict):
-        return CacheLookup(
+    origin = envelope.get("origin_provenance")
+    if not isinstance(artifact, dict) or not isinstance(origin, dict):
+        return CacheEntry(
             "CORRUPT",
+            None,
             None,
             payload.expected_sha256,
             payload.actual_sha256,
-            "node cache artifact is not an object",
+            "node cache artifact or origin is not an object",
         )
-    return payload._replace(data=artifact)
+    return CacheEntry(
+        "VALID",
+        artifact,
+        origin,
+        payload.expected_sha256,
+        payload.actual_sha256,
+        payload.reason,
+    )
 
 
 def read_node_cache_origin(
@@ -87,12 +132,7 @@ def read_node_cache_origin(
     cache_key: str,
 ) -> dict[str, Any] | None:
     """Return immutable origin provenance for one valid node-cache entry."""
-
-    lookup = _read_node_cache_envelope(artifacts_path, cache_key)
-    if lookup.state != "VALID" or not isinstance(lookup.data, dict):
-        return None
-    origin = lookup.data.get("origin_provenance")
-    return origin if isinstance(origin, dict) else None
+    return read_cache_entry(artifacts_path, cache_key).origin
 
 
 def _read_node_cache_envelope(
@@ -272,19 +312,86 @@ def materialize_artifact(
             f"Artifact for {node_name!r} contains duplicate output path(s): "
             + ", ".join(sorted(duplicates))
         )
-    if claim is not None:
-        claim(tuple(destination for _path, destination, _value in resolved_outputs))
+    staging_root = Path(tempfile.mkdtemp(prefix=".kigumi-materialize-", dir=project_root))
+    try:
+        staged_outputs: list[tuple[Path, Path]] = []
+        for relative_path, _destination, contents in resolved_text:
+            staged = staging_root / relative_path
+            atomic_write_text(staged, contents)
+            staged_outputs.append((staged, _destination))
+        for relative_path, _destination, digest in resolved_blobs:
+            staged = staging_root / relative_path
+            try:
+                blob_store.materialize(digest, staged)
+            except FileNotFoundError as error:
+                raise FileNotFoundError(
+                    f"Blob {digest} referenced by node {node_name!r} is missing"
+                ) from error
+            staged_outputs.append((staged, _destination))
 
-    for _relative_path, destination, contents in resolved_text:
-        atomic_write_text(destination, contents)
-    for _relative_path, destination, digest in resolved_blobs:
-        try:
-            blob_store.materialize(digest, destination)
-        except FileNotFoundError as error:
-            raise FileNotFoundError(
-                f"Blob {digest} referenced by node {node_name!r} is missing"
-            ) from error
+        if claim is not None:
+            claim(tuple(destination for _path, destination, _value in resolved_outputs))
+        _commit_staged_outputs(staged_outputs, staging_root)
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
     return sorted(path.as_posix() for path, _ in (*text_outputs, *blob_outputs))
+
+
+def _commit_staged_outputs(staged_outputs: list[tuple[Path, Path]], staging_root: Path) -> None:
+    """Replace all staged outputs, restoring prior paths if any replacement fails."""
+    rollback_root = Path(tempfile.mkdtemp(prefix=".kigumi-rollback-", dir=staging_root))
+    changes: list[tuple[Path, Path | None, bool]] = []
+    created_parents: list[Path] = []
+    try:
+        for index, (staged, destination) in enumerate(staged_outputs):
+            _ensure_destination_parent(destination, created_parents)
+            backup: Path | None = None
+            if _path_exists(destination):
+                if destination.is_dir():
+                    raise IsADirectoryError(f"Cannot replace output directory: {destination}")
+                backup = rollback_root / str(index)
+                destination.replace(backup)
+            changes.append((destination, backup, False))
+            staged.replace(destination)
+            changes[-1] = (destination, backup, True)
+    except BaseException:
+        _rollback_staged_outputs(changes, created_parents)
+        raise
+    finally:
+        shutil.rmtree(rollback_root, ignore_errors=True)
+
+
+def _rollback_staged_outputs(
+    changes: list[tuple[Path, Path | None, bool]], created_parents: list[Path]
+) -> None:
+    """Undo committed replacements and remove directories created for staging targets."""
+    for destination, backup, installed in reversed(changes):
+        if installed:
+            destination.unlink(missing_ok=True)
+        if backup is not None and _path_exists(backup):
+            backup.replace(destination)
+    for directory in sorted(set(created_parents), key=lambda path: len(path.parts), reverse=True):
+        with suppress(OSError):
+            directory.rmdir()
+
+
+def _ensure_destination_parent(destination: Path, created: list[Path]) -> None:
+    """Create missing destination parents while retaining enough information to undo them."""
+    missing: list[Path] = []
+    parent = destination.parent
+    while not _path_exists(parent):
+        missing.append(parent)
+        if parent.parent == parent:
+            break
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        created.append(directory)
+
+
+def _path_exists(path: Path) -> bool:
+    """Return whether a path exists, including a dangling symbolic link."""
+    return path.exists() or path.is_symlink()
 
 
 def _output_destination(

@@ -7,7 +7,12 @@ import pytest
 
 from kigumi.artifacts import sha
 from kigumi.calling import CacheIntegrityError, LLMCaller, read_call_cache
-from kigumi.store import node_cache_path, read_node_cache, write_node_cache
+from kigumi.store import (
+    node_cache_path,
+    read_cache_entry,
+    read_node_cache,
+    write_node_cache,
+)
 from kigumi.testing import FakeTransport
 
 
@@ -41,6 +46,42 @@ def test_missing_l3_node_cache_reports_missing(tmp_path: Path) -> None:
 
     assert lookup.state == "MISSING"
     assert lookup.data is None
+
+
+def test_cache_entry_returns_artifact_origin_and_state_as_one_snapshot(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifact = {"answer": "cached"}
+    origin = {
+        "artifact_sha256": sha(artifact),
+        "evidence_policy_digest": "policy-a",
+    }
+    write_node_cache(artifacts, "node-key", artifact, origin)
+
+    entry = read_cache_entry(artifacts, "node-key")
+
+    assert entry.state == "VALID"
+    assert entry.artifact == artifact
+    assert entry.origin == origin
+    assert entry.lookup.data == artifact
+    assert entry.lookup.expected_sha256 == entry.lookup.actual_sha256 == sha(artifact)
+
+
+def test_cache_entry_preserves_missing_and_corrupt_states(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+
+    missing = read_cache_entry(artifacts, "missing")
+    assert missing.state == "MISSING"
+    assert missing.artifact is None
+    assert missing.origin is None
+
+    path = node_cache_path(artifacts, "corrupt")
+    path.parent.mkdir(parents=True)
+    path.write_text("{torn", encoding="utf-8")
+    corrupt = read_cache_entry(artifacts, "corrupt")
+    assert corrupt.state == "CORRUPT"
+    assert corrupt.artifact is None
+    assert corrupt.origin is None
+    assert corrupt.reason is not None
 
 
 def test_corrupt_l1_call_cache_is_reported_and_not_reexecuted(tmp_path: Path) -> None:

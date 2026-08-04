@@ -38,7 +38,7 @@ class ExecutionEnvelope:
         self.blob_store = blob_store
         self.ensure_archive_id = ensure_archive_id
         self.approval_path = approval_path
-        self._output_lock = threading.Lock()
+        self._output_lock = threading.RLock()
         self._output_owners: list[tuple[Path, str]] = []
 
     def lookup(
@@ -52,17 +52,22 @@ class ExecutionEnvelope:
         """Return a node-cache artifact unless this execution is forced."""
         if forced or cache_policy != "auto":
             return None, False
-        lookup = store.read_node_cache(self.artifacts_path, cache_key)
-        if lookup.state == "CORRUPT":
+        entry = store.read_cache_entry(self.artifacts_path, cache_key)
+        if entry.state == "CORRUPT":
             raise CacheIntegrityError(
                 store.node_cache_path(self.artifacts_path, cache_key),
-                lookup,
+                entry.lookup,
             )
-        artifact = lookup.data if lookup.state == "VALID" else None
-        if artifact is not None and evidence_policy_digest is not None:
-            origin = store.read_node_cache_origin(self.artifacts_path, cache_key)
-            if origin is None or origin.get("evidence_policy_digest") != evidence_policy_digest:
-                return None, False
+        artifact = entry.artifact if entry.state == "VALID" else None
+        if (
+            artifact is not None
+            and evidence_policy_digest is not None
+            and (
+                entry.origin is None
+                or entry.origin.get("evidence_policy_digest") != evidence_policy_digest
+            )
+        ):
+            return None, False
         return artifact, artifact is not None
 
     def seal(
@@ -104,17 +109,32 @@ class ExecutionEnvelope:
         self, label: str, artifact: dict[str, Any], *, allow_item_owners: bool = False
     ) -> list[str]:
         """Materialize declared files and blobs for a completed artifact."""
-        return store.materialize_artifact(
-            artifact,
-            label,
-            self.resolve,
-            self.blob_store,
-            lambda outputs: self._claim_outputs(label, outputs, allow_item_owners),
-        )
+        claimed: tuple[tuple[Path, str], ...] = ()
+
+        def claim(outputs: tuple[Path, ...]) -> None:
+            nonlocal claimed
+            claimed = self._claim_outputs(label, outputs, allow_item_owners)
+
+        # Keep the reservation and the store's commit in one critical section.
+        # Otherwise a concurrent materialize could observe a provisional claim,
+        # proceed without adding an owner, and then lose that owner if this
+        # materialization rolled its disk changes back.
+        with self._output_lock:
+            try:
+                return store.materialize_artifact(
+                    artifact,
+                    label,
+                    self.resolve,
+                    self.blob_store,
+                    claim,
+                )
+            except BaseException:
+                self._release_output_claims(claimed)
+                raise
 
     def _claim_outputs(
         self, label: str, outputs: tuple[Path, ...], allow_item_owners: bool
-    ) -> None:
+    ) -> tuple[tuple[Path, str], ...]:
         """Atomically reserve a complete artifact output set for this run."""
         with self._output_lock:
             for path in outputs:
@@ -132,12 +152,21 @@ class ExecutionEnvelope:
                             f"Output path {relative_path!r} is owned by {owner!r}; "
                             f"{label!r} cannot claim it"
                         )
+            new_owners: list[tuple[Path, str]] = []
             for path in outputs:
                 if not any(
                     store.output_paths_equivalent(path, owned_path)
                     for owned_path, _owner in self._output_owners
                 ):
-                    self._output_owners.append((path, label))
+                    new_owners.append((path, label))
+            self._output_owners.extend(new_owners)
+            return tuple(new_owners)
+
+    def _release_output_claims(self, claimed: tuple[tuple[Path, str], ...]) -> None:
+        """Remove only the provisional ownership entries made by one attempt."""
+        with self._output_lock:
+            for owner_entry in claimed:
+                self._output_owners.remove(owner_entry)
 
     def write_sidecar(
         self,
@@ -157,18 +186,28 @@ class ExecutionEnvelope:
         prompt_resolutions: dict[str, Any] | None = None,
     ) -> None:
         """Persist one run artifact and its deterministic metadata shape."""
-        origin = (
-            store.read_node_cache_origin(self.artifacts_path, cache_key)
-            if cache_hit and isinstance(cache_key, str)
-            else origin_provenance
-            or _origin_provenance(
+        if cache_hit and isinstance(cache_key, str):
+            entry = store.read_cache_entry(self.artifacts_path, cache_key)
+            if entry.state == "CORRUPT":
+                raise CacheIntegrityError(
+                    store.node_cache_path(self.artifacts_path, cache_key),
+                    entry.lookup,
+                )
+            origin = (
+                entry.origin
+                if entry.state == "VALID"
+                and entry.origin is not None
+                and entry.origin.get("evidence_policy_digest") == evidence_policy.digest
+                else None
+            )
+        else:
+            origin = origin_provenance or _origin_provenance(
                 artifact,
                 calls,
                 evidence_policy=evidence_policy,
                 agent_provenance=agent_provenance,
                 prompt_resolutions=prompt_resolutions,
             )
-        )
         if origin is None or origin.get("artifact_sha256") != sha(artifact):
             raise ValueError("run sidecar cannot resolve hash-bound origin provenance")
         metadata: dict[str, Any] = {
