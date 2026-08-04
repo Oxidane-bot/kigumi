@@ -7,6 +7,7 @@ import pytest
 
 from kigumi._runstate import AttemptStore
 from kigumi.artifacts import atomic_write_json, canonical_json, sha, write_artifact
+from kigumi.errors import CacheIntegrityError
 from kigumi.inspect import diff_components, load_call, trace_run
 from kigumi.profile import WorkflowProfileError
 
@@ -107,6 +108,7 @@ def test_trace_run_groups_map_items_and_links_llm_payloads(tmp_path: Path) -> No
             "meta": call,
             "messages": [{"role": "user", "content": "hello"}],
             "response": "world",
+            "response_sha256": sha("world"),
             "reasoning": "because",
         },
     )
@@ -154,16 +156,47 @@ def test_load_call_resolves_prefix_and_fails_visibly_for_missing_or_ambiguous(
     tmp_path: Path,
 ) -> None:
     cache = tmp_path / "caller-cache"
-    atomic_write_json(cache / "llm" / "abc123.json", {"response": "one"})
+    atomic_write_json(
+        cache / "llm" / "abc123.json",
+        {
+            "meta": {"key": "abc123"},
+            "response": "one",
+            "response_sha256": sha("one"),
+        },
+    )
 
     key, payload = load_call(cache, "abc")
 
     assert key == "abc123"
-    assert payload == {"response": "one"}
+    assert payload == {
+        "meta": {"key": "abc123"},
+        "response": "one",
+        "response_sha256": sha("one"),
+    }
     with pytest.raises(FileNotFoundError, match="caller-cache/llm"):
         load_call(cache, "missing")
-    atomic_write_json(cache / "llm" / "abc456.json", {"response": "two"})
+    atomic_write_json(
+        cache / "llm" / "abc456.json",
+        {
+            "meta": {"key": "abc456"},
+            "response": "two",
+            "response_sha256": sha("two"),
+        },
+    )
     with pytest.raises(ValueError, match="abc123, abc456"):
+        load_call(cache, "abc")
+
+
+def test_load_call_rejects_corrupt_l1_payload_with_cache_integrity_error(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "caller-cache"
+    atomic_write_json(
+        cache / "llm" / "abc123.json",
+        {"meta": {"key": "abc123"}, "response": "one"},
+    )
+
+    with pytest.raises(CacheIntegrityError):
         load_call(cache, "abc")
 
 

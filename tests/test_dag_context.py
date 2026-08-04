@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from kigumi.calling import LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag, UndeclaredInputError
+from kigumi.prompt import validate_prompt_resolution_record
 from kigumi.testing import FakeTransport
 from tests._dag_helpers import _make_dag
 
@@ -80,6 +81,52 @@ def test_run_file_snapshot_binds_key_and_context_to_one_immutable_value(
         "second": {"value": "stable"},
     }
     assert second_sidecar["key_components"]["files:input.txt"] == sha256(b"stable").hexdigest()
+
+
+def test_context_llm_file_uses_run_snapshot_and_persists_valid_request_lineage(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "input.txt"
+    source.write_bytes(b"before")
+    transport = FakeTransport(["answer"])
+    dag = Dag(
+        KigumiConfig(project_root=tmp_path, source_dirs=[]),
+        LLMCaller(transport, tmp_path / "llm"),
+    )
+
+    @dag.node("call", files=("input.txt",))
+    def call(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs
+        source.write_bytes(b"after")
+        return {
+            "answer": ctx.call(
+                [
+                    {
+                        "role": "user",
+                        "content": {
+                            "kigumi_file": str(source),
+                            "format": "text/plain",
+                        },
+                    }
+                ]
+            )
+        }
+
+    result = dag.run(run_id="llm-file-snapshot")
+
+    request = transport.requests[0][0][0]["content"][0]
+    assert request["file"]["file_data"].endswith("YmVmb3Jl")
+    sidecar = json.loads(
+        (tmp_path / "artifacts" / "runs" / result.run_id / "call.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    resolution = sidecar["calls"][0]["prompt_resolution"]
+    validate_prompt_resolution_record(resolution)
+    assert set(resolution["base"]) == {"ref", "sha256", "bytes"}
+    assert resolution["base"]["ref"] == "unmanaged"
+    assert resolution["attachments"][0]["content_hash"] == sha256(b"before").hexdigest()
+    assert resolution["attachments"][0]["size_bytes"] == len(b"before")
 
 
 def test_context_rejects_an_undeclared_file_with_a_declaration_hint(tmp_path: Path) -> None:

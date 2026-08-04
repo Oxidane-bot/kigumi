@@ -62,6 +62,9 @@ _durable_side_effect: contextvars.ContextVar[Callable[[dict[str, Any]], None] | 
 _prompt_lineage: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "kigumi_prompt_lineage", default=None
 )
+_file_snapshot_reader: contextvars.ContextVar[Callable[[str | Path], bytes] | None] = (
+    contextvars.ContextVar("kigumi_file_snapshot_reader", default=None)
+)
 _response_spec: contextvars.ContextVar[ResponseSpec | None] = contextvars.ContextVar(
     "kigumi_response_spec", default=None
 )
@@ -115,6 +118,18 @@ def prompt_resolution_boundary(
         yield
     finally:
         _prompt_lineage.reset(token)
+
+
+@contextmanager
+def file_snapshot_boundary(reader: Callable[[str | Path], bytes]) -> Iterator[None]:
+    """Bind an immutable DAG file reader to LLM file-reference preparation."""
+    if not callable(reader):
+        raise TypeError("file snapshot reader must be callable")
+    token = _file_snapshot_reader.set(reader)
+    try:
+        yield
+    finally:
+        _file_snapshot_reader.reset(token)
 
 
 @contextmanager
@@ -186,6 +201,7 @@ class _FileReference:
     detail: Any
     has_detail: bool
     identity: FileIdentity | None = None
+    snapshot_data: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -194,7 +210,8 @@ class _FilePreflight:
 
     path: Path
     size_bytes: int
-    identity: FileIdentity
+    identity: FileIdentity | None
+    snapshot_data: bytes | None = None
 
 
 def _open_regular_file(
@@ -221,6 +238,10 @@ def _open_regular_file(
 
 def _hash_regular_file(probe: _FilePreflight) -> str:
     """Hash a preflighted file through one stable descriptor."""
+    if probe.snapshot_data is not None:
+        if len(probe.snapshot_data) != probe.size_bytes:
+            raise ValueError(f"kigumi_file changed during hashing: {probe.path}")
+        return sha256(probe.snapshot_data).hexdigest()
     with _open_regular_file(
         probe.path,
         expected_identity=probe.identity,
@@ -243,6 +264,8 @@ def _hash_regular_file(probe: _FilePreflight) -> str:
 
 def _read_preflighted_file(reference: _FileReference) -> bytes:
     """Read a reference only after rechecking its regular-file identity and size."""
+    if reference.snapshot_data is not None:
+        return reference.snapshot_data
     if reference.identity is None:
         size_bytes, identity = _regular_file_probe(reference.path)
         probe = _FilePreflight(reference.path, size_bytes, identity)
@@ -284,12 +307,26 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
     """Read one L1 payload while preserving missing and corrupt states."""
     if cache_key is not None:
         cache_path = Path(cache_path) / "llm" / f"{cache_key}.json"
+        expected_key = cache_key
+    else:
+        cache_path = Path(cache_path)
+        expected_key = cache_path.name.removesuffix(".json")
     try:
-        with cache_path.open(encoding="utf-8") as handle:
-            cached = json.load(handle)
+        with open_regular_file(
+            cache_path,
+            identity=_file_identity,
+            expected_identity=None,
+            phase="reading L1 cache",
+            error=lambda message, path: ValueError(f"call cache file {message}: {path}"),
+        ) as handle:
+            raw = handle.read()
     except FileNotFoundError:
         return CacheLookup("MISSING", None, None, None, "call cache file is missing")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
+        return CacheLookup("CORRUPT", None, None, None, f"call cache JSON read failed: {error}")
+    try:
+        cached = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         return CacheLookup("CORRUPT", None, None, None, f"call cache JSON read failed: {error}")
     if not isinstance(cached, dict):
         return CacheLookup("CORRUPT", None, None, None, "call cache JSON is not an object")
@@ -320,6 +357,16 @@ def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLook
             expected_sha256,
             actual_sha256,
             "call cache response digest validation failed",
+        )
+    metadata = cached.get("meta")
+    actual_key = metadata.get("key") if isinstance(metadata, dict) else None
+    if actual_key != expected_key:
+        return CacheLookup(
+            "CORRUPT",
+            None,
+            expected_sha256,
+            actual_sha256,
+            "call cache request key validation failed",
         )
     return CacheLookup("VALID", cached, expected_sha256, actual_sha256, None)
 
@@ -494,6 +541,7 @@ class LLMCaller:
         prepared = self._prepare_file_references(
             normalized_messages,
             preflight_policy=self.preflight_policy,
+            snapshot_reader=_file_snapshot_reader.get(),
         )
         key_messages = prepared.key_messages if prepared is not None else normalized_messages
         cache_messages = prepared.cache_messages if prepared is not None else normalized_messages
@@ -785,15 +833,17 @@ class LLMCaller:
                 response_spec=response_spec,
             )
         lineage_attachments = cls._attachments_from_lineage(prompt_lineage)
+        rendered_sha256 = sha(key_messages)
+        rendered_bytes = len(json.dumps(key_messages, ensure_ascii=False).encode("utf-8"))
         return PromptResolution(
             spec_name="unmanaged",
             structure_digest="unmanaged",
-            base={},
+            base={"ref": "unmanaged", "sha256": rendered_sha256, "bytes": rendered_bytes},
             layers=(),
             axes=(),
             materials=(),
-            rendered_sha256=sha(key_messages),
-            rendered_bytes=len(json.dumps(key_messages, ensure_ascii=False).encode("utf-8")),
+            rendered_sha256=rendered_sha256,
+            rendered_bytes=rendered_bytes,
             messages=request_messages,
             attachments=[*lineage_attachments, *attachments],
             response_spec=response_spec,
@@ -843,6 +893,7 @@ class LLMCaller:
         messages: list[dict[str, Any]],
         *,
         preflight_policy: PreflightPolicy = _DEFAULT_PREFLIGHT_POLICY,
+        snapshot_reader: Callable[[str | Path], bytes] | None = None,
     ) -> _PreparedMessages | None:
         values = [
             value
@@ -851,7 +902,11 @@ class LLMCaller:
         ]
         if not values:
             return None
-        probes = cls._preflight_file_references(values, preflight_policy)
+        probes = cls._preflight_file_references(
+            values,
+            preflight_policy,
+            snapshot_reader=snapshot_reader,
+        )
         references = {
             id(value): cls._file_reference(value, probe=probes[id(value)]) for value in values
         }
@@ -894,6 +949,8 @@ class LLMCaller:
         cls,
         values: list[dict[str, Any]],
         policy: PreflightPolicy,
+        *,
+        snapshot_reader: Callable[[str | Path], bytes] | None = None,
     ) -> dict[int, _FilePreflight]:
         if len(values) > policy.max_attachments:
             report = PreflightReport(
@@ -919,9 +976,16 @@ class LLMCaller:
             if not isinstance(raw_path, str):
                 raise ValueError("kigumi_file must be a path string")
             path = Path(raw_path)
-            size_bytes, identity = _regular_file_probe(path)
-            probes[id(value)] = _FilePreflight(path, size_bytes, identity)
-            total_bytes += size_bytes
+            if snapshot_reader is None:
+                size_bytes, identity = _regular_file_probe(path)
+                probe = _FilePreflight(path, size_bytes, identity)
+            else:
+                snapshot_data = snapshot_reader(path)
+                if not isinstance(snapshot_data, bytes):
+                    raise ValueError(f"kigumi_file snapshot must contain bytes: {path}")
+                probe = _FilePreflight(path, len(snapshot_data), None, snapshot_data)
+            probes[id(value)] = probe
+            total_bytes += probe.size_bytes
 
         if total_bytes > policy.max_attachment_bytes:
             report = PreflightReport(
@@ -1029,6 +1093,7 @@ class LLMCaller:
             detail=value.get("detail"),
             has_detail="detail" in value,
             identity=probe.identity,
+            snapshot_data=probe.snapshot_data,
         )
 
     @staticmethod

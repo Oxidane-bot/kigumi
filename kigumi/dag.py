@@ -73,6 +73,7 @@ from .calling import (
     DryRunError,
     LLMCaller,
     durable_side_effect_boundary,
+    file_snapshot_boundary,
     observe,
 )
 from .config import KigumiConfig
@@ -571,7 +572,8 @@ class NodeContext:
         **params: Any,
     ) -> str:
         """Make one cached L1 call using the caller protocol expected by helpers."""
-        return self._dag.caller.call(messages, model=model, **params)
+        with file_snapshot_boundary(self._checked_file):
+            return self._dag.caller.call(messages, model=model, **params)
 
     def call_validated(self, prompt: str, model_cls: Any, **kwargs: Any) -> Any:
         """Call for a validated Pydantic model through this node's caller gate."""

@@ -244,7 +244,13 @@ def test_new_l1_call_cache_with_response_digest_remains_valid_and_replayable(
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     path.write_text(
-        json.dumps({"response": "new cached", "response_sha256": sha("new cached")}),
+        json.dumps(
+            {
+                "meta": {"key": key},
+                "response": "new cached",
+                "response_sha256": sha("new cached"),
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -253,11 +259,117 @@ def test_new_l1_call_cache_with_response_digest_remains_valid_and_replayable(
     assert caller.transport.requests == []
 
 
+def test_l1_cache_symlink_is_corrupt_not_replayable_or_missing(tmp_path: Path) -> None:
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = sha(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    path = tmp_path / "llm" / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "meta": {"key": key},
+        "response": "cached",
+        "response_sha256": sha("cached"),
+    }
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        path.symlink_to(target)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support symlinks: {error}")
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    assert "symlink" in (lookup.reason or "")
+    with pytest.raises(CacheIntegrityError):
+        caller.call("hello")
+    assert caller.transport.requests == []
+
+
+def test_l1_cache_dangling_symlink_is_corrupt_not_a_miss(tmp_path: Path) -> None:
+    caller = LLMCaller(FakeTransport(), tmp_path)
+    key = sha(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    path = tmp_path / "llm" / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    try:
+        path.symlink_to(tmp_path / "missing.json")
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"target filesystem does not support symlinks: {error}")
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "CORRUPT"
+    with pytest.raises(CacheIntegrityError):
+        caller.call("hello")
+    assert caller.transport.requests == []
+
+
+def test_l1_cache_cross_key_payload_is_corrupt_not_replayed(tmp_path: Path) -> None:
+    first_key = sha(
+        {
+            "messages": [{"role": "user", "content": "first"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    second_key = sha(
+        {
+            "messages": [{"role": "user", "content": "second"}],
+            "model": "default",
+            "params": {},
+            "seed": 0,
+        }
+    )
+    root = tmp_path / "llm"
+    root.mkdir()
+    (root / f"{first_key}.json").write_text(
+        json.dumps(
+            {
+                "meta": {"key": first_key},
+                "response": "first answer",
+                "response_sha256": sha("first answer"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / f"{second_key}.json").write_bytes((root / f"{first_key}.json").read_bytes())
+
+    caller = LLMCaller(FakeTransport(), tmp_path)
+
+    lookup = read_call_cache(root / f"{second_key}.json")
+
+    assert lookup.state == "CORRUPT"
+    assert "key" in (lookup.reason or "")
+    with pytest.raises(CacheIntegrityError):
+        caller.call("second")
+    assert caller.transport.requests == []
+
+
 def test_valid_and_missing_l1_call_cache_states(tmp_path: Path) -> None:
     valid_path = tmp_path / "llm" / "valid.json"
     valid_path.parent.mkdir(parents=True)
     valid_path.write_text(
-        json.dumps({"response": "cached", "response_sha256": sha("cached")}),
+        json.dumps(
+            {
+                "meta": {"key": "valid"},
+                "response": "cached",
+                "response_sha256": sha("cached"),
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -265,6 +377,10 @@ def test_valid_and_missing_l1_call_cache_states(tmp_path: Path) -> None:
     missing = read_call_cache(tmp_path / "llm" / "missing.json")
 
     assert valid.state == "VALID"
-    assert valid.data == {"response": "cached", "response_sha256": sha("cached")}
+    assert valid.data == {
+        "meta": {"key": "valid"},
+        "response": "cached",
+        "response_sha256": sha("cached"),
+    }
     assert valid.expected_sha256 == valid.actual_sha256 == sha("cached")
     assert missing.state == "MISSING"

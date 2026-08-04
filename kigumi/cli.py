@@ -29,6 +29,7 @@ from .enforce import (
     raw_io_waiver_reasons,
     waiver_reasons,
 )
+from .errors import CacheIntegrityError
 from .inspect import diff_components, durable_run_state, load_call, trace_run
 from .profile import WorkflowProfileError, load_run_profile
 from .prompt import TemplateSlotError, load_template, render_template, slot_names
@@ -922,7 +923,7 @@ def _diff(config: KigumiConfig, run_a: str, run_b: str, *, json_output: bool) ->
 def _trace(config: KigumiConfig, run_id: str, node: str | None, *, json_output: bool) -> int:
     try:
         result = trace_run(config.artifacts_path, config.llm_cache_path, run_id, node)
-    except (FileNotFoundError, ValueError, WorkflowProfileError) as error:
+    except (CacheIntegrityError, FileNotFoundError, ValueError, WorkflowProfileError) as error:
         _error(str(error))
         return 1
     if json_output:
@@ -970,7 +971,7 @@ def _print_trace_node(entry: dict[str, Any], *, indent: str) -> None:
 def _call(config: KigumiConfig, key_prefix: str, field: str | None) -> int:
     try:
         _key, payload = load_call(config.llm_cache_path, key_prefix)
-    except (FileNotFoundError, ValueError) as error:
+    except (CacheIntegrityError, FileNotFoundError, ValueError) as error:
         _error(str(error))
         return 1
     if field == "response":

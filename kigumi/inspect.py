@@ -17,6 +17,8 @@ from ._runstate import (
     RunManifestError,
     validate_run_path,
 )
+from .calling import read_call_cache
+from .errors import CacheIntegrityError
 from .profile import WorkflowProfileError, _validate_run_integrity, load_run_profile
 from .store import run_directory
 
@@ -144,19 +146,29 @@ def durable_run_state(
 def load_call(llm_cache_path: Path, key_prefix: str) -> tuple[str, dict[str, Any]]:
     """Load exactly one L1 payload selected by a cache-key prefix."""
     root = llm_cache_path / "llm"
-    candidates = sorted(
-        path for path in root.glob("*.json") if path.stem.startswith(key_prefix) and path.is_file()
-    )
+    try:
+        candidates = sorted(
+            path
+            for path in root.iterdir()
+            if path.name.endswith(".json") and path.stem.startswith(key_prefix)
+        )
+    except FileNotFoundError:
+        candidates = []
+    except OSError as error:
+        raise ValueError(f"Unable to inspect LLM cache directory {root}: {error}") from error
     if not candidates:
         raise FileNotFoundError(f"No LLM payload matching {key_prefix!r} under {root}")
     if len(candidates) > 1:
         keys = ", ".join(path.stem for path in candidates)
         raise ValueError(f"Ambiguous LLM cache key prefix {key_prefix!r}: {keys}")
     path = candidates[0]
-    payload = _read_json(path)
-    if not payload:
-        raise ValueError(f"Invalid LLM payload: {path}")
-    return path.stem, payload
+    lookup = read_call_cache(path)
+    if lookup.state == "MISSING":
+        raise FileNotFoundError(f"No LLM payload matching {key_prefix!r} under {root}")
+    if lookup.state == "CORRUPT":
+        raise CacheIntegrityError(path, lookup)
+    assert isinstance(lookup.data, dict)
+    return path.stem, lookup.data
 
 
 def diff_components(artifacts_path: Path, run_a: str, run_b: str) -> dict[str, Any]:
@@ -197,13 +209,16 @@ def _trace_entry(
             payload_path: str | None = None
             if isinstance(key, str):
                 candidate = llm_cache_path / "llm" / f"{key}.json"
-                if candidate.is_file():
+                lookup = read_call_cache(candidate)
+                if lookup.state == "VALID":
                     payload_path = str(candidate.resolve())
-                else:
+                elif lookup.state == "MISSING":
                     warnings.append(
                         f"LLM payload missing for key {key!r}; configure llm_cache_dir to match "
                         f"the LLMCaller cache_dir ({llm_cache_path})."
                     )
+                else:
+                    raise CacheIntegrityError(candidate, lookup)
             else:
                 warnings.append(
                     f"LLM call for node {name!r} has no key; cannot locate its payload under "

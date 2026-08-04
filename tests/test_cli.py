@@ -713,6 +713,7 @@ def test_trace_call_diff_and_json_run_views_use_persisted_evidence(
             "meta": call,
             "messages": [{"role": "user", "content": "hello"}],
             "response": "world",
+            "response_sha256": sha("world"),
             "reasoning": "why",
         },
     )
@@ -741,6 +742,21 @@ def test_trace_call_diff_and_json_run_views_use_persisted_evidence(
     assert "run not found: run-typo" in capsys.readouterr().err
     assert main(["trace", "run-2", "--node", "typo"]) == 1
     assert "node not found in run-2: typo" in capsys.readouterr().err
+
+
+def test_cli_call_reports_corrupt_l1_payload_without_replaying_it(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    atomic_write_json(
+        root / "artifacts" / "_llm" / "llm" / "abc123.json",
+        {"meta": {"key": "abc123"}, "response": "world"},
+    )
+    monkeypatch.chdir(root)
+
+    assert main(["call", "abc123", "--field", "response"]) == 1
+
+    assert "Corrupt cache" in capsys.readouterr().err
 
 
 def test_runs_show_and_trace_include_durable_attempt_state(

@@ -29,6 +29,7 @@ from .failures import (
     ProviderFailure,
     canonical_failure,
 )
+from .prompt import PromptResolutionError, validate_prompt_resolution_record
 
 AGENT_EXECUTOR_SCHEMA = 5
 AGENT_SCHEMA = 3
@@ -640,6 +641,11 @@ def execute_agent_task(
     prompt_resolution: Mapping[str, Any] | None = None,
     session_in: Mapping[str, Any] | None = None,
 ) -> AgentTaskExecution:
+    if prompt_resolution is not None:
+        try:
+            validate_prompt_resolution_record(prompt_resolution)
+        except PromptResolutionError as error:
+            raise AgentResultError(f"Agent prompt resolution is invalid: {error}") from error
     expected_adapter = adapter_identity.get("adapter")
     unkeyed = isinstance(expected_adapter, Mapping) and expected_adapter.get("unkeyed") is True
     if not unkeyed and (
