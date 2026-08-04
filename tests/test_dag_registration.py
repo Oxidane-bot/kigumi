@@ -173,6 +173,62 @@ def test_registration_hard_fails_dynamic_callables_and_their_aliases(tmp_path: P
         assert snippet in message
 
 
+def test_registration_hard_fails_raw_io_fact_propagation_escapes(tmp_path: Path) -> None:
+    """注册环必须与 enforce 一样收口容器、星号、重绑定和定义期表达式。"""
+    dag = _make_dag(tmp_path)
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("indexed-container")
+        def indexed_container(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            readers = [open]
+            return {"text": readers[0]("secret.txt")}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("builtin-import-chain")
+        def builtin_import_chain(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            import builtins
+
+            importer = builtins.__dict__["__import__"]
+            builtins_module = importer("builtins")
+            reader = builtins_module.__dict__["open"]
+            return {"text": reader("secret.txt")}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("helper-star")
+        def helper_star(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            def helper(reader: Any) -> str:
+                return reader("secret.txt")
+
+            readers = [open]
+            return {"text": helper(*readers)}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("map-star")
+        def map_star(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            return {"values": list(map(*[open], inputs))}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("rebound-context")
+        def rebound_context(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+            ctx = Path("secret.txt")
+            return {"text": ctx.read_text()}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("definition-expressions")
+        def definition_expressions(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            @Path("decorator-secret.txt").read_text()
+            def helper(value: Path("annotation-secret.txt").read_text()) -> str:
+                return value
+
+            return {"value": ctx.read_text("declared.txt")}
+
+
 def test_registration_hard_fails_nested_classes_and_reachable_instance_method_alias(
     tmp_path: Path,
 ) -> None:

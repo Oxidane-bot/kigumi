@@ -447,6 +447,160 @@ def node(inputs, ctx):
     ]
 
 
+def test_raw_io_rejects_builtin_import_lookup_chained_to_open() -> None:
+    """__import__ 的 builtins 字典链不能绕过动态 import 与 raw-I/O 硬切。"""
+    source = """
+import builtins
+
+def node(inputs, ctx):
+    importer = builtins.__dict__["__import__"]
+    builtins_module = importer("builtins")
+    reader = builtins_module.__dict__["open"]
+    return reader("secret.txt").read()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/builtin-import-chain.py"))
+
+    assert [finding.lineno for finding in findings] == [7, 8]
+    snippets = {finding.snippet for finding in findings}
+    assert {
+        'reader = builtins_module.__dict__["open"]',
+        'return reader("secret.txt").read()',
+    } <= snippets
+    assert all(not finding.waived for finding in findings)
+
+
+def test_raw_io_rejects_direct_static_container_callable_index() -> None:
+    """静态 callable 容器的直接下标调用必须传播 raw-I/O 事实。"""
+    source = """
+def node(inputs, ctx):
+    readers = [open]
+    return readers[0]("secret.txt")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/static-container-call.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'return readers[0]("secret.txt")',
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_hard_dynamic_and_opaque_findings_ignore_raw_io_waivers() -> None:
+    """动态/opaque callable 的结构 finding 不能被旧缓存理由放行。"""
+    source = """
+import builtins
+
+def node(inputs, ctx):
+    opaque = builtins.__dict__["open"]  # kigumi: raw-io-ok old cache
+    return opaque("secret.txt")  # kigumi: raw-io-ok old cache
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/opaque-waiver.py"))
+
+    assert [(finding.lineno, finding.waived, finding.waiver_reason) for finding in findings] == [
+        (5, False, None),
+        (6, False, None),
+    ]
+
+
+def test_raw_io_keeps_unknown_data_subscripts_out_of_scope() -> None:
+    """未知数据下标没有可证明 callable 事实时不能扩大误报边界。"""
+    source = """
+def node(inputs, ctx):
+    readers = inputs["readers"]
+    return readers[index]
+"""
+
+    assert check_raw_io_source(source, Path("nodes/unknown-data-subscript.py")) == []
+
+
+def test_raw_io_propagates_static_container_through_helper_star_args() -> None:
+    """helper(*readers) 展开的 raw callable 不能丢失参数事实。"""
+    source = """
+def node(inputs, ctx):
+    def helper(reader):
+        return reader("secret.txt")
+
+    readers = [open]
+    return helper(*readers)
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/helper-star-container.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'return reader("secret.txt")',
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_rejects_starred_static_map_callback() -> None:
+    """map(*[open], ...) 的静态 callback 展开不能绕过 raw-I/O 检查。"""
+    source = """
+def node(inputs, ctx):
+    return list(map(*[open], inputs))
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/starred-map-callback.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "return list(map(*[open], inputs))",
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_reaches_lambda_from_static_container_index_call() -> None:
+    """静态容器下标取得的 lambda 函数体必须进入可达扫描。"""
+    source = """
+def node(inputs, ctx):
+    readers = [lambda: Path("lambda-secret.txt").read_text()]
+    return readers[0]()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/container-lambda.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        'readers = [lambda: Path("lambda-secret.txt").read_text()]',
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_rejects_context_read_after_context_rebinding() -> None:
+    """ctx 被重新绑定为 Path 后，read_text 不再是受控上下文读取。"""
+    source = """
+def node(inputs, ctx):
+    ctx = Path("secret.txt")
+    return ctx.read_text()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/rebound-context.py"))
+
+    assert [finding.snippet for finding in findings] == [
+        "return ctx.read_text()",
+    ]
+    assert findings[0].waived is False
+
+
+def test_raw_io_scans_nested_helper_decorators_and_annotations() -> None:
+    """nested helper 的 decorator/annotation 在定义时执行，不能藏 raw read。"""
+    source = """
+def node(inputs, ctx):
+    @Path("decorator-secret.txt").read_text()
+    def helper(value: Path("annotation-secret.txt").read_text()):
+        return value
+
+    return ctx.read_text("declared.txt")
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/helper-definition-expressions.py"))
+
+    assert {
+        '@Path("decorator-secret.txt").read_text()',
+        'def helper(value: Path("annotation-secret.txt").read_text()):',
+    } <= {finding.snippet for finding in findings}
+    assert all(not finding.waived for finding in findings)
+
+
 def test_raw_io_rejects_imported_and_indirect_raw_callable_aliases() -> None:
     """危险 callable 的导入、赋值和动态取值都不能绕过 raw-I/O 守卫。"""
     source = """
@@ -463,7 +617,7 @@ def node(inputs, ctx):
 
     findings = check_raw_io_source(source, Path("nodes/sample.py"))
 
-    assert [finding.lineno for finding in findings] == [5, 6, 7, 8, 9]
+    assert [finding.lineno for finding in findings] == [5, 6, 7, 8, 9, 10]
     assert all(not finding.waived for finding in findings)
 
 
@@ -542,7 +696,7 @@ def node(inputs, ctx):
 
 
 def test_raw_io_dynamic_call_target_wins_over_raw_getattr_shape() -> None:
-    """直接执行动态 getattr 结果仍不可豁免；绑定后才沿用 raw alias 语义。"""
+    """getattr 及其派生 callable 都是动态硬切，raw-io-ok 不能豁免。"""
     source = """
 def node(inputs, ctx):
     direct = getattr(Path, "read_text")("secret.txt")  # kigumi: raw-io-ok not enough
@@ -556,7 +710,9 @@ def node(inputs, ctx):
     assert [(finding.lineno, finding.waived, finding.waiver_reason) for finding in findings] == [
         (3, False, None),
         (4, False, None),
-        (5, True, "fixture input"),
+        (5, False, None),
+        (6, False, None),
+        (6, False, None),
     ]
 
 
@@ -649,3 +805,22 @@ def writer(inputs, ctx):
     findings = check_raw_io_node_paths([source.parent])
 
     assert [(finding.lineno, finding.waived) for finding in findings] == [(4, False)]
+
+
+def test_raw_io_path_guard_propagates_static_container_callable_facts(tmp_path: Path) -> None:
+    """项目级装饰器筛选也必须沿用静态容器 callable 事实。"""
+    source = tmp_path / "nodes" / "indexed.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        """
+@dag.node("indexed")
+def indexed(inputs, ctx):
+    readers = [open]
+    return readers[0]("secret.txt")
+""",
+        encoding="utf-8",
+    )
+
+    findings = check_raw_io_node_paths([source.parent])
+
+    assert [(finding.lineno, finding.waived) for finding in findings] == [(5, False)]
