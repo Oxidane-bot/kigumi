@@ -1991,65 +1991,86 @@ class Dag:
         except (OSError, RunManifestError, ValueError) as error:
             raise ValueError(f"Run {run_id!r} declaration cannot be recovered: {error}") from error
 
-        state = attempts.state_for(target)
-        if state is None:
-            raise ValueError(f"Recovery target {target!r} has no durable attempt state")
-        if state.get("status") != "failed":
-            raise ValueError(f"Recovery target {target!r} is not terminally failed")
-        if state.get("attempt") != from_attempt:
-            raise ValueError(
-                f"Recovery target {target!r} is at attempt {state.get('attempt')}, "
-                f"not {from_attempt}"
+        # The runstate recovery mutations are individually atomic, but a fail
+        # decision has no target state transition of its own.  Keep the
+        # decision check and the matching public runstate mutation inside the
+        # same run lock so a fail/retry pair cannot both observe the same
+        # failed attempt and commit two decisions.
+        with attempts._run_locked():  # type: ignore[attr-defined]  # noqa: SLF001
+            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(current_manifest, dict)
+                or current_manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA
+            ):
+                raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
+            if current_manifest.get("status") != "failed":
+                raise ValueError(f"Run {run_id!r} is not in terminal failed state")
+
+            state = attempts.state_for(target)
+            if state is None:
+                raise ValueError(f"Recovery target {target!r} has no durable attempt state")
+            if state.get("status") != "failed":
+                raise ValueError(f"Recovery target {target!r} is not terminally failed")
+            if state.get("attempt") != from_attempt:
+                raise ValueError(
+                    f"Recovery target {target!r} is at attempt {state.get('attempt')}, "
+                    f"not {from_attempt}"
+                )
+            if _recovery_decision_exists(run_dir, from_attempt):
+                raise ValueError(
+                    f"Recovery target {target!r} attempt {from_attempt} already has a decision"
+                )
+
+            recovery_time = _recovery_time()
+            recovered_by = _recovered_by()
+            evidence_refs = list(evidence)
+            normalized_reason = reason.strip()
+            to_attempt = from_attempt if decision == "fail" else from_attempt + 1
+            receipt = RecoveryReceipt(
+                recovery_time=recovery_time,
+                from_attempt=from_attempt,
+                to_attempt=to_attempt,
+                decision=decision,
+                reason=normalized_reason,
+                evidence_refs=evidence_refs,
+                recovered_by=recovered_by,
             )
+            receipt_payload = _recovery_payload(receipt)
+            if decision == "fail":
+                attempts.write_recovery_receipt(receipt_payload)
+                return receipt
 
-        recovery_time = _recovery_time()
-        recovered_by = _recovered_by()
-        evidence_refs = list(evidence)
-        normalized_reason = reason.strip()
-        to_attempt = from_attempt if decision == "fail" else from_attempt + 1
-        receipt = RecoveryReceipt(
-            recovery_time=recovery_time,
-            from_attempt=from_attempt,
-            to_attempt=to_attempt,
-            decision=decision,
-            reason=normalized_reason,
-            evidence_refs=evidence_refs,
-            recovered_by=recovered_by,
-        )
-        receipt_payload = _recovery_payload(receipt)
-        if decision == "fail":
-            attempts.write_recovery_receipt(receipt_payload)
+            inherited_nodes = self._recovery_inherited_nodes(
+                run_dir,
+                target_root,
+                order,
+                attempts=attempts,
+            )
+            attempts.schedule_recovery(
+                target,
+                from_attempt=from_attempt,
+                to_attempt=to_attempt,
+                recovery=receipt_payload,
+                recovery_receipt=receipt_payload,
+                inherited_nodes=inherited_nodes,
+            )
+            attempts.update_manifest(
+                "pending_retry",
+                pending_retries=attempts.pending_retries(),
+                ambiguous_attempts=attempts.ambiguous_attempts(),
+            )
             return receipt
-
-        inherited_nodes = self._recovery_inherited_nodes(
-            run_dir,
-            target_root,
-            order,
-        )
-        attempts.schedule_recovery(
-            target,
-            from_attempt=from_attempt,
-            to_attempt=to_attempt,
-            recovery=receipt_payload,
-            recovery_receipt=receipt_payload,
-            inherited_nodes=inherited_nodes,
-        )
-        attempts.update_manifest(
-            "pending_retry",
-            pending_retries=attempts.pending_retries(),
-            ambiguous_attempts=attempts.ambiguous_attempts(),
-        )
-        return receipt
 
     def _recovery_inherited_nodes(
         self,
         run_dir: Path,
         target: str,
         order: list[str],
+        *,
+        attempts: AttemptStore,
     ) -> dict[str, Any]:
         """Describe successful run-local artifacts that the retry will inherit."""
         downstream = _downstream_nodes(self._nodes, {target})
-        attempts = AttemptStore(run_dir, {})
         inherited: dict[str, Any] = {}
         for name in order:
             if name == target or name in downstream:
@@ -3786,7 +3807,13 @@ class Dag:
                 raise first
             if isinstance(
                 first,
-                (AmbiguousAttemptError, RetryExhausted, ProviderFailure, BudgetExceeded),
+                (
+                    AmbiguousAttemptError,
+                    CacheIntegrityError,
+                    RetryExhausted,
+                    ProviderFailure,
+                    BudgetExceeded,
+                ),
             ):
                 raise first
             details = ", ".join(
@@ -4751,6 +4778,20 @@ def _recovery_payload(receipt: RecoveryReceipt) -> dict[str, Any]:
         "evidence_refs": list(receipt.evidence_refs),
         "recovered_by": receipt.recovered_by,
     }
+
+
+def _recovery_decision_exists(run_dir: Path, from_attempt: int) -> bool:
+    """Return whether this failed attempt already has an append-only decision."""
+    for path in sorted(run_dir.glob("recovery-*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Recovery receipt {path.name!r} is not valid JSON") from error
+        if not isinstance(payload, dict):
+            raise ValueError(f"Recovery receipt {path.name!r} is not a JSON object")
+        if payload.get("from_attempt") == from_attempt:
+            return True
+    return False
 
 
 class _DocstringStripper(ast.NodeTransformer):

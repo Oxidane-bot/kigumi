@@ -142,6 +142,51 @@ def test_dynamic_cache_hits_pass_each_item_snapshot_to_sidecar(
     assert captured["work@two"].state == "VALID"
 
 
+def test_corrupt_map_item_cache_propagates_without_calling_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = _make_dag(tmp_path)
+    item_calls: list[str] = []
+    item_cache_key: str | None = None
+    original_write_sidecar = execution_module.ExecutionEnvelope.write_sidecar
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "one"}, {"id": "two"}]}
+
+    @dag.map("work", items_from=("source", "items"), key_fn=lambda item: item["id"])
+    def work(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        item_calls.append(item["id"])
+        return {"id": item["id"]}
+
+    def capture_item_key(
+        self: Any,
+        label: str,
+        artifact: dict[str, Any],
+        cache_key: str | list[str],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal item_cache_key
+        if label == "work@one":
+            assert isinstance(cache_key, str)
+            item_cache_key = cache_key
+        original_write_sidecar(self, label, artifact, cache_key, **kwargs)
+
+    monkeypatch.setattr(execution_module.ExecutionEnvelope, "write_sidecar", capture_item_key)
+    dag.run(run_id="map-corrupt-prime")
+    assert item_calls == ["one", "two"]
+    assert item_cache_key is not None
+
+    cache_path = dag.config.artifacts_path / "_cache" / "nodes" / f"{item_cache_key}.json"
+    cache_path.write_text('{"artifact": {"broken": true}', encoding="utf-8")
+
+    with pytest.raises(CacheIntegrityError):
+        dag.run(run_id="map-corrupt-hit")
+    assert item_calls == ["one", "two"]
+
+
 def test_docstring_does_not_change_cache_but_code_does(tmp_path: Path) -> None:
     """教训 code_version: 注释文档不换缓存族，逻辑变更必须换。"""
     first = _load_work(tmp_path / "first.py", "first documentation", 1)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Any
 from urllib.error import HTTPError
 
@@ -271,6 +272,82 @@ def test_concurrent_recover_has_one_receipt_and_one_queued_attempt(tmp_path: Pat
     assert len(list(run_dir.glob("recovery-*.json"))) == 1
     attempt_two = list((run_dir / "attempts").glob("*/attempt-0002.json"))
     assert len(attempt_two) == 1
+
+
+def test_mixed_fail_and_retry_recovery_is_one_atomic_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fail/retry race must commit only one recovery decision."""
+    first = _retry_dag(
+        tmp_path,
+        _SequenceTransport([_authentication_failure()]),
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+    with pytest.raises(ProviderFailure):
+        first.run(run_id="mixed-recovery")
+
+    fail_entered = Event()
+    retry_started = Event()
+    original_write = dag_module.AttemptStore.write_recovery_receipt
+
+    def delay_fail_receipt(self: Any, payload: dict[str, Any]) -> Any:
+        if payload.get("decision") == "fail":
+            fail_entered.set()
+            assert retry_started.wait(timeout=5)
+        return original_write(self, payload)
+
+    monkeypatch.setattr(dag_module.AttemptStore, "write_recovery_receipt", delay_fail_receipt)
+    retry_dag = _retry_dag(
+        tmp_path,
+        _SequenceTransport([]),
+        RetryPolicy(max_attempts=1, initial_delay_seconds=0, jitter="none"),
+    )
+
+    def run_fail() -> tuple[str, Any]:
+        try:
+            return (
+                "ok",
+                first.recover(
+                    "mixed-recovery",
+                    "ask",
+                    from_attempt=1,
+                    decision="fail",
+                    reason="operator confirmed the failure is final",
+                ),
+            )
+        except BaseException as error:
+            return ("error", error)
+
+    def run_retry() -> tuple[str, Any]:
+        retry_started.set()
+        try:
+            return (
+                "ok",
+                retry_dag.recover(
+                    "mixed-recovery",
+                    "ask",
+                    from_attempt=1,
+                    decision="retry_not_started",
+                    reason="operator confirmed retry is safe",
+                ),
+            )
+        except BaseException as error:
+            return ("error", error)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fail_future = executor.submit(run_fail)
+        assert fail_entered.wait(timeout=5)
+        retry_future = executor.submit(run_retry)
+        outcomes = [fail_future.result(timeout=5), retry_future.result(timeout=5)]
+
+    successes = [value for status, value in outcomes if status == "ok"]
+    failures = [value for status, value in outcomes if status == "error"]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], (ValueError, RunManifestError))
+
+    run_dir = tmp_path / "artifacts" / "runs" / "mixed-recovery"
+    assert len(list(run_dir.glob("recovery-*.json"))) == 1
 
 
 def test_recovery_does_not_use_dag_level_receipt_write_after_injected_crash(
