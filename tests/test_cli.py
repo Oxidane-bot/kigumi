@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -918,6 +919,138 @@ def test_runs_approve_diff_and_gc_commands_use_persisted_artifacts(
     assert not (cache_root / "old.json").exists()
     assert (blobs_root / retained_blob).exists()
     assert not (blobs_root / stale_blob).exists()
+
+
+def test_runs_list_rejects_external_sidecar_symlinks(tmp_path: Path, monkeypatch, capsys) -> None:
+    root = _project(tmp_path)
+    run_path = root / "artifacts" / "runs" / "owned"
+    _write_completed_cli_run(
+        run_path,
+        target="node",
+        artifact={"value": "safe"},
+        cache="miss",
+        cache_key="safe-cache",
+        key_components={},
+        seconds=0.0,
+        calls=[],
+    )
+    external = tmp_path / "external-sidecar.json"
+    external.write_text('{"cache": "hit", "secret": "must-not-leak"}', encoding="utf-8")
+    try:
+        (run_path / "escape.json.meta.json").symlink_to(external)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"filesystem does not support file symlinks: {error}")
+
+    monkeypatch.chdir(root)
+    assert main(["runs", "list", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert "symlink" in captured.err
+    assert "must-not-leak" not in captured.out + captured.err
+
+
+def test_runs_list_and_show_reject_symlinked_run_directories(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    runs = root / "artifacts" / "runs"
+    runs.mkdir(parents=True)
+    external = tmp_path / "external-run"
+    external.mkdir()
+    (external / "_run.json").write_text(
+        '{"secret": "must-not-leak"}',
+        encoding="utf-8",
+    )
+    try:
+        (runs / "escape").symlink_to(external, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"filesystem does not support directory symlinks: {error}")
+
+    monkeypatch.chdir(root)
+    assert main(["runs", "list"]) == 1
+    listed = capsys.readouterr()
+    assert "symlink" in listed.err
+    assert "must-not-leak" not in listed.out + listed.err
+    assert main(["runs", "show", "escape"]) == 1
+    shown = capsys.readouterr()
+    assert "symlink" in shown.err
+    assert "must-not-leak" not in shown.out + shown.err
+
+
+def test_runs_show_rejects_external_approval_directory_symlink(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    run_path = root / "artifacts" / "runs" / "owned"
+    _write_completed_cli_run(
+        run_path,
+        target="node",
+        artifact={"value": "safe"},
+        cache="miss",
+        cache_key="safe-cache",
+        key_components={},
+        seconds=0.0,
+        calls=[],
+    )
+    external = tmp_path / "external-approvals"
+    external.mkdir()
+    (external / "leaked.json").write_text(
+        '{"secret": "must-not-leak"}',
+        encoding="utf-8",
+    )
+    approvals = run_path / "approvals"
+    try:
+        approvals.symlink_to(external, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"filesystem does not support directory symlinks: {error}")
+
+    monkeypatch.chdir(root)
+    assert main(["runs", "show", "owned", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert "Unable to inspect Pending approval directory" in captured.err
+    assert "must-not-leak" not in captured.out + captured.err
+
+
+def test_runs_show_rejects_fifo_sidecar_without_blocking(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    run_path = root / "artifacts" / "runs" / "fifo"
+    _write_completed_cli_run(
+        run_path,
+        target="node",
+        artifact={"value": "safe"},
+        cache="miss",
+        cache_key="safe-cache",
+        key_components={},
+        seconds=0.0,
+        calls=[],
+    )
+    fifo = run_path / "blocked.json.meta.json"
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("filesystem does not support FIFOs")
+    try:
+        os.mkfifo(fifo)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"filesystem does not support FIFOs: {error}")
+
+    project_root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (project_root, env.get("PYTHONPATH")) if part
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from kigumi.cli import main; raise SystemExit(main(['runs', 'show', 'fifo']))",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "regular file" in result.stderr
 
 
 def test_cli_check_reports_clean_dag(tmp_path: Path, capsys) -> None:

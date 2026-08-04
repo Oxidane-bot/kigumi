@@ -13,11 +13,13 @@ import stat
 import subprocess
 import sys
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._runstate import RUN_MANIFEST_SCHEMA
+from ._runstate import RUN_MANIFEST_SCHEMA, AttemptStore, RunManifestError
+from ._safe_io import SecureDirectory, _open_regular_file_at
 from ._safe_io import secure_atomic_write_text as atomic_write_text
 from .artifacts import canonical_json
 from .config import KigumiConfig, find_project_root, load_config, load_env
@@ -949,16 +951,22 @@ def _render(config: KigumiConfig, template_name: str, specifications: list[str])
 
 def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output: bool) -> int:
     if command == "list":
+        try:
+            run_paths = _run_directories(config.artifacts_path / "runs")
+        except WorkflowProfileError as error:
+            _error(str(error))
+            return 1
         runs: list[dict[str, Any]] = []
-        for run_path in _run_directories(config.artifacts_path / "runs"):
-            sidecars = list(run_path.glob("*.json.meta.json"))
-            metadata = [_read_json(path) for path in sidecars]
-            hits = sum(1 for item in metadata if item.get("cache") == "hit")
-            misses = sum(1 for item in metadata if item.get("cache") == "miss")
-            pending = _pending_names(run_path)
+        for run_path in run_paths:
             try:
+                with _owned_run(run_path) as store:
+                    sidecars = _sidecar_paths(run_path, store=store)
+                    metadata = [_read_owned_json(store, path) for path in sidecars]
+                    hits = sum(1 for item in metadata if item.get("cache") == "hit")
+                    misses = sum(1 for item in metadata if item.get("cache") == "miss")
+                    pending = _pending_names(run_path, store=store)
                 durable = durable_run_state(run_path)
-            except WorkflowProfileError as error:
+            except (FileNotFoundError, WorkflowProfileError) as error:
                 _error(str(error))
                 return 1
             runs.append(
@@ -990,13 +998,23 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
     except ValueError as error:
         _error(str(error))
         return 1
-    if not run_path.is_dir():
-        _error(f"run not found: {run_id}")
-        return 1
     workflow: dict[str, Any] | None = None
     manifest_path = run_path / "_run.json"
-    manifest = _read_json(manifest_path)
-    if manifest_path.is_file():
+    try:
+        with _owned_run(run_path) as store:
+            manifest_info = _owned_entry_stat(store, manifest_path, label="Run manifest")
+            manifest = _read_owned_json(store, manifest_path)
+            sidecar_paths = _sidecar_paths(run_path, store=store)
+            sidecar_metadata = [_read_owned_json(store, path) for path in sidecar_paths]
+            pending = _pending_names(run_path, store=store)
+            approved_paths = _approval_paths(run_path, store=store)
+    except FileNotFoundError:
+        _error(f"run not found: {run_id}")
+        return 1
+    except WorkflowProfileError as error:
+        _error(str(error))
+        return 1
+    if manifest_info is not None:
         try:
             if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
                 raise WorkflowProfileError(f"Run {run_id!r} has an unsupported manifest schema")
@@ -1016,9 +1034,9 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
         node_sources = [
             {
                 "target": sidecar.name.removesuffix(".json.meta.json"),
-                **_read_json(sidecar),
+                **metadata,
             }
-            for sidecar in sorted(run_path.glob("*.json.meta.json"))
+            for sidecar, metadata in zip(sidecar_paths, sidecar_metadata, strict=True)
         ]
     for metadata in node_sources:
         name = metadata.get("target", metadata.get("name"))
@@ -1032,18 +1050,16 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
                 "calls": call_count,
             }
         )
-    pending = _pending_names(run_path)
     try:
         durable = durable_run_state(run_path)
     except WorkflowProfileError as error:
         _error(str(error))
         return 1
-    approvals = run_path / "approvals"
-    approved: list[str] = []
-    if approvals.is_dir():
-        for approval in sorted(approvals.glob("*.json")):
-            if not approval.name.endswith(".pending.json"):
-                approved.append(approval.stem)
+    approved = [
+        approval.name.removesuffix(".json")
+        for approval in approved_paths
+        if not approval.name.endswith(".pending.json")
+    ]
     if json_output:
         _print_json(
             {
@@ -1112,26 +1128,151 @@ def _runs(config: KigumiConfig, command: str, run_id: str | None, *, json_output
 
 
 def _run_directories(runs_root: Path) -> list[Path]:
-    if not runs_root.is_dir():
+    try:
+        with SecureDirectory(runs_root, create=False) as directory:
+            paths: list[Path] = []
+            for name in directory.names():
+                try:
+                    info = directory.stat(name)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    raise WorkflowProfileError(
+                        f"Run directory must not be a symlink: {runs_root / name}"
+                    )
+                if stat.S_ISDIR(info.st_mode):
+                    paths.append(runs_root / name)
+            return sorted(paths, key=run_sort_key)
+    except FileNotFoundError:
         return []
-    return sorted((path for path in runs_root.iterdir() if path.is_dir()), key=run_sort_key)
+    except WorkflowProfileError:
+        raise
+    except (OSError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Unable to inspect runs directory {runs_root}: {error}"
+        ) from error
+
+
+@contextmanager
+def _owned_run(run_path: Path):
+    """Keep one run's descriptor-bound ownership boundary for CLI reads."""
+    try:
+        store = AttemptStore(run_path, {})
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Unable to inspect run {run_path.name!r} safely: {error}"
+        ) from error
+    if store._run_directory is None:  # noqa: SLF001
+        if store._runs_directory is not None:  # noqa: SLF001
+            store._runs_directory.close()  # noqa: SLF001
+        raise FileNotFoundError(run_path)
+    try:
+        yield store
+    finally:
+        for directory in (
+            store._run_directory,  # noqa: SLF001
+            store._runs_directory,  # noqa: SLF001
+        ):
+            if directory is not None:
+                directory.close()
+
+
+def _owned_entry_stat(
+    store: AttemptStore,
+    path: Path,
+    *,
+    label: str,
+) -> os.stat_result | None:
+    """Stat one run entry through the bound AttemptStore directory."""
+    try:
+        return store._owned_stat(path)  # noqa: SLF001
+    except FileNotFoundError:
+        return None
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(f"Unable to inspect {label} path {path}: {error}") from error
+
+
+def _owned_json_paths(
+    store: AttemptStore,
+    directory_path: Path,
+    *,
+    suffix: str,
+    label: str,
+) -> list[Path]:
+    """List regular JSON entries from a descriptor-bound run directory."""
+    try:
+        names = store._owned_names(directory_path)  # noqa: SLF001
+    except FileNotFoundError:
+        return []
+    except (OSError, RunManifestError, ValueError) as error:
+        raise WorkflowProfileError(
+            f"Unable to inspect {label} directory {directory_path}: {error}"
+        ) from error
+    paths: list[Path] = []
+    for name in sorted(name for name in names if name.endswith(suffix)):
+        path = directory_path / name
+        info = _owned_entry_stat(store, path, label=label)
+        if info is None:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise WorkflowProfileError(f"{label} must not be a symlink: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise WorkflowProfileError(f"{label} must reference a regular file: {path}")
+        paths.append(path)
+    return paths
+
+
+def _sidecar_paths(run_path: Path, *, store: AttemptStore) -> list[Path]:
+    return _owned_json_paths(
+        store,
+        run_path,
+        suffix=".json.meta.json",
+        label="Run sidecar",
+    )
+
+
+def _approval_paths(run_path: Path, *, store: AttemptStore) -> list[Path]:
+    return _owned_json_paths(
+        store,
+        run_path / "approvals",
+        suffix=".json",
+        label="Approval file",
+    )
+
+
+def _read_owned_json(store: AttemptStore, path: Path) -> dict[str, Any]:
+    """Read one run JSON object through the bound durable reader."""
+    data, corrupted = store._read_owned_json(path)  # noqa: SLF001
+    if corrupted or not isinstance(data, dict):
+        return {}
+    return data
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+        with (
+            SecureDirectory(path.parent, create=False) as directory,
+            _open_regular_file_at(
+                directory,
+                path.name,
+                phase="reading CLI JSON",
+            ) as handle,
+        ):
+            data = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _pending_names(run_path: Path) -> list[str]:
-    approvals = run_path / "approvals"
-    if not approvals.is_dir():
-        return []
+def _pending_names(run_path: Path, *, store: AttemptStore) -> list[str]:
     return sorted(
-        path.name.removesuffix(".pending.json") for path in approvals.glob("*.pending.json")
+        path.name.removesuffix(".pending.json")
+        for path in _owned_json_paths(
+            store,
+            run_path / "approvals",
+            suffix=".pending.json",
+            label="Pending approval",
+        )
     )
 
 
