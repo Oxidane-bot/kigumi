@@ -135,11 +135,29 @@ def test_write_sidecar_uses_cache_entry_snapshot_for_cache_hits(
 ) -> None:
     envelope = _envelope(tmp_path)
     artifact = envelope.seal({"answer": "cached"}, "key", label="Node 'work'")
+    cache_entry = store.read_cache_entry(envelope.artifacts_path, "key")
 
-    def fail_if_called(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("cache origin must come from the same cache snapshot")
+    def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("cache hit with a supplied snapshot must not reread the key")
 
-    monkeypatch.setattr(store, "read_node_cache_origin", fail_if_called)
+    monkeypatch.setattr(store, "read_cache_entry", fail_if_called)
+
+    envelope.write_sidecar(
+        "work",
+        artifact,
+        "key",
+        cache_hit=True,
+        seconds=0.25,
+        calls=[],
+        cache_entry=cache_entry,
+    )
+
+
+def test_write_sidecar_keeps_legacy_cache_key_read_when_snapshot_is_omitted(
+    tmp_path: Path,
+) -> None:
+    envelope = _envelope(tmp_path)
+    artifact = envelope.seal({"answer": "cached"}, "key", label="Node 'work'")
 
     envelope.write_sidecar(
         "work",
@@ -149,3 +167,10 @@ def test_write_sidecar_uses_cache_entry_snapshot_for_cache_hits(
         seconds=0.25,
         calls=[],
     )
+
+    metadata = json.loads(
+        (tmp_path / "artifacts" / "runs" / "run-0001" / "work.json.meta.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["origin_provenance"]["artifact_sha256"] == sha(artifact)

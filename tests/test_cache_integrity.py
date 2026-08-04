@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from kigumi import EvidencePolicy
 from kigumi.artifacts import sha
 from kigumi.calling import CacheIntegrityError, LLMCaller, read_call_cache
 from kigumi.store import (
@@ -14,6 +15,24 @@ from kigumi.store import (
     write_node_cache,
 )
 from kigumi.testing import FakeTransport
+
+
+def _valid_origin(artifact: dict[str, object]) -> dict[str, object]:
+    policy = EvidencePolicy()
+    return {
+        "kind": "code",
+        "artifact_sha256": sha(artifact),
+        "calls": [],
+        "agent": None,
+        "prompt_resolutions": {},
+        "prompt_sha256": None,
+        "model": None,
+        "params": {},
+        "provider_response_id": None,
+        "usage": None,
+        "evidence_policy": policy.canonical(),
+        "evidence_policy_digest": policy.digest,
+    }
 
 
 def test_corrupt_l3_node_cache_is_reported_as_corrupt(tmp_path: Path) -> None:
@@ -32,7 +51,7 @@ def test_corrupt_l3_node_cache_is_reported_as_corrupt(tmp_path: Path) -> None:
 def test_valid_l3_node_cache_reports_data_and_digests(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
     artifact = {"answer": "cached"}
-    write_node_cache(artifacts, "node-key", artifact, {"artifact_sha256": sha(artifact)})
+    write_node_cache(artifacts, "node-key", artifact, _valid_origin(artifact))
 
     lookup = read_node_cache(artifacts, "node-key")
 
@@ -51,10 +70,7 @@ def test_missing_l3_node_cache_reports_missing(tmp_path: Path) -> None:
 def test_cache_entry_returns_artifact_origin_and_state_as_one_snapshot(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
     artifact = {"answer": "cached"}
-    origin = {
-        "artifact_sha256": sha(artifact),
-        "evidence_policy_digest": "policy-a",
-    }
+    origin = _valid_origin(artifact)
     write_node_cache(artifacts, "node-key", artifact, origin)
 
     entry = read_cache_entry(artifacts, "node-key")
@@ -64,6 +80,57 @@ def test_cache_entry_returns_artifact_origin_and_state_as_one_snapshot(tmp_path:
     assert entry.origin == origin
     assert entry.lookup.data == artifact
     assert entry.lookup.expected_sha256 == entry.lookup.actual_sha256 == sha(artifact)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "prompt_sha256",
+        "model",
+        "params",
+        "provider_response_id",
+        "usage",
+        "evidence_policy",
+        "evidence_policy_digest",
+        "kind",
+        "calls",
+        "agent",
+        "prompt_resolutions",
+    ),
+)
+def test_cache_entry_rejects_incomplete_origin_provenance(
+    tmp_path: Path, missing_field: str
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifact = {"answer": "cached"}
+    origin = _valid_origin(artifact)
+    del origin[missing_field]
+    write_node_cache(artifacts, "node-key", artifact, origin)
+
+    entry = read_cache_entry(artifacts, "node-key")
+
+    assert entry.state == "CORRUPT"
+    assert entry.artifact is None
+    assert entry.origin is None
+    assert entry.reason is not None
+    assert missing_field in entry.reason
+    assert read_node_cache(artifacts, "node-key").state == "CORRUPT"
+
+
+def test_cache_entry_allows_contractual_none_provenance_values(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifact = {"answer": "cached"}
+    write_node_cache(artifacts, "node-key", artifact, _valid_origin(artifact))
+
+    entry = read_cache_entry(artifacts, "node-key")
+
+    assert entry.state == "VALID"
+    assert entry.origin is not None
+    assert entry.origin["prompt_sha256"] is None
+    assert entry.origin["model"] is None
+    assert entry.origin["provider_response_id"] is None
+    assert entry.origin["usage"] is None
+    assert entry.origin["agent"] is None
 
 
 def test_cache_entry_preserves_missing_and_corrupt_states(tmp_path: Path) -> None:

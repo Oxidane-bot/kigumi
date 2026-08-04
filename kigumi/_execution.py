@@ -184,10 +184,16 @@ class ExecutionEnvelope:
         origin_provenance: dict[str, Any] | None = None,
         agent_provenance: dict[str, Any] | None = None,
         prompt_resolutions: dict[str, Any] | None = None,
+        cache_entry: store.CacheEntry | None = None,
     ) -> None:
         """Persist one run artifact and its deterministic metadata shape."""
-        if cache_hit and isinstance(cache_key, str):
+        if cache_hit and cache_entry is not None:
+            entry = cache_entry
+        elif cache_hit and isinstance(cache_key, str):
             entry = store.read_cache_entry(self.artifacts_path, cache_key)
+        else:
+            entry = None
+        if entry is not None:
             if entry.state == "CORRUPT":
                 raise CacheIntegrityError(
                     store.node_cache_path(self.artifacts_path, cache_key),

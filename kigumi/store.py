@@ -22,6 +22,22 @@ from .errors import OutputOwnershipError
 _RUN_ID_PATTERN = re.compile(r"run-(\d+)")
 _HISTORY_ID_PATTERN = re.compile(r"\d{4}")
 _NODE_CACHE_ENVELOPE_SCHEMA = 3
+_ORIGIN_PROVENANCE_FIELDS = (
+    "artifact_sha256",
+    "kind",
+    "calls",
+    "agent",
+    "prompt_resolutions",
+    "prompt_sha256",
+    "model",
+    "params",
+    "provider_response_id",
+    "usage",
+    "evidence_policy",
+    "evidence_policy_digest",
+)
+_ORIGIN_KINDS = frozenset(("call", "agent", "code"))
+_EVIDENCE_MODES = frozenset(("full", "redacted", "hash_only"))
 
 CacheState = Literal["MISSING", "VALID", "CORRUPT"]
 
@@ -117,6 +133,16 @@ def read_cache_entry(artifacts_path: Path, cache_key: str) -> CacheEntry:
             payload.actual_sha256,
             "node cache artifact or origin is not an object",
         )
+    origin_reason = _origin_provenance_error(origin, payload.expected_sha256)
+    if origin_reason is not None:
+        return CacheEntry(
+            "CORRUPT",
+            None,
+            None,
+            payload.expected_sha256,
+            payload.actual_sha256,
+            origin_reason,
+        )
     return CacheEntry(
         "VALID",
         artifact,
@@ -125,6 +151,48 @@ def read_cache_entry(artifacts_path: Path, cache_key: str) -> CacheEntry:
         payload.actual_sha256,
         payload.reason,
     )
+
+
+def _origin_provenance_error(origin: dict[str, Any], artifact_sha256: str | None) -> str | None:
+    """Return an integrity error for an incomplete or malformed cache origin."""
+    missing = [field for field in _ORIGIN_PROVENANCE_FIELDS if field not in origin]
+    if missing:
+        return "node cache origin provenance missing required field(s): " + ", ".join(missing)
+    if origin["artifact_sha256"] != artifact_sha256:
+        return "node cache origin provenance artifact binding is invalid"
+    kind = origin["kind"]
+    if not isinstance(kind, str) or kind not in _ORIGIN_KINDS:
+        return "node cache origin provenance kind is invalid"
+    if not isinstance(origin["calls"], list) or not all(
+        isinstance(call, dict) for call in origin["calls"]
+    ):
+        return "node cache origin provenance calls must be a list of objects"
+    if origin["agent"] is not None and not isinstance(origin["agent"], dict):
+        return "node cache origin provenance agent must be an object or null"
+    if not isinstance(origin["prompt_resolutions"], dict):
+        return "node cache origin provenance prompt_resolutions must be an object"
+    for field in ("prompt_sha256", "model", "provider_response_id"):
+        value = origin[field]
+        if value is not None and not isinstance(value, str):
+            return f"node cache origin provenance {field} must be a string or null"
+    if not isinstance(origin["params"], dict):
+        return "node cache origin provenance params must be an object"
+    if origin["usage"] is not None and not isinstance(origin["usage"], dict):
+        return "node cache origin provenance usage must be an object or null"
+    policy = origin["evidence_policy"]
+    if not isinstance(policy, dict) or set(policy) != {
+        "request",
+        "response",
+        "stderr",
+        "trajectory",
+    }:
+        return "node cache origin provenance evidence_policy schema is invalid"
+    if any(not isinstance(mode, str) or mode not in _EVIDENCE_MODES for mode in policy.values()):
+        return "node cache origin provenance evidence_policy mode is invalid"
+    policy_digest = origin["evidence_policy_digest"]
+    if not isinstance(policy_digest, str) or policy_digest != sha(policy):
+        return "node cache origin provenance evidence_policy_digest is invalid"
+    return None
 
 
 def read_node_cache_origin(
