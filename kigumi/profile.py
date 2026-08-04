@@ -34,14 +34,24 @@ def _validate_run_integrity(run_path: Path) -> DurableRunSnapshot:
     return snapshot
 
 
+def _bind_run_attempts(run_path: Path) -> AttemptStore:
+    """Bind a run before the compatibility path check can race with a rename."""
+    attempts = AttemptStore(run_path, {})
+    # The store constructor has already captured the parent/run descriptors.
+    # Keep this explicit check for the historical validation seam, but never do
+    # it before binding: a replacement ordinary directory must be rejected by
+    # the descriptor ownership checks instead of becoming the profile source.
+    validate_run_path(run_path)
+    return attempts
+
+
 def _validate_run_integrity_bound(run_path: Path) -> tuple[DurableRunSnapshot, AttemptStore]:
     """Validate the one shared durable snapshot used by all read surfaces."""
     try:
-        validate_run_path(run_path)
         # Keep the descriptor-bound store alive for the rest of this profile
         # read.  Re-opening ``failures`` by path after validation would let a
         # concurrent run-directory replacement select a different tree.
-        attempts = AttemptStore(run_path, {})
+        attempts = _bind_run_attempts(run_path)
         manifest_path = run_path / "_run.json"
         manifest, corrupted = attempts._read_owned_json(manifest_path)  # noqa: SLF001
         if corrupted:
@@ -82,15 +92,18 @@ def load_run_profile(
     _snapshot: DurableRunSnapshot | None = None,
 ) -> dict[str, Any]:
     """Load a runtime profile without importing or executing the registered DAG."""
-    try:
-        validate_run_path(run_path)
-    except RunManifestError as error:
-        raise WorkflowProfileError(
-            f"Run {run_path.name!r} durable path ownership validation failed: {error}"
-        ) from error
     if _snapshot is not None:
         snapshot = _snapshot
-        attempts = AttemptStore(run_path, {})
+        try:
+            # A caller-provided snapshot still needs a store bound before the
+            # compatibility path check; otherwise this branch can bind a
+            # replacement directory after validation and mix its failures into
+            # the supplied snapshot.
+            attempts = _bind_run_attempts(run_path)
+        except (OSError, RunManifestError, ValueError) as error:
+            raise WorkflowProfileError(
+                f"Run {run_path.name!r} durable path ownership validation failed: {error}"
+            ) from error
     else:
         snapshot, attempts = _validate_run_integrity_bound(run_path)
     if not snapshot.strict:

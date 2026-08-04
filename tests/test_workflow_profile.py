@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import kigumi.profile as profile_module
 from kigumi import (
     AgentCapabilities,
     AgentCompletion,
@@ -21,7 +23,12 @@ from kigumi import (
     PromptRef,
     PromptSpec,
 )
-from kigumi.profile import WorkflowProfileError, render_profile_markdown
+from kigumi.profile import (
+    WorkflowProfileError,
+    _validate_run_integrity,
+    load_run_profile,
+    render_profile_markdown,
+)
 from tests._agent_helpers import make_agent_spec
 from tests._dag_helpers import _make_dag
 
@@ -300,6 +307,66 @@ def test_runtime_profile_failure_receipts_are_owned_nonblocking_and_fail_closed(
 
     with pytest.raises(WorkflowProfileError, match="failure|owned|invalid"):
         dag.profile(result.run_id)
+
+
+@pytest.mark.parametrize("use_snapshot", [False, True])
+def test_runtime_profile_rejects_ordinary_run_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_snapshot: bool,
+) -> None:
+    """A replacement run tree must not contribute failures to a profile."""
+    dag = _make_dag(tmp_path)
+
+    @dag.node("work")
+    def work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "original"}
+
+    result = dag.run(run_id="profile-ownership")
+    run_path = tmp_path / "artifacts" / "runs" / result.run_id
+    original_path = tmp_path / "original-run"
+    replacement_path = tmp_path / "replacement-run"
+    run_path.rename(original_path)
+    shutil.copytree(original_path, replacement_path)
+    failures = replacement_path / "failures"
+    failures.mkdir()
+    (failures / "external.json").write_text(
+        json.dumps(
+            {
+                "failure_schema": 2,
+                "node": "external-only",
+                "status": "failed",
+                "failure": {"failure_type": "runtime", "message": "external"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_path.rename(run_path)
+
+    snapshot = _validate_run_integrity(run_path) if use_snapshot else None
+    swapped = False
+    original_validate = profile_module.validate_run_path
+
+    def validate_then_replace(path: Path) -> Path:
+        nonlocal swapped
+        validated = original_validate(path)
+        if not swapped:
+            swapped = True
+            path.rename(original_path)
+            replacement_path.rename(path)
+        return validated
+
+    monkeypatch.setattr(profile_module, "validate_run_path", validate_then_replace)
+
+    with pytest.raises(WorkflowProfileError, match="owned|changed|integrity"):
+        if use_snapshot:
+            assert snapshot is not None
+            load_run_profile(run_path, _snapshot=snapshot)
+        else:
+            load_run_profile(run_path)
+
+    assert swapped is True
 
 
 def test_runtime_profile_reports_resume_count_without_reexecuting_provider(
