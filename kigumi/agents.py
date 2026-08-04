@@ -153,6 +153,8 @@ def _capsule_secure_io_supported() -> bool:
 def _open_capsule_directory(
     root: Path,
     relative_parts: tuple[str, ...] = (),
+    *,
+    root_fd: int | None = None,
 ) -> tuple[int, list[int]]:
     """Open a capsule directory and every path component without following symlinks."""
     if not _capsule_secure_io_supported():
@@ -160,13 +162,19 @@ def _open_capsule_directory(
     if any(part in {"", ".", ".."} for part in relative_parts):
         raise ValueError(f"Unsafe Agent capsule path: {'/'.join(relative_parts)!r}")
 
-    absolute = root.absolute()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     descriptors: list[int] = []
     try:
-        current = os.open(absolute.anchor, flags)
-        descriptors.append(current)
-        for component in (*absolute.parts[1:], *relative_parts):
+        if root_fd is None:
+            absolute = root.absolute()
+            current = os.open(absolute.anchor, flags)
+            descriptors.append(current)
+            root_parts = absolute.parts[1:]
+        else:
+            current = os.dup(root_fd)
+            descriptors.append(current)
+            root_parts = ()
+        for component in (*root_parts, *relative_parts):
             if component in {"", "."}:
                 continue
             current = os.open(component, flags, dir_fd=current)
@@ -204,11 +212,16 @@ def _open_capsule_regular_file(parent_fd: int, name: str, label: str) -> tuple[i
         raise
 
 
-def _read_capsule_regular_file(root: Path, relative: str) -> bytes:
+def _read_capsule_regular_file(
+    root: Path,
+    relative: str,
+    *,
+    root_fd: int | None = None,
+) -> bytes:
     parts = tuple(relative.split("/"))
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"Unsafe Agent capsule path: {relative!r}")
-    parent_fd, descriptors = _open_capsule_directory(root, parts[:-1])
+    parent_fd, descriptors = _open_capsule_directory(root, parts[:-1], root_fd=root_fd)
     descriptor = -1
     try:
         descriptor, before = _open_capsule_regular_file(parent_fd, parts[-1], relative)
@@ -245,6 +258,7 @@ def _walk_capsule_directory(
     relative: str = "",
     *,
     read_files: bool,
+    root_fd: int | None = None,
 ) -> Iterable[tuple[str, bool, bytes | None]]:
     """Walk one capsule directory through stable descriptors.
 
@@ -253,7 +267,7 @@ def _walk_capsule_directory(
     raced FIFO or symlink is rejected rather than followed or blocked.
     """
     parts = tuple(part for part in relative.split("/") if part)
-    directory_fd, descriptors = _open_capsule_directory(root, parts)
+    directory_fd, descriptors = _open_capsule_directory(root, parts, root_fd=root_fd)
     try:
         yield relative, True, None
         yield from _walk_capsule_fd(directory_fd, relative, read_files=read_files)
@@ -370,14 +384,28 @@ class AgentSpec:
 
     @classmethod
     def load(cls, path: str | Path) -> AgentSpec:
-        root = Path(path)
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError("AgentSpec path must be a regular directory, not a symlink")
-        root = root.resolve()
-        _validate_capsule_tree(root)
+        root = Path(path).absolute()
+        try:
+            root_fd, descriptors = _open_capsule_directory(root)
+        except (OSError, ValueError) as error:
+            raise ValueError("AgentSpec path must be a regular directory, not a symlink") from error
+        try:
+            return cls._load_bound(root, root_fd)
+        finally:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    @classmethod
+    def _load_bound(cls, root: Path, root_fd: int) -> AgentSpec:
+        _validate_capsule_tree(root, root_fd=root_fd)
         for directory_name in ("skills", "hooks"):
             try:
-                descriptors = _open_capsule_directory(root, (directory_name,))[1]
+                descriptors = _open_capsule_directory(
+                    root,
+                    (directory_name,),
+                    root_fd=root_fd,
+                )[1]
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"Agent capsule must contain a regular {directory_name}/ directory"
@@ -387,7 +415,7 @@ class AgentSpec:
                     with suppress(OSError):
                         os.close(descriptor)
         try:
-            manifest_bytes = _read_capsule_regular_file(root, "agent.toml")
+            manifest_bytes = _read_capsule_regular_file(root, "agent.toml", root_fd=root_fd)
             manifest = tomllib.loads(manifest_bytes.decode("utf-8"))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
             raise ValueError(f"Invalid Agent manifest: {error}") from error
@@ -446,9 +474,20 @@ class AgentSpec:
             relative = _capsule_path(raw, prefix=f"{kind}/" if kind != "system" else None)
             try:
                 if directory:
-                    entries = _walk_capsule_directory(root, relative, read_files=True)
+                    entries = _walk_capsule_directory(
+                        root,
+                        relative,
+                        read_files=True,
+                        root_fd=root_fd,
+                    )
                 else:
-                    entries = ((relative, False, _read_capsule_regular_file(root, relative)),)
+                    entries = (
+                        (
+                            relative,
+                            False,
+                            _read_capsule_regular_file(root, relative, root_fd=root_fd),
+                        ),
+                    )
                 for rel, is_directory, data in entries:
                     if not is_directory and data is None:
                         raise ValueError(f"Agent capsule resource has no bytes: {rel}")
@@ -523,9 +562,13 @@ class AgentSpec:
             path.write_bytes(data)
 
 
-def _validate_capsule_tree(root: Path) -> None:
+def _validate_capsule_tree(root: Path, *, root_fd: int | None = None) -> None:
     try:
-        for relative, is_directory, _data in _walk_capsule_directory(root, read_files=False):
+        for relative, is_directory, _data in _walk_capsule_directory(
+            root,
+            read_files=False,
+            root_fd=root_fd,
+        ):
             if is_directory:
                 continue
             lowered = Path(relative).name.lower()

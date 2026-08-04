@@ -170,22 +170,22 @@ class Message:
     """Structured message with typed parts."""
 
     role: str
-    parts: list[str | dict[str, Any]]
+    parts: tuple[str | Mapping[str, Any], ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, str) or not self.role:
             raise ValueError("Message role must be a non-empty string")
-        if not isinstance(self.parts, list):
-            raise ValueError("Message parts must be a list")
-        checked: list[str | dict[str, Any]] = []
+        if not isinstance(self.parts, (list, tuple)):
+            raise ValueError("Message parts must be a list or tuple")
+        checked: list[str | Mapping[str, Any]] = []
         for part in self.parts:
-            if not isinstance(part, (str, dict)):
+            if not isinstance(part, (str, Mapping)):
                 raise ValueError("Message parts must contain only strings or dictionaries")
-            checked.append(dict(part) if isinstance(part, dict) else part)
-        object.__setattr__(self, "parts", checked)
+            checked.append(_freeze_value(part))
+        object.__setattr__(self, "parts", tuple(checked))
 
     def canonical(self) -> dict[str, Any]:
-        return {"role": self.role, "parts": list(self.parts)}
+        return {"role": self.role, "parts": [_thaw_value(part) for part in self.parts]}
 
 
 @dataclass(frozen=True)
@@ -958,12 +958,12 @@ class PromptResolution:
     rendered_sha256: str
     rendered_bytes: int
     schema: int = PROMPT_RESOLUTION_SCHEMA
-    messages: list[Message] = field(default_factory=list)
-    attachments: list[Attachment] = field(default_factory=list)
+    messages: tuple[Message, ...] = field(default_factory=tuple)
+    attachments: tuple[Attachment, ...] = field(default_factory=tuple)
     response_spec: ResponseSpec = field(default_factory=ResponseSpec)
 
     def __post_init__(self) -> None:
-        if self.schema != PROMPT_RESOLUTION_SCHEMA:
+        if type(self.schema) is not int or self.schema != PROMPT_RESOLUTION_SCHEMA:
             raise PromptResolutionError("unsupported prompt resolution schema")
         object.__setattr__(self, "base", _freeze_value(dict(self.base)))
         object.__setattr__(
@@ -1016,8 +1016,8 @@ class PromptResolution:
                 raise PromptResolutionError("PromptResolution response_spec must be ResponseSpec")
         else:
             response_spec = self.response_spec
-        object.__setattr__(self, "messages", checked_messages)
-        object.__setattr__(self, "attachments", checked_attachments)
+        object.__setattr__(self, "messages", tuple(checked_messages))
+        object.__setattr__(self, "attachments", tuple(checked_attachments))
         object.__setattr__(self, "response_spec", response_spec)
 
     def _body(self) -> dict[str, Any]:

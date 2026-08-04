@@ -326,6 +326,30 @@ def test_agent_spec_rejects_symlink_raced_into_add_reference(
     assert policy_opens >= 2
 
 
+def test_agent_spec_binds_capsule_root_without_following_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capsule = _capsule(tmp_path / "agent")
+    outside = _capsule(tmp_path / "outside", model="outside-model")
+    moved = tmp_path / "moved-agent"
+    original_open = agents_module.os.open
+    replaced = False
+
+    def replace_root_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal replaced
+        if path == capsule.name and kwargs.get("dir_fd") is not None and not replaced:
+            capsule.rename(moved)
+            capsule.symlink_to(outside)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(agents_module.os, "open", replace_root_before_open)
+
+    with pytest.raises(ValueError, match="regular directory|symlink|safely"):
+        AgentSpec.load(capsule)
+    assert replaced
+
+
 def _fake_pi(path: Path) -> Path:
     path.write_text(
         textwrap.dedent(

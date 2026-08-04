@@ -74,14 +74,14 @@ def test_resolution_digest_is_content_addressed_for_attachments(tmp_path: Path) 
     second = _resolve_file(tmp_path, "two.txt", b"same content")
     changed = _resolve_file(tmp_path, "one.txt", b"changed content")
 
-    assert first.resolution.attachments == [
+    assert first.resolution.attachments == (
         Attachment(
             path="one.txt",
             content_hash=sha256(b"same content").hexdigest(),
             mime_type="text/plain",
             size_bytes=len(b"same content"),
-        )
-    ]
+        ),
+    )
     assert first.resolution.digest == second.resolution.digest
     assert first.resolution.digest != changed.resolution.digest
 

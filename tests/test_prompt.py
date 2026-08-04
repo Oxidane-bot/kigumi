@@ -79,6 +79,59 @@ def test_managed_prompt_record_is_accepted_when_complete() -> None:
     validate_prompt_resolution_record(record)
 
 
+def test_prompt_resolution_lineage_inputs_are_deeply_immutable() -> None:
+    nested_part = {"type": "text", "metadata": {"labels": ["source"]}}
+    message = Message(role="user", parts=[nested_part])
+    resolution = PromptResolution(
+        spec_name="managed",
+        structure_digest="structure",
+        base={},
+        layers=(),
+        axes=(),
+        materials=(),
+        rendered_sha256="rendered",
+        rendered_bytes=8,
+        messages=[message],
+        attachments=[
+            Attachment(
+                path="input.txt",
+                content_hash="a" * 64,
+                mime_type="text/plain",
+                size_bytes=5,
+            )
+        ],
+    )
+    digest = resolution.digest
+
+    with pytest.raises((AttributeError, TypeError)):
+        resolution.messages.append(message)
+    with pytest.raises((AttributeError, TypeError)):
+        resolution.attachments[0].path = "changed.txt"
+    with pytest.raises((AttributeError, TypeError)):
+        message.parts[0]["metadata"]["labels"].append("changed")
+
+    canonical = resolution.canonical()
+    canonical["messages"][0]["parts"][0]["metadata"]["labels"].append("changed")
+    assert resolution.digest == digest
+    assert nested_part["metadata"]["labels"] == ["source"]
+
+
+@pytest.mark.parametrize("schema", [True, 1.0])
+def test_prompt_resolution_constructor_requires_native_schema_one(schema: object) -> None:
+    with pytest.raises(PromptResolutionError, match="unsupported prompt resolution schema"):
+        PromptResolution(
+            spec_name="managed",
+            structure_digest="structure",
+            base={},
+            layers=(),
+            axes=(),
+            materials=(),
+            rendered_sha256="rendered",
+            rendered_bytes=8,
+            schema=schema,  # type: ignore[arg-type]
+        )
+
+
 def test_managed_prompt_record_requires_all_request_fields_before_digest_validation() -> None:
     messages = [Message(role="user", parts=["hello"])]
     attachments = [
