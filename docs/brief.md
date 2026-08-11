@@ -87,6 +87,11 @@ Project commands read artifacts from disk. They find `pyproject.toml` and
 Without a valid `[tool.kigumi]` they exit 2 — except `kigumi init`, `kigumi brief`
 and `kigumi docs`, which work anywhere.
 
+`kigumi init` scaffolds a fresh project. If `[tool.kigumi]` already exists, it leaves the
+project configuration and layout unchanged and synchronizes CLAUDE.md and AGENTS.md.
+The shipped guidance is appended only when its injection sentinel is absent, so repeated
+init calls do not duplicate the injected section.
+
 Graph commands need the graph itself, which only exists once your Python has run.
 They import the factory named by `[tool.kigumi] dag_entry` (`"module:callable"`,
 returning a `Dag`) and inspect what it builds. Without that key they exit 2 and tell
@@ -169,7 +174,7 @@ If a project has both, they inspect the same graph.
 | Reject bare LLM loops and undeclared file reads | `kigumi guard [--changed]` |
 | Drop old caches and artifacts | `kigumi gc --keep N` |
 | Render a template with explicit slots | `kigumi render TEMPLATE --slot k=v` |
-| Scaffold `[tool.kigumi]` into a fresh project | `kigumi init [--hooks]` |
+| Scaffold a fresh project or sync its agent docs | `kigumi init [--hooks]` |
 | Re-read this page, or list every shipped page | `kigumi brief` / `kigumi docs` |
 
 `--json` on `kigumi trace`, `kigumi diff`, `kigumi runs list` and `kigumi runs show` is stable

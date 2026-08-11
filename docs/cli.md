@@ -34,14 +34,16 @@ parser 及其子命令都提供 argparse 自动生成的 `-h` / `--help`；下�
 ### `kigumi init`
 
 在当前目录的既有 `pyproject.toml` 追加 `[tool.kigumi]` 默认配置，创建配置目录与
-`.gitkeep`，并把 artifacts 目录加入 `.gitignore`。
+`.gitkeep`，并把 artifacts 目录加入 `.gitignore`。若 `[tool.kigumi]` 已存在，则保留
+项目配置和目录，只同步根目录的 `CLAUDE.md`/`AGENTS.md`；只有缺少
+`<!-- kigumi-agent-docs -->` sentinel 时才追加注入区块，重复执行不会重复注入。
 
 | 参数 | 必需 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `--hooks` | 否 | `False` | 额外安装执行 `uv run kigumi guard --changed` 的 pre-commit hook。 |
 
-成功为 0。没有 `pyproject.toml`、TOML 无效、配置块已存在、`--hooks` 不在 Git 仓库内，
-或目标 hook 已存在时为 1；命令不会覆盖既有 hook。
+成功为 0。没有 `pyproject.toml`、TOML 无效、`[tool.kigumi]` 不是表、`--hooks` 不在 Git
+仓库内，或目标 hook 已存在时为 1；命令不会覆盖既有 hook。
 
 ### `kigumi brief`
 
