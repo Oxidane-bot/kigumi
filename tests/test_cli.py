@@ -344,7 +344,7 @@ def test_recovery_advice_graph_args_can_be_added_before_separator() -> None:
 
 
 def test_init_creates_default_layout_and_is_idempotent(tmp_path: Path, monkeypatch, capsys) -> None:
-    """Init scaffolds a new project once, then only synchronizes its agent docs."""
+    """Init scaffolds once; the agent-docs sentinel makes repeat init idempotent."""
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
@@ -543,7 +543,7 @@ def test_init_appends_to_existing_agent_docs_without_duplication(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """教训 agent_docs_append: existing CLAUDE.md/AGENTS.md gets section appended, not replaced."""
+    """Existing agent docs get one appended section, guarded by the sentinel on repeat init."""
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\n", encoding="utf-8")
     existing = "# My Project\n\nCustom rules here.\n"
     (tmp_path / "CLAUDE.md").write_text(existing, encoding="utf-8")
@@ -570,7 +570,10 @@ def test_init_appends_to_existing_agent_docs_without_duplication(
 def test_init_existing_kigumi_syncs_docs_without_scaffolding_or_changing_pyproject(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Existing projects receive missing guidance while config and custom text stay intact."""
+    """Existing projects sync missing guidance while preserving config and custom text.
+
+    The sentinel keeps repeated synchronization idempotent.
+    """
     pyproject = tmp_path / "pyproject.toml"
     original_pyproject = (
         "[project]\nname = 'sample'\n\n"

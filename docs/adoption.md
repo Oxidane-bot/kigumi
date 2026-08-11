@@ -37,7 +37,10 @@ kigumi explain <node@item>   # map/scan 的单个 item
 ```
 
 这三条里后两条要读内存里的图，因此需要 `[tool.kigumi]` 声明 `dag_entry`
-（`kigumi init` 会写好）；未声明时命令以 2 退出并告诉你补哪个键。程序内可以直接调用
+（新项目运行 `kigumi init` 会写好）；已有 `[tool.kigumi]` 的项目运行 `kigumi init` 时，
+配置和目录保持不变，只同步根目录的 `CLAUDE.md`/`AGENTS.md` 使用规范。注入区块带有
+`<!-- kigumi-agent-docs -->` sentinel；标记已存在时跳过，因此重复执行不会重复追加。
+未声明时命令以 2 退出并告诉你补哪个键。程序内可以直接调用
 `dag.plan()` 与 `dag.explain()`。完整命令参数见 [CLI 参考](cli.md)；
 所有症状的排查流程见[六、排障](#六排障按症状查)。
 
@@ -86,8 +89,9 @@ thinking、system prompt、tools、skills、hooks 和 limits 的唯一来源；�
 `dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
 `check` / `graph` / `profile` / `resume` / `retry-resolve` / `recover` 要读内存里的图，而节点是靠
 装饰器在 import 时注册的，所以这些命令必须 import 一个返回 `Dag` 的工厂函数。指向它，
-这组命令就能在项目里直接敲；不指向，其余命令照常工作。`kigumi init` 会生成
-`nodes/graph.py` 骨架并写好这个键。
+这组命令就能在项目里直接敲；不指向，其余命令照常工作。新项目运行 `kigumi init` 会生成
+`nodes/graph.py` 骨架并写好这个键；已经有 `[tool.kigumi]` 的项目不会因此重写配置或生成
+脚手架目录，而是按上面的规则同步 Agent 文档。
 
 工厂函数被 import 时必须只注册节点、不产生副作用——图命令只读拓扑，不应触发任何执行。
 

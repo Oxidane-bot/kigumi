@@ -609,7 +609,10 @@ class _InitTransaction:
 
 
 def _plan_agent_doc_writes(root: Path) -> list[tuple[Path, str]]:
-    """Plan missing kigumi guidance without replacing host documentation."""
+    """Plan missing guidance without replacing host documentation.
+
+    The agent-docs sentinel makes repeated ``init`` calls idempotent per file.
+    """
     try:
         brief = _demote_brief_headings(read_doc("brief")).strip()
     except (FileNotFoundError, KeyError, OSError) as error:
@@ -780,6 +783,7 @@ _restore_atomic_write_text = atomic_write_text
 
 
 def _init(root: Path, *, hooks: bool) -> int:
+    """Apply the init plan; repeat idempotency comes from sentinel-aware planning."""
     try:
         plan = _plan_init(root, hooks=hooks)
     except _InitValidationError as error:
