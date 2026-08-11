@@ -13,7 +13,7 @@ Print this page any time with `kigumi brief`. Other shipped pages: `kigumi docs`
 kigumi only analyzes what you declare. Two boundaries decide what it can do
 for you:
 
-- `kigumi guard` scans only the directories listed in `[tool.kigumi] source_dirs`
+- `kigumi guard` scans only the paths listed in `[tool.kigumi] source_dirs`
   (default `["nodes", "lib"]`). A bare model loop in main.py or in an ad-hoc
   `scripts/` file is never reported.
 - Graph commands (describe, plan, explain, graph, profile) only see nodes
@@ -22,7 +22,7 @@ for you:
 
 Pipeline code written outside those boundaries gets no caching, no plan forecast,
 no explain, no guard and no resume. It is not a lighter way to use kigumi; it is
-not using kigumi. Put pipeline code in a source_dirs directory and register it as
+not using kigumi. Put pipeline code in a source_dirs path and register it as
 a node.
 
 ## Do not reimplement

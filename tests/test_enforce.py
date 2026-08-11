@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from kigumi.enforce import (
     RawIOFinding,
     check_paths,
@@ -93,9 +95,31 @@ async def run(items, client):
     path.parent.mkdir()
     path.write_text(source, encoding="utf-8")
 
-    findings = check_paths([tmp_path / "nodes", tmp_path / "missing"])
+    findings = check_paths([tmp_path / "nodes"])
 
     assert [finding.lineno for finding in findings] == [4, 8]
+
+
+def test_check_paths_scans_single_python_file(tmp_path: Path) -> None:
+    path = tmp_path / "single.py"
+    path.write_text(
+        "for item in items:\n    client.call([])\n",
+        encoding="utf-8",
+    )
+
+    findings = check_paths([path])
+
+    assert [finding.lineno for finding in findings] == [2]
+
+
+def test_check_paths_rejects_missing_and_non_python_paths(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.py"
+    non_python = tmp_path / "notes.txt"
+    non_python.write_text("not Python", encoding="utf-8")
+
+    for path in (missing, non_python):
+        with pytest.raises(ValueError, match=str(path)):
+            check_paths([path])
 
 
 def test_comprehensions_count_as_loops() -> None:

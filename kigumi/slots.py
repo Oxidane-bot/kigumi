@@ -127,11 +127,15 @@ class FileSlots:
         """Build an optional limiter from stripped environment variables."""
         lock_dir = os.getenv(f"{prefix}_LOCK_DIR", "").strip() or None
         capacity_file = os.getenv(f"{prefix}_CAPACITY_FILE", "").strip() or None
-        slots_text = os.getenv(f"{prefix}_SLOTS", "").strip()
-        try:
-            slots = int(slots_text)
-        except ValueError:
+        slots_name = f"{prefix}_SLOTS"
+        slots_text = os.getenv(slots_name)
+        if slots_text is None:
             slots = 0
+        else:
+            try:
+                slots = int(slots_text.strip())
+            except ValueError as error:
+                raise ValueError(f"{slots_name} must be a valid integer") from error
         return cls(lock_dir, slots, capacity_file)
 
     @property

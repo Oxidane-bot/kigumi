@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 配置加载现在会拒绝形状非法的 `source_dirs`，守卫扫描支持单个 `.py` 文件并会对缺失或无效路径报错；`FileSlots.from_env()` 对已设置但无法解析的 `KIGUMI_REQUEST_SLOTS` 也会以带变量名的配置错误失败。
+
+### 兼容性
+
+- 本次不改变缓存键成分或缓存族；合法 `source_dirs` 的 `source_paths` 结果保持不变。
+
 ## [0.13.0] - 2026-08-04
 
 ### 重大变更

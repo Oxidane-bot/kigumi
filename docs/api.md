@@ -370,8 +370,8 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
 - `raw_io_waiver_reasons(text: str) -> list[str]`：只提取 `raw-io-ok` 理由，不与另一类混合。
 - `check_source(text: str, path: Path) -> list[Finding]`：检查一段源码中循环/推导式下的
   `.call()` 与 `.llm()`。
-- `check_paths(source_dirs: list[Path]) -> list[Finding]`：递归检查目录中的 Python 文件的
-  循环裸 LLM 调用；不存在的目录跳过。
+- `check_paths(source_dirs: list[Path]) -> list[Finding]`：递归检查目录中的 Python 文件，或直接
+  检查单个 `.py` 文件中的循环裸 LLM 调用；缺失或无效路径抛出 `ValueError`。
 - `check_raw_io_node_source(text: str, path: Path) -> list[RawIOFinding]`：以模块中顶层
   `node`/`map`/`scan`/`foreach`/`agent` 装饰器函数为入口，递归跟随可达 helper/lambda 及其默认参数。
 - `check_raw_io_node_paths(source_dirs: list[Path]) -> list[RawIOFinding]`：对目录递归执行
