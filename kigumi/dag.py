@@ -514,6 +514,21 @@ class _FileSnapshot:
         return Path(os.path.abspath(candidate))
 
 
+@dataclass(frozen=True)
+class NodeKeyDecision:
+    """Prepared cache-key facts shared by execution and diagnostic paths."""
+
+    key_components: dict[str, str]
+    cache_key: str
+    effective_cache_policy: CachePolicy
+    prompt_resolutions: dict[str, ResolvedPrompt]
+    prompt_resolution_records: dict[str, Any]
+    prompt_snapshot: PromptCatalogSnapshot
+    file_snapshot: _FileSnapshot | None
+    file_contents: dict[str, bytes]
+    function_inputs: dict[str, dict[str, Any]]
+
+
 class NodeContext:
     """节点执行上下文；文件读取只能访问节点已声明的输入。"""
 
@@ -1573,30 +1588,22 @@ class Dag:
             cache_entry: store.CacheEntry | None = None
             effective_cache_policy = node.cache if libs_cache_reusable else "off"
             if node.items_from is None:
-                function_inputs = self._function_inputs(node, inputs)
-                file_contents = self._file_contents(node, file_snapshot=file_snapshot)
-                prompt_resolutions = self._resolve_prompt_specs(
-                    node,
-                    prompt_snapshot,
-                    inputs,
-                    function_inputs=function_inputs,
-                    file_contents=file_contents,
-                )
-                prompt_resolution_records = {
-                    name: resolved.resolution.canonical()
-                    for name, resolved in prompt_resolutions.items()
-                }
-                key_components = self._key_components(
+                decision = self._node_key_decision(
                     node,
                     upstream_shas,
                     libs_hashes[node.name],
                     upstream_artifacts=inputs,
+                    libs_cache_reusable=libs_cache_reusable,
                     prompt_snapshot=prompt_snapshot,
-                    prompt_resolutions=prompt_resolutions,
-                    projected_inputs=function_inputs,
-                    file_contents=file_contents,
+                    file_snapshot=file_snapshot,
                 )
-                cache_key = sha(key_components)
+                function_inputs = decision.function_inputs
+                prompt_resolutions = decision.prompt_resolutions
+                prompt_resolution_records = decision.prompt_resolution_records
+                file_contents = decision.file_contents
+                key_components = decision.key_components
+                cache_key = decision.cache_key
+                effective_cache_policy = decision.effective_cache_policy
                 prior_state = (
                     attempt_store.state_for(node.name) if existing_manifest is not None else None
                 )
@@ -1640,10 +1647,9 @@ class Dag:
                     artifact, cache_hit = None, False
                 else:
                     try:
-                        cache_entry = self._cache_entry_for_lookup(
-                            cache_key,
+                        cache_entry = self._cache_entry_for_decision(
+                            decision,
                             forced=node.name in forced_nodes,
-                            cache_policy=(node.cache if libs_cache_reusable else "off"),
                             evidence_policy=evidence_policy,
                         )
                     except CacheIntegrityError as error:
@@ -2004,7 +2010,7 @@ class Dag:
                     )
                 if node.items_from is None:
                     effective_cache_policy = (
-                        "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                        "off" if checkpoint_used else decision.effective_cache_policy
                     )
                 if node.items_from is None and not resumed_completed and not cache_hit:
                     # miss 路径喂下游的必须与命中路径同形态:命中读的是
@@ -2964,6 +2970,21 @@ class Dag:
         )
         return (entry.artifact, True) if entry is not None else (None, False)
 
+    def _cache_entry_for_decision(
+        self,
+        decision: NodeKeyDecision,
+        *,
+        forced: bool,
+        evidence_policy: EvidencePolicy,
+    ) -> store.CacheEntry | None:
+        """Look up one prepared key using its already resolved cache policy."""
+        return self._cache_entry_for_lookup(
+            decision.cache_key,
+            forced=forced,
+            cache_policy=decision.effective_cache_policy,
+            evidence_policy=evidence_policy,
+        )
+
     def plan(
         self,
         run_id: str | None = None,
@@ -3017,23 +3038,22 @@ class Dag:
             inputs = {dependency: artifacts[dependency] for dependency in node.deps}
             upstream_shas = {dependency: artifact_shas[dependency] for dependency in node.deps}
             if node.items_from is None:
-                cache_key = sha(
-                    self._key_components(
-                        node,
-                        upstream_shas,
-                        libs_hashes[node.name],
-                        upstream_artifacts=inputs,
-                        prompt_snapshot=prompt_snapshot,
-                    )
+                decision = self._node_key_decision(
+                    node,
+                    upstream_shas,
+                    libs_hashes[node.name],
+                    upstream_artifacts=inputs,
+                    libs_cache_reusable=libs_cache_reusable,
+                    prompt_snapshot=prompt_snapshot,
                 )
                 artifact = None
-                if node.cache == "auto" and libs_cache_reusable and node_name not in forced_nodes:
-                    artifact, _ = self._lookup_cache(
-                        cache_key,
+                if decision.effective_cache_policy == "auto" and node_name not in forced_nodes:
+                    entry = self._cache_entry_for_decision(
+                        decision,
                         forced=False,
-                        cache_policy=node.cache,
                         evidence_policy=evidence_policy,
                     )
+                    artifact = entry.artifact if entry is not None else None
                 if artifact is None:
                     nodes[node_name] = "miss"
                     continue
@@ -3085,31 +3105,29 @@ class Dag:
                     item_files = (
                         tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                     )
-                    cache_key = sha(
-                        self._key_components(
-                            node,
-                            upstream_shas,
-                            libs_hashes[node.name],
-                            upstream_artifacts=inputs,
-                            item=item,
-                            item_files=item_files,
-                            carry=carry,
-                            prompt_snapshot=prompt_snapshot,
-                        )
+                    decision = self._node_key_decision(
+                        node,
+                        upstream_shas,
+                        libs_hashes[node.name],
+                        upstream_artifacts=inputs,
+                        item=item,
+                        item_files=item_files,
+                        carry=carry,
+                        libs_cache_reusable=libs_cache_reusable,
+                        prompt_snapshot=prompt_snapshot,
                     )
                     artifact = None
                     if (
-                        node.cache == "auto"
-                        and libs_cache_reusable
+                        decision.effective_cache_policy == "auto"
                         and node_name not in forced_nodes
                         and item_id not in forced_items.get(node_name, set())
                     ):
-                        artifact, _ = self._lookup_cache(
-                            cache_key,
+                        entry = self._cache_entry_for_decision(
+                            decision,
                             forced=False,
-                            cache_policy=node.cache,
                             evidence_policy=evidence_policy,
                         )
+                        artifact = entry.artifact if entry is not None else None
                     if artifact is None:
                         nodes[expanded_name] = "miss"
                         previous_pending = expanded_name
@@ -3140,29 +3158,28 @@ class Dag:
                 item_files = (
                     tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                 )
-                key_components = self._key_components(
+                decision = self._node_key_decision(
                     node,
                     upstream_shas,
                     libs_hashes[node.name],
                     upstream_artifacts=inputs,
                     item=item,
                     item_files=item_files,
+                    libs_cache_reusable=libs_cache_reusable,
                     prompt_snapshot=prompt_snapshot,
                 )
-                cache_key = sha(key_components)
                 artifact = None
                 if (
-                    node.cache == "auto"
-                    and libs_cache_reusable
+                    decision.effective_cache_policy == "auto"
                     and node_name not in forced_nodes
                     and item_id not in forced_items.get(node_name, set())
                 ):
-                    artifact, _ = self._lookup_cache(
-                        cache_key,
+                    entry = self._cache_entry_for_decision(
+                        decision,
                         forced=False,
-                        cache_policy=node.cache,
                         evidence_policy=evidence_policy,
                     )
+                    artifact = entry.artifact if entry is not None else None
                 status = "hit" if artifact is not None else "miss"
                 nodes[f"{node_name}@{item_id}"] = status
                 item_statuses.append(status)
@@ -3304,7 +3321,8 @@ class Dag:
         """重建一个 explain 目标的当前键成分，不执行节点函数。"""
         memo: dict[str, dict[str, Any]] = {}
         components: dict[str, dict[str, str]] = {}
-        libs_hashes = self._libs_hashes(self._nodes.values())
+        libs_identities = self._libs_identities(self._nodes.values())
+        libs_hashes = {name: identity.digest for name, identity in libs_identities.items()}
         prompt_snapshot = prompt_snapshot or self._prompt_snapshot()
 
         def artifact_for(name: str) -> dict[str, Any]:
@@ -3314,22 +3332,23 @@ class Dag:
             inputs = {dependency: artifact_for(dependency) for dependency in node.deps}
             upstream_shas = {dependency: sha(artifact) for dependency, artifact in inputs.items()}
             if node.items_from is None:
-                component = self._key_components(
+                decision = self._node_key_decision(
                     node,
                     upstream_shas,
                     libs_hashes[node.name],
                     upstream_artifacts=inputs,
+                    libs_cache_reusable=libs_identities[node.name].cache_reusable,
                     prompt_snapshot=prompt_snapshot,
                 )
-                artifact, _ = self._lookup_cache(
-                    sha(component),
+                entry = self._cache_entry_for_decision(
+                    decision,
                     forced=False,
-                    cache_policy="auto",
                     evidence_policy=node.evidence_policy or self._caller_evidence_policy(),
                 )
+                artifact = entry.artifact if entry is not None else None
                 if artifact is None:
                     raise RuntimeError(f"Cannot read current cached artifact for node {name!r}")
-                components[name] = component
+                components[name] = decision.key_components
                 memo[name] = artifact
                 return artifact
 
@@ -3352,7 +3371,7 @@ class Dag:
                 item_files = (
                     tuple(Path(path) for path in node.files_fn(item)) if node.files_fn else ()
                 )
-                component = self._key_components(
+                decision = self._node_key_decision(
                     node,
                     upstream_shas,
                     libs_hashes[node.name],
@@ -3360,20 +3379,21 @@ class Dag:
                     item=item,
                     item_files=item_files,
                     carry=carry,
+                    libs_cache_reusable=libs_identities[node.name].cache_reusable,
                     prompt_snapshot=prompt_snapshot,
                 )
-                artifact, _ = self._lookup_cache(
-                    sha(component),
+                entry = self._cache_entry_for_decision(
+                    decision,
                     forced=False,
-                    cache_policy="auto",
                     evidence_policy=node.evidence_policy or self._caller_evidence_policy(),
                 )
+                artifact = entry.artifact if entry is not None else None
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for map item "
                         f"{name}@{current_item_id!r}"
                     )
-                components[f"{name}@{current_item_id}"] = component
+                components[f"{name}@{current_item_id}"] = decision.key_components
                 completed[current_item_id] = artifact
                 if node.scan:
                     carry = node.carry_fn(artifact) if node.carry_fn is not None else artifact
@@ -3390,13 +3410,15 @@ class Dag:
         if item_id is None:
             if target_node.items_from is not None:
                 raise RuntimeError(f"Map node {node_name!r} has no singular cache key")
-            return self._key_components(
+            decision = self._node_key_decision(
                 target_node,
                 target_upstream_shas,
                 libs_hashes[target_node.name],
                 upstream_artifacts=target_inputs,
+                libs_cache_reusable=libs_identities[target_node.name].cache_reusable,
                 prompt_snapshot=prompt_snapshot,
             )
+            return decision.key_components
 
         assert target_node.items_from is not None
         entries = self._map_entries(target_node, target_inputs)
@@ -3418,7 +3440,7 @@ class Dag:
                 if target_node.files_fn
                 else ()
             )
-            component = self._key_components(
+            decision = self._node_key_decision(
                 target_node,
                 target_upstream_shas,
                 libs_hashes[target_node.name],
@@ -3426,17 +3448,18 @@ class Dag:
                 item=item,
                 item_files=item_files,
                 carry=carry,
+                libs_cache_reusable=libs_identities[target_node.name].cache_reusable,
                 prompt_snapshot=prompt_snapshot,
             )
             if current_item_id == item_id:
-                return component
+                return decision.key_components
             if target_node.scan:
-                artifact, _ = self._lookup_cache(
-                    sha(component),
+                entry = self._cache_entry_for_decision(
+                    decision,
                     forced=False,
-                    cache_policy="auto",
                     evidence_policy=target_node.evidence_policy or self._caller_evidence_policy(),
                 )
+                artifact = entry.artifact if entry is not None else None
                 if artifact is None:
                     raise RuntimeError(
                         "Cannot read current cached artifact for earlier scan item "
@@ -4257,31 +4280,23 @@ class Dag:
                         item_files,
                         file_snapshot=file_snapshot,
                     )
-                    prompt_resolutions = self._resolve_prompt_specs(
-                        node,
-                        prompt_snapshot,
-                        inputs,
-                        item=item,
-                        function_inputs=shared_inputs,
-                        file_contents=file_contents,
-                    )
-                    prompt_resolution_records = {
-                        name: resolved.resolution.canonical()
-                        for name, resolved in prompt_resolutions.items()
-                    }
-                    key_components = self._key_components(
+                    decision = self._node_key_decision(
                         node,
                         upstream_shas,
                         libs_hash,
                         upstream_artifacts=inputs,
                         item=item,
                         item_files=item_files,
+                        libs_cache_reusable=libs_cache_reusable,
                         prompt_snapshot=prompt_snapshot,
-                        prompt_resolutions=prompt_resolutions,
-                        projected_inputs=shared_inputs,
+                        file_snapshot=file_snapshot,
+                        function_inputs=shared_inputs,
                         file_contents=file_contents,
                     )
-                    cache_key = sha(key_components)
+                    prompt_resolutions = decision.prompt_resolutions
+                    prompt_resolution_records = decision.prompt_resolution_records
+                    key_components = decision.key_components
+                    cache_key = decision.cache_key
                     declaration_digest = self._attempt_declaration_digest(
                         node,
                         key_components,
@@ -4329,10 +4344,9 @@ class Dag:
                         artifact, cache_hit = None, False
                     else:
                         try:
-                            cache_entry = self._cache_entry_for_lookup(
-                                cache_key,
+                            cache_entry = self._cache_entry_for_decision(
+                                decision,
                                 forced=forced_all or item_id in forced_items,
-                                cache_policy=(node.cache if libs_cache_reusable else "off"),
                                 evidence_policy=(
                                     node.evidence_policy or self._caller_evidence_policy()
                                 ),
@@ -4491,9 +4505,7 @@ class Dag:
                                 label=(f"Map node {node.name!r} item {item_id!r}"),
                                 calls=calls,
                                 cache_policy=(
-                                    "off"
-                                    if checkpoint_used or not libs_cache_reusable
-                                    else node.cache
+                                    "off" if checkpoint_used else decision.effective_cache_policy
                                 ),
                                 evidence_policy=self._caller_evidence_policy(),
                                 prompt_resolutions=prompt_resolution_records,
@@ -4537,7 +4549,7 @@ class Dag:
                         "prompt_resolutions": prompt_resolution_records,
                         "cache_entry": cache_entry,
                         "cache_policy": (
-                            "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                            "off" if checkpoint_used else decision.effective_cache_policy
                         ),
                     }
             except Exception as error:
@@ -4778,20 +4790,7 @@ class Dag:
                         item_files,
                         file_snapshot=file_snapshot,
                     )
-                    prompt_resolutions = self._resolve_prompt_specs(
-                        node,
-                        prompt_snapshot,
-                        inputs,
-                        item=item,
-                        carry=carry,
-                        function_inputs=shared_inputs,
-                        file_contents=file_contents,
-                    )
-                    prompt_resolution_records = {
-                        name: resolved.resolution.canonical()
-                        for name, resolved in prompt_resolutions.items()
-                    }
-                    key_components = self._key_components(
+                    decision = self._node_key_decision(
                         node,
                         upstream_shas,
                         libs_hash,
@@ -4799,12 +4798,16 @@ class Dag:
                         item=item,
                         item_files=item_files,
                         carry=carry,
+                        libs_cache_reusable=libs_cache_reusable,
                         prompt_snapshot=prompt_snapshot,
-                        prompt_resolutions=prompt_resolutions,
-                        projected_inputs=shared_inputs,
+                        file_snapshot=file_snapshot,
+                        function_inputs=shared_inputs,
                         file_contents=file_contents,
                     )
-                    cache_key = sha(key_components)
+                    prompt_resolutions = decision.prompt_resolutions
+                    prompt_resolution_records = decision.prompt_resolution_records
+                    key_components = decision.key_components
+                    cache_key = decision.cache_key
                     declaration_digest = self._attempt_declaration_digest(
                         node,
                         key_components,
@@ -4856,10 +4859,9 @@ class Dag:
                         artifact, cache_hit = None, False
                     else:
                         try:
-                            cache_entry = self._cache_entry_for_lookup(
-                                cache_key,
+                            cache_entry = self._cache_entry_for_decision(
+                                decision,
                                 forced=forced_all or item_id in forced_items,
-                                cache_policy=(node.cache if libs_cache_reusable else "off"),
                                 evidence_policy=evidence_policy,
                             )
                         except CacheIntegrityError as error:
@@ -5121,9 +5123,7 @@ class Dag:
                                 label=(f"Scan node {node.name!r} item {item_id!r}"),
                                 calls=calls,
                                 cache_policy=(
-                                    "off"
-                                    if checkpoint_used or not libs_cache_reusable
-                                    else node.cache
+                                    "off" if checkpoint_used else decision.effective_cache_policy
                                 ),
                                 evidence_policy=evidence_policy,
                                 agent_provenance=agent_provenance,
@@ -5177,7 +5177,7 @@ class Dag:
                             key_components=key_components,
                             outputs=outputs,
                             cache_policy=(
-                                "off" if checkpoint_used or not libs_cache_reusable else node.cache
+                                "off" if checkpoint_used else decision.effective_cache_policy
                             ),
                             evidence_policy=evidence_policy,
                             agent_provenance=agent_provenance,
@@ -5226,6 +5226,94 @@ class Dag:
             cache_keys,
             item_cache_statuses,
             effective_cache_policy,
+        )
+
+    def _node_key_decision(
+        self,
+        node: _Node,
+        upstream_shas: Mapping[str, str],
+        libs_hash: str,
+        *,
+        upstream_artifacts: Mapping[str, dict[str, Any]] | None = None,
+        item: Any = _NO_ITEM,
+        item_files: tuple[Path, ...] = (),
+        carry: Any = _NO_CARRY,
+        libs_cache_reusable: bool,
+        prompt_snapshot: PromptCatalogSnapshot | None = None,
+        file_snapshot: _FileSnapshot | None = None,
+        function_inputs: Mapping[str, dict[str, Any]] | None = None,
+        file_contents: Mapping[str, bytes] | None = None,
+    ) -> NodeKeyDecision:
+        """Prepare one node/item cache decision from the canonical key builder."""
+        snapshot = (
+            prompt_snapshot if prompt_snapshot is not None else self._prompt_snapshot((node,))
+        )
+        omitted_local: set[str] = set()
+        if item is not _NO_ITEM:
+            assert node.items_from is not None
+            omitted_local.add(node.local_items_source or node.items_from[0])
+            if node.scan and node.carry_from is not None:
+                omitted_local.add(node.local_carry_source or node.carry_from[0])
+        prepared_inputs = (
+            dict(function_inputs)
+            if function_inputs is not None
+            else self._function_inputs(
+                node,
+                upstream_artifacts or {},
+                omitted_local=omitted_local,
+            )
+        )
+        captured_snapshot = file_snapshot
+        if file_contents is None:
+            if captured_snapshot is None:
+                captured_snapshot = _FileSnapshot.capture(
+                    self.config.project_root,
+                    self.config.resolve,
+                    (*node.files, *item_files),
+                )
+            captured_files = self._file_contents(
+                node,
+                item_files,
+                file_snapshot=captured_snapshot,
+            )
+        else:
+            captured_files = dict(file_contents)
+        prompt_resolutions = self._resolve_prompt_specs(
+            node,
+            snapshot,
+            upstream_artifacts or {},
+            item=item,
+            carry=carry,
+            function_inputs=prepared_inputs,
+            item_files=item_files,
+            file_contents=captured_files,
+        )
+        prompt_resolution_records = {
+            name: resolved.resolution.canonical() for name, resolved in prompt_resolutions.items()
+        }
+        key_components = self._key_components(
+            node,
+            upstream_shas,
+            libs_hash,
+            upstream_artifacts=upstream_artifacts,
+            item=item,
+            item_files=item_files,
+            carry=carry,
+            prompt_snapshot=snapshot,
+            prompt_resolutions=prompt_resolutions,
+            projected_inputs=prepared_inputs,
+            file_contents=captured_files,
+        )
+        return NodeKeyDecision(
+            key_components=key_components,
+            cache_key=sha(key_components),
+            effective_cache_policy=node.cache if libs_cache_reusable else "off",
+            prompt_resolutions=prompt_resolutions,
+            prompt_resolution_records=prompt_resolution_records,
+            prompt_snapshot=snapshot,
+            file_snapshot=captured_snapshot,
+            file_contents=captured_files,
+            function_inputs=prepared_inputs,
         )
 
     def _key_components(
