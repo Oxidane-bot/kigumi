@@ -146,7 +146,8 @@ positional-only 时都以 2 退出并指名问题所在，完整规则见
 Extension 只应读取，不应要求操作者手工设置。
 
 需要多进程 L1 同 key single-flight 时，把同一个启用的 `FileSlots` 传给
-`LLMCaller(..., slots=slots)`；它会复用该对象的 lock root。`slots` 未传，或
+`LLMCaller(..., slots=slots)`；它会复用该对象的 lock root。需要避免同 key 无限排队时，额外传
+`key_lock_timeout_seconds=...`；省略或传 `None` 保持原有等待语义。`slots` 未传，或
 `FileSlots.enabled` 为假时，不创建键锁文件，也不改变原有的进程内 `threading.Lock` 行为。
 这里沿用 `KIGUMI_REQUEST_*`，不使用只属于 Agent capacity 的 `agent_lock_path`。
 
@@ -301,7 +302,8 @@ print(sorted(result.artifacts))
 同名 `ResourceRequest` 共享一个 run 内资源池；`units` 是一次执行占用的单位数。
 没有 `resources=` 的节点使用 `None` 默认池，可以用
 `resource_limits={None: 2}` 显式限制它们；未在 `resource_limits` 中出现的资源名
-默认使用 `workers` 作为上限。资源声明只影响调度，不进入缓存键。需要同时占用多种
+默认使用 `workers` 作为上限；设置某资源为 `0` 表示禁用该池，需求节点会在执行前失败。
+`resource_timeout_seconds=...` 可限制资源排队等待，省略或传 `None` 保持无限等待。资源声明只影响调度，不进入缓存键。需要同时占用多种
 资源时，框架按名称固定获取顺序；请求单位数超过上限会在 run 开始时拒绝。
 
 一个重要的迁移点：map item 与普通父节点现在共用同一个 run-wide concurrency plane，

@@ -142,12 +142,7 @@ class FileSlots:
     @contextmanager
     def acquire(self, *, timeout_seconds: float | None = None) -> Iterator[SlotLease]:
         """Hold one slot, releasing it even when the protected request fails."""
-        if timeout_seconds is not None and (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, int | float)
-            or timeout_seconds <= 0
-        ):
-            raise ValueError("timeout_seconds must be positive or null")
+        self._validate_timeout(timeout_seconds)
         if not self.enabled:
             yield SlotLease(None, 0.0)
             return
@@ -162,8 +157,9 @@ class FileSlots:
             handle.close()
 
     @contextmanager
-    def acquire_key(self, key: str) -> Iterator[None]:
+    def acquire_key(self, key: str, *, timeout_seconds: float | None = None) -> Iterator[None]:
         """Hold one advisory lock for a cache key when this root is enabled."""
+        self._validate_timeout(timeout_seconds)
         if not self.enabled:
             yield
             return
@@ -172,11 +168,33 @@ class FileSlots:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         path = self._lock_dir / f"key_{digest}.lock"
         with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            started = time.monotonic()
+            if timeout_seconds is None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        remaining = timeout_seconds - (time.monotonic() - started)
+                        if remaining <= 0:
+                            raise SlotTimeoutError(time.monotonic() - started) from None
+                        time.sleep(min(0.05, remaining))
+                    else:
+                        break
             try:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _validate_timeout(timeout_seconds: float | None) -> None:
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int | float)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be positive or null")
 
     def _acquire_handle(self, started: float, timeout_seconds: float | None) -> tuple[TextIO, str]:
         assert self._lock_dir is not None

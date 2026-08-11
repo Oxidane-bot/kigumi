@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### 新增
+
+- `Dag.run()` 与 `Dag.resume()` 新增 `resource_timeout_seconds`，可限制节点等待运行资源的时间；默认值 `None` 保持无限等待。
+- `FileSlots.acquire_key()` 与 `LLMCaller(key_lock_timeout_seconds=...)` 支持有界 key lock 等待，超时抛出 `SlotTimeoutError`；默认行为不变。
+- `resource_limits` 接受 `0` 表示禁用资源池；需求该资源的节点会在执行前带资源名确定性失败，未使用该资源的节点不受影响。
+
 ## [0.13.0] - 2026-08-04
 
 ### 重大变更

@@ -108,6 +108,18 @@ def test_file_slot_timeout_has_no_lock_leak(tmp_path: Path) -> None:
         assert second.slot_identity == "slot_000"
 
 
+def test_file_key_slot_timeout_has_no_lock_leak(tmp_path: Path) -> None:
+    slots = FileSlots(tmp_path / "locks", 1)
+    with slots.acquire_key("same-key"):
+        try:
+            with slots.acquire_key("same-key", timeout_seconds=0.01):
+                raise AssertionError("occupied key lock must not be acquired")
+        except SlotTimeoutError as error:
+            assert error.wait_seconds >= 0.01
+    with slots.acquire_key("same-key", timeout_seconds=0.1):
+        pass
+
+
 def test_capacity_file_clamps_and_invalid_values_fall_back(tmp_path: Path) -> None:
     capacity = tmp_path / "capacity.txt"
     capacity.write_text("1", encoding="utf-8")

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from kigumi.calling import (
     durable_side_effect_boundary,
 )
 from kigumi.prompt import PreflightPolicy, RequestTooLarge
+from kigumi.slots import SlotTimeoutError
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 
@@ -407,6 +409,28 @@ def test_cache_hit_skips_transport_and_budget(tmp_path: Path) -> None:
     assert len(transport.requests) == 1
     assert budget.spent == 4
     assert caller.calls[-1]["cache"] == "hit"
+
+
+def test_llmcaller_passes_key_lock_timeout_to_slots(tmp_path: Path) -> None:
+    seen: list[float | None] = []
+
+    class RecordingSlots:
+        @contextmanager
+        def acquire_key(self, key: str, *, timeout_seconds: float | None = None):
+            del key
+            seen.append(timeout_seconds)
+            raise SlotTimeoutError(timeout_seconds or 0.0)
+            yield
+
+    caller = LLMCaller(
+        FakeTransport(),
+        tmp_path,
+        slots=RecordingSlots(),  # type: ignore[arg-type]
+        key_lock_timeout_seconds=0.01,
+    )
+    with pytest.raises(SlotTimeoutError):
+        caller.call("hello")
+    assert seen == [0.01]
 
 
 def test_reasoning_is_cached_but_not_in_call_metadata(tmp_path: Path) -> None:
