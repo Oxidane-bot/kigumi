@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- Prompt resolution 持久化 schema 不匹配时现在报告持久化版本、当前支持版本和可操作指引：无可用迁移的旧版本要求 rebuild，新版本要求 upgrade kigumi；增加了后续迁移用的空注册表与分发骨架。schema-1 字段、canonical 字节和缓存键保持不变。
+
 ## [0.13.0] - 2026-08-04
 
 ### 重大变更

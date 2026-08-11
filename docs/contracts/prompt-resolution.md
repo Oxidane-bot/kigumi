@@ -52,6 +52,9 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
    带 CALL lineage 的 record 必须成组包含字符串 `base_resolution_digest`、`phase`（`primary`
    或 `repair`）和非负整数 `repair_round`，并满足 primary=0、repair>0 及 base digest 绑定。
    旧 legacy body 不属于可接受形态，不能把它当作普通 cache miss，也不能猜测缺失字段。
+   当前支持的持久化版本是 `prompt_resolution_schema=1`。校验整数版本不匹配时，先查
+   `kigumi.prompt.PROMPT_RESOLUTION_MIGRATIONS`；注册的迁移函数返回的字段会与原 record 合并，
+   然后按 schema 1 的完整契约重新校验。当前注册表为空，没有隐式的 0→1 迁移。
 10. `preflight()` 在缓存查找和 provider 请求前检查估算 token、附件数量和总字节数；违规抛
     `RequestTooLarge`，不得静默调用 `clip()`。
 11. `ctx.resolve_prompt()` 只返回预解析对象；只有 `ctx.call(resolved)` 或把该对象直接作为
@@ -65,7 +68,12 @@ CALL/Agent receipt 中的 `prompt_resolution_schema=1`。
 
 静态声明、路径、slot 或 fragment 错误抛 `PromptDefinitionError`；运行时 selector/material
 解析错误抛 `PromptResolutionError`。两类错误都在缓存查找与副作用前失败。0.7 receipt 中
-resolution schema 或 digest 损坏时 resume/profile fail closed。
+resolution schema 或 digest 损坏时 resume/profile fail closed。整数版本低于当前支持版本且没有
+迁移时，抛出包含源版本和支持版本的
+`persisted Prompt resolution schema <old> is older than supported schema 1; no migration available — rebuild required`；
+高于当前版本时，抛出
+`persisted Prompt resolution schema <new> is newer than supported schema 1; upgrade kigumi`。
+非整数、缺失、未知字段、迁移失败或迁移后的 schema-1 record 损坏仍直接拒绝，不按 miss 重建。
 
 ## Verification
 
