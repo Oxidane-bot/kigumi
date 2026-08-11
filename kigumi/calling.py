@@ -197,6 +197,17 @@ class DryRunError(RuntimeError):
     """Raised when dry-run mode would otherwise make a live model request."""
 
 
+class _SingleFlightLock:
+    """Track one in-process key lock until its last participant exits."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waiters = 0
+        self.done = False
+        self.result: str | None = None
+        self.error: BaseException | None = None
+
+
 class Caller(Protocol):
     """Any object that can perform the normalized call used by repair helpers."""
 
@@ -525,8 +536,7 @@ class LLMCaller:
         self.preflight_policy = preflight_policy
         self.calls: list[dict[str, Any]] = []
         self._calls_lock = threading.Lock()
-        # 键锁只增不减:caller 与一次 run 同生命周期,键集有界;若改成常驻服务需先加回收。
-        self._key_locks: dict[str, threading.Lock] = {}
+        self._key_locks: dict[str, _SingleFlightLock] = {}
         self._key_locks_lock = threading.Lock()
         # The threading lock is the fast in-process layer. When FileSlots is enabled,
         # acquire_key adds cross-process single-flight for this L1 key. Budget
@@ -626,10 +636,12 @@ class LLMCaller:
                 prompt_lineage=prompt_lineage,
             )
 
-        with self._lock_for_key(key), self._file_lock_for_key(key):
+        with self._lock_for_key(key) as single_flight, self._file_lock_for_key(key):
+            if single_flight.error is not None:
+                raise single_flight.error
             cached = self._read_cached_response(cache_path)
             if cached is not None:
-                return self._record_cache_hit(
+                result = self._record_cache_hit(
                     cached,
                     key=key,
                     model_alias=model,
@@ -638,6 +650,13 @@ class LLMCaller:
                     messages=key_messages,
                     prompt_lineage=prompt_lineage,
                 )
+                single_flight.result = result
+                return result
+
+            if single_flight.done:
+                if single_flight.result is None:
+                    raise RuntimeError("single-flight completed without a result")
+                return single_flight.result
 
             if self.dry:
                 raise DryRunError(f"Dry run would call model {model!r} for cache key {key}")
@@ -784,6 +803,7 @@ class LLMCaller:
                 if permit is not None:
                     permit.cancel()
                 raise
+            single_flight.result = response.text
             return response.text
 
     @staticmethod
@@ -1252,9 +1272,30 @@ class LLMCaller:
         )
         return cached_response
 
-    def _lock_for_key(self, key: str) -> threading.Lock:
+    @contextmanager
+    def _lock_for_key(self, key: str) -> Iterator[_SingleFlightLock]:
         with self._key_locks_lock:
-            return self._key_locks.setdefault(key, threading.Lock())
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = _SingleFlightLock()
+                self._key_locks[key] = lock
+            lock.waiters += 1
+        try:
+            with lock.lock:
+                try:
+                    yield lock
+                except BaseException as error:
+                    if not lock.done:
+                        lock.error = error
+                        lock.done = True
+                    raise
+                else:
+                    lock.done = True
+        finally:
+            with self._key_locks_lock:
+                lock.waiters -= 1
+                if lock.done and lock.waiters == 0 and self._key_locks.get(key) is lock:
+                    del self._key_locks[key]
 
     @contextmanager
     def _file_lock_for_key(self, key: str) -> Iterator[None]:
