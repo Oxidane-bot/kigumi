@@ -246,7 +246,8 @@ result = dag.run(workers=4)
 
 节点必须把**所有会影响输出的东西声明出来**:上游用 `deps`、Prompt 用
 `prompt_specs`、数据文件用 `files`、标量参数用 `params`。缓存键由这些声明 +
-节点函数源码 + source_dirs 全部源码共同决定——没声明的输入 = 缓存不知道
+节点函数源码 + 该节点在配置源码路径内静态可达的 import 闭包共同决定；`source_dirs`
+中对该节点不可达的源码文件不进入该节点身份——没声明的输入 = 缓存不知道
 它变了 = 陈旧结果静默复用。这是接入时最容易犯的错。
 
 节点体内读文件必须走 `ctx.read_text(path)` / `ctx.read_bytes(path)`:它们按与缓存键
@@ -395,6 +396,11 @@ spawn 前失败。
 manifest 用 `Message` 保存消息顺序，用 `Attachment` 保存文件路径、内容摘要、MIME
 和字节数，用 `ResponseSpec` 保存响应格式与 schema identity；附件原文不会被塞进
 provenance。
+
+这里的保证只覆盖附件内容：附件内容哈希进入缓存键，发送前也会复核哈希，因此消费者不必
+手动核对附件内容哈希。框架不强制核对 `files=` 声明与实际 attach 的路径是否一致；例如声明
+`a.png` 却实际 attach `b.png` 不会因此被拒绝，这项声明核对仍由调用方负责。`FileRef` 仍按
+下文约束，只能读取 `files=` / `files_fn=` 声明的文件。
 
 在低层直接构造 manifest 时，先用 `preflight()` 检查，再决定是否继续：
 
@@ -938,7 +944,7 @@ artifact 的 immutable origin selection。默认不展开 CALL/Agent 内容；
 要么声明的输入逐字节没变(必命中),要么必重算——所有排障都是在问
 "键的哪个成分变了"或"哪个输入漏声明了"(见排障一节)。由此推论:
 
-- 改了节点函数源码或 source_dirs 里任何 .py 的代码 → 相关节点全部重算
+- 改了节点函数源码或该节点静态可达 import 闭包中的源码 → 相关节点全部重算
   (故意的,代码就是配方的一部分)。注释与 docstring 不算代码:source 与
   libs 两个成分都按剥离后的 AST 哈希,修文档注不换族。
 - 改了 Prompt 模板、PromptSpec base、固定/已选 layer、selector/binding 或 material →
@@ -1754,7 +1760,7 @@ kigumi diff run-0041 run-0042 --json
 
 | 症状 | 第一反应 |
 | --- | --- |
-| 节点意外重算 | `dag.explain("node")` 或 `dag.explain("node@item")` 直接列出变化成分;记住 source_dirs 里任何 `.py` 的代码变更(注释/docstring 除外)都在 `libs` 成分里 |
+| 节点意外重算 | `dag.explain("node")` 或 `dag.explain("node@item")` 直接列出变化成分;记住只有该节点静态可达 import 闭包中的 `.py` 代码变更(注释/docstring 除外)才在该节点的 `libs` 成分里 |
 | 明明改了输入却命中 / 结果陈旧 | 该节点是否绕过 `ctx.read_text` 读了未声明文件;逐个核对 `files`/`files_fn` 声明,`render_summary()` 的声明表适合快速扫 |
 | `force` 了还是老答案 | L3 与 L1 是两层:`force` 只重执行函数体,prompt 没变时 `ctx.call` 仍从 L1 重放;想要新答案换 `seed` |
 | 两次 run 结果哪里不同 | `dag.diff(run_a, run_b)`,按内容哈希报 changed,不重跑节点 |
