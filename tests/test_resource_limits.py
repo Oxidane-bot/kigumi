@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from kigumi import ResourceRequest
 from tests._dag_helpers import _make_dag
 
@@ -191,3 +193,69 @@ def test_nodes_without_resources_use_the_default_pool(tmp_path: Path) -> None:
 
     assert len(result.artifacts) == 5
     assert peak == 3
+
+
+def test_resource_timeout_is_exposed_and_names_the_waited_resource(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    ran_nodes: list[str] = []
+    outcome: list[BaseException | object] = []
+
+    @dag.node("first", resources=(ResourceRequest("gpu"),))
+    def first(inputs: dict[str, Any], ctx: Any) -> dict[str, bool]:
+        del inputs, ctx
+        ran_nodes.append("first")
+        started.set()
+        assert release.wait(5)
+        return {"done": True}
+
+    @dag.node("second", resources=(ResourceRequest("gpu"),))
+    def second(inputs: dict[str, Any], ctx: Any) -> dict[str, bool]:
+        del inputs, ctx
+        ran_nodes.append("second")
+        started.set()
+        assert release.wait(5)
+        return {"done": True}
+
+    def execute() -> None:
+        try:
+            outcome.append(
+                dag.run(
+                    workers=2,
+                    resource_limits={"gpu": 1},
+                    resource_timeout_seconds=0.05,
+                )
+            )
+        except BaseException as error:  # pragma: no cover - asserted below
+            outcome.append(error)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    assert started.wait(5)
+    time.sleep(0.5)
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], TimeoutError)
+    assert "gpu" in str(outcome[0])
+    assert "s for resource 'gpu'" in str(outcome[0])
+    assert len(ran_nodes) == 1
+
+
+def test_zero_resource_limit_fails_before_a_resource_node_runs(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+    ran = False
+
+    @dag.node("gpu", resources=(ResourceRequest("gpu"),))
+    def gpu(inputs: dict[str, Any], ctx: Any) -> dict[str, bool]:
+        nonlocal ran
+        del inputs, ctx
+        ran = True
+        return {"done": True}
+
+    with pytest.raises(ValueError, match=r"resource 'gpu'.*limit is 0"):
+        dag.run(resource_limits={"gpu": 0})
+    assert not ran

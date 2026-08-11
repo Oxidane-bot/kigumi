@@ -508,6 +508,7 @@ class LLMCaller:
         slots: FileSlots | None = None,
         evidence_policy: EvidencePolicy = _DEFAULT_EVIDENCE_POLICY,
         preflight_policy: PreflightPolicy = _DEFAULT_PREFLIGHT_POLICY,
+        key_lock_timeout_seconds: float | None = None,
     ) -> None:
         self.transport = transport
         self.cache_dir = Path(cache_dir)
@@ -515,6 +516,7 @@ class LLMCaller:
         self.budget = budget
         self.dry = dry
         self.slots = slots
+        self.key_lock_timeout_seconds = key_lock_timeout_seconds
         if not isinstance(evidence_policy, EvidencePolicy):
             raise TypeError("evidence_policy must be EvidencePolicy")
         if not isinstance(preflight_policy, PreflightPolicy):
@@ -1263,7 +1265,11 @@ class LLMCaller:
         if not callable(acquire_key):
             yield
             return
-        with acquire_key(key):
+        if self.key_lock_timeout_seconds is None:
+            lock_context = acquire_key(key)
+        else:
+            lock_context = acquire_key(key, timeout_seconds=self.key_lock_timeout_seconds)
+        with lock_context:
             yield
 
     def _append_call(self, metadata: dict[str, Any]) -> None:

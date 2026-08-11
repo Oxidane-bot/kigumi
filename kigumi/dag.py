@@ -131,7 +131,12 @@ class _ResourcePool:
         self.semaphore = threading.Semaphore(limit)
         self._acquire_lock = threading.Lock()
 
-    def acquire(self, units: int, deadline: float | None) -> None:
+    def acquire(
+        self,
+        units: int,
+        deadline: float | None,
+        started: float | None = None,
+    ) -> None:
         acquired = 0
         # Holding this lock while acquiring all units prevents two callers from
         # each taking part of a multi-unit request and waiting on one another.
@@ -145,7 +150,10 @@ class _ResourcePool:
                             timeout=max(0.0, deadline - time.monotonic())
                         )
                     if not available:
-                        raise TimeoutError(f"Timed out waiting for resource {self.name!r}")
+                        waited = time.monotonic() - started if started is not None else 0.0
+                        raise TimeoutError(
+                            f"Timed out waiting {waited:.3f}s for resource {self.name!r}"
+                        )
                     acquired += 1
             except BaseException:
                 for _ in range(acquired):
@@ -179,14 +187,13 @@ class _PermitPlane:
             grouped[name] = grouped.get(name, 0) + units
         ordered = sorted(grouped, key=lambda name: "" if name is None else name)
         acquired: list[tuple[_ResourcePool, int]] = []
-        deadline = (
-            time.monotonic() + self._timeout_seconds if self._timeout_seconds is not None else None
-        )
+        started = time.monotonic()
+        deadline = started + self._timeout_seconds if self._timeout_seconds is not None else None
         try:
             for name in ordered:
                 pool = self._pools[name]
                 units = grouped[name]
-                pool.acquire(units, deadline)
+                pool.acquire(units, deadline, started)
                 acquired.append((pool, units))
             yield
         finally:
@@ -1368,6 +1375,7 @@ class Dag:
         *,
         workers: int,
         resource_limits: Mapping[str | None, int] | None,
+        resource_timeout_seconds: float | None = None,
     ) -> tuple[_PermitPlane, int]:
         """Build one run-local plane and enough workers to serve its declared limits."""
         if resource_limits is not None and not isinstance(resource_limits, Mapping):
@@ -1378,8 +1386,8 @@ class Dag:
             for name, limit in resource_limits.items():
                 if name is not None and not isinstance(name, str):
                     raise TypeError("resource_limits keys must be strings or None")
-                if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-                    raise ValueError(f"resource_limits[{name!r}] must be a positive integer")
+                if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                    raise ValueError(f"resource_limits[{name!r}] must be a non-negative integer")
                 configured[name] = limit
 
         used_names: set[str | None] = set()
@@ -1401,6 +1409,10 @@ class Dag:
             for name, units in grouped.items():
                 limit = limits[name]
                 if units > limit:
+                    if limit == 0:
+                        raise ValueError(
+                            f"Node {node_name!r} requires disabled resource {name!r} (limit is 0)"
+                        )
                     raise ValueError(
                         f"Node {node_name!r} requests {units} units of resource {name!r}, "
                         f"but its limit is {limit}"
@@ -1412,7 +1424,10 @@ class Dag:
         execution_workers = (
             workers if resource_limits is None else max(workers, sum(limits.values(), 0))
         )
-        return _PermitPlane(limits), execution_workers
+        return _PermitPlane(
+            limits,
+            timeout_seconds=resource_timeout_seconds,
+        ), execution_workers
 
     def run(
         self,
@@ -1421,6 +1436,7 @@ class Dag:
         force: Iterable[str] = (),
         workers: int = 1,
         resource_limits: Mapping[str | None, int] | None = None,
+        resource_timeout_seconds: float | None = None,
         *,
         _bound_attempt_store: AttemptStore | None = None,
     ) -> RunResult:
@@ -1467,6 +1483,7 @@ class Dag:
             order,
             workers=workers,
             resource_limits=resource_limits,
+            resource_timeout_seconds=resource_timeout_seconds,
         )
         current_run_id = (
             run_id if run_id is not None else store.allocate_run_id(self.config.artifacts_path)
@@ -2222,6 +2239,7 @@ class Dag:
         *,
         workers: int = 1,
         resource_limits: Mapping[str | None, int] | None = None,
+        resource_timeout_seconds: float | None = None,
     ) -> RunResult:
         """Resume one schema-2 run under its originally bound declaration."""
         run_dir = store.run_directory(self.config.artifacts_path, run_id)
@@ -2253,6 +2271,7 @@ class Dag:
             force=force,
             workers=workers,
             resource_limits=resource_limits,
+            resource_timeout_seconds=resource_timeout_seconds,
             _bound_attempt_store=bound_attempts,
         )
 

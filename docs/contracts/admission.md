@@ -11,7 +11,7 @@ Status: Draft (Unreleased)
 ## Scope
 
 适用于 `Budget`/`BudgetPermit`、`LLMCaller(budget=..., slots=...)`、`ResourceRequest`、
-`Dag.run(resource_limits=...)`，以及普通节点、map/scan/foreach 和 Agent 节点的
+`Dag.run(resource_limits=..., resource_timeout_seconds=...)`，以及普通节点、map/scan/foreach 和 Agent 节点的
 run-local 调度。
 
 ## Source of truth
@@ -24,17 +24,16 @@ run-local 调度。
 
 `Budget.reserve()` 返回 `BudgetPermit`；permit 的成功路径调用 `commit(actual_usage)`，
 失败或取消路径调用 `cancel()`。节点用 `resources=(ResourceRequest(name, units),)`
-声明资源，run 用 `resource_limits={name: limit}` 给出上限；没有资源声明的节点使用
-`None` 默认池。`ResourceRequest.scope` 只接受 `host`、`account`、`global` 三个声明值；
+声明资源，run 用 `resource_limits={name: limit}` 给出上限，并可用
+`resource_timeout_seconds` 限制资源排队等待；没有资源声明的节点使用 `None` 默认池。
+`ResourceRequest.scope` 只接受 `host`、`account`、`global` 三个声明值；
 它不会把这个 run-local permit plane 变成跨进程或跨主机锁。
 
 `LLMCaller` 保留进程内同 key `threading.Lock`；当传入启用的 `FileSlots` 时，再按同一
-lock root 取得 `acquire_key(key)`。该文件锁覆盖二次 L1 cache check、预算 admission、
-provider 请求和缓存写入；未启用时 `acquire_key` 是 no-op。与
-`acquire(timeout_seconds=...)` 不同，`acquire_key()` 没有 timeout，也不会抛
-`SlotTimeoutError`；等待方会一直阻塞到持锁方释放锁或进程消失。正常情况下持锁时长由 transport
-timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上界。等待方没有 timeout 诊断；
-运维应检查 lock root 下对应的 `key_<sha256>.lock` 文件及其持锁进程。
+lock root 取得 `acquire_key(key, timeout_seconds=...)`。该文件锁覆盖二次 L1 cache check、
+预算 admission、provider 请求和缓存写入；未启用时 `acquire_key` 是 no-op。`timeout_seconds=None`
+保持原有无限等待；传入正数时，等待超过上限抛 `SlotTimeoutError`。`LLMCaller` 用
+`key_lock_timeout_seconds` 配置这一透传值；它不影响请求槽 `acquire()` 的配置或 L1 缓存键。
 
 ## Invariants
 
@@ -55,18 +54,21 @@ timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上�
    竞争 `None` 池；同名资源按累计 `units` 竞争同一个池；不同命名资源可以按各自上限并行。
    map/scan item 与就绪的普通节点共用该 plane，不再在 scheduler worker 内创建嵌套的
    `workers` 池。
-6. `resource_limits` 中的上限必须是正整数；没有显式上限的已使用资源默认以 `workers`
-   为上限；单个节点合计请求超过对应上限时，run 在执行前拒绝。资源声明的 cache identity
-   由[缓存键契约](cache-key.md)约束。
+6. `resource_limits` 中的上限必须是非负整数；没有显式上限的已使用资源默认以 `workers`
+   为上限。值为 `0` 表示资源池禁用：任何合计请求该资源的节点都在执行前确定性失败并带出
+   资源名，未使用该资源的节点不受影响。正整数下，单个节点合计请求超过对应上限时仍在执行前
+   拒绝。资源声明的 cache identity 由[缓存键契约](cache-key.md)约束。
 7. 多资源请求按资源名固定顺序取得，取得失败会释放已取得的部分；节点正常返回或抛错后
-   都释放全部 permit。资源池是 run-local、进程内边界，不能替代跨进程 Agent slot、
+   都释放全部 permit。`resource_timeout_seconds=None` 保持无限等待；设置后超时抛带资源名与
+   实际等待时长的 `TimeoutError`。资源池是 run-local、进程内边界，不能替代跨进程 Agent slot、
    provider capacity 或分布式 quota。
 
 ## Failure behavior
 
 预算预留不足抛 `BudgetExceeded` 且不发 provider 请求；实际用量超预算的 `commit` 仍保留
 调用记录和已写入的成功响应后抛出。非法资源声明或 `resource_limits` 抛 `TypeError`/
-`ValueError`；资源请求超过上限在执行前失败，资源等待超时或节点异常不会泄漏 permit。
+`ValueError`；禁用资源、资源请求超过正整数上限或资源等待超时都在节点执行前失败，资源等待
+超时、key lock 超时或节点异常不会泄漏 permit/文件锁。
 
 ## Verification
 

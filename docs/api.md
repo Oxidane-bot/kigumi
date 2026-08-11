@@ -54,8 +54,10 @@
 
 - `ResourceRequest(name: str, units: int = 1, scope: str = "global") -> None`
   （`kigumi._declarations`，顶层导出）：声明节点运行时容量需求（GPU、供应商配额、CPU 槽位）。
-  节点用 `resources=(ResourceRequest("gpu"),)` 声明，`dag.run(resource_limits={"gpu": 1})`
-  给出运行期上限；未声明资源的节点走 `None` 默认池。多资源按名字确定序获取，避免互等。
+  节点用 `resources=(ResourceRequest("gpu"),)` 声明，`dag.run(resource_limits={"gpu": 1},
+  resource_timeout_seconds=...)` 给出运行期上限与可选等待上限；未声明资源的节点走 `None`
+  默认池。`resource_limits` 值为 `0` 表示该资源池禁用，需求节点在执行前带资源名失败；多资源
+  按名字确定序获取，避免互等。
 - `class CacheIntegrityError(RuntimeError)`（`kigumi.errors`，顶层导出）：缓存条目存在但不可
   安全复用（JSON 撕裂、响应为空、`response_sha256` 不匹配）。损坏不再退化成 miss，因此不会
   静默重新计费；先核对该条目再决定是删除重算还是修复。`CacheLookup`（`kigumi.store`）是缓存
@@ -82,9 +84,10 @@
   `RunResult.pending_checkpoints`；批准后使用同一个 `run_id` 恢复。见
   [检查点契约](contracts/checkpoint.md)。
 - `SlotTimeoutError(wait_seconds: float) -> None`（仅
-  `from kigumi.slots import SlotTimeoutError`）：`FileSlots.acquire` 在受保护工作开始前未能
-  取得 slot。降低并发、提高 timeout 或检查共享 lock/capacity 配置；Agent 路径会把它转成
-  `AgentRuntimeFailureCode.CAPACITY`。见 [Agent 容量契约](contracts/agent-capacity.md)。
+  `from kigumi.slots import SlotTimeoutError`）：`FileSlots.acquire` 或
+  `FileSlots.acquire_key` 在受保护工作开始前未能取得 slot/key lock。降低并发、提高 timeout 或
+  检查共享 lock/capacity 配置；Agent 路径会把 slot 超时转成 `AgentRuntimeFailureCode.CAPACITY`。
+  见 [Agent 容量契约](contracts/agent-capacity.md)。
 - `class WorkflowProfileError(RuntimeError)`（仅
   `from kigumi.profile import WorkflowProfileError`）：schema-2 WorkflowProfile 或关联
   receipt 缺失、schema 不支持、结构无效或 digest 不匹配。保留损坏现场并重新生成可信 run；
@@ -94,13 +97,11 @@
   或 manifest、attempt state、candidate、artifact/Prompt lineage 摘要损坏。用原声明恢复，
   声明已变则新建 run；损坏一律 fail closed。见 [retry/resume 契约](contracts/retry-resume.md)。
 
-`FileSlots.acquire_key(key)` 与 `acquire()` 使用同一启用条件和 lock root：未配置时是 no-op，启用
-时用 `key_<sha256(key)>.lock` 保护一次 L1 key 的二次 cache check、provider 请求和缓存写入，
-并在 `finally` 中释放。它只消除同 key 的重复穿透，不提供跨进程预算总账。与
-`acquire(timeout_seconds=...)` 不同，`acquire_key()` 没有 timeout，也不会抛
-`SlotTimeoutError`；等待方会一直阻塞到持锁方释放锁或进程消失。正常情况下持锁时长由 transport
-timeout 约束，但 SIGSTOP 或无 timeout 的 transport 会让等待没有上界。等待方没有 timeout 诊断；
-运维应检查 lock root 下对应的 `key_<sha256>.lock` 文件及其持锁进程。
+`FileSlots.acquire_key(key, timeout_seconds=...)` 与 `acquire()` 使用同一启用条件和 lock root：未
+配置时是 no-op，启用时用 `key_<sha256(key)>.lock` 保护一次 L1 key 的二次 cache check、provider
+请求和缓存写入，并在 `finally` 中释放。它只消除同 key 的重复穿透，不提供跨进程预算总账。
+`timeout_seconds=None` 保持无限等待；设置正数后超时抛 `SlotTimeoutError(wait_seconds)`。
+`LLMCaller(..., key_lock_timeout_seconds=...)` 会将该值传给 key lock，且不进入 L1 缓存键。
 
 ### Agent
 
