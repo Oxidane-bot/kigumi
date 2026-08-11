@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from urllib.error import HTTPError
 
 import pytest
@@ -130,4 +131,27 @@ def test_agent_runtime_subcodes_are_closed_canonical_and_code_compatible() -> No
         AgentExecutionFailure(
             runtime_code=AgentRuntimeFailureCode.PROTOCOL,
             runtime_subcode=AgentRuntimeFailureSubCode.BRIDGE_POLICY,
+        )
+
+
+def test_agent_runtime_origin_diagnostics_round_trip_without_plaintext() -> None:
+    message = "origin-secret"
+    digest = hashlib.sha256(message.encode()).hexdigest()
+    failure = AgentExecutionFailure(
+        runtime_code=AgentRuntimeFailureCode.PROTOCOL,
+        exception_type="RuntimeError",
+        message_digest=digest,
+    )
+
+    canonical = failure.canonical()
+    assert canonical["exception_type"] == "RuntimeError"
+    assert canonical["message_digest"] == digest
+    assert message not in canonical
+    restored = AgentExecutionFailure.from_canonical(canonical)
+    assert restored.canonical() == canonical
+
+    with pytest.raises(ValueError, match="provided together"):
+        AgentExecutionFailure(
+            runtime_code=AgentRuntimeFailureCode.PROTOCOL,
+            exception_type="RuntimeError",
         )

@@ -8,6 +8,8 @@
 
 - 配置加载现在会拒绝形状非法的 `source_dirs`，守卫扫描支持单个 `.py` 文件并会对缺失或无效路径报错；`FileSlots.from_env()` 对已设置但无法解析的 `KIGUMI_REQUEST_SLOTS` 也会以带变量名的配置错误失败。
 - Prompt resolution 持久化 schema 不匹配时现在报告持久化版本、当前支持版本和可操作指引：无可用迁移的旧版本要求 rebuild，新版本要求 upgrade kigumi；增加了后续迁移用的空注册表与分发骨架。schema-1 字段、canonical 字节和缓存键保持不变。
+- Agent 未知运行时失败现在保留异常类型名与消息 SHA-256 摘要；Pi 的 thinking/reasoning 拒绝诊断补充
+  provider 与 model，失败记录仍不保存明文消息或凭据。
 
 ### 兼容性
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -139,3 +140,7 @@ def test_execute_agent_task_preserves_known_runtime_sources_and_redacts_unknown(
     assert record["failure"]["runtime_subcode"] == (
         runtime_subcode.value if runtime_subcode is not None else None
     )
+    assert failure.exception_type == type(error).__name__
+    assert failure.message_digest == hashlib.sha256(str(error).encode()).hexdigest()
+    assert record["failure"]["exception_type"] == type(error).__name__
+    assert record["failure"]["message_digest"] == hashlib.sha256(str(error).encode()).hexdigest()
