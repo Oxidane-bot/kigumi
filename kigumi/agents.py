@@ -1190,12 +1190,20 @@ def execute_agent_task(
         elif isinstance(error, ProviderFailure):
             typed_error = AgentExecutionFailure(provider_failure=error)
         elif isinstance(error, AgentRuntimeResultError):
+            origin = canonical_failure(error)
             typed_error = AgentExecutionFailure(
                 runtime_code=error.runtime_code,
                 runtime_subcode=error.runtime_subcode,
+                exception_type=origin["exception_type"],
+                message_digest=origin["message_digest"],
             )
         else:
-            typed_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.PROTOCOL)
+            origin = canonical_failure(error)
+            typed_error = AgentExecutionFailure(
+                runtime_code=AgentRuntimeFailureCode.PROTOCOL,
+                exception_type=origin["exception_type"],
+                message_digest=origin["message_digest"],
+            )
         failure = {
             "failure_schema": FAILURE_SCHEMA,
             "node": node_name,

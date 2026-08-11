@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### 修复
+
+- Agent 未知运行时失败现在保留异常类型名与消息 SHA-256 摘要；Pi 的 thinking/reasoning 拒绝诊断补充
+  provider 与 model，失败记录仍不保存明文消息或凭据。
+
 ## [0.13.0] - 2026-08-04
 
 ### 重大变更

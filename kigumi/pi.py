@@ -415,7 +415,8 @@ class PiRpcAdapter:
                     context.emit_event(normalized_event)
                     if request.spec.thinking == "off" and thinking_events:
                         raise AgentRuntimeResultError(
-                            "Pi emitted thinking content while AgentSpec thinking=off",
+                            "Pi emitted thinking content while AgentSpec thinking=off "
+                            f"(provider={request.spec.provider}, model={request.spec.model})",
                             runtime_subcode=AgentRuntimeFailureSubCode.ENVELOPE,
                         )
                     if event_type == "response" and event.get("id") == prompt_id:
@@ -504,6 +505,8 @@ class PiRpcAdapter:
                                 normalized = _admit_usage(
                                     normalized,
                                     thinking=request.spec.thinking,
+                                    provider=request.spec.provider,
+                                    model=request.spec.model,
                                 )
                                 usage = _merge_usage(usage, normalized)
                             reason = message.get("stopReason", message.get("stop_reason"))
@@ -522,6 +525,8 @@ class PiRpcAdapter:
                                 normalized = _admit_usage(
                                     normalized,
                                     thinking=request.spec.thinking,
+                                    provider=request.spec.provider,
+                                    model=request.spec.model,
                                 )
                                 usage = _merge_usage(usage, normalized)
                     elif event_type == "compaction_end":
@@ -532,6 +537,8 @@ class PiRpcAdapter:
                                 normalized = _admit_usage(
                                     normalized,
                                     thinking=request.spec.thinking,
+                                    provider=request.spec.provider,
+                                    model=request.spec.model,
                                 )
                                 usage = _merge_usage(usage, normalized)
                     elif event_type == "agent_settled":
@@ -792,7 +799,9 @@ def _normalize_usage(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _admit_usage(value: Mapping[str, Any], *, thinking: str) -> dict[str, Any]:
+def _admit_usage(
+    value: Mapping[str, Any], *, thinking: str, provider: str, model: str
+) -> dict[str, Any]:
     normalized = dict(value)
     reasoning = normalized.get("reasoning")
     if thinking == "off":
@@ -800,7 +809,8 @@ def _admit_usage(value: Mapping[str, Any], *, thinking: str) -> dict[str, Any]:
             normalized["reasoning"] = 0
         elif isinstance(reasoning, int) and reasoning > 0:
             raise AgentResultError(
-                "Pi reported non-zero reasoning tokens while AgentSpec thinking=off"
+                "Pi reported non-zero reasoning tokens while AgentSpec thinking=off "
+                f"(provider={provider}, model={model})"
             )
     return normalized
 

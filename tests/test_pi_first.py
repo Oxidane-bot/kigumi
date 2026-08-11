@@ -1213,6 +1213,9 @@ def test_pi_rpc_adapter_fails_closed_and_keeps_redacted_evidence(
         assert raised.value.provider_failure.kind is provider_kind
     if message is not None:
         assert message in str(raised.value)
+    if mode in {"thinking_off", "reasoning_usage_off"}:
+        assert "provider=test" in str(raised.value)
+        assert "model=test-model" in str(raised.value)
     assert {name for name, _, _ in captured} == {"pi-rpc.jsonl", "pi-stderr.txt"}
     assert b"very-secret" not in b"".join(data for _, data, _ in captured)
 

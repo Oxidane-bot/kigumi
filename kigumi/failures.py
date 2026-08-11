@@ -188,6 +188,8 @@ class AgentExecutionFailure(RuntimeError):
         provider_failure: ProviderFailure | None = None,
         runtime_code: AgentRuntimeFailureCode | None = None,
         runtime_subcode: AgentRuntimeFailureSubCode | None = None,
+        exception_type: str | None = None,
+        message_digest: str | None = None,
     ) -> None:
         if (provider_failure is None) == (runtime_code is None):
             raise ValueError("exactly one of provider_failure or runtime_code is required")
@@ -208,9 +210,24 @@ class AgentExecutionFailure(RuntimeError):
                     f"runtime_subcode {runtime_subcode.value!r} requires "
                     f"runtime_code {expected_code.value!r}"
                 )
+        if (exception_type is None) != (message_digest is None):
+            raise ValueError("exception_type and message_digest must be provided together")
+        if exception_type is not None:
+            if provider_failure is not None:
+                raise ValueError("exception origin requires a runtime failure")
+            if not isinstance(exception_type, str) or not exception_type:
+                raise ValueError("exception_type must be a non-empty string or null")
+            if (
+                not isinstance(message_digest, str)
+                or len(message_digest) != 64
+                or any(character not in "0123456789abcdef" for character in message_digest)
+            ):
+                raise ValueError("message_digest must be a lowercase SHA-256 digest")
         self.provider_failure = provider_failure
         self.runtime_code = runtime_code
         self.runtime_subcode = runtime_subcode
+        self.exception_type = exception_type
+        self.message_digest = message_digest
         message = (
             str(provider_failure)
             if provider_failure is not None
@@ -220,7 +237,7 @@ class AgentExecutionFailure(RuntimeError):
 
     def canonical(self) -> dict[str, Any]:
         """Return the stable failure payload used by Agent files and receipts."""
-        return {
+        payload: dict[str, Any] = {
             "failure_type": "provider" if self.provider_failure is not None else "runtime",
             "provider_failure": (
                 self.provider_failure.canonical() if self.provider_failure is not None else None
@@ -230,6 +247,10 @@ class AgentExecutionFailure(RuntimeError):
                 self.runtime_subcode.value if self.runtime_subcode is not None else None
             ),
         }
+        if self.exception_type is not None:
+            payload["exception_type"] = self.exception_type
+            payload["message_digest"] = self.message_digest
+        return payload
 
     @classmethod
     def from_canonical(cls, value: Mapping[str, Any]) -> AgentExecutionFailure:
@@ -237,6 +258,8 @@ class AgentExecutionFailure(RuntimeError):
         provider = value.get("provider_failure")
         runtime = value.get("runtime_code")
         runtime_subcode = value.get("runtime_subcode")
+        exception_type = value.get("exception_type")
+        message_digest = value.get("message_digest")
         if runtime_subcode is not None and not isinstance(runtime_subcode, str):
             raise ValueError("runtime_subcode must be a string or null")
         return cls(
@@ -249,6 +272,8 @@ class AgentExecutionFailure(RuntimeError):
                 if isinstance(runtime_subcode, str)
                 else None
             ),
+            exception_type=exception_type,
+            message_digest=message_digest,
         )
 
 
