@@ -35,6 +35,25 @@ def test_empty_kigumi_table_activates_defaults(tmp_path: Path) -> None:
     assert config.agent_slot_timeout_seconds == 300
 
 
+def test_source_dirs_rejects_bare_string_and_invalid_entries(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"source_dirs must be a list of non-empty strings, got str",
+    ):
+        KigumiConfig(project_root=tmp_path, source_dirs="src")  # type: ignore[arg-type]
+
+    for source_dirs in (None, [""], ["src", 1], {"src"}):
+        with pytest.raises(ValueError, match="source_dirs"):
+            KigumiConfig(project_root=tmp_path, source_dirs=source_dirs)  # type: ignore[arg-type]
+
+
+def test_source_dirs_accepts_tuples_and_empty_lists(tmp_path: Path) -> None:
+    assert KigumiConfig(project_root=tmp_path, source_dirs=()).source_paths == []
+    assert KigumiConfig(project_root=tmp_path, source_dirs=("src",)).source_paths == [
+        (tmp_path / "src").resolve()
+    ]
+
+
 def test_agent_capacity_environment_overrides_project_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

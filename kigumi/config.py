@@ -149,6 +149,21 @@ class KigumiConfig:
     project_root: Path = field(default_factory=Path.cwd, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.source_dirs, (list, tuple)):
+            raise ValueError(
+                "source_dirs must be a list of non-empty strings, "
+                f"got {type(self.source_dirs).__name__}"
+            )
+        invalid_source_dirs = [
+            index
+            for index, source_dir in enumerate(self.source_dirs)
+            if not isinstance(source_dir, str) or not source_dir
+        ]
+        if invalid_source_dirs:
+            raise ValueError(
+                "source_dirs must be a list of non-empty strings; "
+                f"invalid item at index {invalid_source_dirs[0]}"
+            )
         overrides: tuple[tuple[str, str, type[int] | type[float]], ...] = (
             ("agent_slots", "KIGUMI_AGENT_SLOTS", int),
             (

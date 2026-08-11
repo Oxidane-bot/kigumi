@@ -6,6 +6,8 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from kigumi.calling import LLMCaller
 from kigumi.slots import AdaptiveCapacity, FileSlots, SlotTimeoutError
 from kigumi.testing import FakeTransport
@@ -88,6 +90,15 @@ def test_disabled_slots_pass_through_without_filesystem_side_effects(
     with from_env.acquire():
         pass
     assert not from_env.enabled
+
+
+def test_invalid_request_slots_environment_fails_with_named_config_error(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KIGUMI_REQUEST_SLOTS", "not-an-integer")
+
+    with pytest.raises(ValueError, match="KIGUMI_REQUEST_SLOTS"):
+        FileSlots.from_env()
 
 
 def test_file_slots_limit_parallel_processes(tmp_path: Path) -> None:

@@ -57,7 +57,7 @@ uv add --editable "~/Documents/Projects/kigumi[litellm]"  # 需要真实模型�
 prompts_dir = "prompts"          # 模板根目录,模板文件为 <name>.md
 artifacts_dir = "artifacts"      # runs/ 与节点缓存的根
 llm_cache_dir = "artifacts/_llm" # L1 LLM 载荷；须与 LLMCaller.cache_dir 一致
-source_dirs = ["nodes", "lib"]   # 两个用途:helper 源码哈希 + 守卫扫描
+source_dirs = ["nodes", "lib"]   # 目录或 .py 文件;用于 helper 源码哈希 + 守卫扫描
 env_file = ".env"                # KIGUMI_MODEL_DEFAULT / KIGUMI_MODEL_PRO / api key
 agent_slots = 1                  # 外部 Agent 默认全局串行
 agent_lock_dir = "artifacts/_locks/agents"
@@ -134,7 +134,7 @@ positional-only 时都以 2 退出并指名问题所在，完整规则见
 | `KIGUMI_LIVE` | pytest 插件；必须精确等于 `"1"` | 其他值或缺席时自动 skip `live` 测试。 |
 | `KIGUMI_REQUEST_LOCK_DIR` | `FileSlots.from_env()`；去空白后的 lock 目录 | 默认 prefix 下的名称；空值使 limiter 不具备 lock root。 |
 | `KIGUMI_REQUEST_CAPACITY_FILE` | `FileSlots.from_env()`；去空白后的容量文件 | 可选；设置后动态限制有效 slots。 |
-| `KIGUMI_REQUEST_SLOTS` | `FileSlots.from_env()`；整数 | 缺席或无法解析时为 `0`；只有 lock dir 存在且 slots 至少为 1 才启用。 |
+| `KIGUMI_REQUEST_SLOTS` | `FileSlots.from_env()`；整数 | 缺席时为 `0`；已设置但无法解析时以带变量名的配置错误失败；只有 lock dir 存在且 slots 至少为 1 才启用。 |
 | `KIGUMI_WORKSPACE` | `PiRpcAdapter` 注入 Pi 子进程；staged workspace 绝对路径 | Kigumi/Pi Extension 协议值，不是用户配置入口。 |
 | `KIGUMI_ALLOWED_TOOLS` | `PiRpcAdapter` 注入；逗号连接的 `AgentSpec.tools` | Extension 据此限制已声明工具。 |
 | `KIGUMI_MAX_TOOL_CALLS` | `PiRpcAdapter` 注入；`AgentLimits.max_tool_calls` 的十进制文本 | Extension 的工具调用上限。 |
@@ -1195,7 +1195,7 @@ helper 循环。
 | 需要检查 | 使用 | 检查范围 |
 | --- | --- | --- |
 | 一段源码中的循环裸 LLM 调用 | `check_source(text, path)` | `for`/`while`/`async for` 与四种推导式下的 `.call()`/`.llm()` |
-| 配置的整个源码目录中的循环裸 LLM 调用 | `check_paths(source_dirs)` | 递归 `*.py`；不存在的目录跳过 |
+| 配置的 source_dirs 中的循环裸 LLM 调用 | `check_paths(source_dirs)` | 目录递归 `*.py`，单个 `.py` 文件直扫；缺失或无效路径报错 |
 | 一个模块中带装饰器的节点直接读文件 | `check_raw_io_node_source(text, path)` | 以顶层 `node`/`map`/`scan`/`foreach`/`agent` 函数为入口递归检查可达 helper/lambda 及其默认参数 |
 | 配置的整个源码目录中的节点直接读文件 | `check_raw_io_node_paths(source_dirs)` | 上一行的项目级版本 |
 | 注册环已经拿到的单个节点函数体 | `check_raw_io_source(text, path, context_name="ctx")` | 以节点体为入口递归检查可达 helper/lambda 及其默认参数；`context_name` 是实际上下文参数名 |

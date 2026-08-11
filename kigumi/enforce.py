@@ -285,12 +285,18 @@ def check_source(text: str, path: Path) -> list[Finding]:
 
 
 def check_paths(source_dirs: list[Path]) -> list[Finding]:
-    """Recursively check Python files in supplied directories, skipping absent paths."""
+    """Check Python files in supplied directories or individual ``.py`` files."""
     findings: list[Finding] = []
-    for source_dir in source_dirs:
-        if not source_dir.is_dir():
-            continue
-        for path in sorted(source_dir.rglob("*.py")):
+    for source_path in source_dirs:
+        if source_path.is_dir():
+            paths = sorted(source_path.rglob("*.py"))
+        elif source_path.is_file() and source_path.suffix == ".py":
+            paths = [source_path]
+        else:
+            raise ValueError(
+                f"Source path must be an existing directory or .py file: {source_path}"
+            )
+        for path in paths:
             findings.extend(check_source(path.read_text(encoding="utf-8"), path))
     return findings
 

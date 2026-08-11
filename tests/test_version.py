@@ -71,15 +71,17 @@ def test_latest_changelog_release_matches_package_version() -> None:
     assert releases[0] == __version__, "the newest dated release must be the package version"
 
 
-def test_release_candidate_identity_is_explicit_and_unreleased_stays_empty() -> None:
+def test_release_candidate_identity_is_explicit_and_unreleased_is_documented() -> None:
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert __version__ == EXPECTED_RELEASE_VERSION
-    assert re.search(
-        rf"^## \[Unreleased\]\n\n## \[{re.escape(EXPECTED_RELEASE_VERSION)}\] - "
+    match = re.search(
+        rf"^## \[Unreleased\]\n(?P<unreleased>.*?)^## \[{re.escape(EXPECTED_RELEASE_VERSION)}\] - "
         rf"{re.escape(EXPECTED_RELEASE_DATE)}$",
         changelog,
-        re.MULTILINE,
-    ), "the release candidate must have a dated section immediately after an empty Unreleased shell"
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, "the release candidate must follow the Unreleased section"
+    assert match.group("unreleased").strip(), "the Unreleased section must document pending changes"
 
 
 def test_revised_contracts_are_indexed_as_0_13() -> None:
