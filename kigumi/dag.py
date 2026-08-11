@@ -8713,6 +8713,62 @@ class _StaticLibsAnalyzer:
                     )
                 )
 
+    @staticmethod
+    def _runtime_global_names(
+        globals_map: Mapping[Any, Any] | None,
+        referenced_names: set[str],
+        all_globals_observable: bool,
+    ) -> tuple[list[str], bool]:
+        """Select safe global bindings and report namespace-level uncertainty."""
+        if globals_map is None:
+            return [], True
+
+        safe_global_names: set[str] = set()
+        uncacheable = False
+        for name in globals_map:
+            if len(safe_global_names) >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
+                uncacheable = True
+                break
+            if type(name) is str:
+                safe_global_names.add(name)
+            else:
+                uncacheable = True
+        if len(safe_global_names) != len(globals_map):
+            uncacheable = True
+        if all_globals_observable:
+            uncacheable = True
+            selected_names = sorted(safe_global_names)
+        else:
+            selected_names = sorted(referenced_names & safe_global_names)
+        return selected_names, uncacheable
+
+    def _runtime_global_material(
+        self,
+        scope: str,
+        binding: str,
+        value: Any,
+        traversal: _RuntimeTraversalContext,
+        state_context: _RuntimeStateContext,
+        all_globals_observable: bool,
+    ) -> tuple[Any | None, bool, set[_RuntimeModuleRecord]]:
+        """Materialize one global and retain conservative provenance decisions."""
+        runtime_records = self._runtime_module_records(scope, binding, value, traversal)
+        has_configured_provenance = any(record[3] or record[4] for record in runtime_records)
+        material = _transactional_runtime_state_material(value, state_context)
+        uncacheable = False
+        if material is _UNREPRESENTABLE_RUNTIME_STATE:
+            if _is_pydantic_model_class(value):
+                material = _pydantic_model_runtime_material(value)
+            elif has_configured_provenance or all_globals_observable:
+                uncacheable = True
+                material = {
+                    "type": "unrepresentable",
+                    "class": _runtime_type_identity(type(value)),
+                }
+            else:
+                material = None
+        return material, uncacheable, runtime_records
+
     def _collect_callable_globals(
         self,
         binding: str,
@@ -8741,47 +8797,27 @@ class _StaticLibsAnalyzer:
         if referenced_overflow[0]:
             uncacheable[0] = True
         all_globals_observable = _function_observes_all_globals(function)
-        safe_global_names: set[str] = set()
-        for name in globals_map:
-            if len(safe_global_names) >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
-                uncacheable[0] = True
-                break
-            if type(name) is str:
-                safe_global_names.add(name)
-            else:
-                uncacheable[0] = True
-        if len(safe_global_names) != len(globals_map):
-            uncacheable[0] = True
-        if all_globals_observable:
-            uncacheable[0] = True
-            selected_names = sorted(safe_global_names)
-        else:
-            selected_names = sorted(referenced_names & safe_global_names)
+        selected_names, names_uncacheable = self._runtime_global_names(
+            globals_map,
+            referenced_names,
+            all_globals_observable,
+        )
+        uncacheable[0] = uncacheable[0] or names_uncacheable
         for name in selected_names:
             if traversal.overflow:
                 uncacheable[0] = True
                 break
             value = globals_map[name]
-            runtime_records = self._runtime_module_records(
+            material, value_uncacheable, runtime_records = self._runtime_global_material(
                 "callable-global",
                 f"{binding}:{name}",
                 value,
                 traversal,
+                state_context,
+                all_globals_observable,
             )
             records.update(runtime_records)
-            has_configured_provenance = any(record[3] or record[4] for record in runtime_records)
-            material = _transactional_runtime_state_material(value, state_context)
-            if material is _UNREPRESENTABLE_RUNTIME_STATE:
-                if _is_pydantic_model_class(value):
-                    material = _pydantic_model_runtime_material(value)
-                elif has_configured_provenance or all_globals_observable:
-                    uncacheable[0] = True
-                    material = {
-                        "type": "unrepresentable",
-                        "class": _runtime_type_identity(type(value)),
-                    }
-                else:
-                    material = None
+            uncacheable[0] = uncacheable[0] or value_uncacheable
             if material is not None:
                 global_values.append((f"{binding}:{name}", material))
             nested_callables = self._runtime_nested_callables(value, traversal, depth + 1)
@@ -8922,52 +8958,28 @@ class _StaticLibsAnalyzer:
         if referenced_overflow[0]:
             uncacheable[0] = True
         all_globals_observable = _function_observes_all_globals(function)
-        if globals_map is None:
-            uncacheable[0] = True
-        else:
-            safe_global_names: set[str] = set()
-            for name in globals_map:
-                if len(safe_global_names) >= _RUNTIME_PROVENANCE_MAX_MEMBERS:
-                    uncacheable[0] = True
-                    break
-                if type(name) is str:
-                    safe_global_names.add(name)
-                else:
-                    uncacheable[0] = True
-            if len(safe_global_names) != len(globals_map):
-                uncacheable[0] = True
-            if all_globals_observable:
-                uncacheable[0] = True
-                selected_names = sorted(safe_global_names)
-            else:
-                selected_names = sorted(referenced_globals & safe_global_names)
+        selected_names, names_uncacheable = self._runtime_global_names(
+            globals_map,
+            referenced_globals,
+            all_globals_observable,
+        )
+        uncacheable[0] = uncacheable[0] or names_uncacheable
+        if globals_map is not None:
             for binding_name in selected_names:
                 if traversal.overflow:
                     uncacheable[0] = True
                     break
                 value = globals_map[binding_name]
-                runtime_records = self._runtime_module_records(
+                value_material, value_uncacheable, runtime_records = self._runtime_global_material(
                     "global",
                     binding_name,
                     value,
                     traversal,
+                    state_context,
+                    all_globals_observable,
                 )
                 records.update(runtime_records)
-                has_configured_provenance = any(
-                    record[3] or record[4] for record in runtime_records
-                )
-                value_material = _transactional_runtime_state_material(value, state_context)
-                if value_material is _UNREPRESENTABLE_RUNTIME_STATE:
-                    if _is_pydantic_model_class(value):
-                        value_material = _pydantic_model_runtime_material(value)
-                    elif has_configured_provenance or all_globals_observable:
-                        uncacheable[0] = True
-                        value_material = {
-                            "type": "unrepresentable",
-                            "class": _runtime_type_identity(type(value)),
-                        }
-                    else:
-                        value_material = None
+                uncacheable[0] = uncacheable[0] or value_uncacheable
                 if value_material is not None:
                     global_values.append((binding_name, value_material))
                 nested_callables = self._runtime_nested_callables(value, traversal, 1)
