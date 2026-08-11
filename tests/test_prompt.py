@@ -80,6 +80,48 @@ def test_managed_prompt_record_is_accepted_when_complete() -> None:
     validate_prompt_resolution_record(record)
 
 
+@pytest.mark.parametrize(
+    ("schema", "guidance"),
+    (
+        (0, "older than supported schema 1; no migration available — rebuild required"),
+        (2, "newer than supported schema 1; upgrade kigumi"),
+    ),
+)
+def test_persisted_prompt_resolution_schema_mismatch_reports_versions_and_guidance(
+    schema: int, guidance: str
+) -> None:
+    record = _managed_record([], [], ResponseSpec())
+    record["prompt_resolution_schema"] = schema
+
+    with pytest.raises(PromptResolutionError) as error:
+        validate_prompt_resolution_record(record)
+
+    assert str(error.value) == f"persisted Prompt resolution schema {schema} is {guidance}"
+
+
+def test_prompt_resolution_migration_registry_dispatches_and_preserves_record_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _managed_record(
+        [Message(role="user", parts=["hello"])],
+        [],
+        ResponseSpec(),
+    )
+    legacy_record = {**record, "prompt_resolution_schema": 0}
+    seen: list[dict[str, Any]] = []
+
+    def migrate(value: dict[str, Any]) -> dict[str, Any]:
+        seen.append(dict(value))
+        return {"prompt_resolution_schema": prompt_module.PROMPT_RESOLUTION_SCHEMA}
+
+    monkeypatch.setitem(prompt_module.PROMPT_RESOLUTION_MIGRATIONS, 0, migrate)
+
+    validate_prompt_resolution_record(legacy_record)
+
+    assert seen == [legacy_record]
+    assert legacy_record == {**record, "prompt_resolution_schema": 0}
+
+
 def test_prompt_resolution_lineage_inputs_are_deeply_immutable() -> None:
     nested_part = {"type": "text", "metadata": {"labels": ["source"]}}
     message = Message(role="user", parts=[nested_part])
@@ -147,6 +189,32 @@ def test_prompt_resolution_constructor_requires_native_schema_one(schema: object
             rendered_bytes=8,
             schema=schema,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.parametrize(
+    ("schema", "guidance"),
+    (
+        (0, "older than supported schema 1; no migration available — rebuild required"),
+        (2, "newer than supported schema 1; upgrade kigumi"),
+    ),
+)
+def test_prompt_resolution_constructor_schema_mismatch_reports_versions_and_guidance(
+    schema: int, guidance: str
+) -> None:
+    with pytest.raises(PromptResolutionError) as error:
+        PromptResolution(
+            spec_name="managed",
+            structure_digest="structure",
+            base={},
+            layers=(),
+            axes=(),
+            materials=(),
+            rendered_sha256="rendered",
+            rendered_bytes=8,
+            schema=schema,
+        )
+
+    assert str(error.value) == f"persisted Prompt resolution schema {schema} is {guidance}"
 
 
 def test_managed_prompt_record_requires_all_request_fields_before_digest_validation() -> None:

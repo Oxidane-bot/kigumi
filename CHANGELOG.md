@@ -4,15 +4,10 @@
 
 ## [Unreleased]
 
-### 新增
-
-- `Dag.run()` 与 `Dag.resume()` 新增 `resource_timeout_seconds`，可限制节点等待运行资源的时间；默认值 `None` 保持无限等待。
-- `FileSlots.acquire_key()` 与 `LLMCaller(key_lock_timeout_seconds=...)` 支持有界 key lock 等待，超时抛出 `SlotTimeoutError`；默认行为不变。
-- `resource_limits` 接受 `0` 表示禁用资源池；需求该资源的节点会在执行前带资源名确定性失败，未使用该资源的节点不受影响。
-
 ### 修复
 
 - 配置加载现在会拒绝形状非法的 `source_dirs`，守卫扫描支持单个 `.py` 文件并会对缺失或无效路径报错；`FileSlots.from_env()` 对已设置但无法解析的 `KIGUMI_REQUEST_SLOTS` 也会以带变量名的配置错误失败。
+- Prompt resolution 持久化 schema 不匹配时现在报告持久化版本、当前支持版本和可操作指引：无可用迁移的旧版本要求 rebuild，新版本要求 upgrade kigumi；增加了后续迁移用的空注册表与分发骨架。schema-1 字段、canonical 字节和缓存键保持不变。
 
 ### 兼容性
 

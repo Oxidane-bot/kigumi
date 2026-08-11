@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -36,6 +36,9 @@ _SLOT_PATTERN = re.compile(r"{{([a-z_][a-z0-9_]*)}}")
 _NAME_PATTERN = re.compile(r"[a-z_][a-z0-9_]*")
 _SENTENCE_BOUNDARY = re.compile(r"[。！？.!?]")
 PROMPT_RESOLUTION_SCHEMA = 1
+PromptResolutionRecord = dict[str, Any]
+PromptResolutionMigration = Callable[[PromptResolutionRecord], PromptResolutionRecord]
+PROMPT_RESOLUTION_MIGRATIONS: dict[int, PromptResolutionMigration] = {}
 _ORIGINAL_OS_OPEN = os.open
 
 
@@ -138,6 +141,46 @@ class PromptDefinitionError(ValueError):
 
 class PromptResolutionError(ValueError):
     """Raised when runtime facts cannot deterministically resolve a Prompt declaration."""
+
+
+def _prompt_resolution_schema_mismatch(schema: int) -> PromptResolutionError:
+    if schema < PROMPT_RESOLUTION_SCHEMA:
+        return PromptResolutionError(
+            f"persisted Prompt resolution schema {schema} is older than supported schema "
+            f"{PROMPT_RESOLUTION_SCHEMA}; no migration available — rebuild required"
+        )
+    return PromptResolutionError(
+        f"persisted Prompt resolution schema {schema} is newer than supported schema "
+        f"{PROMPT_RESOLUTION_SCHEMA}; upgrade kigumi"
+    )
+
+
+def _dispatch_prompt_resolution_migration(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Apply one registered persisted-record migration while retaining untouched fields."""
+    schema = value["prompt_resolution_schema"]
+    if schema == PROMPT_RESOLUTION_SCHEMA:
+        return value
+
+    migration = PROMPT_RESOLUTION_MIGRATIONS.get(schema)
+    if migration is None:
+        raise _prompt_resolution_schema_mismatch(schema)
+    try:
+        migrated = migration(dict(value))
+    except PromptResolutionError:
+        raise
+    except Exception as error:
+        raise PromptResolutionError(
+            f"persisted Prompt resolution schema {schema} migration failed"
+        ) from error
+    if not isinstance(migrated, Mapping):
+        raise PromptResolutionError(
+            f"persisted Prompt resolution schema {schema} migration returned invalid record"
+        )
+
+    migrated_record = dict(value)
+    migrated_record.update(migrated)
+    migrated_record["prompt_resolution_schema"] = PROMPT_RESOLUTION_SCHEMA
+    return migrated_record
 
 
 @dataclass(frozen=True)
@@ -785,12 +828,10 @@ def validate_prompt_resolution_record(value: Any) -> None:
         schema = value["prompt_resolution_schema"]
     except (KeyError, TypeError) as error:
         raise PromptResolutionError("persisted Prompt resolution has invalid schema") from error
-    if (
-        isinstance(schema, bool)
-        or not isinstance(schema, int)
-        or schema != PROMPT_RESOLUTION_SCHEMA
-    ):
+    if isinstance(schema, bool) or not isinstance(schema, int):
         raise PromptResolutionError("persisted Prompt resolution has invalid schema")
+    value = _dispatch_prompt_resolution_migration(value)
+    schema = value["prompt_resolution_schema"]
     if any(not isinstance(field, str) for field in value):
         raise PromptResolutionError("persisted Prompt resolution has invalid schema fields")
     required_fields = {
@@ -970,8 +1011,10 @@ class PromptResolution:
     response_spec: ResponseSpec = field(default_factory=ResponseSpec)
 
     def __post_init__(self) -> None:
-        if type(self.schema) is not int or self.schema != PROMPT_RESOLUTION_SCHEMA:
+        if type(self.schema) is not int:
             raise PromptResolutionError("unsupported prompt resolution schema")
+        if self.schema != PROMPT_RESOLUTION_SCHEMA:
+            raise _prompt_resolution_schema_mismatch(self.schema)
         object.__setattr__(self, "base", _freeze_value(dict(self.base)))
         object.__setattr__(
             self,
