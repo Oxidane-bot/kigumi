@@ -14,8 +14,8 @@ import pytest
 from kigumi import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_RELEASE_VERSION = "0.13.0"
-EXPECTED_RELEASE_DATE = "2026-08-04"
+EXPECTED_RELEASE_VERSION = "0.13.1"
+EXPECTED_RELEASE_DATE = "2026-08-12"
 RELEASE_HEADING_PATTERN = re.compile(
     r"^## \[(?P<version>\d+\.\d+\.\d+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?$",
     re.MULTILINE,
@@ -85,14 +85,16 @@ def test_release_candidate_identity_is_explicit_and_unreleased_records_changes()
 
 
 def test_revised_contracts_are_indexed_as_0_13() -> None:
+    """Contracts were established in 0.13.0 and remain active across 0.13.x."""
+    CONTRACTS_VERSION = "0.13.0"
     index = (ROOT / "docs" / "contracts" / "README.md").read_text(encoding="utf-8")
     for filename in ("guards.md", "retry-resume.md", "prompt-resolution.md"):
         document = (ROOT / "docs" / "contracts" / filename).read_text(encoding="utf-8")
         status = re.search(r"^Status: (Active \(\d+\.\d+\.\d+\))$", document, re.MULTILINE)
         assert status is not None
-        assert status.group(1) == f"Active ({EXPECTED_RELEASE_VERSION})"
+        assert status.group(1) == f"Active ({CONTRACTS_VERSION})"
         assert re.search(
-            rf"\]\({re.escape(filename)}\) \| Active \({re.escape(EXPECTED_RELEASE_VERSION)}\) \|",
+            rf"\]\({re.escape(filename)}\) \| Active \({re.escape(CONTRACTS_VERSION)}\) \|",
             index,
         ), f"{filename} must be indexed with its 0.13.0 revision"
 
