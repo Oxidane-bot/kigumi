@@ -549,6 +549,83 @@ def test_inflight_same_key_calls_transport_once(tmp_path: Path) -> None:
     assert len(caller.transport.requests) == 1
 
 
+def test_single_flight_lock_cleanup_after_completion(tmp_path: Path) -> None:
+    """完成的 single-flight 锁在成功和异常路径都应被释放。"""
+    caller = LLMCaller(FakeTransport(), tmp_path / "success")
+
+    assert caller.call("hello") == "answer"
+    assert caller._key_locks == {}
+
+    class FailingTransport(FakeTransport):
+        def complete(self, messages, model, **params):
+            del messages, model, params
+            raise RuntimeError("provider failed")
+
+    failing = LLMCaller(FailingTransport(), tmp_path / "failure")
+    with pytest.raises(ProviderFailure):
+        failing.call("hello")
+    assert failing._key_locks == {}
+
+    for index in range(16):
+        assert caller.call(f"request-{index}") == "answer"
+    assert caller._key_locks == {}
+
+
+def test_inflight_failure_is_shared_and_lock_is_cleaned(tmp_path: Path) -> None:
+    """同键等待者共享首个异常，最后一个等待者退出后清理锁。"""
+    start = threading.Barrier(3)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    class BlockingFailingTransport(FakeTransport):
+        def complete(self, messages, model, **params):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            entered.set()
+            assert release.wait(timeout=2)
+            del messages, model, params
+            raise RuntimeError("provider failed")
+
+    caller = LLMCaller(BlockingFailingTransport(), tmp_path)
+    failures: list[ProviderFailure] = []
+
+    def invoke() -> None:
+        start.wait()
+        with pytest.raises(ProviderFailure) as raised:
+            caller.call("hello")
+        failures.append(raised.value)
+
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    first.start()
+    second.start()
+    start.wait()
+    assert entered.wait(timeout=2)
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with caller._key_locks_lock:
+            lock = next(iter(caller._key_locks.values()), None)
+            if lock is not None and lock.waiters == 2:
+                break
+        time.sleep(0.01)
+    else:
+        pytest.fail("second caller did not join the in-flight single-flight lock")
+
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(failures) == 2
+    assert calls == 1
+    assert caller._key_locks == {}
+
+
 def test_cross_process_same_key_calls_provider_once(tmp_path: Path) -> None:
     """教训 cross_process_single_flight: 同一 L1 键跨进程只允许一次穿透。"""
     script = tmp_path / "caller_worker.py"

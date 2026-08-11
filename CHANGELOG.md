@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 修复 single-flight 锁在调用完成后未释放的内存泄漏（#20）
+
 ### 兼容性
 
 - 本次不改变缓存键成分或缓存族；合法 `source_dirs` 的 `source_paths` 结果保持不变。
