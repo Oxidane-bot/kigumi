@@ -6997,13 +6997,15 @@ def _tree_observes_all_globals(
     return visitor.found or reached_overflow
 
 
-def _function_uses_module_identity(
+def _inspect_function_tree(
     function: Callable[..., Any],
     seen_functions: set[int] | None = None,
     call_budget: _CallGraphBudget | None = None,
     call_depth: int = 0,
+    *,
+    evaluator: Callable[..., bool],
 ) -> bool:
-    """Inspect the called Python-function graph for owner identity observation."""
+    """Parse one function source and evaluate its static-analysis tree."""
     if seen_functions is None:
         seen_functions = set()
     if call_budget is None:
@@ -7019,12 +7021,22 @@ def _function_uses_module_identity(
         tree = ast.parse(source)
     except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
         return True
-    return _tree_uses_module_identity(
-        tree,
+    return evaluator(tree, function, seen_functions, call_budget, call_depth)
+
+
+def _function_uses_module_identity(
+    function: Callable[..., Any],
+    seen_functions: set[int] | None = None,
+    call_budget: _CallGraphBudget | None = None,
+    call_depth: int = 0,
+) -> bool:
+    """Inspect the called Python-function graph for owner identity observation."""
+    return _inspect_function_tree(
         function,
         seen_functions,
         call_budget,
         call_depth,
+        evaluator=_tree_uses_module_identity,
     )
 
 
@@ -7035,27 +7047,12 @@ def _function_observes_all_globals(
     call_depth: int = 0,
 ) -> bool:
     """Decide whether the called Python-function graph can inspect all globals."""
-    if seen_functions is None:
-        seen_functions = set()
-    if call_budget is None:
-        call_budget = _CallGraphBudget(seen_functions)
-    target = function.__func__ if _is_method(function) else function
-    identity = id(target)
-    if identity in seen_functions:
-        return False
-    if not call_budget.enter(target, call_depth):
-        return True
-    try:
-        source = textwrap.dedent(inspect.getsource(function))
-        tree = ast.parse(source)
-    except (OSError, SyntaxError, TypeError, ValueError, RecursionError):
-        return True
-    return _tree_observes_all_globals(
-        tree,
+    return _inspect_function_tree(
         function,
         seen_functions,
         call_budget,
         call_depth,
+        evaluator=_tree_observes_all_globals,
     )
 
 
@@ -9196,11 +9193,14 @@ class _StaticLibsAnalyzer:
         importer_module_name: str,
         binding_name: str | None,
         bound_module_name: str | None = None,
+        *,
+        resolver: Callable[[tuple[str, ...]], _ImportResolution] | None = None,
     ) -> bool:
         """Validate every loaded configured module prefix of a dotted import."""
+        resolve_prefix = self._resolve_absolute if resolver is None else resolver
         for index in range(1, len(parts) + 1):
             prefix_parts = parts[:index]
-            resolution = self._resolve_absolute(prefix_parts)
+            resolution = resolve_prefix(prefix_parts)
             if resolution.ambiguous:
                 return False
             if not resolution.paths and self._loaded_prefix_reaches_source(prefix_parts):
@@ -9446,32 +9446,25 @@ class _StaticLibsAnalyzer:
         roots: Iterable[Path] = (),
     ) -> bool:
         """Validate loaded modules against relative targets for every qualified prefix."""
-        for index in range(1, len(identity_parts) + 1):
+
+        def resolve_prefix(prefix_parts: tuple[str, ...]) -> _ImportResolution:
             prefix_filesystem_parts = self._relative_filesystem_prefix(
                 identity_parts,
                 package_length,
                 filesystem_package_parts,
-                index,
+                len(prefix_parts),
             )
             if prefix_filesystem_parts is None:
-                return False
-            resolution = self._resolve_relative_target(
-                identity_parts[:index], prefix_filesystem_parts, roots
-            )
-            if resolution.ambiguous:
-                return False
-            if not resolution.paths and self._loaded_prefix_reaches_source(identity_parts[:index]):
-                return False
-            if resolution.paths and self._loaded_module_mismatch(
-                (".".join(identity_parts[:index]),),
-                resolution,
-                importer_module_name=importer_module_name,
-                binding_name=binding_name,
-                bound_module_name=bound_module_name,
-                require_loaded=True,
-            ):
-                return False
-        return True
+                return _ImportResolution(ambiguous=True)
+            return self._resolve_relative_target(prefix_parts, prefix_filesystem_parts, roots)
+
+        return self._validate_loaded_prefixes(
+            identity_parts,
+            importer_module_name,
+            binding_name,
+            bound_module_name,
+            resolver=resolve_prefix,
+        )
 
     def _relative_package_context(
         self, importer: Path, importer_module_name: str
