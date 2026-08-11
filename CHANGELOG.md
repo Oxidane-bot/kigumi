@@ -4,16 +4,15 @@
 
 ## [Unreleased]
 
-### 修复
-
-- 配置加载现在会拒绝形状非法的 `source_dirs`，守卫扫描支持单个 `.py` 文件并会对缺失或无效路径报错；`FileSlots.from_env()` 对已设置但无法解析的 `KIGUMI_REQUEST_SLOTS` 也会以带变量名的配置错误失败。
-- Prompt resolution 持久化 schema 不匹配时现在报告持久化版本、当前支持版本和可操作指引：无可用迁移的旧版本要求 rebuild，新版本要求 upgrade kigumi；增加了后续迁移用的空注册表与分发骨架。schema-1 字段、canonical 字节和缓存键保持不变。
-- Agent 未知运行时失败现在保留异常类型名与消息 SHA-256 摘要；Pi 的 thinking/reasoning 拒绝诊断补充
-  provider 与 model，失败记录仍不保存明文消息或凭据。
-
 ### 兼容性
 
 - 本次不改变缓存键成分或缓存族；合法 `source_dirs` 的 `source_paths` 结果保持不变。
+
+### 文档
+
+- 对齐缓存键与附件说明：每个节点的 `libs` 只覆盖静态可达 import 闭包，`source_dirs` 中不可达的源码
+  不进入该节点身份；附件内容哈希进入缓存键，因此不必手动核对内容哈希，但 `files=` 声明与实际
+  attach 路径的一致性不由框架强制，仍由调用方负责。
 
 ## [0.13.0] - 2026-08-04
 
@@ -204,8 +203,8 @@
   只按输出额度计算,输入 token 不设防。
 - 副作用边界改按 executor 类型安装,不再要求节点声明 `retry`:此前未声明重试策略的节点
   在付费调用后崩溃不会留下 `side_effect_started`,恢复时会误判为「未产生副作用」。
-- 附件一致性由框架保证:附件哈希进提示摘要,消费者不必再手动核对「已声明」与「已发送」
-  的附件是否一致。
+- 附件内容哈希进入提示摘要和缓存键,发送前会复核哈希,因此消费者不必再手动核对附件内容哈希；但
+  框架不强制校验 `files=` 声明与实际发送的附件路径是否一致,这项声明核对仍由调用方负责。
 - 损坏与缺失现被区分:损坏的 attempt 状态抛 `StateIntegrityError`,损坏的缓存条目按
   `CORRUPT` 上报而非静默当作 miss 重新调用供应商。新增 `CacheLookup` 三态读取结果与
   `CacheIntegrityError`。

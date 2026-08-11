@@ -37,9 +37,10 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 3. `items_from` 与 scan 的 `carry_from` 源不入共享 `upstream`；`item` 按内容入键；`carry` 只按
    本项实收内容入键，`carry_fn` 源码不入键。消费投影的源码同样不入键；节点函数收到 canonical
    JSON round-trip 后的投影视图而非完整上游产物，未声明投影的依赖输入形态不变。
-4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 管理的源码宇宙严格是
-   `config.source_paths`，只纳入从节点函数所属模块出发、在其中由静态 import 图可达的文件，并
-   按传递闭包计算。项目根下未列入配置源码路径的 imported helper 不进入 `libs`；独立的 `source`
+4. `source` 与 `libs` 都按剥除 docstring/注释后的 AST 哈希；`libs` 不覆盖 `source_dirs` 下所有
+   源码，而是对每个节点只纳入从节点函数所属模块出发、由静态 import 图可达的
+   `config.source_paths` 文件，并按传递闭包计算。`source_dirs` 中对该节点不可达的文件不进入该节点的
+   `libs` 身份；项目根下未列入配置源码路径的 imported helper 不进入 `libs`；独立的 `source`
    成分只覆盖注册节点函数本身，其他外部输入必须加入 `source_dirs` 或声明显式指纹。
    静态分析只接受模块顶层、无歧义的 import；配置源码快照中任一文件语法残破、节点模块
    无法定位或读取、可达模块无法解析，或发现条件/嵌套 import、`importlib` 及其子模块/动态导入调用、
