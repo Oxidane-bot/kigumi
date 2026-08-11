@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-12
+
 ### 新增
 
 - `Dag.run()` 与 `Dag.resume()` 新增 `resource_timeout_seconds`，可限制节点等待运行资源的时间；默认值 `None` 保持无限等待。
