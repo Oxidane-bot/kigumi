@@ -5713,7 +5713,8 @@ def test_registration_rejects_globals_in_reached_class_body(tmp_path: Path) -> N
     try:
         config = KigumiConfig(project_root=tmp_path, source_dirs=[])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        _assert_registration_rejected(dag, module.run)
+        with pytest.warns(GuardUnknownWarning, match="raw-io.opaque-call"):
+            _assert_registration_rejected(dag, module.run)
     finally:
         sys.modules.pop(node_name, None)
 
