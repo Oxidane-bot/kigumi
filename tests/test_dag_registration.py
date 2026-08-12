@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from kigumi.enforce import GuardUnknownWarning
 from tests._dag_helpers import _make_dag
+
+
+class Formatter:
+    def call(self, value: Any) -> Any:
+        return value
 
 
 def test_registration_duplicate_unknown_dependency_and_cycle_are_rejected(tmp_path: Path) -> None:
@@ -124,10 +131,13 @@ def test_registration_rejects_raw_io_waiver_without_a_reason(tmp_path: Path) -> 
 
 
 def test_registration_hard_fails_dynamic_callables_and_their_aliases(tmp_path: Path) -> None:
-    """注册入口必须执行动态解析硬切，而不是只依赖独立 AST 测试。"""
+    """注册入口拒绝已证明动态执行，同时把 getattr 不确定性单独告警。"""
     dag = _make_dag(tmp_path)
 
-    with pytest.raises(ValueError) as caught:
+    with (
+        pytest.warns(GuardUnknownWarning, match="raw-io.dynamic-call"),
+        pytest.raises(ValueError) as caught,
+    ):
 
         @dag.node("dynamic-callables")
         def dynamic_callables(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
@@ -161,8 +171,6 @@ def test_registration_hard_fails_dynamic_callables_and_their_aliases(tmp_path: P
         "globals_alias()",
         "locals()",
         "locals_alias()",
-        "getattr(Path, method_name)",
-        'getattr_alias(Path, "read_text")',
         'eval("1")',
         'eval_alias("1")',
         'exec("pass")',
@@ -184,7 +192,7 @@ def test_registration_hard_fails_raw_io_fact_propagation_escapes(tmp_path: Path)
             readers = [open]
             return {"text": readers[0]("secret.txt")}
 
-    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+    with pytest.warns(GuardUnknownWarning, match="raw-io.opaque-call"):
 
         @dag.node("builtin-import-chain")
         def builtin_import_chain(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
@@ -334,36 +342,30 @@ def test_registration_allows_context_bound_reads(tmp_path: Path) -> None:
     assert context_reads.__name__ == "context_reads"
 
 
-def test_registration_rejects_every_direct_context_getattr_form(tmp_path: Path) -> None:
-    """getattr 的结果即使不立即调用，也不能绕过节点边界。"""
+def test_registration_only_rejects_executed_literal_context_read_getattr(tmp_path: Path) -> None:
+    """literal probe 不产生 finding；只有执行 read_text callable 才是 ERROR。"""
     dag = _make_dag(tmp_path)
 
-    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+    @dag.node("literal-context-reader-assignment")
+    def literal_context_reader_assignment(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        reader = getattr(ctx, "read_text")  # noqa: B009 -- non-executed probe.
+        return {"reader": reader}
 
-        @dag.node("dynamic-context-reader-assignment")
-        def dynamic_context_reader_assignment(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
-            del inputs
-            reader = getattr(ctx, "read_text")  # noqa: B009 -- hard-cut regression probe.
-            return {"reader": reader}
+    @dag.node("literal-context-reader-return")
+    def literal_context_reader_return(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        return {"reader": getattr(ctx, "read_text")}  # noqa: B009
 
-    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
-
-        @dag.node("dynamic-context-reader-return")
-        def dynamic_context_reader_return(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
-            del inputs
-            return {"reader": getattr(ctx, "read_text")}  # noqa: B009
-
-    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
-
-        @dag.node("dynamic-context-params")
-        def dynamic_context_params(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
-            del inputs
-            return {"params": getattr(ctx, "params")}  # noqa: B009
+    @dag.node("literal-context-params")
+    def literal_context_params(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs
+        return {"params": getattr(ctx, "params")}  # noqa: B009
 
     with pytest.raises(ValueError, match="Raw file reads are not allowed"):
 
-        @dag.node("dynamic-context-reader-call")
-        def dynamic_context_reader_call(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        @dag.node("literal-context-reader-call")
+        def literal_context_reader_call(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
             del inputs
             return {"text": getattr(ctx, "read_text")("input.txt")}  # noqa: B009
 
@@ -418,6 +420,42 @@ def test_node_registration_blocks_loop_calls_and_allows_reasoned_waivers(tmp_pat
         return {"value": "registered"}
 
     assert waived.__name__ == "waived"
+
+
+def test_registration_warns_for_unknown_but_only_rejects_proven_errors(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+
+    with pytest.warns(GuardUnknownWarning, match="raw-llm.loop-call"):
+
+        @dag.node("unknown-method")
+        def unknown_method(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            for value in inputs.values():
+                Formatter().call(value)
+            return {}
+
+    with pytest.warns(GuardUnknownWarning, match="raw-io.dynamic-call"):
+
+        @dag.node("dynamic-getattr")
+        def dynamic_getattr(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            method = inputs["method"]
+            return {"value": getattr(inputs, method)()}
+
+    with pytest.raises(ValueError, match="Raw file reads are not allowed"):
+
+        @dag.node("literal-getattr-read")
+        def literal_getattr_read(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+            return {"value": getattr(Path("secret.txt"), "read_text")()}  # noqa: B009
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+
+        @dag.node("literal-getattr-probe")
+        def literal_getattr_probe(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del ctx
+            return {"value": getattr(inputs, "model_dump", None)}
+
+    assert not [item for item in recorded if issubclass(item.category, GuardUnknownWarning)]
 
 
 def test_foreach_validates_registration_once(tmp_path: Path, monkeypatch: Any) -> None:

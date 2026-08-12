@@ -17,6 +17,13 @@
   `transport.cache_identity()` 与 `PreparedRequest.canonical()`；L3 同步换族，旧缓存首次访问
   将 miss 并可能重新计费。附件 identity 只绑定内容摘要和稳定 MIME/detail 表示，不绑定
   base64 或临时绝对路径，实际发送仍展开为 provider wire 内容。
+- 静态守卫改为最小三值模型：`Finding` / `RawIOFinding` 新增稳定 `rule` 与
+  `GuardVerdict.ERROR` / `GuardVerdict.UNKNOWN`，不再兼容旧构造形状。已证明的
+  `ctx.call` / `ctx.llm` 与 raw read 仍为 `ERROR`；opaque callable、未知 receiver 的
+  `.call` / `.llm` 拼写和动态 `getattr` 为 `UNKNOWN`。非调用 literal `getattr` probe 不再
+  误报，literal `getattr(..., "read_text")()` 仍是 `ERROR`。
+- 注册期只拒绝未豁免 `ERROR`，并用 `GuardUnknownWarning` 显式报告 `UNKNOWN`；pytest
+  守卫与图检查沿用同一 verdict。`raw-llm-ok` / `raw-io-ok` 继续各自要求非空理由且不互代。
 
 ### 新增
 
@@ -27,6 +34,8 @@
   resolved secret 不进入配置字节或 identity；模型可严格声明 `reasoning`、`context_window` 与
   `max_tokens`，并映射到 Pi 的 `reasoning`、`contextWindow`、`maxTokens`。typed providers 与手写
   `extra_config_files["models.json"]` 不能共存，其他 extra 配置文件继续作为 escape hatch。
+- `kigumi guard`、`kigumi check` 与 `dag check` 新增 `--strict-unknown`；默认
+  `UNKNOWN` warning 退出 0，严格模式下退出 1。
 
 ### 修复
 
@@ -42,6 +51,7 @@
 - typed provider 配置没有在上述第 8 缓存族之外引入额外换族：最终仍沿用既有
   `extra_config_files_sha256["models.json"]` 字节摘要身份；typed 与手写配置在最终
   `models.json` 字节完全相同时具有相同 adapter identity。
+- 守卫判定与 finding 数据形状变更不在上述第 8 缓存族之外产生额外换族。
 
 ## [0.13.1] - 2026-08-12
 

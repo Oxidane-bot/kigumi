@@ -13,7 +13,7 @@ from typing import Any
 
 from .artifacts import atomic_write_json, sha
 from .config import KigumiConfig, find_project_root, load_config
-from .enforce import Finding, RawIOFinding, check_paths, check_raw_io_node_paths
+from .enforce import Finding, GuardVerdict, RawIOFinding, check_paths, check_raw_io_node_paths
 from .prompt import render_template, slot_names
 from .transport import PreparedRequest, Response, Transport
 
@@ -311,13 +311,28 @@ def _guard_item(pytest: Any) -> type[Any]:
                 warnings.warn(
                     _waiver_message(raw_io_waived, "raw-io"), pytest.PytestWarning, stacklevel=1
                 )
-            llm_violations = [finding for finding in llm_findings if not finding.waived]
+            unknowns = [
+                finding
+                for finding in [*llm_findings, *raw_io_findings]
+                if not finding.waived and finding.verdict is GuardVerdict.UNKNOWN
+            ]
+            if unknowns:
+                warnings.warn(_unknown_message(unknowns), pytest.PytestWarning, stacklevel=1)
+            llm_violations = [
+                finding
+                for finding in llm_findings
+                if not finding.waived and finding.verdict is GuardVerdict.ERROR
+            ]
             if llm_violations:
                 locations = "\n".join(
                     f"{finding.path}:{finding.lineno}" for finding in llm_violations
                 )
                 raise AssertionError(f"Raw LLM calls inside loops:\n{locations}")
-            raw_io_violations = [finding for finding in raw_io_findings if not finding.waived]
+            raw_io_violations = [
+                finding
+                for finding in raw_io_findings
+                if not finding.waived and finding.verdict is GuardVerdict.ERROR
+            ]
             if raw_io_violations:
                 locations = "\n".join(
                     f"{finding.path}:{finding.lineno}" for finding in raw_io_violations
@@ -356,3 +371,11 @@ def _waiver_message(findings: list[Finding] | list[RawIOFinding], guard: str) ->
         f"{finding.path}:{finding.lineno} ({finding.waiver_reason})" for finding in findings
     )
     return f"kigumi {guard} waivers: {locations}"
+
+
+def _unknown_message(findings: list[Finding | RawIOFinding]) -> str:
+    locations = ", ".join(
+        f"{finding.path}:{finding.lineno} [{finding.rule} {finding.verdict.value}]"
+        for finding in findings
+    )
+    return f"kigumi guard unknowns: {locations}"

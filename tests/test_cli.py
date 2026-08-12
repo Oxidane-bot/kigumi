@@ -683,17 +683,21 @@ def test_guard_reports_violations_waivers_and_new_changed_waivers(
     nodes = root / "nodes"
     nodes.mkdir()
     bad = nodes / "bad.py"
-    bad.write_text("for item in items:\n    client.call([])\n", encoding="utf-8")
+    bad.write_text(
+        "def node(items, ctx):\n    for item in items:\n        ctx.call([])\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(root)
 
     assert main(["guard"]) == 1
-    assert "nodes/bad.py:2" in capsys.readouterr().out
+    assert "nodes/bad.py:3" in capsys.readouterr().out
     bad.write_text(
-        "for item in items:\n    client.call([])  # kigumi: raw-llm-ok fixture tape\n",
+        "def node(items, ctx):\n    for item in items:\n"
+        "        ctx.call([])  # kigumi: raw-llm-ok fixture tape\n",
         encoding="utf-8",
     )
     assert main(["guard"]) == 0
-    assert "waiver nodes/bad.py:2 fixture tape" in capsys.readouterr().out
+    assert "waiver nodes/bad.py:3 fixture tape" in capsys.readouterr().out
     assert main(["guard", "--changed"]) == 2
     assert "git repository" in capsys.readouterr().err
 
@@ -704,29 +708,65 @@ def test_guard_reports_violations_waivers_and_new_changed_waivers(
     _git(root, "add", ".")
     _git(root, "commit", "-m", "clean")
     bad.write_text(
-        "for item in items:\n    client.call([])  # kigumi: raw-llm-ok fixture tape\n",
+        "def node(items, ctx):\n    for item in items:\n"
+        "        ctx.call([])  # kigumi: raw-llm-ok fixture tape\n",
         encoding="utf-8",
     )
 
     assert main(["guard", "--changed"]) == 0
-    assert "new waiver: nodes/bad.py:2 fixture tape" in capsys.readouterr().out
+    assert "new waiver: nodes/bad.py:3 fixture tape" in capsys.readouterr().out
 
     untracked = nodes / "untracked.py"
-    untracked.write_text("for item in items:\n    client.call([])\n", encoding="utf-8")
+    untracked.write_text(
+        "def node(items, ctx):\n    for item in items:\n        ctx.call([])\n",
+        encoding="utf-8",
+    )
     # git diff 看不见未跟踪文件;guard --changed 必须照样抓到。
     assert main(["guard", "--changed"]) == 1
-    assert "nodes/untracked.py:2" in capsys.readouterr().out
+    assert "nodes/untracked.py:3" in capsys.readouterr().out
 
     untracked.unlink()
     _git(root, "add", ".")
     _git(root, "commit", "-m", "waiver committed")
     bad.write_text(
-        "# shifted\nfor item in items:\n    client.call([])  # kigumi: raw-llm-ok fixture tape\n",
+        "# shifted\ndef node(items, ctx):\n    for item in items:\n"
+        "        ctx.call([])  # kigumi: raw-llm-ok fixture tape\n",
         encoding="utf-8",
     )
     # 行号漂移不是新增豁免:比对按理由文本,不按行号。
     assert main(["guard", "--changed"]) == 0
     assert "new waiver" not in capsys.readouterr().out
+
+
+def test_guard_warns_for_unknown_by_default_and_strict_unknown_blocks(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    root = _project(tmp_path)
+    nodes = root / "nodes"
+    nodes.mkdir()
+    (nodes / "unknown.py").write_text(
+        """
+def format_all(items, formatter):
+    for item in items:
+        formatter.call(item)
+
+@dag.node("dynamic")
+def dynamic(inputs, ctx):
+    return getattr(inputs, method_name)()
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(root)
+
+    assert main(["guard"]) == 0
+    output = capsys.readouterr().out
+    assert "warning nodes/unknown.py:4" in output
+    assert "UNKNOWN [raw-llm.loop-call]" in output
+    assert "warning nodes/unknown.py:8" in output
+    assert "UNKNOWN [raw-io.dynamic-call]" in output
+
+    assert main(["guard", "--strict-unknown"]) == 1
+    assert "warning nodes/unknown.py:4" in capsys.readouterr().out
 
 
 def test_guard_checks_decorated_raw_io_but_not_helpers_and_tracks_its_waivers(
@@ -1252,7 +1292,7 @@ def test_cli_check_reports_guard_violation(tmp_path: Path, capsys) -> None:
     nodes = tmp_path / "nodes"
     nodes.mkdir()
     (nodes / "bad.py").write_text(
-        "for item in items:\n    client.call([])\n",
+        "def node(items, ctx):\n    for item in items:\n        ctx.call([])\n",
         encoding="utf-8",
     )
     dag = _cli_dag(tmp_path, source_dirs=["nodes"])
@@ -1264,7 +1304,32 @@ def test_cli_check_reports_guard_violation(tmp_path: Path, capsys) -> None:
         return {"status": "ok"}
 
     assert _run_dag_cli(dag, ["check"]) == 1
-    assert "violation" in capsys.readouterr().out
+    assert "[ERROR:raw-llm.loop-call]" in capsys.readouterr().out
+
+
+def test_cli_check_warns_for_unknown_and_supports_strict_unknown(tmp_path: Path, capsys) -> None:
+    nodes = tmp_path / "nodes"
+    nodes.mkdir()
+    (nodes / "unknown.py").write_text(
+        """
+def format_all(items, formatter):
+    for item in items:
+        formatter.call(item)
+
+@dag.node("dynamic")
+def dynamic(inputs, ctx):
+    return getattr(inputs, method_name)()
+""",
+        encoding="utf-8",
+    )
+    dag = _cli_dag(tmp_path, source_dirs=["nodes"])
+
+    assert _run_dag_cli(dag, ["check"]) == 0
+    output = capsys.readouterr().out
+    assert "formatter.call(item) [UNKNOWN:raw-llm.loop-call]" in output
+    assert "getattr(inputs, method_name)() [UNKNOWN:raw-io.dynamic-call]" in output
+
+    assert _run_dag_cli(dag, ["check", "--strict-unknown"]) == 1
 
 
 def test_cli_check_reports_source_syntax_error_as_nonzero_diagnostic(

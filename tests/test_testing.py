@@ -225,14 +225,14 @@ def test_plugin_fails_bad_template_and_guard_violation(pytester: Any) -> None:
     prompts.joinpath("bad.md").write_text("{{BadSlot}}", encoding="utf-8")
     source = pytester.mkdir("src")
     source.joinpath("bad.py").write_text(
-        "for item in items:\n    client.call([])\n",
+        "def node(items, ctx):\n    for item in items:\n        ctx.call([])\n",
         encoding="utf-8",
     )
 
     result = pytester.runpytest_subprocess("-q")
 
     result.assert_outcomes(failed=2)
-    result.stdout.fnmatch_lines(["*bad.py:2*"])
+    result.stdout.fnmatch_lines(["*bad.py:3*"])
 
 
 def test_plugin_warns_for_waived_guard_finding(pytester: Any) -> None:
@@ -248,6 +248,24 @@ def test_plugin_warns_for_waived_guard_finding(pytester: Any) -> None:
 
     result.assert_outcomes(passed=1, warnings=1)
     result.stdout.fnmatch_lines(["*fixture replay*"])
+
+
+def test_plugin_warns_but_does_not_fail_for_unknown_guard_finding(pytester: Any) -> None:
+    pytester.makefile(".toml", pyproject="[tool.kigumi]\nsource_dirs = ['src']\n")
+    source = pytester.mkdir("src")
+    source.joinpath("unknown.py").write_text(
+        """
+def format_all(items, formatter):
+    for item in items:
+        formatter.call(item)
+""",
+        encoding="utf-8",
+    )
+
+    result = pytester.runpytest_subprocess("-q")
+
+    result.assert_outcomes(passed=1, warnings=1)
+    result.stdout.fnmatch_lines(["*raw-llm.loop-call*UNKNOWN*"])
 
 
 def test_plugin_skips_live_tests_without_environment_flag(pytester: Any, monkeypatch: Any) -> None:

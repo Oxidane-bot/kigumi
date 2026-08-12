@@ -27,6 +27,7 @@ from .dag import GRAPH_COMMAND_HELP, Dag, register_graph_commands
 from .docs import SHIPPED_DOCS, read_doc
 from .enforce import (
     Finding,
+    GuardVerdict,
     RawIOFinding,
     check_paths,
     check_raw_io_node_paths,
@@ -144,7 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "guard":
-        return _guard(config, changed=args.changed)
+        return _guard(
+            config,
+            changed=args.changed,
+            strict_unknown=args.strict_unknown,
+        )
     if args.command == "doctor":
         return _doctor(config)
     if args.command == "render":
@@ -186,6 +191,7 @@ def _parser() -> argparse.ArgumentParser:
 
     guard = subcommands.add_parser("guard")
     guard.add_argument("--changed", action="store_true")
+    guard.add_argument("--strict-unknown", action="store_true")
 
     subcommands.add_parser("doctor")
 
@@ -845,7 +851,7 @@ def _demote_brief_headings(brief: str) -> str:
     return "".join(lines)
 
 
-def _guard(config: KigumiConfig, *, changed: bool) -> int:
+def _guard(config: KigumiConfig, *, changed: bool, strict_unknown: bool) -> int:
     if changed:
         paths = _changed_source_paths(config)
         if paths is None:
@@ -856,10 +862,28 @@ def _guard(config: KigumiConfig, *, changed: bool) -> int:
             *check_paths(config.source_paths),
             *check_raw_io_node_paths(config.source_paths),
         ]
-    violations = [finding for finding in findings if not finding.waived]
-    for finding in violations:
+    errors = [
+        finding
+        for finding in findings
+        if not finding.waived and finding.verdict is GuardVerdict.ERROR
+    ]
+    unknowns = [
+        finding
+        for finding in findings
+        if not finding.waived and finding.verdict is GuardVerdict.UNKNOWN
+    ]
+    for finding in errors:
         location = _display_path(config.project_root, finding.path)
-        print(f"{location}:{finding.lineno}: {finding.snippet}")
+        print(
+            f"error {location}:{finding.lineno}: "
+            f"{finding.verdict.value} [{finding.rule}] {finding.snippet}"
+        )
+    for finding in unknowns:
+        location = _display_path(config.project_root, finding.path)
+        print(
+            f"warning {location}:{finding.lineno}: "
+            f"{finding.verdict.value} [{finding.rule}] {finding.snippet}"
+        )
     for finding in findings:
         if finding.waived:
             print(
@@ -869,7 +893,7 @@ def _guard(config: KigumiConfig, *, changed: bool) -> int:
             )
     if changed:
         _print_new_waivers(config.project_root, findings)
-    return 1 if violations else 0
+    return 1 if errors or (strict_unknown and unknowns) else 0
 
 
 def _changed_source_paths(config: KigumiConfig) -> list[Path] | None:

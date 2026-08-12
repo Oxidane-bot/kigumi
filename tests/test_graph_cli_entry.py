@@ -123,7 +123,7 @@ class TestPreexistingNodesModuleIsolation:
 
 
 EXPECTED_GRAPH_ARGUMENTS: dict[str, tuple[list[str], set[str]]] = {
-    "check": ([], set()),
+    "check": ([], {"--strict-unknown"}),
     "plan": ([], {"--targets"}),
     "graph": ([], {"--html", "--run-id", "--prompts"}),
     "profile": ([], {"--run-id", "--format", "--include-content"}),

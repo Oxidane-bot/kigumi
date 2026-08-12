@@ -22,6 +22,7 @@ import textwrap
 import threading
 import time
 import types
+import warnings
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext, suppress
@@ -81,7 +82,14 @@ from .calling import (
     observe,
 )
 from .config import KigumiConfig
-from .enforce import check_paths, check_raw_io_node_paths, check_raw_io_source, check_source
+from .enforce import (
+    GuardUnknownWarning,
+    GuardVerdict,
+    check_paths,
+    check_raw_io_node_paths,
+    check_raw_io_source,
+    check_source,
+)
 from .errors import CacheIntegrityError, OutputOwnershipError
 from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
@@ -3850,7 +3858,6 @@ class Dag:
 
     def _cli_check(self, args: argparse.Namespace) -> int:
         """Print static declaration and source-guard findings without running nodes."""
-        del args
         guard_findings: list[Any] = []
         guard_error: BaseException | None = None
         if self.config.source_dirs:
@@ -3859,13 +3866,22 @@ class Dag:
                 guard_findings.extend(check_raw_io_node_paths(self.config.source_paths))
             except (OSError, UnicodeError, SyntaxError, ValueError) as error:
                 guard_error = error
-        guard_violations = [finding for finding in guard_findings if not finding.waived]
+        guard_violations = [
+            finding
+            for finding in guard_findings
+            if not finding.waived and finding.verdict is GuardVerdict.ERROR
+        ]
+        guard_unknowns = [
+            finding
+            for finding in guard_findings
+            if not finding.waived and finding.verdict is GuardVerdict.UNKNOWN
+        ]
         guard_waivers = [finding for finding in guard_findings if finding.waived]
 
         errors = [
             (
                 f"{_cli_display_path(self.config.project_root, finding.path)}:{finding.lineno}: "
-                f"{finding.snippet} [violation]"
+                f"{finding.snippet} [{finding.verdict.value}:{finding.rule}]"
             )
             for finding in guard_violations
         ]
@@ -3914,6 +3930,14 @@ class Dag:
                 for field in fields
                 if not field["description"]
             )
+        warnings.extend(
+            (
+                f"{_cli_display_path(self.config.project_root, finding.path)}:{finding.lineno}: "
+                f"{finding.snippet} [{finding.verdict.value}:{finding.rule}]"
+            )
+            for finding in guard_unknowns
+        )
+        strict_unknown = bool(getattr(args, "strict_unknown", False))
 
         print(
             f"check: {self.config.project_root.name or 'pipeline'} "
@@ -3932,9 +3956,12 @@ class Dag:
             for finding in guard_waivers:
                 location = _cli_display_path(self.config.project_root, finding.path)
                 print(f"  {location}:{finding.lineno}: {finding.snippet} [waived]")
-        print(f"\nguards: {len(guard_violations)} violations, {len(guard_waivers)} waived")
+        print(
+            f"\nguards: {len(guard_violations)} errors, "
+            f"{len(guard_unknowns)} unknown, {len(guard_waivers)} waived"
+        )
         print(f"\nsummary: {len(errors)} errors, {len(warnings)} warnings")
-        return 1 if errors else 0
+        return 1 if errors or (strict_unknown and guard_unknowns) else 0
 
     def _cli_plan(self, args: argparse.Namespace) -> int:
         """Print a read-only cache forecast for optionally selected targets."""
@@ -5600,7 +5627,8 @@ def register_graph_commands(
             )
         return parser
 
-    add("check")
+    check = add("check")
+    check.add_argument("--strict-unknown", action="store_true")
 
     plan = add("plan")
     plan.add_argument("--targets")
@@ -10103,7 +10131,12 @@ def _validate_registration(function: NodeFunction) -> _NodeAstMetadata:
         raise ValueError(f"Cannot inspect source for node {function!r}") from error
     source = textwrap.dedent("".join(source_lines))
     findings = check_source(source, Path(source_path))
-    violations = [finding for finding in findings if not finding.waived]
+    violations = [
+        finding
+        for finding in findings
+        if not finding.waived and finding.verdict is GuardVerdict.ERROR
+    ]
+    _warn_registration_unknowns(findings, start_line=start_line)
     if violations:
         locations = "\n".join(
             f"{finding.path}:{start_line + finding.lineno - 1}: {finding.snippet}"
@@ -10118,7 +10151,12 @@ def _validate_registration(function: NodeFunction) -> _NodeAstMetadata:
         Path(source_path),
         context_name=context_name,
     )
-    raw_io_violations = [finding for finding in raw_io_findings if not finding.waived]
+    raw_io_violations = [
+        finding
+        for finding in raw_io_findings
+        if not finding.waived and finding.verdict is GuardVerdict.ERROR
+    ]
+    _warn_registration_unknowns(raw_io_findings, start_line=start_line)
     if raw_io_violations:
         locations = "\n".join(
             f"{finding.path}:{start_line + finding.lineno - 1}: {finding.snippet}"
@@ -10130,6 +10168,18 @@ def _validate_registration(function: NodeFunction) -> _NodeAstMetadata:
         )
         raise ValueError(message + locations)
     return _extract_node_ast_metadata(source, function.__globals__)
+
+
+def _warn_registration_unknowns(findings: list[Any], *, start_line: int) -> None:
+    for finding in findings:
+        if finding.waived or finding.verdict is not GuardVerdict.UNKNOWN:
+            continue
+        warnings.warn(
+            f"Guard UNKNOWN [{finding.rule}] {finding.path}:"
+            f"{start_line + finding.lineno - 1}: {finding.snippet}",
+            GuardUnknownWarning,
+            stacklevel=4,
+        )
 
 
 def _extract_node_ast_metadata(source: str, globals_: Mapping[str, Any]) -> _NodeAstMetadata:

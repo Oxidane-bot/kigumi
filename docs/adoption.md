@@ -1206,9 +1206,8 @@ from kigumi.testing import CassetteTransport, FakeTransport
   `prompt_path.name`，例如 `kigumi_dry_render[extract.md]`）。该项读取模板，以
   `<槽位名>` 填满 `slot_names()` 发现的全部槽位，经严格 `render_template()` 渲染，并断言
   不残留 `{{` 语法；全程不调用模型。
-- 每次 collection 追加一个 `kigumi_guard`。它扫描配置的 `source_dirs`，对未豁免的循环裸
-  LLM 调用或节点原始文件读取失败；有理由的 `raw-llm-ok` / `raw-io-ok` 以 pytest warning
-  保持可见。
+- 每次 collection 追加一个 `kigumi_guard`。它扫描配置的 `source_dirs`：未豁免 `ERROR`
+  使测试失败，`UNKNOWN` 与有理由的 `raw-llm-ok` / `raw-io-ok` 以 pytest warning 保持可见。
 
 插件同时注册 `live` marker，并提供 `kigumi_cassette` fixture。fixture 是一个
 `Callable[[str], CassetteTransport]`：`kigumi_cassette("review")` 解析到项目根下
@@ -1247,7 +1246,7 @@ def test_live_delivery(): ...
 
 ### 守卫四环
 
-裸循环里打 LLM(`for ... ctx.llm(...)`)会在节点注册时被 AST 检查拒绝——
+裸循环里已证明的 LLM 调用（如 `for ... ctx.llm(...)`）会在节点注册时被 AST 检查拒绝——
 循环调用必须走 `foreach` fan-out 或 `repair_loop`,让每次调用有独立缓存键
 与产物。确实需要豁免时在行尾写 `# kigumi: raw-llm-ok <理由>`,理由必填,
 git hook 会把新增豁免摆到评审面前。
@@ -1258,8 +1257,11 @@ git hook 会把新增豁免摆到评审面前。
 外环以装饰节点函数体为入口,并递归跟随执行路径中可达的局部 helper/lambda；helper/lambda 的默认参数
 按定义时执行扫描,未被节点执行路径引用的普通 helper 不会产生误报；节点执行范围内的 nested class
 直接硬拒绝。节点及其可达 helper 的正常文件读取都应使用 `ctx.read_text`/`ctx.read_bytes` 这个受控入口；
-动态名称解析的 `getattr` 是硬切结构违规。raw-LLM 的 `check_source`/`check_paths` 则会递归扫描源码里的
-helper 循环。
+`eval`/`exec` 等已证明动态执行结构仍硬拒绝；opaque callable、只命中 `.call`/`.llm`
+拼写的未知 receiver 与动态 `getattr` 执行标为 `UNKNOWN`，注册期告警但不拒绝。非调用位置
+的 literal probe（如 `getattr(value, "model_dump", None)`）不产生 finding，而
+`getattr(value, "read_text")()` 是已证明 raw read，仍为 `ERROR`。raw-LLM 的
+`check_source`/`check_paths` 会递归扫描源码里的 helper 循环。
 
 #### 直接调用 `kigumi.enforce` 时选哪个 helper
 
@@ -1275,7 +1277,8 @@ helper 循环。
 | 注册环已经拿到的单个节点函数体 | `check_raw_io_source(text, path, context_name="ctx")` | 以节点体为入口递归检查可达 helper/lambda 及其默认参数；`context_name` 是实际上下文参数名 |
 
 `check_paths()` 只做 raw-LLM 扫描，不能替代 raw-I/O 检查；反过来也一样。所有结果的
-`path`、`lineno`、`snippet`、`waived` 和 `waiver_reason` 都可用于自定义报告；
+`path`、`lineno`、`snippet`、稳定 `rule`、`verdict`、`waived` 和 `waiver_reason` 都可用于自定义报告；
+`verdict` 是 `GuardVerdict.ERROR` 或 `GuardVerdict.UNKNOWN`，proven-safe 不产生 finding。
 `waiver_reasons()` 与 `raw_io_waiver_reasons()` 只是分别读取两类豁免理由（包括重复项），
 不负责判断违规。空理由的注释仍是违规，`raw-llm-ok` 也不能替代 `raw-io-ok`。
 
@@ -1286,20 +1289,23 @@ from pathlib import Path
 
 from kigumi.enforce import check_raw_io_source, check_source
 
-llm = check_source("for item in items:\n    client.call(item)\n", Path("nodes/batch.py"))
+llm = check_source(
+    "def node(items, ctx):\n    for item in items:\n        ctx.call(item)\n",
+    Path("nodes/batch.py"),
+)
 io = check_raw_io_source(
     "def node(inputs, ctx):\n    return open('input.txt').read()\n",
     Path("nodes/node.py"),
 )
-print([(finding.lineno, finding.waived) for finding in llm])
-print([(finding.lineno, finding.waived) for finding in io])
+print([(finding.lineno, finding.rule, finding.verdict.value) for finding in llm])
+print([(finding.lineno, finding.rule, finding.verdict.value) for finding in io])
 ```
 
 输出：
 
 ```text
-[(2, False)]
-[(2, False)]
+[(3, 'raw-llm.loop-call', 'ERROR')]
+[(2, 'raw-io.read', 'ERROR')]
 ```
 
 项目的 CI 和提交环应使用 wrapper，而不是自行把 findings 猜成状态：
@@ -1314,11 +1320,13 @@ uv run kigumi init --hooks
 uv run kigumi guard --changed
 ```
 
-`kigumi guard` 无未豁免 finding 时退出 `0`，有违规时退出 `1`；未配置项目、
+`kigumi guard` 默认只因未豁免 `ERROR` 退出 `1`；`UNKNOWN` 明确打印 warning 但仍退出
+`0`。需要把 review 边界也设为 CI 门时使用 `--strict-unknown`，此时未豁免 `UNKNOWN`
+也退出 `1`。未配置项目、
 `--changed` 不在有 `HEAD` 的 Git 仓库中等使用错误退出 `2`。`--changed` 还会把相对 `HEAD` 新增的
 豁免理由打印为 `new waiver`，但新增理由本身不是失败条件；有理由的豁免始终打印清单。
-pytest 插件激活后会追加 `kigumi_guard`：未豁免 finding 使该测试失败，有理由的豁免发
-`PytestWarning`；它不会做 `HEAD` 比较，所以提交审查仍用 `guard --changed`。
+pytest 插件激活后会追加 `kigumi_guard`：未豁免 `ERROR` 使该测试失败，`UNKNOWN` 与有理由
+豁免发 `PytestWarning`；它不会做 `HEAD` 比较，所以提交审查仍用 `guard --changed`。
 
 不要把项目级 raw-I/O 扫描当成运行时沙箱：它以装饰节点函数体为入口，递归跟随执行路径中可达的
 局部 helper/lambda；未被节点执行路径引用的普通 helper 不会产生误报。注册环仍是已注册节点的精确

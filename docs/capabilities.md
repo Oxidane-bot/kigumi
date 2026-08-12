@@ -116,9 +116,9 @@ adoption.md 的"设计边界"一节。
 | 录制一次真实响应后离线重放 | `kigumi.testing.CassetteTransport` |
 | 真实请求测试的凭证门 | `@pytest.mark.live` + `kigumi.testing.skip_unless_env` + `KIGUMI_LIVE=1` |
 | 模板槽位自动体检 | pytest 插件自动生成 `kigumi_dry_render[...]` |
-| 拒绝裸循环调用与未声明读文件 | 注册环 + `kigumi guard` + `kigumi_guard` 测试项 |
-| 直接取得循环裸 LLM findings | `kigumi.enforce.check_source` / `kigumi.enforce.check_paths` / `kigumi.enforce.Finding` |
-| 直接取得节点 raw-I/O findings | `kigumi.enforce.check_raw_io_source` / `kigumi.enforce.check_raw_io_node_source` / `kigumi.enforce.check_raw_io_node_paths` / `kigumi.enforce.RawIOFinding` |
+| 拒绝已证明裸循环调用与未声明读文件，显式复核 unknown | 注册环 + `kigumi guard [--strict-unknown]` + `kigumi_guard` 测试项 |
+| 直接取得带稳定 rule/verdict 的循环裸 LLM findings | `kigumi.enforce.check_source` / `kigumi.enforce.check_paths` / `kigumi.enforce.Finding` / `kigumi.enforce.GuardVerdict` |
+| 直接取得带稳定 rule/verdict 的节点 raw-I/O findings | `kigumi.enforce.check_raw_io_source` / `kigumi.enforce.check_raw_io_node_source` / `kigumi.enforce.check_raw_io_node_paths` / `kigumi.enforce.RawIOFinding` |
 | 豁免守卫(必写理由) | `# kigumi: raw-llm-ok <理由>` / `# kigumi: raw-io-ok <理由>` |
 
 ## 运维与排障

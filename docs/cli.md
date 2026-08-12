@@ -72,9 +72,11 @@ source of truth，wheel 通过 hatch `force-include` 映射而非复制，因此
 | 参数 | 必需 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `--changed` | 否 | `False` | 只检查 Git 中相对 `HEAD` 已修改、已暂存与未跟踪的 Python 源文件，并报告新增豁免。 |
+| `--strict-unknown` | 否 | `False` | 把未豁免 `UNKNOWN` warning 也作为退出 1；不改变 finding 的 verdict。 |
 
-没有未豁免 violation 时为 0，有 violation 时为 1。`--changed` 不在 Git 仓库内或无法取得
-变更清单时为 2。
+默认只因未豁免 `ERROR` 为 1；未豁免 `UNKNOWN` 会明确打印 warning 但仍为 0。
+`--strict-unknown` 下任一未豁免 `UNKNOWN` 也为 1。`--changed` 不在 Git 仓库内或无法取得
+变更清单时为 2。两类豁免仍分别要求非空理由。
 
 ### `kigumi doctor`
 
@@ -226,8 +228,13 @@ kigumi explain scene_E2S4 --graph-arg episode=E2S4
 ### `kigumi check`
 
 只读检查图声明、声明文件、source guards、节点 docstring 与 Pydantic 字段说明。
-无命令专属参数。存在 error（包括未豁免 guard violation 或声明文件缺失）时为 1；
-只有 warning 时仍为 0。
+
+| 参数 | 必需 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `--strict-unknown` | 否 | `False` | 把 source guard 的未豁免 `UNKNOWN` 同时计入 error。 |
+
+存在 error（包括未豁免 guard `ERROR` 或声明文件缺失）时为 1；默认只有 warning/guard
+`UNKNOWN` 时仍为 0。`dag check` 共享同一参数与判定。
 
 ### `kigumi plan`
 

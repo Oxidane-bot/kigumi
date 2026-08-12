@@ -21,6 +21,7 @@ from kigumi.artifacts import sha
 from kigumi.calling import CacheIntegrityError, LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag, ResourceRequest
+from kigumi.enforce import GuardUnknownWarning
 from kigumi.prompt import (
     Attachment,
     Message,
@@ -41,6 +42,17 @@ def _assert_registration_rejected(dag: Dag, function: Any) -> None:
         ValueError,
         match=r"Raw file reads are not allowed in node registration",
     ):
+        dag.node("work")(function)
+
+
+def _assert_registration_warned(
+    dag: Dag,
+    function: Any,
+    *,
+    rule: str,
+) -> None:
+    """UNKNOWN remains registerable, but its stable rule must stay inspectable."""
+    with pytest.warns(GuardUnknownWarning, match=rule):
         dag.node("work")(function)
 
 
@@ -1552,8 +1564,8 @@ def test_libs_hash_binds_reflective_owner_identity(
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_builtins_globals(tmp_path: Path) -> None:
-    """0.13 hard cut: builtins.globals() is opaque at registration time."""
+def test_registration_warns_for_builtins_globals(tmp_path: Path) -> None:
+    """Opaque builtins.globals() stays inspectable without blocking registration."""
     node_name = "libs_builtins_globals_rejected"
     node_path = tmp_path / "node.py"
     node_path.write_text(
@@ -1568,13 +1580,13 @@ def test_registration_rejects_builtins_globals(tmp_path: Path) -> None:
             KigumiConfig(project_root=tmp_path, source_dirs=[]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.opaque-call")
     finally:
         sys.modules.pop(node_name, None)
 
 
-def test_registration_rejects_getattr_function_globals(tmp_path: Path) -> None:
-    """0.13 hard cut: getattr(run, "__globals__") 必须注册期拒绝。"""
+def test_registration_warns_for_getattr_function_globals(tmp_path: Path) -> None:
+    """getattr 后继续动态下标是 opaque review，不冒充已证明 ERROR。"""
     source = tmp_path / "src"
     source.mkdir()
     (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
@@ -1594,7 +1606,7 @@ def test_registration_rejects_getattr_function_globals(tmp_path: Path) -> None:
             KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.opaque-call")
     finally:
         sys.path[:] = original_sys_path
         sys.modules.pop("helper", None)
@@ -1602,21 +1614,25 @@ def test_registration_rejects_getattr_function_globals(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("prelude", "expression"),
+    ("prelude", "expression", "expected_rule"),
     [
-        pytest.param("", 'globals()["__name__"]', id="direct-globals"),
-        pytest.param("", 'eval("__name__")', id="eval"),
+        pytest.param("", 'globals()["__name__"]', "raw-io.opaque-call", id="direct-globals"),
+        pytest.param("", 'eval("__name__")', None, id="eval"),
         pytest.param(
             "import sys\nOWNER = sys.modules[__name__]\nlookup_name = '__name__'\n",
             "getattr(OWNER, lookup_name)",
+            "raw-io.dynamic-call",
             id="dynamic-owner-lookup",
         ),
     ],
 )
-def test_registration_rejects_opaque_owner_reflection(
-    tmp_path: Path, prelude: str, expression: str
+def test_registration_classifies_opaque_owner_reflection(
+    tmp_path: Path,
+    prelude: str,
+    expression: str,
+    expected_rule: str | None,
 ) -> None:
-    """opaque namespace/eval/dynamic getattr 不再进入 L3 owner 分析。"""
+    """已证明 eval 仍拒绝；opaque namespace/dynamic getattr 进入可见复核。"""
     node_path = tmp_path / "node.py"
     node_path.write_text(
         prelude + "\ndef run(inputs, ctx):\n" + f"    return {{'value': {expression}}}\n",
@@ -1629,7 +1645,10 @@ def test_registration_rejects_opaque_owner_reflection(
             KigumiConfig(project_root=tmp_path, source_dirs=[]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        if expected_rule is None:
+            _assert_registration_rejected(dag, module.run)
+        else:
+            _assert_registration_warned(dag, module.run, rule=expected_rule)
     finally:
         sys.modules.pop(node_name, None)
 
@@ -1757,8 +1776,8 @@ def test_libs_hash_ignores_module_identity_name_in_docstring(tmp_path: Path) -> 
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_getattr_helper_value(tmp_path: Path) -> None:
-    """0.13 hard cut: getattr(helper, "VALUE") 必须注册期拒绝。"""
+def test_registration_allows_literal_getattr_helper_value_probe(tmp_path: Path) -> None:
+    """非调用位置的 literal getattr probe 不产生 guard finding。"""
     source = tmp_path / "src"
     source.mkdir()
     (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
@@ -1790,7 +1809,7 @@ def test_registration_rejects_getattr_helper_value(tmp_path: Path) -> None:
         config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
 
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        _assert_registration_rejected(dag, load_node(first_name))
+        dag.node("work")(load_node(first_name))
     finally:
         sys.path[:] = original_sys_path
         for name in ("helper", first_name, second_name):
@@ -1878,8 +1897,8 @@ def test_libs_hash_owner_reflection_is_receiver_and_scope_aware(
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_getattr_helper_name(tmp_path: Path) -> None:
-    """0.13 hard cut: getattr(helper, "__name__") 必须注册期拒绝。"""
+def test_registration_allows_literal_getattr_helper_name_probe(tmp_path: Path) -> None:
+    """literal metadata probe 不执行动态 callable，因此不进入 raw-I/O guard。"""
     source = tmp_path / "src"
     source.mkdir()
     (source / "helper.py").write_text("VALUE = 'configured'\n", encoding="utf-8")
@@ -1899,7 +1918,7 @@ def test_registration_rejects_getattr_helper_name(tmp_path: Path) -> None:
             KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        dag.node("work")(module.run)
     finally:
         sys.path[:] = original_sys_path
         sys.modules.pop("helper", None)
@@ -2453,23 +2472,32 @@ def test_libs_hash_fallback_binds_allowed_global_alias(
 
 
 @pytest.mark.parametrize(
-    ("prelude", "body"),
+    ("prelude", "body", "expected_rule"),
     [
-        pytest.param("", "return {'value': eval('VALUE')}", id="eval"),
-        pytest.param("", "return {'value': globals()['VALUE']}", id="globals"),
+        pytest.param("", "return {'value': eval('VALUE')}", None, id="eval"),
+        pytest.param(
+            "",
+            "return {'value': globals()['VALUE']}",
+            "raw-io.opaque-call",
+            id="globals",
+        ),
         pytest.param(
             "",
             "namespace = {}\n"
             "    exec('result = VALUE', globals(), namespace)\n"
             "    return {'value': namespace['result']}",
+            None,
             id="exec",
         ),
     ],
 )
-def test_registration_rejects_dynamic_global_introspection(
-    tmp_path: Path, prelude: str, body: str
+def test_registration_classifies_dynamic_global_introspection(
+    tmp_path: Path,
+    prelude: str,
+    body: str,
+    expected_rule: str | None,
 ) -> None:
-    """globals/eval/exec 的不透明命名空间观察必须在注册期硬失败。"""
+    """eval/exec 是 ERROR；globals 下标无法证明目标，作为 UNKNOWN 告警。"""
     node_name = "libs_dynamic_globals_rejected"
     node_path = tmp_path / f"{node_name}.py"
     node_path.write_text(
@@ -2482,7 +2510,10 @@ def test_registration_rejects_dynamic_global_introspection(
             KigumiConfig(project_root=tmp_path, source_dirs=[]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        if expected_rule is None:
+            _assert_registration_rejected(dag, module.run)
+        else:
+            _assert_registration_warned(dag, module.run, rule=expected_rule)
     finally:
         sys.modules.pop(node_name, None)
 
@@ -3067,13 +3098,14 @@ def test_libs_hash_falls_back_for_aliased_dynamic_imports(
 
 
 @pytest.mark.parametrize(
-    ("case_name", "dynamic_import", "dynamic_call"),
+    ("case_name", "dynamic_import", "dynamic_call", "expected_rule"),
     [
         pytest.param(
             "attribute_target",
             "class Box:\n    pass\n\nbox = Box()\n",
             "    box.load = __import__\n"
             '    helper = box.load("{package_name}.helper", fromlist=["VALUE"])\n',
+            None,
             id="attribute-target",
         ),
         pytest.param(
@@ -3081,12 +3113,14 @@ def test_libs_hash_falls_back_for_aliased_dynamic_imports(
             "loaders = {}\n",
             '    loaders["x"] = __import__\n'
             '    helper = loaders["x"]("{package_name}.helper", fromlist=["VALUE"])\n',
+            None,
             id="container-target",
         ),
         pytest.param(
             "walrus_target",
             "",
             '    helper = (load := __import__)("{package_name}.helper", fromlist=["VALUE"])\n',
+            "raw-io.opaque-call",
             id="walrus-target",
         ),
     ],
@@ -3096,8 +3130,9 @@ def test_registration_rejects_dynamic_import_alias_containers(
     case_name: str,
     dynamic_import: str,
     dynamic_call: str,
+    expected_rule: str | None,
 ) -> None:
-    """0.13 hard cut: opaque __import__ aliases cannot enter a node."""
+    """Proven alias mutation is ERROR; walrus callable provenance remains UNKNOWN."""
     package_name = f"libs_dynamic_alias_rejected_{case_name}"
     source = tmp_path / "src" / package_name
     source.mkdir(parents=True)
@@ -3123,7 +3158,10 @@ def test_registration_rejects_dynamic_import_alias_containers(
             KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        if expected_rule is None:
+            _assert_registration_rejected(dag, module.run)
+        else:
+            _assert_registration_warned(dag, module.run, rule=expected_rule)
     finally:
         sys.path[:] = original_sys_path
         for name in module_names:
@@ -3164,8 +3202,8 @@ def test_registration_rejects_direct_builtin_getattr_import(tmp_path: Path) -> N
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_computed_dynamic_import_lookup(tmp_path: Path) -> None:
-    """通过动态 getattr 取得 __import__ 的节点必须注册期失败。"""
+def test_registration_warns_for_computed_dynamic_import_lookup(tmp_path: Path) -> None:
+    """动态 getattr 无法证明实际属性，因此注册但给出 UNKNOWN。"""
     package_name = "libs_dynamic_import_rejected"
     source = tmp_path / "src" / package_name
     source.mkdir(parents=True)
@@ -3191,7 +3229,7 @@ def test_registration_rejects_computed_dynamic_import_lookup(tmp_path: Path) -> 
             KigumiConfig(project_root=tmp_path, source_dirs=["src"]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.dynamic-call")
     finally:
         sys.path[:] = original_sys_path
         for name in module_names:
@@ -5089,8 +5127,8 @@ def test_detached_configured_native_container_provenance_is_non_reusable(
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_complete_globals_observation(tmp_path: Path) -> None:
-    """任意 globals namespace 观察在注册期硬失败，不进入 L3 分析。"""
+def test_registration_warns_for_complete_globals_observation(tmp_path: Path) -> None:
+    """globals namespace 的动态下标保持 UNKNOWN 并在注册期可见。"""
     source = tmp_path / "src"
     source.mkdir()
     node_name = "libs_all_globals_off_node"
@@ -5106,7 +5144,7 @@ def test_registration_rejects_complete_globals_observation(tmp_path: Path) -> No
         module = _load_libs_runtime_module(node_path, node_name)
         config = KigumiConfig(project_root=tmp_path, source_dirs=["src"])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.opaque-call")
     finally:
         sys.modules.pop(node_name, None)
 
@@ -5308,10 +5346,10 @@ def test_libs_hash_fails_closed_for_unresolved_attribute_call(tmp_path: Path) ->
             sys.modules.pop(name, None)
 
 
-def test_registration_rejects_globals_in_reached_nested_function(
+def test_registration_warns_for_globals_in_reached_nested_function(
     tmp_path: Path,
 ) -> None:
-    """被调用 nested function 的 globals 观察也必须注册期硬失败。"""
+    """被调用 nested function 的 opaque globals 观察也必须产生注册期告警。"""
     node_path = tmp_path / "node.py"
     node_path.write_text(
         "VALUE = 'A'\n"
@@ -5330,7 +5368,7 @@ def test_registration_rejects_globals_in_reached_nested_function(
             KigumiConfig(project_root=tmp_path, source_dirs=[]),
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.opaque-call")
     finally:
         sys.modules.pop("libs_nested_all_globals", None)
 
@@ -5680,10 +5718,10 @@ def test_registration_rejects_globals_in_reached_class_body(tmp_path: Path) -> N
         sys.modules.pop(node_name, None)
 
 
-def test_registration_rejects_globals_in_multi_level_nested_calls(
+def test_registration_warns_for_globals_in_multi_level_nested_calls(
     tmp_path: Path,
 ) -> None:
-    """outer -> inner -> deep 的 globals 观察必须注册期硬失败。"""
+    """outer -> inner -> deep 的 globals UNKNOWN 必须跟随可达调用并告警。"""
     node_name = "libs_multi_level_globals_node"
     node_path = tmp_path / f"{node_name}.py"
     node_path.write_text(
@@ -5702,7 +5740,7 @@ def test_registration_rejects_globals_in_multi_level_nested_calls(
     try:
         config = KigumiConfig(project_root=tmp_path, source_dirs=[])
         dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
-        _assert_registration_rejected(dag, module.run)
+        _assert_registration_warned(dag, module.run, rule="raw-io.opaque-call")
     finally:
         sys.modules.pop(node_name, None)
 

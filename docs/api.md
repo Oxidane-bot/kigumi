@@ -391,10 +391,15 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
 列表，不定义 CLI 或 pytest 的退出语义。项目接入时的选择、wrapper 和失败码见
 [守卫四环](adoption.md#守卫四环)。
 
-- `Finding(path: Path, lineno: int, snippet: str, waived: bool, waiver_reason: str | None) -> None`：
-  循环裸 LLM finding；`waived` 只有在行尾 `raw-llm-ok` 后确实有非空理由时为真。
-- `RawIOFinding(path: Path, lineno: int, snippet: str, waived: bool, waiver_reason: str | None) -> None`：
-  节点直接文件读取 finding；其 `raw-io-ok` 豁免与 `Finding` 的豁免独立。
+- `GuardVerdict(StrEnum)`：稳定值 `ERROR` / `UNKNOWN`；proven-safe 不产生 finding。
+- `GuardUnknownWarning(UserWarning)`：注册期对未豁免 `UNKNOWN` 的可检查告警类型。
+- `Finding(path: Path, lineno: int, snippet: str, rule: str, verdict: GuardVerdict, waived: bool, waiver_reason: str | None) -> None`：
+  循环裸 LLM finding；稳定 rule 为 `raw-llm.loop-call`。已证明的 `ctx.call` / `ctx.llm`
+  为 `ERROR`，未知 receiver 的方法拼写与 opaque callable 为 `UNKNOWN`；`waived` 只有在行尾
+  `raw-llm-ok` 后确实有非空理由时为真。
+- `RawIOFinding(path: Path, lineno: int, snippet: str, rule: str, verdict: GuardVerdict, waived: bool, waiver_reason: str | None) -> None`：
+  节点 raw-I/O finding；稳定 rule 为 `raw-io.read`、`raw-io.dynamic-call`、
+  `raw-io.opaque-call` 或 `raw-io.nested-class`。其 `raw-io-ok` 豁免与 `Finding` 的豁免独立。
 - `waiver_reasons(text: str) -> list[str]`：按源码行序提取所有 `raw-llm-ok` 理由，保留重复项。
 - `raw_io_waiver_reasons(text: str) -> list[str]`：只提取 `raw-io-ok` 理由，不与另一类混合。
 - `check_source(text: str, path: Path) -> list[Finding]`：检查一段源码中循环/推导式下的

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from kigumi.enforce import (
+    GuardVerdict,
     RawIOFinding,
     check_paths,
     check_raw_io_node_paths,
@@ -14,6 +15,60 @@ from kigumi.enforce import (
     raw_io_waiver_reasons,
     waiver_reasons,
 )
+
+
+def test_guard_findings_expose_stable_rules_and_ternary_verdicts() -> None:
+    """已证明的危险是 ERROR；只命中拼写或 opaque 边界是 UNKNOWN。"""
+    loop_source = """
+def node(items, ctx):
+    dynamic = getattr(ctx, method_name)
+    for item in items:
+        ctx.call(item)
+        ctx.llm(item)
+        Formatter().call(item)
+        formatter.llm(item)
+        dynamic(item)
+"""
+
+    findings = check_source(loop_source, Path("nodes/verdict-loop.py"))
+
+    assert [(finding.snippet, finding.rule, finding.verdict) for finding in findings] == [
+        ("ctx.call(item)", "raw-llm.loop-call", GuardVerdict.ERROR),
+        ("ctx.llm(item)", "raw-llm.loop-call", GuardVerdict.ERROR),
+        ("Formatter().call(item)", "raw-llm.loop-call", GuardVerdict.UNKNOWN),
+        ("formatter.llm(item)", "raw-llm.loop-call", GuardVerdict.UNKNOWN),
+        ("dynamic(item)", "raw-llm.loop-call", GuardVerdict.UNKNOWN),
+    ]
+
+
+def test_raw_io_getattr_verdict_matrix_uses_only_executed_probes() -> None:
+    """literal 非读取 probe 安全；已知 read_text 是 ERROR，动态执行是 UNKNOWN。"""
+    source = """
+def node(inputs, ctx):
+    probe = getattr(inputs, "model_dump", None)
+    raw = getattr(Path("secret.txt"), "read_text")()
+    dynamic = getattr(inputs, method_name)()
+    opaque = globals()[callable_name]
+    return raw, dynamic, opaque()
+"""
+
+    findings = check_raw_io_source(source, Path("nodes/getattr-verdicts.py"))
+
+    assert [(finding.snippet, finding.rule, finding.verdict) for finding in findings] == [
+        (
+            'raw = getattr(Path("secret.txt"), "read_text")()',
+            "raw-io.read",
+            GuardVerdict.ERROR,
+        ),
+        (
+            "dynamic = getattr(inputs, method_name)()",
+            "raw-io.dynamic-call",
+            GuardVerdict.UNKNOWN,
+        ),
+        ("opaque = globals()[callable_name]", "raw-io.opaque-call", GuardVerdict.UNKNOWN),
+        ("return raw, dynamic, opaque()", "raw-io.opaque-call", GuardVerdict.UNKNOWN),
+    ]
+    assert all("model_dump" not in finding.snippet for finding in findings)
 
 
 def test_loop_calls_are_findings_but_non_loop_calls_are_not() -> None:
@@ -206,8 +261,8 @@ def node(items, ctx):
     ]
 
 
-def test_raw_io_rejects_builtins_namespace_and_vars_lookup_without_waivers() -> None:
-    """__builtins__ 与 vars(builtins) 都是不可证明的 raw-I/O 动态边界。"""
+def test_raw_io_marks_builtins_namespace_and_vars_lookup_unknown() -> None:
+    """__builtins__ 与 vars(builtins) 不冒充已证明 raw read，且可显式复核豁免。"""
     source = """
 import builtins
 
@@ -228,7 +283,13 @@ def node(inputs, ctx):
         'from_vars = vars(builtins)["open"]  # kigumi: raw-io-ok not a structural waiver',
         'second = from_vars("second-secret.txt").read()',
     } <= snippets
-    assert all(not finding.waived for finding in findings)
+    assert [finding.verdict for finding in findings] == [
+        GuardVerdict.UNKNOWN,
+        GuardVerdict.UNKNOWN,
+        GuardVerdict.UNKNOWN,
+        GuardVerdict.UNKNOWN,
+    ]
+    assert [finding.waived for finding in findings] == [True, False, True, False]
 
 
 def test_raw_io_augmented_context_rebinding_honors_read_waiver() -> None:
@@ -596,8 +657,8 @@ def node(inputs, ctx):
     ]
 
 
-def test_raw_io_rejects_builtins_dict_callable_lookup_but_not_arbitrary_subscripts() -> None:
-    """builtins.__dict__ 的 callable lookup 是 opaque；普通动态下标仍保持未知。"""
+def test_raw_io_proves_literal_builtins_open_but_not_arbitrary_subscripts() -> None:
+    """builtins.__dict__ 的 literal open 可证明；普通动态下标仍保持未知。"""
     source = """
 import builtins
 
@@ -608,9 +669,12 @@ def node(inputs, ctx):
 
     findings = check_raw_io_source(source, Path("nodes/builtin-dict.py"))
 
-    assert [(finding.lineno, finding.snippet, finding.waived) for finding in findings] == [
-        (5, 'opaque = builtins.__dict__["open"]', False),
-        (6, 'return opaque("secret.txt").read(), readers[index]("not-proven-raw")', False),
+    assert [(finding.lineno, finding.snippet, finding.verdict) for finding in findings] == [
+        (
+            6,
+            'return opaque("secret.txt").read(), readers[index]("not-proven-raw")',
+            GuardVerdict.ERROR,
+        ),
     ]
 
 
@@ -653,8 +717,8 @@ def node(inputs, ctx):
     assert findings[0].waived is False
 
 
-def test_raw_io_hard_dynamic_and_opaque_findings_ignore_raw_io_waivers() -> None:
-    """动态/opaque callable 的结构 finding 不能被旧缓存理由放行。"""
+def test_raw_io_proven_open_alias_honors_reasoned_raw_io_waiver() -> None:
+    """已证明的 builtins open alias 是可由独立 raw-io 理由豁免的 ERROR。"""
     source = """
 import builtins
 
@@ -665,9 +729,11 @@ def node(inputs, ctx):
 
     findings = check_raw_io_source(source, Path("nodes/opaque-waiver.py"))
 
-    assert [(finding.lineno, finding.waived, finding.waiver_reason) for finding in findings] == [
-        (5, False, None),
-        (6, False, None),
+    assert [
+        (finding.lineno, finding.verdict, finding.waived, finding.waiver_reason)
+        for finding in findings
+    ] == [
+        (6, GuardVerdict.ERROR, True, "old cache"),
     ]
 
 
@@ -784,7 +850,13 @@ def node(inputs, ctx):
 
     findings = check_raw_io_source(source, Path("nodes/sample.py"))
 
-    assert [finding.lineno for finding in findings] == [5, 6, 7, 8, 9, 10]
+    assert [(finding.lineno, finding.verdict) for finding in findings] == [
+        (5, GuardVerdict.UNKNOWN),
+        (6, GuardVerdict.ERROR),
+        (7, GuardVerdict.ERROR),
+        (8, GuardVerdict.ERROR),
+        (9, GuardVerdict.ERROR),
+    ]
     assert all(not finding.waived for finding in findings)
 
 
@@ -862,8 +934,8 @@ def node(inputs, ctx):
     ]
 
 
-def test_raw_io_dynamic_call_target_wins_over_raw_getattr_shape() -> None:
-    """getattr 及其派生 callable 都是动态硬切，raw-io-ok 不能豁免。"""
+def test_raw_io_literal_getattr_read_is_a_proven_waivable_error() -> None:
+    """literal read_text getattr 只在执行点形成已证明、可审计豁免的 ERROR。"""
     source = """
 def node(inputs, ctx):
     direct = getattr(Path, "read_text")("secret.txt")  # kigumi: raw-io-ok not enough
@@ -874,12 +946,12 @@ def node(inputs, ctx):
 
     findings = check_raw_io_source(source, Path("nodes/classifier.py"))
 
-    assert [(finding.lineno, finding.waived, finding.waiver_reason) for finding in findings] == [
-        (3, False, None),
-        (4, False, None),
-        (5, False, None),
-        (6, False, None),
-        (6, False, None),
+    assert [
+        (finding.lineno, finding.rule, finding.verdict, finding.waived, finding.waiver_reason)
+        for finding in findings
+    ] == [
+        (3, "raw-io.read", GuardVerdict.ERROR, True, "not enough"),
+        (5, "raw-io.read", GuardVerdict.ERROR, True, "fixture input"),
     ]
 
 
