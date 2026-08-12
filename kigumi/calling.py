@@ -29,7 +29,7 @@ from ._safe_io import (
     open_regular_file,
     read_regular_bytes,
 )
-from .artifacts import atomic_write_json, sha
+from .artifacts import atomic_write_json, canonical_json, sha
 from .errors import CacheIntegrityError
 from .evidence import EvidencePolicy, scrub_evidence
 from .failures import (
@@ -53,7 +53,7 @@ from .prompt import (
 )
 from .slots import FileSlots
 from .store import CacheLookup
-from .transport import EmptyResponseError, Transport
+from .transport import EmptyResponseError, PreparedRequest, Transport, TruncatedResponseError
 
 _call_observer: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
     "kigumi_call_observer", default=None
@@ -230,8 +230,24 @@ class _FileReference:
     size_bytes: int
     detail: Any
     has_detail: bool
+    cached_value: Mapping[str, Any]
     identity: FileIdentity | None = None
     snapshot_data: bytes | None = None
+
+    def _prepared_canonical(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "kigumi_file_sha256": self.digest,
+            "format": self.mime,
+        }
+        if self.has_detail:
+            value["detail"] = self.detail
+        return value
+
+    def _prepared_evidence(self) -> dict[str, Any]:
+        return dict(self.cached_value)
+
+    def _prepared_wire(self) -> dict[str, Any]:
+        return LLMCaller._expand_file_reference(self)
 
 
 @dataclass(frozen=True)
@@ -333,6 +349,17 @@ class _PreparedMessages:
     attachments: list[Attachment]
 
 
+def _prepared_evidence_value(value: Any) -> Any:
+    projection = getattr(value, "_prepared_evidence", None)
+    if callable(projection):
+        return _prepared_evidence_value(projection())
+    if isinstance(value, Mapping):
+        return {key: _prepared_evidence_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_prepared_evidence_value(item) for item in value]
+    return value
+
+
 def read_call_cache(cache_path: Path, cache_key: str | None = None) -> CacheLookup:
     """Read one L1 payload while preserving missing and corrupt states."""
     if cache_key is not None:
@@ -416,6 +443,10 @@ class BudgetPermit:
     def cancel(self) -> None:
         """Release this reservation without spending it."""
         self._budget._cancel(self)
+
+    def _commit_reserved(self) -> None:
+        """Conservatively spend the estimate when a sent request has no usage."""
+        self._budget._commit_reserved(self)
 
 
 class Budget:
@@ -512,6 +543,15 @@ class Budget:
             permit._active = False
             self._reserved -= permit._estimated_tokens
 
+    def _commit_reserved(self, permit: BudgetPermit) -> None:
+        with self._lock:
+            if not permit._active:
+                raise RuntimeError("Budget permit is no longer active")
+            permit._active = False
+            self._reserved -= permit._estimated_tokens
+            self._spent += permit._estimated_tokens
+            self._raise_if_exceeded()
+
     def _raise_if_exceeded(self) -> None:
         if self.max_tokens is not None and self._spent > self.max_tokens:
             raise BudgetExceeded(f"Token budget exceeded: spent {self._spent} > {self.max_tokens}")
@@ -596,8 +636,18 @@ class LLMCaller:
             preflight_policy=self.preflight_policy,
             snapshot_reader=_file_snapshot_reader.get(),
         )
-        key_messages = prepared.key_messages if prepared is not None else normalized_messages
-        cache_messages = prepared.cache_messages if prepared is not None else normalized_messages
+        transport_messages = (
+            prepared.transport_messages if prepared is not None else normalized_messages
+        )
+        prepared_request = self.transport.prepare(transport_messages, model, dict(params))
+        if not isinstance(prepared_request, PreparedRequest):
+            raise TypeError("Transport.prepare() must return PreparedRequest")
+        prepared_canonical = prepared_request.canonical()
+        key_messages = prepared_canonical["messages"]
+        effective_model = prepared_canonical["model"]
+        effective_params = prepared_canonical["params"]
+        cache_messages = _prepared_evidence_value(prepared_request.messages)
+        transport_identity = json.loads(canonical_json(self.transport.cache_identity()))
         request_resolution = self._request_resolution(
             base_resolution=base_resolution,
             prompt_lineage=prompt_lineage,
@@ -623,12 +673,9 @@ class LLMCaller:
         report = preflight(request_resolution, self.preflight_policy)
         if not report.is_valid():
             raise RequestTooLarge(report)
-        resolved_model = self.transport.resolve(model)
-        # Cache keys preserve caller intent before transport parameter normalization.
         key_inputs: dict[str, Any] = {
-            "messages": key_messages,
-            "model": resolved_model,
-            "params": params,
+            "transport": transport_identity,
+            "prepared": prepared_canonical,
             "seed": self.seed,
         }
         if response_spec != ResponseSpec():
@@ -641,9 +688,11 @@ class LLMCaller:
                 cached,
                 key=key,
                 model_alias=model,
-                model=resolved_model,
-                params=params,
+                model=effective_model,
+                params=effective_params,
                 messages=key_messages,
+                request_value=cache_messages,
+                transport_identity=transport_identity,
                 prompt_lineage=prompt_lineage,
             )
 
@@ -656,9 +705,11 @@ class LLMCaller:
                     cached,
                     key=key,
                     model_alias=model,
-                    model=resolved_model,
-                    params=params,
+                    model=effective_model,
+                    params=effective_params,
                     messages=key_messages,
+                    request_value=cache_messages,
+                    transport_identity=transport_identity,
                     prompt_lineage=prompt_lineage,
                 )
                 single_flight.result = result
@@ -672,40 +723,41 @@ class LLMCaller:
             if self.dry:
                 raise DryRunError(f"Dry run would call model {model!r} for cache key {key}")
 
-            transport_messages = (
-                self._expand_transport_messages(prepared.transport_messages)
-                if prepared is not None
-                else normalized_messages
-            )
+            # Materialize lazy attachment parts before reservation, slots, or the
+            # durable provider-effect boundary. ``send`` expands the same frozen
+            # request again, reusing the descriptor-bound bytes held by each part.
+            prepared_request.wire()
             permit = (
-                self.budget.reserve(self._estimate_tokens(normalized_messages, params))
+                self.budget.reserve(self._estimate_tokens(key_messages, effective_params))
                 if self.budget is not None
                 else None
             )
             started = time.monotonic()
+            provider_effect_started = False
             # 槽位限的是远程请求本身;base64 展开是本地工作,不许占着槽做。
             try:
                 slot_context = self.slots.acquire() if self.slots is not None else nullcontext()
                 with slot_context:
                     durable_callback = _durable_side_effect.get()
                     if durable_callback is not None:
-                        self._validate_durable_transport()
                         durable_callback(
                             {
                                 "active_effect_schema": 1,
                                 "kind": "call",
                                 "key": key,
-                                "model": resolved_model,
-                                "params_digest": sha(params),
+                                "model": effective_model,
+                                "params_digest": sha(effective_params),
                                 "prompt_sha": sha(key_messages),
+                                "transport_identity_digest": sha(transport_identity),
                                 "managed": _is_managed_prompt_resolution(prompt_lineage),
                                 "prompt_resolution": copy.deepcopy(prompt_lineage),
                             }
                         )
-                    response = self.transport.complete(transport_messages, model, **params)
+                    provider_effect_started = True
+                    response = self.transport.send(prepared_request)
             except Exception as error:
-                if permit is not None:
-                    permit.cancel()
+                self._settle_failed_permit(permit, provider_effect_started)
+                permit = None
                 seconds = time.monotonic() - started
                 failure = (
                     error
@@ -719,31 +771,37 @@ class LLMCaller:
                 metadata = self._meta(
                     key=key,
                     model_alias=model,
-                    model=resolved_model,
-                    params=params,
+                    model=effective_model,
+                    params=effective_params,
                     messages=key_messages,
                     seconds=seconds,
                     usage={},
                     cache="failure",
                     failure=canonical_failure(failure),
                     request_value=cache_messages,
+                    transport_identity=transport_identity,
                     prompt_lineage=prompt_lineage,
                 )
                 self._append_call(metadata)
                 raise failure from None
             except BaseException:
-                if permit is not None:
-                    permit.cancel()
+                self._settle_failed_permit(permit, provider_effect_started)
                 raise
             seconds = time.monotonic() - started
-            if not response.text:
-                if permit is not None:
-                    permit.cancel()
-                empty = EmptyResponseError(
-                    f"Transport returned an empty response for model {resolved_model!r}."
+            incomplete: Exception | None = None
+            if response.finish_reason == "length":
+                incomplete = TruncatedResponseError(
+                    f"Transport returned a truncated response for model {effective_model!r}."
                 )
+            elif not response.text:
+                incomplete = EmptyResponseError(
+                    f"Transport returned an empty response for model {effective_model!r}."
+                )
+            if incomplete is not None:
+                self._settle_failed_permit(permit, True)
+                permit = None
                 failure = provider_failure_from_exception(
-                    empty,
+                    incomplete,
                     provider=type(self.transport).__name__,
                     stage=ProviderFailureStage.RESPONSE,
                 )
@@ -751,8 +809,8 @@ class LLMCaller:
                     self._meta(
                         key=key,
                         model_alias=model,
-                        model=resolved_model,
-                        params=params,
+                        model=effective_model,
+                        params=effective_params,
                         messages=key_messages,
                         seconds=seconds,
                         usage=response.usage,
@@ -762,6 +820,7 @@ class LLMCaller:
                         provider_model_observed=response.model_observed,
                         failure=canonical_failure(failure),
                         request_value=cache_messages,
+                        transport_identity=transport_identity,
                         response_value={
                             "text": response.text,
                             "reasoning": response.reasoning,
@@ -779,46 +838,72 @@ class LLMCaller:
                         self.budget is not None and self.budget.max_tokens is not None
                     ),
                 )
-                payload = {
-                    "meta": self._meta(
+            except Exception as error:
+                self._settle_failed_permit(permit, True)
+                permit = None
+                self._append_call(
+                    self._meta(
                         key=key,
                         model_alias=model,
-                        model=resolved_model,
-                        params=params,
+                        model=effective_model,
+                        params=effective_params,
                         messages=key_messages,
                         seconds=seconds,
                         usage=response.usage,
-                        cache="miss",
+                        cache="failure",
                         provider_response_id=response.provider_response_id,
                         provider_model=response.model,
                         provider_model_observed=response.model_observed,
+                        failure=canonical_failure(error),
                         request_value=cache_messages,
+                        transport_identity=transport_identity,
                         response_value={
                             "text": response.text,
                             "reasoning": response.reasoning,
                         },
                         prompt_lineage=prompt_lineage,
-                    ),
-                    "response": response.text,
-                    "response_sha256": sha(response.text),
-                    "messages": cache_messages,
-                    "reasoning": response.reasoning,
-                }
+                    )
+                )
+                raise
+            payload = {
+                "meta": self._meta(
+                    key=key,
+                    model_alias=model,
+                    model=effective_model,
+                    params=effective_params,
+                    messages=key_messages,
+                    seconds=seconds,
+                    usage=response.usage,
+                    cache="miss",
+                    provider_response_id=response.provider_response_id,
+                    provider_model=response.model,
+                    provider_model_observed=response.model_observed,
+                    request_value=cache_messages,
+                    transport_identity=transport_identity,
+                    response_value={
+                        "text": response.text,
+                        "reasoning": response.reasoning,
+                    },
+                    prompt_lineage=prompt_lineage,
+                ),
+                "response": response.text,
+                "response_sha256": sha(response.text),
+                "messages": cache_messages,
+                "reasoning": response.reasoning,
+            }
+            try:
                 atomic_write_json(cache_path, payload)
                 self._append_call(payload["meta"])
-                if permit is not None:
-                    try:
-                        permit.commit(response.usage)
-                    finally:
-                        permit = None
-            except Exception:
-                if permit is not None:
-                    permit.cancel()
-                raise
             except BaseException:
                 if permit is not None:
-                    permit.cancel()
+                    permit.commit(response.usage)
+                    permit = None
                 raise
+            if permit is not None:
+                try:
+                    permit.commit(response.usage)
+                finally:
+                    permit = None
             single_flight.result = response.text
             return response.text
 
@@ -1108,7 +1193,7 @@ class LLMCaller:
             return (
                 cls._key_reference(reference),
                 cls._cached_reference(content, reference),
-                reference,
+                [reference],
             )
         if not isinstance(content, list):
             return None
@@ -1165,6 +1250,7 @@ class LLMCaller:
             size_bytes=probe.size_bytes,
             detail=value.get("detail"),
             has_detail="detail" in value,
+            cached_value={**value, "kigumi_file_sha256": digest},
             identity=probe.identity,
             snapshot_data=probe.snapshot_data,
         )
@@ -1222,6 +1308,8 @@ class LLMCaller:
         # 就会脱钩——宁可拒发也不能让内容寻址变成谎言。
         if sha256(data).hexdigest() != reference.digest:
             raise ValueError(f"kigumi_file changed after hashing: {reference.path}")
+        if reference.snapshot_data is None:
+            object.__setattr__(reference, "snapshot_data", data)
         data_url = _data_url(data, reference.mime)
         if reference.mime.startswith("image/"):
             image_url: dict[str, Any] = {"url": data_url}
@@ -1249,6 +1337,8 @@ class LLMCaller:
         model: str,
         params: dict[str, Any],
         messages: list[dict[str, Any]],
+        request_value: Any,
+        transport_identity: Any,
         prompt_lineage: dict[str, Any] | None,
     ) -> str:
         cached_response = cached["response"]
@@ -1278,7 +1368,8 @@ class LLMCaller:
                 provider_response_id=provider_response_id,
                 provider_model=provider_model,
                 provider_model_observed=provider_model_observed,
-                request_value=cached.get("messages", messages),
+                request_value=request_value,
+                transport_identity=transport_identity,
                 response_value={
                     "text": cached_response,
                     "reasoning": cached.get("reasoning"),
@@ -1353,6 +1444,7 @@ class LLMCaller:
         failure: dict[str, Any] | None = None,
         request_value: Any | None = None,
         response_value: Any | None = None,
+        transport_identity: Any | None = None,
         prompt_lineage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata = {
@@ -1368,6 +1460,7 @@ class LLMCaller:
             "provider_response_id": provider_response_id,
             "provider_model": provider_model,
             "provider_model_observed": provider_model_observed,
+            "transport_identity": copy.deepcopy(transport_identity),
             "evidence_policy_digest": self.evidence_policy.digest,
             "evidence_policy": self.evidence_policy.canonical(),
             "request_evidence": scrub_evidence(
@@ -1386,16 +1479,18 @@ class LLMCaller:
             metadata["prompt_resolution"] = copy.deepcopy(prompt_lineage)
         return metadata
 
-    def _validate_durable_transport(self) -> None:
-        limits = {
-            "max_retries": getattr(self.transport, "max_retries", 0),
-            "max_length_retries": getattr(self.transport, "max_length_retries", 0),
-            "max_empty_retries": getattr(self.transport, "max_empty_retries", 0),
-        }
-        enabled = {name: value for name, value in limits.items() if value != 0}
-        if enabled:
-            details = ", ".join(f"{name}={value}" for name, value in sorted(enabled.items()))
-            raise RuntimeError(
-                "Durable retry requires transport, length, and empty retries to be 0 "
-                f"before the provider call ({details})"
-            )
+    def _settle_failed_permit(
+        self,
+        permit: BudgetPermit | None,
+        provider_effect_started: bool,
+    ) -> None:
+        if permit is None:
+            return
+        if (
+            provider_effect_started
+            and self.budget is not None
+            and self.budget.max_tokens is not None
+        ):
+            permit._commit_reserved()
+            return
+        permit.cancel()

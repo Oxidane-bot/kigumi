@@ -4,9 +4,26 @@
 
 ## [Unreleased]
 
+### 重大变更
+
+- `Transport` 现在显式实现 `cache_identity()`、`prepare(messages, model, params)` 与
+  `send(prepared)`；新增冻结的 `PreparedRequest`。L1 preflight、缓存键、预算估算、durable
+  effect metadata、调用记录和实际发送统一使用 transport 归一化后的 effective request。
+  自定义 transport 必须迁移到新协议。
+- transport 的 `send()` 只执行一次 provider attempt；transient、空响应和
+  `finish_reason="length"` 都立即显式失败，不再内部重试或 sleep。需要重试时必须使用 DAG
+  `RetryPolicy`，使每次 provider attempt 都有独立的 durable 边界。
+- **缓存族轮换**：`CACHE_SCHEMA` 升至 8。L1 key 现在绑定 credential-free
+  `transport.cache_identity()` 与 `PreparedRequest.canonical()`；L3 同步换族，旧缓存首次访问
+  将 miss 并可能重新计费。附件 identity 只绑定内容摘要和稳定 MIME/detail 表示，不绑定
+  base64 或临时绝对路径，实际发送仍展开为 provider wire 内容。
+
 ### 修复
 
-- 有限 `Budget(max_tokens=...)` 现在要求成功响应包含 `usage.total_tokens`；缺失用量会在写入成功缓存前 fail closed，不再按零 token 记账而绕过预算。`Budget(max_tokens=None)` 继续支持无用量 transport 的 best-effort 记账。
+- 有限 `Budget(max_tokens=...)` 现在按 effective prepared request 预留；一旦 provider attempt
+  可能已发出，provider 失败、空/截断响应以及缺失或非法 `usage.total_tokens` 都保守地把准入
+  估算记入 `spent`，不能再按零 token 退款。缺失用量仍在写入成功缓存前 fail closed；
+  `Budget(max_tokens=None)` 继续支持无用量 transport 的 best-effort 记账。
 
 ## [0.13.1] - 2026-08-12
 

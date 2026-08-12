@@ -15,7 +15,7 @@ from .artifacts import atomic_write_json, sha
 from .config import KigumiConfig, find_project_root, load_config
 from .enforce import Finding, RawIOFinding, check_paths, check_raw_io_node_paths
 from .prompt import render_template, slot_names
-from .transport import Response, Transport
+from .transport import PreparedRequest, Response, Transport
 
 
 def skip_unless_env(*names: str) -> Any:
@@ -50,14 +50,27 @@ class FakeTransport:
     ) -> None:
         self._responses = iter(responses) if responses is not None else None
         self.resolved_models = dict(resolved_models or {})
+        self.prepared_requests: list[PreparedRequest] = []
         self.requests: list[tuple[list[dict[str, Any]], str, dict[str, Any]]] = []
 
-    def resolve(self, model: str) -> str:
-        """Resolve configured aliases without altering unconfigured model names."""
-        return self.resolved_models.get(model, model)
+    def cache_identity(self) -> dict[str, Any]:
+        return {"transport": "fake", "schema": 1}
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Response:
+    def prepare(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, self.resolved_models.get(model, model), params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
         """Record one request and return its next configured response."""
+        self.prepared_requests.append(prepared)
+        wire = prepared.wire()
+        messages = wire["messages"]
+        model = wire["model"]
+        params = wire["params"]
         self.requests.append((messages, model, params))
         if self._responses is None:
             return Response("answer", {"total_tokens": 4}, "stop", "private", model)
@@ -89,15 +102,24 @@ class ScriptedTransport:
         self.requests: list[tuple[list[dict[str, Any]], str]] = []
         self._lock = threading.Lock()
 
-    def resolve(self, model: str) -> str:
-        """Resolve aliases exactly, or expose the requested scripted model name."""
-        if self.aliases is not None:
-            return self.aliases[model]
-        return f"scripted:{model}"
+    def cache_identity(self) -> dict[str, Any]:
+        return {"transport": "scripted", "schema": 1}
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Response:
+    def prepare(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        """Resolve aliases exactly, or expose the requested scripted model name."""
+        model = self.aliases[model] if self.aliases is not None else f"scripted:{model}"
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
         """Record one request and answer from the first complete-line marker match."""
-        del params
+        wire = prepared.wire()
+        messages = wire["messages"]
+        model = wire["model"]
         text = _scripted_message_text(messages)
         with self._lock:
             self.requests.append((messages, model))
@@ -133,16 +155,28 @@ class CassetteTransport:
         self._cursor = 0
         self._entries = self._read_entries()
 
-    def resolve(self, model: str) -> str:
-        """Keep caller-provided model names stable in tapes."""
-        return model
+    def cache_identity(self) -> dict[str, Any]:
+        identity: dict[str, Any] = {"transport": "cassette", "schema": 1}
+        if self.record_with is not None:
+            identity["delegate"] = self.record_with.cache_identity()
+        return identity
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Response:
+    def prepare(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        if self.record_with is not None:
+            return self.record_with.prepare(messages, model, params)
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
         """Replay the next entry or record a delegated live response."""
         if self.record_with is not None:
-            response = self.record_with.complete(messages, model, **params)
+            response = self.record_with.send(prepared)
             entry = _response_data(response)
-            entry["request_sha"] = _request_sha(messages, model, params)
+            entry["request_sha"] = _request_sha(prepared)
             self._entries.append(entry)
             atomic_write_json(self.path, self._entries)
             return response
@@ -157,7 +191,7 @@ class CassetteTransport:
                 f"Cassette entry {self._cursor - 1} lacks request_sha; "
                 f"re-record the tape: {self.path}"
             )
-        if recorded_sha != _request_sha(messages, model, params):
+        if recorded_sha != _request_sha(prepared):
             raise RuntimeError(
                 f"Cassette request mismatch at entry {self._cursor - 1}: {self.path}"
             )
@@ -308,8 +342,8 @@ def _response_data(response: Response) -> dict[str, Any]:
     }
 
 
-def _request_sha(messages: list[dict[str, Any]], model: str, params: dict[str, Any]) -> str:
-    return sha({"messages": messages, "model": model, "params": params})
+def _request_sha(prepared: PreparedRequest) -> str:
+    return sha(prepared.canonical())
 
 
 def _live_enabled() -> bool:

@@ -23,13 +23,16 @@ import sys
 from pathlib import Path
 
 from kigumi.calling import LLMCaller
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 
 class Transport:
-    def resolve(self, model):
-        return model
+    def cache_identity(self):
+        return {'transport': 'subprocess-concurrency', 'schema': 1}
 
-    def complete(self, messages, model, **params):
+    def prepare(self, messages, model, params):
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared):
         return Response('stable response', {'total_tokens': 1}, 'stop')
 
 print(LLMCaller(Transport(), Path(sys.argv[1])).call('same request'))
@@ -69,11 +72,15 @@ def test_l1_reader_accepts_a_legitimate_atomic_replacement(
     import kigumi._safe_io as safe_io
 
     caller = LLMCaller(FakeTransport(), tmp_path)
+    prepared = caller.transport.prepare(
+        [{"role": "user", "content": "hello"}],
+        "default",
+        {},
+    )
     key = sha(
         {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
+            "transport": caller.transport.cache_identity(),
+            "prepared": prepared.canonical(),
             "seed": 0,
         }
     )

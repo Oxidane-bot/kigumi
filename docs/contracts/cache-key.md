@@ -2,13 +2,13 @@
 
 Status: Active (0.13.0)
 
-> v0.13.0 的 L3 内容键 `CACHE_SCHEMA=7` 保持不变，但 node cache envelope 正式升至 schema 4；
+> Unreleased 将 L3 内容键 `CACHE_SCHEMA=8`，L1 则硬切到 transport identity 与 effective
+> prepared request；这是一次统一换族，不提供旧键兼容读取。
+> node cache envelope 继续为 schema 4；
 > 旧 schema 3 条目（即使已经带有 `cache_key`）按 `CORRUPT` 拒绝，不迁移；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
 > 硬切，不迁移 0.7.x 条目。
 > EvidencePolicy、RetryPolicy 与 Agent capacity 不进入内容键；前两者绑定 run/origin identity。
-> 本次 `libs` 按节点静态 import 闭包细化，沿用这个已发布的 7 轮换，不再把
-> `CACHE_SCHEMA` 递增为 8。
 
 ## Purpose
 
@@ -26,7 +26,15 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
 
 ## Invariants
 
-1. L1 键等于 `sha({messages, model=resolved 后模型, params(调用方原样,传输层归一化不回写), seed})`；当请求带有非默认 `ResponseSpec` 时，键额外绑定其格式与 `schema_sha256`；`seed` 只是键命名空间，不发给供应商。
+1. transport 必须先以无 provider I/O 的 `prepare(messages, model, params)` 返回冻结的
+   `PreparedRequest`。L1 键等于
+   `sha({transport=transport.cache_identity(), prepared=prepared.canonical(), seed})`；当请求带有
+   非默认 `ResponseSpec` 时，键额外绑定其格式与 `schema_sha256`。`cache_identity()` 必须稳定、
+   credential-free，并区分可能改变 wire 语义的 adapter/config；`prepared.canonical()` 是
+   effective messages、resolved model 与 normalized params 的稳定 JSON 投影。`seed` 只是键
+   命名空间，不发给供应商。
+   附件 canonical identity 只保存内容 SHA-256、MIME 与 detail 等稳定逻辑表示，不含 base64
+   或临时绝对路径；`send(prepared)` 仍从同一个 prepared request 展开并获得实际 wire 内容。
 2. L3 成分标签固定为 `source`、`libs`、`upstream:<dep>`、`prompts:<t>`、
    `prompt_specs:<name>`、`files:<p>`、`params`、`item`、`item_files:<p>`、`carry`、
    `kigumi`；引用 `call_validated` 检测到的 Pydantic 模型时额外出现
@@ -105,7 +113,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    该节点视为本次 `off`，且 run、plan、explain、普通节点、map 与 scan 必须使用同一有效策略：
    不读取/写入 L3，不报告空 item 集合的 vacuous aggregate hit，但仍使用同一确定性声明 identity
    支持 durable resume/recovery。L1 不变。
-6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=7, pydantic})`；其中
+6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=8, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
 7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时原则上必须递增
@@ -120,10 +128,12 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    envelope 升至 schema 3，以引入声明式 Prompt resolution、selected-only L3 成分和
    hash-bound origin。0.8.0 从 5 升至 6，以引入 `agent_schema=3` 的 session attachment
    与 Agent scan executor 语义。0.11.0 从 6 升至 7，以绑定 managed request 的
-   attachment content hash、typed message digest 和 response schema identity；本次 `libs`
-   细化搭载同一已发布的 7 轮换，不新增第 8 次全项目换族。0.13.0 将 node cache
+   attachment content hash、typed message digest 和 response schema identity；随后发布的
+   `libs` 细化搭载同一第 7 族，当时未新增全项目换族。0.13.0 将 node cache
    envelope 从 schema 3 升至 schema 4，以正式绑定请求的 L3 `cache_key`；这是 Greenfield
-   envelope 硬切，不迁移旧 schema 3 条目，也不改变内容键 `CACHE_SCHEMA`。
+   envelope 硬切，不迁移旧 schema 3 条目，也不改变当时的内容键 `CACHE_SCHEMA`。
+   Unreleased 从 7 升至 8，使 L1 transport/prepared identity 与 L3 内容族同步硬切；这是
+   本批变更唯一一次缓存族轮换。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash
@@ -149,7 +159,8 @@ miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`C
 
 ## Affected surfaces
 
-- `kigumi/calling.py:141-223`
+- `kigumi.calling.LLMCaller.call`
+- `kigumi.transport.PreparedRequest` 与 `kigumi.transport.Transport`
 - `kigumi/_declarations.py:9-27`
 - kigumi/dag.py 的 `CACHE_SCHEMA` 与 `_kigumi_key_inputs`
 - kigumi/dag.py 的 `Dag._key_components` 与 `Dag._libs_hash`
@@ -162,6 +173,9 @@ miss 重算或静默重新计费；`CacheLookup` 保留 `MISSING`、`VALID`、`C
 锁定测试：`tests/test_calling.py::test_cache_key_ignores_param_order`、
 `tests/test_calling.py::test_resolved_model_changes_cache_key_and_provenance`、
 `tests/test_calling.py::test_seed_changes_cache_key`、
+`tests/test_calling.py::test_plain_messages_use_prepared_request_and_transport_identity_in_cache_key`、
+`tests/test_calling.py::test_transport_cache_identity_is_part_of_l1_key`、
+`tests/test_calling.py::test_prepared_attachment_canonical_uses_digest_not_path_or_base64`、
 `tests/test_dag_cache_keys.py::test_docstring_does_not_change_cache_but_code_does`、
 `tests/test_dag_cache_keys.py::test_kigumi_component_tracks_repair_bytes_and_uses_schema`、
 `tests/test_dag_cache_keys.py::test_key_components_lock_exact_label_set`、

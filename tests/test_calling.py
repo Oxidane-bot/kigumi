@@ -29,7 +29,7 @@ from kigumi.calling import (
 from kigumi.prompt import PreflightPolicy, RequestTooLarge
 from kigumi.slots import SlotTimeoutError
 from kigumi.testing import FakeTransport
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 
 _CROSS_PROCESS_CALLER = """
 from __future__ import annotations
@@ -76,7 +76,7 @@ def increment_provider_count() -> None:
 
 
 class CountingTransport(FakeTransport):
-    def complete(self, messages, model, **params):
+    def send(self, prepared):
         increment_provider_count()
         mark("provider")
         if mode in {"flight", "disabled"}:
@@ -84,7 +84,7 @@ class CountingTransport(FakeTransport):
         elif mode == "hold":
             while True:
                 time.sleep(1)
-        return super().complete(messages, model, **params)
+        return super().send(prepared)
 
 
 if mode in {"flight", "disabled"}:
@@ -151,6 +151,129 @@ def test_cache_key_ignores_param_order(tmp_path: Path) -> None:
     assert [call["cache"] for call in caller.calls] == ["miss", "hit"]
 
 
+def test_effective_prepared_request_drives_key_budget_effect_metadata_and_send(
+    tmp_path: Path,
+) -> None:
+    class RecordingBudget(Budget):
+        def __init__(self) -> None:
+            super().__init__(max_tokens=1_000)
+            self.reservations: list[int] = []
+
+        def reserve(self, estimated_tokens: int):
+            self.reservations.append(estimated_tokens)
+            return super().reserve(estimated_tokens)
+
+    class InjectingTransport:
+        def __init__(self, max_tokens: int) -> None:
+            self.max_tokens = max_tokens
+            self.sent: list[PreparedRequest] = []
+
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "injecting", "version": 1}
+
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(
+                [{"role": "system", "content": "rules"}, *messages],
+                f"provider/{model}",
+                {**params, "max_tokens": self.max_tokens},
+            )
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            self.sent.append(prepared)
+            return Response(
+                "answer",
+                {"total_tokens": 3},
+                "stop",
+                model=prepared.model,
+            )
+
+    budget = RecordingBudget()
+    first_transport = InjectingTransport(100)
+    first = LLMCaller(first_transport, tmp_path, budget=budget)
+    active_effect: dict[str, Any] = {}
+
+    with durable_side_effect_boundary(active_effect.update):
+        assert first.call("hello", model="chat") == "answer"
+
+    effective = first_transport.sent[0].canonical()
+    assert budget.reservations == [104]
+    assert first.calls[0]["model"] == effective["model"] == "provider/chat"
+    assert first.calls[0]["params"] == effective["params"] == {"max_tokens": 100}
+    assert first.calls[0]["prompt_sha"] == sha(effective["messages"])
+    assert first.calls[0]["transport_identity"] == first_transport.cache_identity()
+    assert active_effect["params_digest"] == sha(effective["params"])
+    assert active_effect["prompt_sha"] == sha(effective["messages"])
+    assert active_effect["transport_identity_digest"] == sha(first_transport.cache_identity())
+
+    second_transport = InjectingTransport(200)
+    second = LLMCaller(second_transport, tmp_path)
+    assert second.call("hello", model="chat") == "answer"
+    assert first.calls[0]["key"] != second.calls[0]["key"]
+    assert len(list((tmp_path / "llm").glob("*.json"))) == 2
+
+
+def test_effective_prepared_messages_are_preflighted_before_cache_or_send(
+    tmp_path: Path,
+) -> None:
+    class ExpandingTransport:
+        def __init__(self) -> None:
+            self.sent = 0
+
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "expanding", "version": 1}
+
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(
+                [{"role": "system", "content": "x" * 200}, *messages],
+                model,
+                params,
+            )
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            del prepared
+            self.sent += 1
+            return Response("must not send", {"total_tokens": 1}, "stop")
+
+    transport = ExpandingTransport()
+    caller = LLMCaller(
+        transport,
+        tmp_path,
+        preflight_policy=PreflightPolicy(max_tokens=10),
+    )
+
+    with pytest.raises(RequestTooLarge):
+        caller.call("hello")
+
+    assert transport.sent == 0
+    assert not (tmp_path / "llm").exists()
+
+
+def test_transport_cache_identity_is_part_of_l1_key(tmp_path: Path) -> None:
+    class RoutedTransport:
+        def __init__(self, route: str) -> None:
+            self.route = route
+            self.sent = 0
+
+        def cache_identity(self) -> dict[str, str]:
+            return {"transport": "routed", "route": self.route}
+
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(messages, model, params)
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            self.sent += 1
+            return Response(self.route, {"total_tokens": 1}, "stop", model=prepared.model)
+
+    first_transport = RoutedTransport("first")
+    second_transport = RoutedTransport("second")
+
+    assert LLMCaller(first_transport, tmp_path).call("same") == "first"
+    assert LLMCaller(second_transport, tmp_path).call("same") == "second"
+
+    assert first_transport.sent == second_transport.sent == 1
+    assert len(list((tmp_path / "llm").glob("*.json"))) == 2
+
+
 def test_seed_changes_cache_key(tmp_path: Path) -> None:
     """seed 是缓存命名空间，同请求不同 seed 必须各自未命中。"""
     transport = FakeTransport()
@@ -201,11 +324,14 @@ def test_call_evidence_policy_is_rebuilt_from_l1_without_provider_request(
 
 def test_failed_call_observation_contains_canonical_typed_failure(tmp_path: Path) -> None:
     class FailingTransport:
-        def resolve(self, model: str) -> str:
-            return model
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "failing", "schema": 1}
 
-        def complete(self, messages, model: str, **params):
-            del messages, model, params
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(messages, model, params)
+
+        def send(self, prepared: PreparedRequest):
+            del prepared
             error = type("TypedError", (RuntimeError,), {"status_code": 429})
             raise error("untrusted prose")
 
@@ -235,9 +361,10 @@ def test_torn_cache_raises_integrity_error(tmp_path: Path) -> None:
     caller = LLMCaller(transport, tmp_path)
     key = sha(
         {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
+            "transport": transport.cache_identity(),
+            "prepared": transport.prepare(
+                [{"role": "user", "content": "hello"}], "default", {}
+            ).canonical(),
             "seed": 0,
         }
     )
@@ -257,9 +384,10 @@ def test_poisoned_empty_cache_raises_integrity_error(tmp_path: Path) -> None:
     caller = LLMCaller(transport, tmp_path)
     key = sha(
         {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
+            "transport": transport.cache_identity(),
+            "prepared": transport.prepare(
+                [{"role": "user", "content": "hello"}], "default", {}
+            ).canonical(),
             "seed": 0,
         }
     )
@@ -410,7 +538,7 @@ def test_provider_malformed_usage_is_rejected_before_cache_write(tmp_path: Path)
 
     assert list((tmp_path / "llm").glob("*.json")) == []
     assert caller.budget is not None
-    assert caller.budget.spent == 0
+    assert caller.budget.spent == 2
 
 
 def test_provider_missing_usage_is_rejected_before_cache_write_with_hard_budget(
@@ -427,7 +555,36 @@ def test_provider_missing_usage_is_rejected_before_cache_write_with_hard_budget(
 
     assert list((tmp_path / "llm").glob("*.json")) == []
     assert caller.budget is not None
-    assert caller.budget.spent == 0
+    # The provider returned a response, so the admitted estimate is consumed even
+    # though missing usage correctly prevents a successful cache entry.
+    assert caller.budget.spent == 2
+
+
+def test_hard_budget_spends_reservation_when_provider_attempt_fails(
+    tmp_path: Path,
+) -> None:
+    class FailingTransport:
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "failing", "schema": 1}
+
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(messages, model, {**params, "max_tokens": 3})
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            del prepared
+            error = type("RateLimited", (RuntimeError,), {"status_code": 429})
+            raise error("provider may have accepted the request")
+
+    budget = Budget(max_tokens=10)
+    caller = LLMCaller(FailingTransport(), tmp_path, budget=budget)
+
+    with pytest.raises(ProviderFailure) as raised:
+        caller.call("hello")
+
+    assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
+    assert budget.spent == 5
+    assert budget._reserved == 0
+    assert caller.calls[0]["params"] == {"max_tokens": 3}
 
 
 def test_cache_hit_skips_transport_and_budget(tmp_path: Path) -> None:
@@ -547,13 +704,8 @@ def test_inflight_same_key_calls_transport_once(tmp_path: Path) -> None:
     release = threading.Event()
 
     class BlockingTransport(FakeTransport):
-        def complete(
-            self,
-            messages: list[dict[str, Any]],
-            model: str,
-            **params: Any,
-        ) -> Response:
-            response = super().complete(messages, model, **params)
+        def send(self, prepared: PreparedRequest) -> Response:
+            response = super().send(prepared)
             entered.set()
             assert release.wait(timeout=2)
             return response
@@ -589,8 +741,8 @@ def test_single_flight_lock_cleanup_after_completion(tmp_path: Path) -> None:
     assert caller._key_locks == {}
 
     class FailingTransport(FakeTransport):
-        def complete(self, messages, model, **params):
-            del messages, model, params
+        def send(self, prepared):
+            del prepared
             raise RuntimeError("provider failed")
 
     failing = LLMCaller(FailingTransport(), tmp_path / "failure")
@@ -612,13 +764,13 @@ def test_inflight_failure_is_shared_and_lock_is_cleaned(tmp_path: Path) -> None:
     calls_lock = threading.Lock()
 
     class BlockingFailingTransport(FakeTransport):
-        def complete(self, messages, model, **params):
+        def send(self, prepared):
             nonlocal calls
             with calls_lock:
                 calls += 1
             entered.set()
             assert release.wait(timeout=2)
-            del messages, model, params
+            del prepared
             raise RuntimeError("provider failed")
 
     caller = LLMCaller(BlockingFailingTransport(), tmp_path)
@@ -769,6 +921,7 @@ def test_kigumi_file_cache_key_uses_content_hash(tmp_path: Path) -> None:
 
     assert len(transport.requests) == 2
     assert [call["cache"] for call in caller.calls] == ["miss", "hit", "miss"]
+    assert caller.calls[1]["request_evidence"][0]["content"][0]["kigumi_file"] == str(copied)
 
 
 def test_direct_file_chat_is_unmanaged_but_keeps_secure_lineage(tmp_path: Path) -> None:
@@ -848,6 +1001,24 @@ def test_kigumi_file_expands_only_for_live_transport(tmp_path: Path) -> None:
     assert video_part["file"]["detail"] == "low"
     assert video_part["file"]["file_data"].startswith("data:video/mp4;base64,")
     assert len(transport.requests) == 2
+
+
+def test_prepared_attachment_canonical_uses_digest_not_path_or_base64(tmp_path: Path) -> None:
+    source = tmp_path / "private" / "image.png"
+    source.parent.mkdir()
+    source.write_bytes(b"image bytes")
+    transport = FakeTransport()
+    caller = LLMCaller(transport, tmp_path / "cache")
+
+    caller.call([{"role": "user", "content": {"kigumi_file": str(source)}}])
+
+    canonical = json.dumps(transport.prepared_requests[0].canonical(), sort_keys=True)
+    assert sha256(b"image bytes").hexdigest() in canonical
+    assert str(source) not in canonical
+    assert "base64" not in canonical
+    assert transport.requests[0][0][0]["content"][0]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
 
 
 def test_kigumi_file_missing_or_unknown_format_fails_before_call(tmp_path: Path) -> None:
@@ -994,18 +1165,24 @@ calling.LLMCaller._file_reference({"kigumi_file": str(source)})
     assert "regular" in result.stderr.lower()
 
 
-def test_plain_messages_keep_existing_cache_key(tmp_path: Path) -> None:
-    """教训 cache_compatibility: 没有文件引用的旧缓存必须逐字节继续命中。"""
+def test_plain_messages_use_prepared_request_and_transport_identity_in_cache_key(
+    tmp_path: Path,
+) -> None:
+    """Plain requests use the same explicit prepared-request cache family."""
     messages = [{"role": "user", "content": "hello"}]
-    caller = LLMCaller(FakeTransport(), tmp_path)
+    transport = FakeTransport()
+    caller = LLMCaller(transport, tmp_path)
 
     caller.call(messages, temperature=0.2)
 
     expected = sha(
         {
-            "messages": messages,
-            "model": "default",
-            "params": {"temperature": 0.2},
+            "transport": transport.cache_identity(),
+            "prepared": transport.prepare(
+                messages,
+                "default",
+                {"temperature": 0.2},
+            ).canonical(),
             "seed": 0,
         }
     )

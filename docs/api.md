@@ -8,6 +8,11 @@
 
 ### 修复、调用与 transport
 
+- `PreparedRequest(messages, model, params)`（`kigumi.transport`，顶层导出）：冻结的 effective
+  provider request；`canonical()` 返回 credential-free 的稳定缓存身份，`wire()` 返回发送所需的
+  展开副本。自定义 `Transport` 实现 `cache_identity()`、
+  `prepare(messages, model, params) -> PreparedRequest` 与 `send(prepared) -> Response`；
+  `send` 每次只允许一次 provider attempt。
 - `class RepairExhausted(RuntimeError)`（`kigumi.repair`，顶层导出）：`repair_loop` /
   `call_validated` 的首次校验与全部 `max_repairs` 修复仍失败。检查异常链中的最后一次校验
   错误，修正 schema、prompt 或 validator；需要审计各轮时传 `sink=` / `on_event=`。见
@@ -16,17 +21,19 @@
   成功响应调用 `commit(actual_usage)`，失败或取消调用 `cancel()`。
 - `class BudgetExceeded(RuntimeError)`（`kigumi.calling`，顶层导出）：预留额度不足，或一次已完成
   调用的实际用量使 `Budget.spent` 推过 `max_tokens` 时抛出。缓存命中不做预留；miss 在 provider
-  请求前按 prompt 长度加 `max_tokens` 做 best-effort 预留，实际用量可能超过预留并在 commit 时
-  被记录。预算只在进程内协调；`LLMCaller` 只有在传入启用的 `FileSlots` 时，才用同一 lock root
+  请求前按 effective prepared request 与 `max_tokens` 做 best-effort 预留，实际用量可能超过预留
+  并在 commit 时被记录。有限预算在 provider attempt 已开始却没有可信用量时，保守地把预留估算
+  计入 `spent`；成功响应缺失或非法 `usage.total_tokens` 在缓存写入前 fail closed。预算只在进程内
+  协调；`LLMCaller` 只有在传入启用的 `FileSlots` 时，才用同一 lock root
   对同 key 做跨进程 single-flight。
 - `class DryRunError(RuntimeError)`（`kigumi.calling`，顶层导出）：`LLMCaller(dry=True)` 遇到
   L1 miss、原本必须发真实请求。先补齐缓存，或在明确允许真实请求的运行中关闭 `dry`。见
   [零真实请求的测试](adoption.md#零真实请求的测试)。
-- `class EmptyResponseError(RuntimeError)`（`kigumi.transport`，顶层导出）：transport 的空文本
-  响应超过 `max_empty_retries`。检查 provider 响应与模型，或调整有界 transport 配置。
+- `class EmptyResponseError(RuntimeError)`（`kigumi.transport`，顶层导出）：单次 transport
+  attempt 返回空文本。检查 provider 响应与模型；需要再次尝试时使用 DAG `RetryPolicy`。
 - `class TruncatedResponseError(RuntimeError)`（`kigumi.transport`，顶层导出）：
-  `finish_reason="length"` 时没有显式 `max_tokens`，或倍增额度后仍超过
-  `max_length_retries`。显式设置合适的 `max_tokens`，并检查输出任务是否过大。
+  单次 attempt 返回 `finish_reason="length"`。设置合适的 `max_tokens` 或缩小任务；需要再次
+  尝试时使用 DAG `RetryPolicy`，transport 不会自行扩容或重试。
 - `ProviderFailure(*, provider: str, stage: ProviderFailureStage, kind: ProviderFailureKind, status_code: int | None, retry_after_ms: int | None, provider_request_id: str | None, message_digest: str, retryable_hint: bool | None) -> None`
   （`kigumi.failures`，顶层导出）：L0/CALL 的结构化 provider 失败事实；只依据 wire/status/
   typed SDK 字段分类。按 `kind` 修复凭证、权限、请求或模型，只有 retry policy 允许的 kind

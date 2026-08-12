@@ -180,10 +180,10 @@ def test_response_schema_identity_changes_managed_cache_key(tmp_path: Path) -> N
     assert caller.calls[0]["prompt_resolution"]["response_spec"]["schema_sha256"] == "a" * 64
 
 
-def test_cache_schema_seven_does_not_read_schema_six_entry(
+def test_cache_schema_eight_does_not_read_schema_seven_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert dag_module.CACHE_SCHEMA == 7
+    assert dag_module.CACHE_SCHEMA == 8
 
     def build() -> Any:
         from kigumi.config import KigumiConfig
@@ -194,7 +194,7 @@ def test_cache_schema_seven_does_not_read_schema_six_entry(
             LLMCaller(FakeTransport(), tmp_path / "llm"),
         )
 
-    monkeypatch.setattr(dag_module, "CACHE_SCHEMA", 6)
+    monkeypatch.setattr(dag_module, "CACHE_SCHEMA", 7)
     old = build()
 
     @old.node("work")
@@ -204,7 +204,7 @@ def test_cache_schema_seven_does_not_read_schema_six_entry(
 
     old_result = old.run(run_id="old")
 
-    monkeypatch.setattr(dag_module, "CACHE_SCHEMA", 7)
+    monkeypatch.setattr(dag_module, "CACHE_SCHEMA", 8)
     new = build()
 
     @new.node("work")

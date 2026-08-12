@@ -288,9 +288,9 @@ def test_documented_schema_values_match_code() -> None:
     assert not mismatches, "Schema documentation drift:\n" + "\n".join(mismatches)
 
 
-def test_cache_schema_seven_is_recorded_in_a_released_changelog_section() -> None:
-    """CACHE_SCHEMA=7 is a released cache-family rotation, not an Unreleased claim."""
-    assert CACHE_SCHEMA == 7
+def test_cache_schema_eight_is_recorded_once_in_unreleased_changelog() -> None:
+    """CACHE_SCHEMA=8 is this Unreleased cache-family rotation; 7 stays historical."""
+    assert CACHE_SCHEMA == 8
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     headings = list(CHANGELOG_RELEASE_PATTERN.finditer(changelog))
@@ -298,19 +298,23 @@ def test_cache_schema_seven_is_recorded_in_a_released_changelog_section() -> Non
 
     unreleased_end = headings[0].start()
     unreleased = changelog[:unreleased_end]
-    assert not re.search(r"CACHE_SCHEMA\s*(?:=|升至)\s*7\b", unreleased)
+    rotations = re.findall(r"CACHE_SCHEMA[^\n]*(?:升至|=)\s*8\b", unreleased)
+    assert len(rotations) == 1, "Unreleased must record exactly one CACHE_SCHEMA=8 rotation"
 
     released_sections: list[tuple[str, str]] = []
     for index, heading in enumerate(headings):
         body_end = headings[index + 1].start() if index + 1 < len(headings) else len(changelog)
         released_sections.append((heading.group("version"), changelog[heading.end() : body_end]))
 
-    rotations = [
+    prior_rotations = [
         version
         for version, body in released_sections
         if re.search(r"CACHE_SCHEMA[^\n]*(?:升至|=)\s*7\b", body)
     ]
-    assert rotations, "CACHE_SCHEMA=7 must be introduced by a dated release section"
+    assert prior_rotations, "CACHE_SCHEMA=7 must remain recorded in a dated release section"
+    assert not any(
+        re.search(r"CACHE_SCHEMA[^\n]*升至\s*8\b", body) for _, body in released_sections
+    ), "CACHE_SCHEMA=8 must not appear as a released rotation"
 
     stale_claims = [
         version

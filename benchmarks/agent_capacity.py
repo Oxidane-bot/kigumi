@@ -16,13 +16,20 @@ from kigumi.agents import (
     AgentTask,
 )
 from kigumi.config import KigumiConfig
+from kigumi.transport import PreparedRequest
 
 
 class _UnusedTransport:
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "unused-capacity-benchmark", "schema": 1}
 
-    def complete(self, messages: object, model: str, **params: object) -> Any:
+    def prepare(
+        self, messages: list[dict[str, Any]], model: str, params: dict[str, Any]
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Any:
+        del prepared
         raise AssertionError("capacity benchmark must not make provider calls")
 
 

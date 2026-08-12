@@ -14,7 +14,7 @@ Source of truth（公开入口见
 
 | 契约 | 状态 | 回答的问题 |
 | --- | --- | --- |
-| [缓存键契约](cache-key.md) | Active (0.11.0) | 哪些输入进入 L1/L3 内容键，什么变化必须换键或换族？ |
+| [缓存键契约](cache-key.md) | Active (0.13.0) | 哪些输入进入 L1/L3 内容键，什么变化必须换键或换族？ |
 | [确定性字节契约](determinism.md) | Active (0.8.0) | cold、warm 与重放路径怎样保持相同的 canonical 字节结果？ |
 | [缓存与产物保留契约](retention.md) | Active (0.8.0) | GC 可以删除什么，保留 run 必须保护哪些 cache 与 blob？ |
 | [分层 Prompt 解析契约](prompt-resolution.md) | Active (0.13.0) | Prompt 声明怎样确定解析、入键并留下不含内容的 lineage？ |

@@ -63,7 +63,7 @@ kigumi/
 ├── store.py        #     存储布局:run、缓存、归档、物化、审批与 GC
 ├── subgraph.py     #     静态可复用子图声明;挂载与执行仍归 Dag
 ├── testing.py      #     pytest 插件(面向用户项目)
-├── transport.py    # L0  传输:complete(messages);LiteLLM/stdlib 可选适配器
+├── transport.py    # L0  传输:prepare/send 单次 attempt;LiteLLM/stdlib 可选适配器
 └── views.py        #     DAG 声明与运行态的只读渲染,消费纯数据
 ```
 
@@ -121,30 +121,31 @@ agent_slot_timeout_seconds = 300
 ## 各层要点
 
 ### L0 transport
-- 唯一接口 `complete(messages, model, **params) -> Response`
-  (text / usage / finish_reason / reasoning / model),外加
-  `resolve(model) -> str`(别名 → 具体模型名,供 L1 构缓存键)。
+- 唯一协议由 `cache_identity()`、
+  `prepare(messages, model, params) -> PreparedRequest` 与
+  `send(prepared) -> Response` 组成。`PreparedRequest` 冻结 effective messages、resolved model
+  与 normalized params，并提供 credential-free `canonical()`；`prepare` 不得触发 provider。
 - LiteLLM 与纯标准库 OpenAI 兼容实现都是可选适配器；任意 SDK 均可实现
-  `Transport` 协议。自愈策略共享,不复制。
+  `Transport` 协议。
 - **params 契约(归一化词汇表,冻结于 P1.1)**:`json_mode=True` →
   `response_format={"type":"json_object"}`;`system="…"` → 前插 system 消息;
   `reasoning_effort` 透传;其余透传。词汇表进缓存键语义,事后扩充只增不改。
-- 非 durable 调用的 transport 故障自愈(全部有界):429/5xx 指数退避、`finish_reason=length` 且调用方
-  显式设了 max_tokens → 加倍重试(至多 2 次);未设 max_tokens 的截断 →
-  抛 TruncatedResponseError(静默返回残文即下游投毒);空响应 → 退避重试,
-  耗尽即抛 EmptyResponseError,**绝不返回空文本**。
-- StdlibTransport 必须带默认超时(300s);所有重试路径都有退避 sleep。
-- durable retry 启用时 transport/length/empty hidden retry 必须全部为 0；否则在请求前拒绝。
-  Adapter 只产出 `ProviderFailure` 事实，retry 决策只属于 `RetryPolicy`。
+- `send` 每次只执行一次 provider attempt：transient 产出 `ProviderFailure`，
+  `finish_reason=length` 抛 `TruncatedResponseError`，空响应抛 `EmptyResponseError`；transport
+  不 sleep、不加倍 token、不重试。再次调用只属于 DAG `RetryPolicy`，从而每次发送都有独立的
+  durable attempt 边界。
+- StdlibTransport 必须带默认超时(300s)。
 - 多档模型别名(default/pro)映射到不同模型/供应商,节点只说档位。
 
 ### L1 calling
 - `LLMCaller(transport, cache_dir, seed, budget, dry)`,依赖注入,测试可替换。
-- 内容寻址缓存:键 = messages + **resolved model**(经 transport.resolve,
-  换 .env 模型 = 换缓存键,防跨模型回放旧答案)+ params + seed;
+- 内容寻址缓存:键 = credential-free **transport identity** + **prepared canonical** + seed；
+  transport 归一化后的 messages/model/params 变化都会换键，换 adapter/config 也不会跨语义回放；
   缺失缓存才是 miss；已存在的撕裂/空/摘要不匹配缓存 fail closed；**空响应拒入缓存**
   (transport 违约时的第二道闸)。
-- 溯源 meta 同记 model_alias 与 resolved model;**先记 calls 再 permit.commit**,
+- preflight、预算估算、durable effect metadata、调用记录与 `send` 全部基于同一个 effective
+  `PreparedRequest`，避免调用方原始参数与 wire 语义分叉。
+- 溯源 meta 同记 model_alias、effective model 与 transport identity；**先记 calls 再 permit.commit**,
   以便实际用量超预算时仍保留最贵调用的溯源;`Budget.record` 保留为无预留的兼容入口
   （超限异常不得吞掉最贵那次调用的溯源）。
 - dry-run 熔断:到达真调用即抛错;缓存命中时不熔断继续走(特性,非 bug:
@@ -161,7 +162,8 @@ agent_slot_timeout_seconds = 300
 - managed request 解析为 `Message`、`Attachment` 与 `ResponseSpec`；`FileRef` 的文件哈希进入
   `PromptResolution`，`preflight()` 在 cache lookup 前拒绝过大请求，绝不以 `clip()` 静默缩短。
 - 跨进程限流(fcntl.flock 请求槽,多进程共享 provider 配额)归 P6a。
-- token 预算记账,超限中止 run。
+- token 预算记账,超限中止 run；有限预算在 provider attempt 已开始但用量未知时保守消费
+  admitted estimate，不能把可能已发出的调用当零。
 
 ### L1.5 prompt(七能力)
 1. `inject(obj)`:材料注入唯一入口——强制 sort_keys、稳定缩进、统一围栏
@@ -408,6 +410,10 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 勾兑——P1 曾带着 4 处对旧实现的退化过审,教训在此。
 
 ## 修订记录
+
+- 2026-08-12 Unreleased：Transport 收敛为 `cache_identity/prepare/send`，冻结的
+  `PreparedRequest` 统一 L1 identity/admission/provenance/send；provider 每次只发送一次，重试只由
+  DAG `RetryPolicy` 表达；`CACHE_SCHEMA=8` 进行一次缓存族硬切。
 
 - 2026-08-04 0.13.0：per-target durable retry/resume receipt chain、可达 helper/raw callable
   guard 的 Greenfield hard cut、blob/物化 fail-closed 边界与 wheel/sdist 发行物验证已落地；

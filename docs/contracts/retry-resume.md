@@ -34,8 +34,10 @@ current state 或 `attempt-NNNN.json`。`write_recovery_receipt(payload)` 仍是
    runtime failure 默认不重试。
 2. full jitter 由 `run_id + target + attempt + policy digest` 确定性派生。provider
    `retry_after_ms` 是下界；`max_delay_seconds` 只限制本地指数退避。
-3. retry digest 属于 run execution identity 与 attempt receipt，不进入 L3 内容键。durable
-   CALL 要求 transport/length/empty hidden retry 全为 0；Pi hidden retry 事件立即失败。
+3. retry digest 属于 run execution identity 与 attempt receipt，不进入 L3 内容键。Transport
+   协议的 `send(prepared)` 固定只执行一次 provider attempt；transient、length 与 empty 都显式
+   失败，不在 transport 内 sleep 或重试。后续 provider attempt 只能由 DAG `RetryPolicy` 创建，
+   因而每次发送都落入独立 durable attempt 边界。Pi hidden retry 事件仍立即失败。
 4. `_run.json` schema 2 绑定 graph identity、targets、force、source/libs、retry/evidence
    digests、完整 Prompt 候选 universe、WorkflowProfile 及其 digest。缺少 schema-2 manifest
    的 run 不可 resume；任何声明或未选中候选变化都 fail closed。

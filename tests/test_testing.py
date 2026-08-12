@@ -8,9 +8,13 @@ from typing import Any
 import pytest
 
 from kigumi.testing import CassetteTransport, FakeTransport, ScriptedTransport, skip_unless_env
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 
 pytest_plugins = ["pytester"]
+
+
+def _send(transport, messages=None, model="default", **params):
+    return transport.send(transport.prepare(messages or [], model, params))
 
 
 def test_fake_transport_replays_configured_responses_and_records_requests() -> None:
@@ -18,14 +22,14 @@ def test_fake_transport_replays_configured_responses_and_records_requests() -> N
     transport = FakeTransport(["first", Response("second", {}, "stop")])
     messages = [{"role": "user", "content": "hello"}]
 
-    assert transport.complete(messages, "model-a", temperature=0.2).text == "first"
-    assert transport.complete([], "model-b").text == "second"
+    assert _send(transport, messages, "model-a", temperature=0.2).text == "first"
+    assert _send(transport, model="model-b").text == "second"
     assert transport.requests == [
         (messages, "model-a", {"temperature": 0.2}),
         ([], "model-b", {}),
     ]
     with pytest.raises(RuntimeError, match="FakeTransport exhausted"):
-        transport.complete([], "model-c")
+        _send(transport, model="model-c")
 
 
 def test_scripted_transport_requires_a_marker_to_fill_an_entire_line() -> None:
@@ -33,16 +37,20 @@ def test_scripted_transport_requires_a_marker_to_fill_an_entire_line() -> None:
     transport = ScriptedTransport({"STAGE: draft": "ok"})
 
     with pytest.raises(AssertionError, match="STAGE: draft"):
-        transport.complete([{"role": "user", "content": "说明 STAGE: draft 只是示例"}], "x")
+        _send(transport, [{"role": "user", "content": "说明 STAGE: draft 只是示例"}], "x")
 
-    assert transport.complete([{"role": "user", "content": "STAGE: draft\n正文"}], "x").text == "ok"
+    assert _send(transport, [{"role": "user", "content": "STAGE: draft\n正文"}], "x").text == "ok"
 
 
 def test_scripted_transport_uses_route_definition_order() -> None:
     """教训 scripted_order: 多个完整标记命中时必须有稳定优先级。"""
     transport = ScriptedTransport({"STAGE: first": "first", "STAGE: second": "second"})
 
-    response = transport.complete([{"role": "user", "content": "STAGE: second\nSTAGE: first"}], "x")
+    response = _send(
+        transport,
+        [{"role": "user", "content": "STAGE: second\nSTAGE: first"}],
+        "x",
+    )
 
     assert response.text == "first"
 
@@ -52,7 +60,7 @@ def test_scripted_transport_reports_markers_and_request_on_miss() -> None:
     transport = ScriptedTransport({"STAGE: known": "ok"})
 
     with pytest.raises(AssertionError) as error:
-        transport.complete([{"role": "user", "content": "STAGE: missing request"}], "x")
+        _send(transport, [{"role": "user", "content": "STAGE: missing request"}], "x")
 
     assert "STAGE: known" in str(error.value)
     assert "STAGE: missing request" in str(error.value)
@@ -72,7 +80,11 @@ def test_scripted_transport_serializes_stateful_responders_under_concurrency() -
     transport = ScriptedTransport({"STAGE: count": respond})
     threads = [
         threading.Thread(
-            target=lambda: transport.complete([{"role": "user", "content": "STAGE: count"}], "x")
+            target=lambda: _send(
+                transport,
+                [{"role": "user", "content": "STAGE: count"}],
+                "x",
+            )
         )
         for _ in range(20)
     ]
@@ -89,23 +101,29 @@ def test_scripted_transport_aliases_make_missing_models_visible() -> None:
     """教训 scripted_aliases: fixture 的别名漏配不能回退为静默模型名。"""
     transport = ScriptedTransport({"STAGE: x": "ok"}, aliases={"default": "fixture-default"})
 
-    assert transport.resolve("default") == "fixture-default"
+    assert transport.prepare([], "default", {}).model == "fixture-default"
     with pytest.raises(KeyError):
-        transport.resolve("heavy")
+        transport.prepare([], "heavy", {})
 
 
 class RecordingTransport:
     def __init__(self) -> None:
         self.calls = 0
 
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "recording", "schema": 1}
 
-    def complete(
+    def prepare(
         self,
         messages: list[dict[str, Any]],
         model: str,
-        **params: Any,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(
+        self,
+        prepared: PreparedRequest,
     ) -> Response:
         self.calls += 1
         return Response(
@@ -113,7 +131,7 @@ class RecordingTransport:
             {"total_tokens": 2},
             "stop",
             "trace",
-            model,
+            prepared.model,
             model_observed=True,
         )
 
@@ -124,16 +142,52 @@ def test_cassette_replays_in_order_and_records_atomically(tmp_path: Path) -> Non
     recorder = RecordingTransport()
     recording = CassetteTransport(path, record_with=recorder)
 
-    assert recording.complete([], "default").text == "recorded"
+    assert _send(recording).text == "recorded"
     replay = CassetteTransport(path)
 
-    replayed = replay.complete([], "default")
+    replayed = _send(replay)
     assert replayed.reasoning == "trace"
     assert replayed.model_observed is True
     with pytest.raises(RuntimeError, match="Cassette exhausted"):
-        replay.complete([], "default")
+        _send(replay)
     assert recorder.calls == 1
     assert json.loads(path.read_text(encoding="utf-8"))[0]["text"] == "recorded"
+
+
+def test_recording_cassette_prepares_with_the_delegated_transport(tmp_path: Path) -> None:
+    class NormalizingTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sent: list[PreparedRequest] = []
+
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "normalizing-recorder", "schema": 1}
+
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(
+                [{"role": "system", "content": "rules"}, *messages],
+                f"provider/{model}",
+                {**params, "max_tokens": 10},
+            )
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            self.sent.append(prepared)
+            return super().send(prepared)
+
+    recorder = NormalizingTransport()
+    cassette = CassetteTransport(tmp_path / "responses.json", record_with=recorder)
+
+    _send(cassette, [{"role": "user", "content": "hello"}], "chat")
+
+    assert recorder.sent[0].canonical() == {
+        "messages": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "hello"},
+        ],
+        "model": "provider/chat",
+        "params": {"max_tokens": 10},
+    }
+    assert cassette.cache_identity()["delegate"] == recorder.cache_identity()
 
 
 def test_plugin_is_noop_without_kigumi_config(pytester: Any) -> None:
@@ -254,14 +308,14 @@ def test_cassette_rejects_replay_with_different_request(tmp_path: Path) -> None:
     """教训 tape_matching: 只按序重放会把换了顺序的调用静默配错答案。"""
     path = tmp_path / "responses.json"
     recording = CassetteTransport(path, record_with=RecordingTransport())
-    recording.complete([{"role": "user", "content": "甲"}], "default")
+    _send(recording, [{"role": "user", "content": "甲"}])
 
     replay = CassetteTransport(path)
     with pytest.raises(RuntimeError, match="request mismatch"):
-        replay.complete([{"role": "user", "content": "乙"}], "default")
+        _send(replay, [{"role": "user", "content": "乙"}])
 
     matched = CassetteTransport(path)
-    assert matched.complete([{"role": "user", "content": "甲"}], "default").text == "recorded"
+    assert _send(matched, [{"role": "user", "content": "甲"}]).text == "recorded"
 
 
 def test_cassette_rejects_legacy_tapes_without_request_sha(tmp_path: Path) -> None:
@@ -284,7 +338,7 @@ def test_cassette_rejects_legacy_tapes_without_request_sha(tmp_path: Path) -> No
 
     replay = CassetteTransport(path)
     with pytest.raises(RuntimeError, match="re-record"):
-        replay.complete([{"role": "user", "content": "任意"}], "default")
+        _send(replay, [{"role": "user", "content": "任意"}])
 
 
 def test_skip_unless_env_lists_every_missing_environment_variable(

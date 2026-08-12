@@ -224,9 +224,9 @@ def test_cache_hit_skips_reserve_and_cache_miss_reserves_before_transport(
     budget = RecordingBudget()
 
     class RecordingTransport(FakeTransport):
-        def complete(self, messages, model, **params):
+        def send(self, prepared):
             assert budget.reservations == [5]
-            return super().complete(messages, model, **params)
+            return super().send(prepared)
 
     transport = RecordingTransport([Response("answer", {"total_tokens": 2}, "stop")])
     caller = LLMCaller(transport, tmp_path, budget=budget)

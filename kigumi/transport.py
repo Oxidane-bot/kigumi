@@ -1,21 +1,97 @@
-"""LLM transport implementations with bounded recovery for transient failures."""
+"""LLM request preparation and single-attempt transport implementations."""
 
 from __future__ import annotations
 
 import json
 import os
-import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .artifacts import sha
 from .failures import (
     ProviderFailureKind,
     ProviderFailureStage,
     provider_failure_from_exception,
 )
 from .slots import AdaptiveCapacity
+
+
+def _freeze_prepared_value(value: Any) -> Any:
+    """Freeze JSON-shaped request state while preserving explicit lazy parts."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_prepared_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_prepared_value(item) for item in value)
+    return value
+
+
+def _canonical_prepared_value(value: Any) -> Any:
+    """Project request state to stable content identity without wire-only bytes."""
+    projection = getattr(value, "_prepared_canonical", None)
+    if callable(projection):
+        return _canonical_prepared_value(projection())
+    if isinstance(value, Mapping):
+        return {key: _canonical_prepared_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_prepared_value(item) for item in value]
+    return value
+
+
+def _wire_prepared_value(value: Any) -> Any:
+    """Expand lazy request parts into the concrete value sent to a provider."""
+    projection = getattr(value, "_prepared_wire", None)
+    if callable(projection):
+        return _wire_prepared_value(projection())
+    if isinstance(value, Mapping):
+        return {key: _wire_prepared_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_wire_prepared_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class PreparedRequest:
+    """Immutable effective request shared by identity, admission, and sending."""
+
+    messages: tuple[Mapping[str, Any], ...]
+    model: str
+    params: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.messages, (list, tuple)) or not all(
+            isinstance(message, Mapping) for message in self.messages
+        ):
+            raise TypeError("PreparedRequest messages must be a list or tuple of mappings")
+        if not isinstance(self.model, str) or not self.model:
+            raise ValueError("PreparedRequest model must be a non-empty string")
+        if not isinstance(self.params, Mapping):
+            raise TypeError("PreparedRequest params must be a mapping")
+        object.__setattr__(
+            self,
+            "messages",
+            tuple(_freeze_prepared_value(message) for message in self.messages),
+        )
+        object.__setattr__(self, "params", _freeze_prepared_value(self.params))
+
+    def canonical(self) -> dict[str, Any]:
+        """Return stable effective-request identity without wire-only expansion."""
+        return {
+            "messages": _canonical_prepared_value(self.messages),
+            "model": self.model,
+            "params": _canonical_prepared_value(self.params),
+        }
+
+    def wire(self) -> dict[str, Any]:
+        """Return a fresh concrete provider payload, expanding lazy parts."""
+        return {
+            "messages": _wire_prepared_value(self.messages),
+            "model": self.model,
+            "params": _wire_prepared_value(self.params),
+        }
 
 
 @dataclass
@@ -32,7 +108,7 @@ class Response:
 
 
 class EmptyResponseError(RuntimeError):
-    """Raised when bounded empty-response retries are exhausted."""
+    """Raised when a provider returns an empty response."""
 
 
 class TruncatedResponseError(RuntimeError):
@@ -42,11 +118,19 @@ class TruncatedResponseError(RuntimeError):
 class Transport(Protocol):
     """The minimal interface used by :class:`kigumi.calling.LLMCaller`."""
 
-    def resolve(self, model: str) -> str:
-        """Resolve a caller-facing model alias to a concrete model name."""
+    def cache_identity(self) -> Any:
+        """Return stable, credential-free adapter identity for L1 caching."""
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Response:
-        """Complete chat messages with the requested model."""
+    def prepare(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        """Resolve aliases and normalize one effective request without provider I/O."""
+
+    def send(self, prepared: PreparedRequest) -> Response:
+        """Send one prepared request exactly once."""
 
 
 def _value(source: Any, name: str, default: Any = None) -> Any:
@@ -81,28 +165,16 @@ def _is_transient_error(error: BaseException) -> bool:
     }
 
 
-class _RetryingTransport:
-    """Shared bounded retry policy for concrete transport adapters."""
+class _BaseTransport:
+    """Shared deterministic request preparation for concrete adapters."""
 
     def __init__(
         self,
         aliases: dict[str, str] | None = None,
-        max_retries: int = 3,
-        backoff_base: float = 1.0,
         *,
         capacity: AdaptiveCapacity | None = None,
-        max_length_retries: int = 2,
-        max_empty_retries: int = 2,
     ) -> None:
-        if min(max_retries, max_length_retries, max_empty_retries) < 0:
-            raise ValueError("transport retry limits must be non-negative")
-        if backoff_base < 0:
-            raise ValueError("backoff_base must be non-negative")
         self.aliases = self._aliases_from_environment() if aliases is None else dict(aliases)
-        self.max_retries = max_retries
-        self.max_length_retries = max_length_retries
-        self.max_empty_retries = max_empty_retries
-        self.backoff_base = backoff_base
         self.capacity = capacity
 
     @staticmethod
@@ -116,7 +188,7 @@ class _RetryingTransport:
             if configured
         }
 
-    def resolve(self, model: str) -> str:
+    def _resolve_model(self, model: str) -> str:
         """Resolve a caller-facing alias to the concrete provider model name."""
         if model in self.aliases:
             resolved = self.aliases[model]
@@ -132,60 +204,48 @@ class _RetryingTransport:
             raise ValueError("A concrete model name is required")
         return model
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Response:
-        """Run one normalized completion under the shared recovery policy."""
-        resolved_model = self.resolve(model)
-        normalized_messages, current_params = self._normalize_request(messages, params)
-        transient_retries = 0
-        length_retries = 0
-        empty_retries = 0
+    def prepare(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        params: dict[str, Any],
+    ) -> PreparedRequest:
+        """Return the resolved, normalized request used by every later boundary."""
+        normalized_messages, normalized_params = self._normalize_request(messages, params)
+        return PreparedRequest(
+            normalized_messages,
+            self._resolve_model(model),
+            normalized_params,
+        )
 
-        while True:
-            try:
-                response = self._complete_once(normalized_messages, resolved_model, current_params)
-            except Exception as error:
-                failure = provider_failure_from_exception(
-                    error,
-                    provider=self._provider_name(),
-                    stage=ProviderFailureStage.TRANSPORT,
-                )
-                transient = _is_transient_error(failure)
-                if transient and self.capacity is not None:
-                    self.capacity.on_throttle()
-                if not transient:
-                    raise failure from None
-                if transient_retries >= self.max_retries:
-                    raise failure from None
-                self._sleep_for_retry(transient_retries)
-                transient_retries += 1
-                continue
+    def send(self, prepared: PreparedRequest) -> Response:
+        """Execute one provider attempt and reject incomplete responses."""
+        if not isinstance(prepared, PreparedRequest):
+            raise TypeError("send requires a PreparedRequest")
+        wire = prepared.wire()
+        try:
+            response = self._send_once(
+                wire["messages"],
+                wire["model"],
+                wire["params"],
+            )
+        except Exception as error:
+            failure = provider_failure_from_exception(
+                error,
+                provider=self._provider_name(),
+                stage=ProviderFailureStage.TRANSPORT,
+            )
+            if _is_transient_error(failure) and self.capacity is not None:
+                self.capacity.on_throttle()
+            raise failure from None
 
-            if response.finish_reason == "length":
-                if "max_tokens" not in current_params:
-                    raise TruncatedResponseError(
-                        f"Model {resolved_model!r} returned a truncated response; "
-                        "explicitly set max_tokens then retry."
-                    )
-                if length_retries >= self.max_length_retries:
-                    raise TruncatedResponseError(
-                        f"Model {resolved_model!r} remained truncated after {length_retries} "
-                        "max_tokens retries."
-                    )
-                current_params["max_tokens"] = int(current_params["max_tokens"]) * 2
-                length_retries += 1
-                continue
-            if not response.text:
-                if empty_retries >= self.max_empty_retries:
-                    raise EmptyResponseError(
-                        f"Model {resolved_model!r} returned an empty response after "
-                        f"{empty_retries} retries."
-                    )
-                self._sleep_for_retry(empty_retries)
-                empty_retries += 1
-                continue
-            if self.capacity is not None:
-                self.capacity.on_success()
-            return response
+        if response.finish_reason == "length":
+            raise TruncatedResponseError(f"Model {prepared.model!r} returned a truncated response.")
+        if not response.text:
+            raise EmptyResponseError(f"Model {prepared.model!r} returned an empty response.")
+        if self.capacity is not None:
+            self.capacity.on_success()
+        return response
 
     @staticmethod
     def _normalize_request(
@@ -205,10 +265,7 @@ class _RetryingTransport:
             normalized_messages.insert(0, {"role": "system", "content": system})
         return normalized_messages, normalized_params
 
-    def _sleep_for_retry(self, retry_number: int) -> None:
-        time.sleep(self.backoff_base * (2**retry_number))
-
-    def _complete_once(
+    def _send_once(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -216,19 +273,18 @@ class _RetryingTransport:
     ) -> Response:
         raise NotImplementedError
 
-    def _failure_endpoint(self) -> str:
-        """Return concrete-adapter context suitable for a final retry error."""
-        return ""
-
     def _provider_name(self) -> str:
         """Return the stable provider adapter label used in typed failures."""
         return type(self).__name__
 
 
-class LiteLLMTransport(_RetryingTransport):
+class LiteLLMTransport(_BaseTransport):
     """Transport backed by LiteLLM, imported only when a call is actually made."""
 
-    def _complete_once(
+    def cache_identity(self) -> dict[str, Any]:
+        return {"transport": "litellm", "schema": 1}
+
+    def _send_once(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -247,7 +303,7 @@ class LiteLLMTransport(_RetryingTransport):
         return "litellm"
 
 
-class StdlibTransport(_RetryingTransport):
+class StdlibTransport(_BaseTransport):
     """OpenAI-compatible transport implemented with the Python standard library."""
 
     def __init__(
@@ -255,21 +311,13 @@ class StdlibTransport(_RetryingTransport):
         api_base: str,
         api_key: str,
         aliases: dict[str, str] | None = None,
-        max_retries: int = 3,
-        backoff_base: float = 1.0,
         timeout: float = 300.0,
         *,
         capacity: AdaptiveCapacity | None = None,
-        max_length_retries: int = 2,
-        max_empty_retries: int = 2,
     ) -> None:
         super().__init__(
             aliases=aliases,
-            max_retries=max_retries,
-            backoff_base=backoff_base,
             capacity=capacity,
-            max_length_retries=max_length_retries,
-            max_empty_retries=max_empty_retries,
         )
         parsed_api_base = urlsplit(api_base)
         if not parsed_api_base.scheme:
@@ -290,7 +338,14 @@ class StdlibTransport(_RetryingTransport):
         self.api_key = api_key
         self._timeout = timeout
 
-    def _complete_once(
+    def cache_identity(self) -> dict[str, Any]:
+        return {
+            "transport": "openai-compatible",
+            "schema": 1,
+            "api_base_sha256": sha(self.api_base),
+        }
+
+    def _send_once(
         self,
         messages: list[dict[str, Any]],
         model: str,
@@ -311,10 +366,6 @@ class StdlibTransport(_RetryingTransport):
         with urlopen(request, timeout=self._timeout) as http_response:  # nosec B310
             raw_response = json.loads(http_response.read().decode("utf-8"))
         return _response_from_provider(raw_response, model)
-
-    def _failure_endpoint(self) -> str:
-        """Add the HTTP endpoint to retry exhaustion diagnostics."""
-        return f" at api_base {self.api_base!r}"
 
     def _provider_name(self) -> str:
         return "openai-compatible"

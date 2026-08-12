@@ -32,7 +32,7 @@ from kigumi.agents import (
 from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 from tests._agent_helpers import make_agent_spec
 
 
@@ -41,11 +41,14 @@ class _SequenceTransport:
         self.outcomes = list(outcomes)
         self.requests = 0
 
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "retry-sequence", "schema": 1}
 
-    def complete(self, messages, model: str, **params) -> Response:
-        del messages, model, params
+    def prepare(self, messages, model: str, params) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
+        del prepared
         self.requests += 1
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
@@ -642,28 +645,6 @@ def test_call_node_evidence_miss_rebuilds_from_l1_without_provider_request(
     assert first_meta["cache_key"] == second_meta["cache_key"]
     assert second_meta["calls"][0]["cache"] == "hit"
     assert second_meta["calls"][0]["response_evidence"]["mode"] == "hash_only"
-
-
-def test_durable_retry_rejects_hidden_transport_retries_before_side_effect(
-    tmp_path: Path,
-) -> None:
-    class HiddenRetryTransport(_SequenceTransport):
-        max_retries = 1
-        max_length_retries = 0
-        max_empty_retries = 0
-
-    transport = HiddenRetryTransport([Response("must not happen", {}, "stop")])
-    dag = _retry_dag(tmp_path, transport, RetryPolicy(initial_delay_seconds=0))
-
-    with pytest.raises(ProviderFailure) as raised:
-        dag.run(run_id="unsafe")
-
-    assert raised.value.kind is ProviderFailureKind.UNKNOWN
-    assert transport.requests == 0
-    state = next((tmp_path / "artifacts" / "runs" / "unsafe" / "attempts").glob("*/state.json"))
-    payload = json.loads(state.read_text())
-    assert payload["side_effect_started"] is False
-    assert payload["status"] == "failed"
 
 
 @pytest.mark.parametrize("cache_policy", ["auto", "off"])

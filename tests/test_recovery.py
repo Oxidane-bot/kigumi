@@ -19,13 +19,20 @@ from kigumi import (
 from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
+from kigumi.transport import PreparedRequest
 
 
 class _UnusedTransport:
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "unused-recovery", "schema": 1}
 
-    def complete(self, messages: Any, model: str, **params: Any) -> Any:
+    def prepare(
+        self, messages: list[dict[str, Any]], model: str, params: dict[str, Any]
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Any:
+        del prepared
         raise AssertionError("recovery tests must not call a provider")
 
 

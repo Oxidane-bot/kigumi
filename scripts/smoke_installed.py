@@ -20,6 +20,7 @@ from kigumi import (
     InputRef,
     LLMCaller,
     PiRpcAdapter,
+    PreparedRequest,
     PromptAxis,
     PromptLayer,
     PromptMaterial,
@@ -39,11 +40,16 @@ class _Transport:
     def __init__(self) -> None:
         self.requests = 0
 
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "installed-smoke", "schema": 1}
 
-    def complete(self, messages: object, model: str, **params: object) -> Response:
-        del messages, model, params
+    def prepare(
+        self, messages: list[dict[str, object]], model: str, params: dict[str, object]
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
+        del prepared
         self.requests += 1
         return Response("smoke", {"total_tokens": 1}, "stop")
 
@@ -65,6 +71,7 @@ def main() -> int:
             EvidencePolicy,
             RetryPolicy,
             ProviderFailure,
+            PreparedRequest,
             PromptRef,
             InputRef,
             PromptAxis,

@@ -9,7 +9,7 @@ import pytest
 from kigumi import AmbiguousAttemptError, LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 
 
 class _SequenceTransport:
@@ -17,11 +17,16 @@ class _SequenceTransport:
         self.outcomes = list(outcomes)
         self.requests = 0
 
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "side-effect-sequence", "schema": 1}
 
-    def complete(self, messages: Any, model: str, **params: Any) -> Response:
-        del messages, model, params
+    def prepare(
+        self, messages: list[dict[str, Any]], model: str, params: dict[str, Any]
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Response:
+        del prepared
         self.requests += 1
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):

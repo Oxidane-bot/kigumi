@@ -18,6 +18,22 @@ from kigumi.store import (
 from kigumi.testing import FakeTransport
 
 
+def _l1_key(prompt: str) -> str:
+    transport = FakeTransport()
+    prepared = transport.prepare(
+        [{"role": "user", "content": prompt}],
+        "default",
+        {},
+    )
+    return sha(
+        {
+            "transport": transport.cache_identity(),
+            "prepared": prepared.canonical(),
+            "seed": 0,
+        }
+    )
+
+
 def _valid_origin(artifact: dict[str, object]) -> dict[str, object]:
     policy = EvidencePolicy()
     return {
@@ -183,14 +199,7 @@ def test_cache_entry_preserves_missing_and_corrupt_states(tmp_path: Path) -> Non
 
 def test_corrupt_l1_call_cache_is_reported_and_not_reexecuted(tmp_path: Path) -> None:
     caller = LLMCaller(FakeTransport(), tmp_path)
-    key = sha(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    key = _l1_key("hello")
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     path.write_text("{torn", encoding="utf-8")
@@ -207,14 +216,7 @@ def test_legacy_l1_call_cache_without_response_digest_is_corrupt_not_replayed(
     tmp_path: Path,
 ) -> None:
     caller = LLMCaller(FakeTransport(), tmp_path)
-    key = sha(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    key = _l1_key("hello")
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"response": "legacy cached"}), encoding="utf-8")
@@ -233,14 +235,7 @@ def test_new_l1_call_cache_with_response_digest_remains_valid_and_replayable(
     tmp_path: Path,
 ) -> None:
     caller = LLMCaller(FakeTransport(), tmp_path)
-    key = sha(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    key = _l1_key("hello")
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -261,14 +256,7 @@ def test_new_l1_call_cache_with_response_digest_remains_valid_and_replayable(
 
 def test_l1_cache_symlink_is_corrupt_not_replayable_or_missing(tmp_path: Path) -> None:
     caller = LLMCaller(FakeTransport(), tmp_path)
-    key = sha(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    key = _l1_key("hello")
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     payload = {
@@ -294,14 +282,7 @@ def test_l1_cache_symlink_is_corrupt_not_replayable_or_missing(tmp_path: Path) -
 
 def test_l1_cache_dangling_symlink_is_corrupt_not_a_miss(tmp_path: Path) -> None:
     caller = LLMCaller(FakeTransport(), tmp_path)
-    key = sha(
-        {
-            "messages": [{"role": "user", "content": "hello"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    key = _l1_key("hello")
     path = tmp_path / "llm" / f"{key}.json"
     path.parent.mkdir(parents=True)
     try:
@@ -318,22 +299,8 @@ def test_l1_cache_dangling_symlink_is_corrupt_not_a_miss(tmp_path: Path) -> None
 
 
 def test_l1_cache_cross_key_payload_is_corrupt_not_replayed(tmp_path: Path) -> None:
-    first_key = sha(
-        {
-            "messages": [{"role": "user", "content": "first"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
-    second_key = sha(
-        {
-            "messages": [{"role": "user", "content": "second"}],
-            "model": "default",
-            "params": {},
-            "seed": 0,
-        }
-    )
+    first_key = _l1_key("first")
+    second_key = _l1_key("second")
     root = tmp_path / "llm"
     root.mkdir()
     (root / f"{first_key}.json").write_text(

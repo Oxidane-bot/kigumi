@@ -11,7 +11,7 @@ import pytest
 from kigumi.calling import LLMCaller
 from kigumi.slots import AdaptiveCapacity, FileSlots, SlotTimeoutError
 from kigumi.testing import FakeTransport
-from kigumi.transport import Response
+from kigumi.transport import PreparedRequest, Response
 
 _WORKER = """
 import fcntl
@@ -197,11 +197,15 @@ def test_cache_miss_holds_slot_around_live_request(tmp_path: Path) -> None:
     events: list[str] = []
 
     class RecordingTransport:
-        def resolve(self, model: str) -> str:
-            return model
+        def cache_identity(self) -> dict[str, object]:
+            return {"transport": "recording-slots", "schema": 1}
 
-        def complete(self, messages, model: str, **params) -> Response:
-            events.append("complete")
+        def prepare(self, messages, model: str, params) -> PreparedRequest:
+            return PreparedRequest(messages, model, params)
+
+        def send(self, prepared: PreparedRequest) -> Response:
+            del prepared
+            events.append("send")
             return Response("answer", {}, "stop")
 
     class RecordingSlots:
@@ -213,4 +217,4 @@ def test_cache_miss_holds_slot_around_live_request(tmp_path: Path) -> None:
 
     caller = LLMCaller(RecordingTransport(), tmp_path, slots=RecordingSlots())
     assert caller.call("hello") == "answer"
-    assert events == ["acquire", "complete", "release"]
+    assert events == ["acquire", "send", "release"]

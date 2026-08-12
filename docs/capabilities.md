@@ -35,9 +35,9 @@ adoption.md 的"设计边界"一节。
 | 结构化输出 + 有界修复环 | `call_validated` / `ctx.call_validated` |
 | 自定义校验的修复环 | `repair_loop` / `ctx.repair` |
 | token 预算上限 | `Budget` |
-| 预算调用前预留、成功提交、失败退款 | `BudgetPermit` / `Budget` |
+| 预算调用前预留、成功提交；发送后未知用量保守记账 | `BudgetPermit` / `Budget` |
 | 排练全流程不发真实请求 | `LLMCaller(dry=True)`(miss 抛 `DryRunError`) |
-| 换 provider / 自实现传输层 | `Transport` 协议 / `LiteLLMTransport` / `StdlibTransport` |
+| 换 provider / 自实现单-attempt 传输层 | `PreparedRequest` / `Transport` 协议 / `LiteLLMTransport` / `StdlibTransport` |
 | 429 自适应并发 | `AdaptiveCapacity` / `FileSlots` |
 | 抓取每次调用的结构化事件 | `observe` |
 | 区分缓存缺失与损坏并阻止静默重算 | `CacheLookup` / `CacheIntegrityError` |

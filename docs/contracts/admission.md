@@ -22,8 +22,10 @@ run-local 调度。
 
 ## Public surface
 
-`Budget.reserve()` 返回 `BudgetPermit`；permit 的成功路径调用 `commit(actual_usage)`，
-失败或取消路径调用 `cancel()`。节点用 `resources=(ResourceRequest(name, units),)`
+`Budget.reserve()` 返回 `BudgetPermit`；permit 的已知成功路径调用 `commit(actual_usage)`，
+provider effect 开始前失败或取消时调用 `cancel()`。有限预算下，provider attempt 一旦可能已经
+发出但无法取得可信实际用量，`LLMCaller` 保守提交准入时的估算值。节点用
+`resources=(ResourceRequest(name, units),)`
 声明资源，run 用 `resource_limits={name: limit}` 给出上限，并可用
 `resource_timeout_seconds` 限制资源排队等待；没有资源声明的节点使用 `None` 默认池。
 `ResourceRequest.scope` 只接受 `host`、`account`、`global` 三个声明值；
@@ -37,13 +39,16 @@ lock root 取得 `acquire_key(key, timeout_seconds=...)`。该文件锁覆盖二
 
 ## Invariants
 
-1. L1 cache hit 在 provider 前返回且不预留预算。L1 miss 必须在 provider 请求前以
-   `Budget.reserve(estimated_tokens)` 完成 admission；预留同时考虑已花费与其他活动预留，
-   不足时抛 `BudgetExceeded`，provider 不得被调用。
+1. transport `prepare()` 必须在 provider side effect 前完成；preflight 与估算都基于它返回的
+   effective `PreparedRequest`。L1 cache hit 在 provider 前返回且不预留预算。L1 miss 必须在
+   provider 请求前以 `Budget.reserve(estimated_tokens)` 完成 admission；预留同时考虑已花费与
+   其他活动预留，不足时抛 `BudgetExceeded`，provider 不得被调用。
 2. 成功响应按 provider 返回的 `total_tokens` 调用 `commit(actual_usage)`，把实际用量记入
-   `Budget.spent`；失败、空响应、取消或写入前的异常调用 `cancel()` 释放预留。估算是
-   best-effort，实际用量可以超过预留；此时 commit 记录实际用量后仍可抛 `BudgetExceeded`，
-   不能把已发生的 provider effect 当成未发生。
+   `Budget.spent`。provider effect 开始前的准备、preflight、cache 与 admission 失败调用
+   `cancel()` 释放预留（尚未取得 permit 时无需取消）；一旦 `send()` 开始，有限预算遇到 provider
+   失败、空/截断响应、缺失或非法 usage 时必须把 admitted estimate 记入 `spent`。估算是
+   best-effort，实际用量可以超过预留；此时 commit 记录实际用量后仍可抛 `BudgetExceeded`。
+   无论失败还是用量不可知，都不能把可能已发生的 provider effect 当成零。
 3. 预算 admission 只在当前进程内协调；它不是跨进程、跨主机或分布式 quota。启用的
    `FileSlots` 只保证同一 L1 key 的 single-flight，不协调不同 key 的预算，也不提供进程
    崩溃后的 durable refund/recovery。需要这些边界时，调用方必须另配外部 quota 或 durable
@@ -65,8 +70,9 @@ lock root 取得 `acquire_key(key, timeout_seconds=...)`。该文件锁覆盖二
 
 ## Failure behavior
 
-预算预留不足抛 `BudgetExceeded` 且不发 provider 请求；实际用量超预算的 `commit` 仍保留
-调用记录和已写入的成功响应后抛出。非法资源声明或 `resource_limits` 抛 `TypeError`/
+预算预留不足抛 `BudgetExceeded` 且不发 provider 请求；有限预算在 provider attempt 已开始后
+无法取得可信用量时保守消费准入估算并保留失败调用记录；成功响应缺失/非法 usage 在缓存写入前
+fail closed。实际用量超预算的 `commit` 仍保留调用记录和已写入的成功响应后抛出。非法资源声明或 `resource_limits` 抛 `TypeError`/
 `ValueError`；禁用资源、资源请求超过正整数上限或资源等待超时都在节点执行前失败，资源等待
 超时、key lock 超时或节点异常不会泄漏 permit/文件锁。
 
@@ -74,6 +80,9 @@ lock root 取得 `acquire_key(key, timeout_seconds=...)`。该文件锁覆盖二
 
 锁定测试见 `tests/test_budget_admission.py`、`tests/test_resource_limits.py`、
 `tests/test_calling.py::test_cache_hit_skips_transport_and_budget`、
+`tests/test_calling.py::test_effective_prepared_request_drives_key_budget_effect_metadata_and_send`、
+`tests/test_calling.py::test_hard_budget_spends_reservation_when_provider_attempt_fails`、
+`tests/test_calling.py::test_provider_missing_usage_is_rejected_before_cache_write_with_hard_budget`、
 `tests/test_calling.py::test_cross_process_same_key_calls_provider_once` 与
 `tests/test_dag_cache_keys.py::test_resource_declarations_do_not_change_cache_key`。
 

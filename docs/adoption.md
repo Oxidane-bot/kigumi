@@ -174,6 +174,11 @@ caller = LLMCaller(  # L1:缓存/预算/dry-run/溯源
 )
 ```
 
+L0 的最小协议是 `cache_identity()`、`prepare(messages, model, params) -> PreparedRequest`
+和 `send(prepared) -> Response`。`prepare` 解析模型别名并归一化参数，不得触发 provider；L1
+随后让 preflight、缓存键、预算、durable metadata 与调用记录全部观察同一 effective request。
+`send` 只执行一次 provider attempt，不在 transport 内 sleep 或重试。
+
 - **命令式链项目**(脚本一条路跑到底):到这一层就够了,直接
   `caller.call(...)` / `repair.call_validated(...)`。
 - **多阶段流水线**:再上 `Dag`(L3),换取节点级缓存、断点续跑、
@@ -206,8 +211,9 @@ print(budget.spent)
 
 实际使用 `LLMCaller` 时只需把同一个 `budget` 传给
 `LLMCaller(..., budget=budget)`：L1 miss 会在 provider 请求前自动 `reserve`，
-cache hit 不预留，provider/transport 失败会 `cancel`，成功响应按实际用量 `commit`。
-预估值是 prompt 长度加显式 `max_tokens` 的 best effort；provider 实际用量可能更高，
+cache hit 不预留，provider effect 前失败会 `cancel`，成功响应按实际用量 `commit`；有限预算在
+provider attempt 已经开始但实际用量未知时，会保守消费 admitted estimate。
+预估值基于 effective prepared request 的 prompt 加显式 `max_tokens`，仍是 best effort；provider 实际用量可能更高，
 所以 `commit` 仍可能在请求完成后抛 `BudgetExceeded`，但响应已经写入缓存。
 
 不要把它当作跨进程或跨主机的总账：`Budget` 预留/commit/cancel 仍只在当前进程内协调；
@@ -544,7 +550,8 @@ def outline(inputs, ctx):
 retry/evidence policy、完整 Prompt 候选与 WorkflowProfile 都由 schema-2 `_run.json` 固定，
 任何变化 fail closed；缺少 schema-2 manifest 的旧 run 不能 resume。
 
-durable CALL 的 transport/length/empty internal retry 必须全为 0，Pi hidden retry 也必须关闭。
+Transport `send` 固定只有一次 attempt；transient、length、empty 都显式失败，后续 provider
+attempt 只能由上述 DAG `RetryPolicy` 创建。Pi hidden retry 也必须关闭。
 若进程在 provider call/Pi spawn 后崩溃且没有 terminal receipt，状态为 ambiguous，必须人工：
 
 ```bash
@@ -1720,8 +1727,9 @@ identity 自动包含 adapter/Pi、capsule、task/files/output 源码摘要；cl
 - **磁带(cassette)按顺序 + 请求指纹重放**:改了 prompt 措辞、模型名或
   参数,磁带会报 mismatch——这是提醒你重录,不是 bug。
 - **`Budget` 在 miss 发 provider 请求前先预留额度**:显式 `max_tokens` 优先作为预估值,
-  否则按 prompt 长度保守估算。成功调用把 provider 实际用量 commit 到 `Budget.spent`,
-  失败调用释放预留；实际用量可能超过预估值,因此 commit 仍可能抛 `BudgetExceeded`,但该次
+  否则按 effective prepared request 的 prompt 长度保守估算。成功调用把 provider 实际用量
+  commit 到 `Budget.spent`；provider effect 前失败释放预留，有限预算在 attempt 已开始但
+  usage 不可信时保守消费预留估算。实际用量可能超过预估值,因此 commit 仍可能抛 `BudgetExceeded`,但该次
   调用已经完成并进入缓存。缓存命中不做预留。预留/commit/cancel 仍只在当前进程内协调；
   传入启用 `FileSlots` 后，同 key single-flight 才跨进程保护二次 cache check、provider
   请求和缓存写入。它不协调不同 key 的预算，也不提供崩溃后的 durable refund/recovery；硬性

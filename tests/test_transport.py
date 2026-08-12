@@ -12,35 +12,55 @@ from kigumi import ProviderFailure, ProviderFailureKind
 from kigumi.transport import (
     EmptyResponseError,
     LiteLLMTransport,
+    PreparedRequest,
     StdlibTransport,
     TruncatedResponseError,
 )
 
 
-def test_length_finish_doubles_max_tokens(monkeypatch) -> None:
-    """教训 judge_14: length completion gets two bounded token-budget expansions."""
+def _send(transport, messages=None, model="default", **params):
+    prepared = transport.prepare(messages or [], model, params)
+    return transport.send(prepared)
+
+
+def test_prepared_request_is_frozen_and_canonical() -> None:
+    messages = [{"role": "user", "content": "hello"}]
+    params = {"temperature": 0.2}
+    prepared = PreparedRequest(messages, "provider/model", params)
+
+    messages[0]["content"] = "changed"
+    params["temperature"] = 1
+
+    assert prepared.canonical() == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "model": "provider/model",
+        "params": {"temperature": 0.2},
+    }
+    with pytest.raises(AttributeError):
+        prepared.model = "other"  # type: ignore[misc]
+
+
+def test_length_response_fails_after_single_send(monkeypatch) -> None:
+    """截断由 DAG RetryPolicy 处理，transport 不改参数或隐藏重试。"""
     parameters: list[int] = []
-    responses: list[dict[str, Any]] = [
-        {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]},
-        {"choices": [{"message": {"content": "still cut"}, "finish_reason": "length"}]},
-        {"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}]},
-    ]
 
     def completion(**kwargs):
         parameters.append(kwargs["max_tokens"])
-        return responses.pop(0)
+        return {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]}
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
-    response = LiteLLMTransport(aliases={"default": "provider/model"}).complete(
-        [{"role": "user", "content": "hello"}], "default", max_tokens=12
-    )
+    with pytest.raises(TruncatedResponseError, match="provider/model"):
+        _send(
+            LiteLLMTransport(aliases={"default": "provider/model"}),
+            [{"role": "user", "content": "hello"}],
+            max_tokens=12,
+        )
 
-    assert response.text == "done"
-    assert parameters == [12, 24, 48]
+    assert parameters == [12]
 
 
-def test_length_without_max_tokens_returns_as_is(monkeypatch) -> None:
+def test_length_without_max_tokens_fails_once(monkeypatch) -> None:
     """教训 truncated_output: 未设预算的截断绝不作为完整答案返回。"""
     attempts = 0
 
@@ -52,31 +72,13 @@ def test_length_without_max_tokens_returns_as_is(monkeypatch) -> None:
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
-    with pytest.raises(TruncatedResponseError, match="explicitly set max_tokens"):
-        LiteLLMTransport(aliases={"default": "provider/model"}).complete([], "default")
+    with pytest.raises(TruncatedResponseError, match="truncated response"):
+        _send(LiteLLMTransport(aliases={"default": "provider/model"}))
 
     assert attempts == 1
 
 
-def test_length_retry_exhaustion_raises(monkeypatch) -> None:
-    """教训 judge_14: 两次预算扩展后仍截断，不能把残文交给下游。"""
-    parameters: list[int] = []
-
-    def completion(**kwargs: Any) -> dict[str, Any]:
-        parameters.append(kwargs["max_tokens"])
-        return {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]}
-
-    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-
-    with pytest.raises(TruncatedResponseError, match="provider/model"):
-        LiteLLMTransport(aliases={"default": "provider/model"}).complete(
-            [], "default", max_tokens=12
-        )
-
-    assert parameters == [12, 24, 48]
-
-
-def test_all_transport_retry_classes_can_be_disabled(monkeypatch) -> None:
+def test_length_and_empty_responses_each_execute_once(monkeypatch) -> None:
     responses = [
         {"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]},
         {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
@@ -86,20 +88,16 @@ def test_all_transport_retry_classes_can_be_disabled(monkeypatch) -> None:
         "litellm",
         SimpleNamespace(completion=lambda **_kwargs: responses.pop(0)),
     )
-    transport = LiteLLMTransport(
-        aliases={"default": "provider/model"},
-        max_retries=0,
-        max_length_retries=0,
-        max_empty_retries=0,
-    )
+    transport = LiteLLMTransport(aliases={"default": "provider/model"})
 
-    with pytest.raises(TruncatedResponseError, match="after 0 max_tokens retries"):
-        transport.complete([], "default", max_tokens=12)
-    with pytest.raises(EmptyResponseError, match="after 0 retries"):
-        transport.complete([], "default")
+    with pytest.raises(TruncatedResponseError):
+        _send(transport, max_tokens=12)
+    with pytest.raises(EmptyResponseError):
+        _send(transport)
+    assert responses == []
 
 
-def test_empty_response_retries(monkeypatch) -> None:
+def test_empty_response_does_not_retry(monkeypatch) -> None:
     responses = [
         {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
         {"choices": [{"message": {"content": "ready"}, "finish_reason": "stop"}]},
@@ -110,15 +108,14 @@ def test_empty_response_retries(monkeypatch) -> None:
         SimpleNamespace(completion=lambda **_kwargs: responses.pop(0)),
     )
 
-    response = LiteLLMTransport(aliases={"default": "provider/model"}).complete([], "default")
+    with pytest.raises(EmptyResponseError):
+        _send(LiteLLMTransport(aliases={"default": "provider/model"}))
 
-    assert response.text == "ready"
-    assert responses == []
+    assert len(responses) == 1
 
 
-def test_empty_response_exhaustion_raises_with_backoff(monkeypatch) -> None:
-    """教训 empty_response_poison: 空响应耗尽时必须中断，不能进入缓存。"""
-    delays: list[float] = []
+def test_empty_response_fails_after_one_attempt(monkeypatch) -> None:
+    """空响应必须中断，不能 sleep、隐藏重试或进入缓存。"""
     attempts = 0
 
     def completion(**_kwargs: Any) -> dict[str, Any]:
@@ -127,60 +124,47 @@ def test_empty_response_exhaustion_raises_with_backoff(monkeypatch) -> None:
         return {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    monkeypatch.setattr("kigumi.transport.time.sleep", delays.append)
 
-    with pytest.raises(EmptyResponseError, match="provider/model.*2 retries"):
-        LiteLLMTransport(aliases={"default": "provider/model"}, backoff_base=0.25).complete(
-            [], "default"
-        )
+    with pytest.raises(EmptyResponseError, match="provider/model"):
+        _send(LiteLLMTransport(aliases={"default": "provider/model"}))
 
-    assert attempts == 3
-    assert delays == [0.25, 0.5]
+    assert attempts == 1
 
 
-def test_429_backoff_retries(monkeypatch) -> None:
-    """Transient 429 failures use bounded exponential delays."""
-    delays: list[float] = []
+def test_429_fails_after_one_attempt(monkeypatch) -> None:
+    """Transient failures are facts for DAG RetryPolicy, not transport loops."""
     attempts = 0
 
     def completion(**_kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts < 3:
-            raise HTTPError("https://example.test", 429, "rate limited", {}, None)
-        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        raise HTTPError("https://example.test", 429, "rate limited", {}, None)
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    monkeypatch.setattr("kigumi.transport.time.sleep", delays.append)
 
-    response = LiteLLMTransport(
-        aliases={"default": "provider/model"}, max_retries=3, backoff_base=0.25
-    ).complete([], "default")
+    with pytest.raises(ProviderFailure) as raised:
+        _send(LiteLLMTransport(aliases={"default": "provider/model"}))
 
-    assert response.text == "ok"
-    assert attempts == 3
-    assert delays == [0.25, 0.5]
+    assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
+    assert attempts == 1
 
 
-def test_transient_retry_exhaustion_returns_typed_provider_failure(monkeypatch) -> None:
+def test_transient_failure_is_typed_after_single_send(monkeypatch) -> None:
     """Retry control consumes structured facts rather than provider prose."""
 
     def completion(**_kwargs: Any) -> None:
         raise HTTPError("https://example.test", 429, "rate limited", {}, None)
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    monkeypatch.setattr("kigumi.transport.time.sleep", lambda _delay: None)
 
     with pytest.raises(ProviderFailure) as raised:
-        LiteLLMTransport(aliases={"default": "provider/model"}, max_retries=1).complete(
-            [], "default"
-        )
+        _send(LiteLLMTransport(aliases={"default": "provider/model"}))
     assert raised.value.provider == "litellm"
     assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
     assert raised.value.status_code == 429
 
 
-def test_stdlib_retry_exhaustion_returns_typed_failure_without_endpoint_secret(
+def test_stdlib_single_send_returns_typed_failure_without_endpoint_secret(
     monkeypatch,
 ) -> None:
 
@@ -194,8 +178,7 @@ def test_stdlib_retry_exhaustion_returns_typed_failure_without_endpoint_secret(
             "https://example.test",
             "secret",
             aliases={"default": "provider/model"},
-            max_retries=0,
-        ).complete([], "default")
+        ).send(PreparedRequest([], "provider/model", {}))
     assert raised.value.provider == "openai-compatible"
     assert raised.value.kind is ProviderFailureKind.RATE_LIMIT
 
@@ -259,11 +242,12 @@ def test_transient_errors_adjust_adaptive_capacity_before_success(monkeypatch) -
         return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    monkeypatch.setattr("kigumi.transport.time.sleep", lambda _delay: None)
     capacity = RecordingCapacity()
-    response = LiteLLMTransport(aliases={"default": "provider/model"}, capacity=capacity).complete(
-        [], "default"
-    )
+    transport = LiteLLMTransport(aliases={"default": "provider/model"}, capacity=capacity)
+
+    with pytest.raises(ProviderFailure):
+        _send(transport)
+    response = _send(transport)
 
     assert response.text == "ok"
     assert capacity.events == ["throttle", "success"]
@@ -295,9 +279,10 @@ def test_stdlib_transport_posts_and_normalizes_response(monkeypatch) -> None:
 
     monkeypatch.setattr("kigumi.transport.urlopen", fake_urlopen)
 
-    response = StdlibTransport(
-        "https://example.test", "secret", aliases={"default": "provider/model"}
-    ).complete([{"role": "user", "content": "hello"}], "default")
+    response = _send(
+        StdlibTransport("https://example.test", "secret", aliases={"default": "provider/model"}),
+        [{"role": "user", "content": "hello"}],
+    )
 
     assert response.text == "ok"
     assert response.reasoning == "internal"
@@ -316,7 +301,7 @@ def test_provider_model_fallback_is_marked_unobserved(monkeypatch) -> None:
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
-    response = LiteLLMTransport(aliases={"default": "provider/model"}).complete([], "default")
+    response = _send(LiteLLMTransport(aliases={"default": "provider/model"}))
 
     assert response.model == "provider/model"
     assert response.model_observed is False
@@ -332,8 +317,10 @@ def test_json_mode_translates_to_response_format(monkeypatch) -> None:
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
-    LiteLLMTransport(aliases={"default": "provider/model"}).complete(
-        [], "default", json_mode=True, reasoning_effort="high"
+    _send(
+        LiteLLMTransport(aliases={"default": "provider/model"}),
+        json_mode=True,
+        reasoning_effort="high",
     )
 
     assert received["response_format"] == {"type": "json_object"}
@@ -352,8 +339,10 @@ def test_system_param_prepends_system_message(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
     messages = [{"role": "user", "content": "hello"}]
 
-    LiteLLMTransport(aliases={"default": "provider/model"}).complete(
-        messages, "default", system="be concise"
+    _send(
+        LiteLLMTransport(aliases={"default": "provider/model"}),
+        messages,
+        system="be concise",
     )
 
     assert received[0] == {"role": "system", "content": "be concise"}
@@ -365,7 +354,11 @@ def test_system_param_conflicts_with_existing_system() -> None:
     transport = LiteLLMTransport(aliases={"default": "provider/model"})
 
     with pytest.raises(ValueError, match="system"):
-        transport.complete([{"role": "system", "content": "one"}], "default", system="two")
+        transport.prepare(
+            [{"role": "system", "content": "one"}],
+            "default",
+            {"system": "two"},
+        )
 
 
 def test_json_mode_conflicts_with_explicit_response_format() -> None:
@@ -373,11 +366,10 @@ def test_json_mode_conflicts_with_explicit_response_format() -> None:
     transport = LiteLLMTransport(aliases={"default": "provider/model"})
 
     with pytest.raises(ValueError, match="response_format"):
-        transport.complete(
+        transport.prepare(
             [],
             "default",
-            json_mode=True,
-            response_format={"type": "text"},
+            {"json_mode": True, "response_format": {"type": "text"}},
         )
 
 
@@ -403,4 +395,4 @@ assert StdlibTransport is not None
 
 def test_unconfigured_alias_is_clear_error() -> None:
     with pytest.raises(ValueError, match="not configured"):
-        LiteLLMTransport(aliases={}).complete([], "default")
+        LiteLLMTransport(aliases={}).prepare([], "default", {})

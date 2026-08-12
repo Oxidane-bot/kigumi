@@ -141,6 +141,7 @@ from .testing import ScriptedTransport
 from .transport import (
     EmptyResponseError,
     LiteLLMTransport,
+    PreparedRequest,
     Response,
     StdlibTransport,
     Transport,
@@ -208,6 +209,7 @@ __all__ = [
     "PreflightPolicy",
     "PreflightReport",
     "PreflightViolation",
+    "PreparedRequest",
     "observe",
     "PlanResult",
     "PiRpcAdapter",

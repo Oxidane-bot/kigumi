@@ -25,6 +25,7 @@ from .calling import Caller, LLMCaller
 from .config import KigumiConfig
 from .dag import Dag
 from .evals import Judgment, Metric
+from .transport import PreparedRequest
 
 SeedMode = Literal["applied", "unsupported"]
 
@@ -145,11 +146,16 @@ def _agent_default_output(artifact: dict[str, Any]) -> Any:
 
 
 class _UnusedTransport:
-    def resolve(self, model: str) -> str:
-        return model
+    def cache_identity(self) -> dict[str, object]:
+        return {"transport": "unused-agent-subject", "schema": 1}
 
-    def complete(self, messages: list[dict[str, Any]], model: str, **params: Any) -> Any:
-        del messages, model, params
+    def prepare(
+        self, messages: list[dict[str, Any]], model: str, params: dict[str, Any]
+    ) -> PreparedRequest:
+        return PreparedRequest(messages, model, params)
+
+    def send(self, prepared: PreparedRequest) -> Any:
+        del prepared
         raise RuntimeError("AgentSubject does not use Dag.caller")
 
 
