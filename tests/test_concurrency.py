@@ -290,7 +290,7 @@ def test_l1_reader_stays_valid_under_atomic_replacement_pressure(
     writes = 160
     writer_done = threading.Event()
     failures: list[BaseException] = []
-    states: list[str] = []
+    lookups: list[Any] = []
 
     def write_cache() -> None:
         try:
@@ -304,13 +304,14 @@ def test_l1_reader_stays_valid_under_atomic_replacement_pressure(
     writer = threading.Thread(target=write_cache)
     writer.start()
     for _ in range(writes):
-        states.append(read_call_cache(path).state)
+        lookups.append(read_call_cache(path))
     writer.join(timeout=10)
 
     assert not writer.is_alive()
     assert failures == []
     assert writer_done.is_set()
-    assert states and set(states) == {"VALID"}
+    corrupt_reasons = [lookup.reason for lookup in lookups if lookup.state != "VALID"]
+    assert lookups and not corrupt_reasons, corrupt_reasons
 
 
 def test_l1_reader_outlasts_more_than_four_consecutive_atomic_open_races(
