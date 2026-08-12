@@ -313,6 +313,43 @@ def test_l1_reader_stays_valid_under_atomic_replacement_pressure(
     assert states and set(states) == {"VALID"}
 
 
+def test_l1_reader_outlasts_more_than_four_consecutive_atomic_open_races(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A finite burst of legitimate publishers must not exhaust the snapshot reader."""
+    import kigumi._safe_io as safe_io
+
+    key = "cache-key"
+    path = tmp_path / "llm" / f"{key}.json"
+    payloads = [
+        {
+            "meta": {"key": key},
+            "response": response,
+            "response_sha256": sha(response),
+        }
+        for response in ("first complete response", "second complete response")
+    ]
+    atomic_write_json(path, payloads[0])
+
+    original_open = safe_io._open_regular_file_at
+    replacements = 8
+    calls = 0
+
+    def replace_before_open(directory, name, **kwargs):
+        nonlocal calls
+        calls += 1
+        if name == path.name and calls <= replacements:
+            atomic_write_json(path, payloads[calls % len(payloads)])
+        return original_open(directory, name, **kwargs)
+
+    monkeypatch.setattr(safe_io, "_open_regular_file_at", replace_before_open)
+
+    lookup = read_call_cache(path)
+
+    assert lookup.state == "VALID"
+    assert calls == replacements + 1
+
+
 def _make_dag(tmp_path: Path) -> Dag:
     config = KigumiConfig(project_root=tmp_path, source_dirs=[])
     return Dag(config, LLMCaller(FakeTransport(), tmp_path))

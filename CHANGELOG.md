@@ -45,6 +45,9 @@
 
 ### 修复
 
+- L1 cache snapshot reader 现在可在有限的连续原子发布竞争中继续绑定完整 descriptor，避免高并发
+  writer 仅因四次重试窗口耗尽而把合法的旧/新完整 payload 误报为 `CORRUPT`；同 inode 原地改写
+  仍然 fail closed。
 - 有限 `Budget(max_tokens=...)` 现在按 effective prepared request 预留；一旦 provider attempt
   可能已发出，provider 失败、空/截断响应以及缺失或非法 `usage.total_tokens` 都保守地把准入
   估算记入 `spent`，不能再按零 token 退款。缺失用量仍在写入成功缓存前 fail closed；

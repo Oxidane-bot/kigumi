@@ -23,7 +23,7 @@ _ORIGINAL_OS_STAT = os.stat
 _ORIGINAL_OS_UNLINK = os.unlink
 _ORIGINAL_OS_RMDIR = os.rmdir
 _ORIGINAL_OS_FSTAT = os.fstat
-_ATOMIC_REPLACE_MAX_ATTEMPTS = 4
+_ATOMIC_REPLACE_MAX_ATTEMPTS = 256
 
 # macOS exposes these directories as root-level symlinks.  They are stable
 # system aliases, unlike a symlink introduced anywhere inside a project path.
