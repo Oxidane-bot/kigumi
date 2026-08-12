@@ -6,7 +6,7 @@
 
 ### 修复
 
-(待补充)
+- 有限 `Budget(max_tokens=...)` 现在要求成功响应包含 `usage.total_tokens`；缺失用量会在写入成功缓存前 fail closed，不再按零 token 记账而绕过预算。`Budget(max_tokens=None)` 继续支持无用量 transport 的 best-effort 记账。
 
 ## [0.13.1] - 2026-08-12
 

@@ -371,9 +371,24 @@ def test_budget_rejects_implicitly_coerced_estimates(
     assert budget._reserved == 0
 
 
-def test_budget_treats_transport_empty_usage_as_zero_tokens() -> None:
-    """transport 将缺失 usage 规范化为 {}, 其成功调用应记为零 token。"""
+def test_hard_budget_rejects_transport_empty_usage_without_mutating_spend() -> None:
+    """有限预算不能把缺失 usage 当零，否则 provider 可绕过预算。"""
     budget = Budget(max_tokens=10)
+
+    with pytest.raises(ValueError, match="usage.total_tokens is required"):
+        budget.record({})
+    assert budget.spent == 0
+
+    permit = budget.reserve(1)
+    with pytest.raises(ValueError, match="usage.total_tokens is required"):
+        permit.commit({})
+    assert budget.spent == 0
+    permit.cancel()
+
+
+def test_unbounded_budget_treats_transport_empty_usage_as_zero_tokens() -> None:
+    """无硬上限时保留兼容的 best-effort usage 记账。"""
+    budget = Budget(max_tokens=None)
 
     budget.record({})
     permit = budget.reserve(1)
@@ -391,6 +406,23 @@ def test_provider_malformed_usage_is_rejected_before_cache_write(tmp_path: Path)
     )
 
     with pytest.raises(ValueError):
+        caller.call("hello")
+
+    assert list((tmp_path / "llm").glob("*.json")) == []
+    assert caller.budget is not None
+    assert caller.budget.spent == 0
+
+
+def test_provider_missing_usage_is_rejected_before_cache_write_with_hard_budget(
+    tmp_path: Path,
+) -> None:
+    caller = LLMCaller(
+        FakeTransport([Response("answer", {}, "stop")]),
+        tmp_path,
+        budget=Budget(max_tokens=10),
+    )
+
+    with pytest.raises(ValueError, match="usage.total_tokens is required"):
         caller.call("hello")
 
     assert list((tmp_path / "llm").glob("*.json")) == []

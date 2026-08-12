@@ -455,7 +455,10 @@ class Budget:
 
     def record(self, usage: dict[str, Any]) -> None:
         """Record usage without a prior reservation and enforce the configured cap."""
-        total = self._usage_tokens(usage)
+        total = self._usage_tokens(
+            usage,
+            require_total_tokens=self.max_tokens is not None,
+        )
         with self._lock:
             self._spent += total
             self._raise_if_exceeded()
@@ -469,13 +472,18 @@ class Budget:
         return value
 
     @staticmethod
-    def _usage_tokens(usage: dict[str, Any]) -> int:
+    def _usage_tokens(
+        usage: dict[str, Any],
+        *,
+        require_total_tokens: bool = False,
+    ) -> int:
         if not isinstance(usage, dict):
             raise TypeError("usage must be a mapping")
         if "total_tokens" not in usage:
-            # Some transports intentionally omit usage for a successful response;
-            # that remains a zero-token response, while an explicitly malformed
-            # total_tokens value is rejected below.
+            if require_total_tokens:
+                raise ValueError("usage.total_tokens is required when a token budget is enforced")
+            # Unbounded budgets retain best-effort accounting for transports that
+            # intentionally omit usage.
             return 0
         total = usage["total_tokens"]
         if type(total) is not int:  # bool is an int subclass but not a token count.
@@ -485,7 +493,10 @@ class Budget:
         return total
 
     def _commit(self, permit: BudgetPermit, usage: dict[str, Any]) -> None:
-        total = self._usage_tokens(usage)
+        total = self._usage_tokens(
+            usage,
+            require_total_tokens=self.max_tokens is not None,
+        )
         with self._lock:
             if not permit._active:
                 raise RuntimeError("Budget permit is no longer active")
@@ -762,7 +773,12 @@ class LLMCaller:
             try:
                 # Validate provider usage before persisting a successful response;
                 # malformed accounting data must not poison the cache or budget.
-                Budget._usage_tokens(response.usage)
+                Budget._usage_tokens(
+                    response.usage,
+                    require_total_tokens=(
+                        self.budget is not None and self.budget.max_tokens is not None
+                    ),
+                )
                 payload = {
                     "meta": self._meta(
                         key=key,
