@@ -413,7 +413,7 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 
 ## 修订记录
 
-- 2026-08-12 Unreleased：Transport 收敛为 `cache_identity/prepare/send`，冻结的
+- 2026-08-12 0.14.0：Transport 收敛为 `cache_identity/prepare/send`，冻结的
   `PreparedRequest` 统一 L1 identity/admission/provenance/send；provider 每次只发送一次，重试只由
   DAG `RetryPolicy` 表达；`CACHE_SCHEMA=8` 进行一次缓存族硬切。
 

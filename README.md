@@ -73,7 +73,7 @@ with no further API cost.
 
 ## Status
 
-0.13.1, API not frozen. The Agent boundary is intentionally an execution adapter,
+0.14.0, API not frozen. The Agent boundary is intentionally an execution adapter,
 not an autonomous factory or optimizer.
 
 The retained `Candidate`, `EvolveResult`, and `evolve_prompt` imports form an

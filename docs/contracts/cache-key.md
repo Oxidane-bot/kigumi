@@ -1,8 +1,8 @@
 # 缓存键契约
 
-Status: Active (0.13.0)
+Status: Active (0.14.0)
 
-> Unreleased 将 L3 内容键 `CACHE_SCHEMA=8`，L1 则硬切到 transport identity 与 effective
+> v0.14.0 将 L3 内容键切换到 `CACHE_SCHEMA=8`，L1 则硬切到 transport identity 与 effective
 > prepared request；这是一次统一换族，不提供旧键兼容读取。
 > node cache envelope 继续为 schema 4；
 > 旧 schema 3 条目（即使已经带有 `cache_key`）按 `CORRUPT` 拒绝，不迁移；
@@ -132,7 +132,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    `libs` 细化搭载同一第 7 族，当时未新增全项目换族。0.13.0 将 node cache
    envelope 从 schema 3 升至 schema 4，以正式绑定请求的 L3 `cache_key`；这是 Greenfield
    envelope 硬切，不迁移旧 schema 3 条目，也不改变当时的内容键 `CACHE_SCHEMA`。
-   Unreleased 从 7 升至 8，使 L1 transport/prepared identity 与 L3 内容族同步硬切；这是
+   0.14.0 从 7 升至 8，使 L1 transport/prepared identity 与 L3 内容族同步硬切；这是
    本批变更唯一一次缓存族轮换。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中

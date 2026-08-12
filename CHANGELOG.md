@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 暂无。
+
+## [0.14.0] - 2026-08-12
+
 ### 重大变更
 
 - `Transport` 现在显式实现 `cache_identity()`、`prepare(messages, model, params)` 与

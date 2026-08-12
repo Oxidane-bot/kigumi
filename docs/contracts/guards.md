@@ -1,6 +1,6 @@
 # 守卫环与豁免契约
 
-Status: Active (0.13.0)
+Status: Active (0.14.0)
 
 > `@dag.agent` builder 与其他节点装饰器同样进入 raw-I/O 扫描。`raw-io-ok` 必须带理由，
 > 且不能由 `raw-llm-ok` 代替。

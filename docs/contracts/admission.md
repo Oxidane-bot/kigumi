@@ -1,6 +1,6 @@
 # 执行准入契约
 
-Status: Draft (Unreleased)
+Status: Active (0.14.0)
 
 ## Purpose
 

@@ -14,7 +14,7 @@ import pytest
 from kigumi import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_RELEASE_VERSION = "0.13.1"
+EXPECTED_RELEASE_VERSION = "0.14.0"
 EXPECTED_RELEASE_DATE = "2026-08-12"
 RELEASE_HEADING_PATTERN = re.compile(
     r"^## \[(?P<version>\d+\.\d+\.\d+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?$",
@@ -84,23 +84,31 @@ def test_release_candidate_identity_is_explicit_and_unreleased_records_changes()
     assert unreleased.group("body").strip(), "[Unreleased] must record pending user-visible changes"
 
 
-def test_revised_contracts_are_indexed_as_0_13() -> None:
-    """Contracts were established in 0.13.0 and remain active across 0.13.x."""
-    CONTRACTS_VERSION = "0.13.0"
+def test_revised_contracts_are_indexed_for_their_latest_release() -> None:
+    """Materially revised contracts identify the release that last changed them."""
     index = (ROOT / "docs" / "contracts" / "README.md").read_text(encoding="utf-8")
-    for filename in ("guards.md", "retry-resume.md", "prompt-resolution.md"):
+    expected_versions = {
+        "admission.md": "0.14.0",
+        "agent-node.md": "0.14.0",
+        "cache-key.md": "0.14.0",
+        "determinism.md": "0.14.0",
+        "guards.md": "0.14.0",
+        "prompt-resolution.md": "0.13.0",
+        "retry-resume.md": "0.14.0",
+    }
+    for filename, contract_version in expected_versions.items():
         document = (ROOT / "docs" / "contracts" / filename).read_text(encoding="utf-8")
         status = re.search(r"^Status: (Active \(\d+\.\d+\.\d+\))$", document, re.MULTILINE)
         assert status is not None
-        assert status.group(1) == f"Active ({CONTRACTS_VERSION})"
+        assert status.group(1) == f"Active ({contract_version})"
         assert re.search(
-            rf"\]\({re.escape(filename)}\) \| Active \({re.escape(CONTRACTS_VERSION)}\) \|",
+            rf"\]\({re.escape(filename)}\) \| Active \({re.escape(contract_version)}\) \|",
             index,
-        ), f"{filename} must be indexed with its 0.13.0 revision"
+        ), f"{filename} must be indexed with its {contract_version} revision"
 
 
 def test_historical_schema_boundaries_remain_explicit() -> None:
-    """0.13 发布边界保留 prompt schema-1，并继续把 admission 留作 Draft。"""
+    """0.14 保留 prompt schema-1，并把已经发布的 admission 契约提升为 Active。"""
     prompt_contract = (ROOT / "docs" / "contracts" / "prompt-resolution.md").read_text(
         encoding="utf-8"
     )
@@ -108,8 +116,8 @@ def test_historical_schema_boundaries_remain_explicit() -> None:
     contract_index = (ROOT / "docs" / "contracts" / "README.md").read_text(encoding="utf-8")
 
     assert "prompt_resolution_schema=1" in prompt_contract
-    assert "Status: Draft (Unreleased)" in admission_contract
-    assert "[执行准入契约](admission.md) | Draft (Unreleased)" in contract_index
+    assert "Status: Active (0.14.0)" in admission_contract
+    assert "[执行准入契约](admission.md) | Active (0.14.0)" in contract_index
 
 
 def test_exact_head_tag_matches_package_version_when_present() -> None:
