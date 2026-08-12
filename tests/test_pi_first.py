@@ -377,6 +377,9 @@ def _fake_pi(path: Path) -> Path:
             import pathlib
             import sys
 
+            started_file = os.environ.get("PI_STARTED_FILE")
+            if started_file:
+                pathlib.Path(started_file).write_text("started", encoding="utf-8")
             if "--version" in sys.argv:
                 print("1.2.3")
                 raise SystemExit(0)
@@ -940,7 +943,15 @@ def test_pi_typed_providers_render_canonical_models_json_with_existing_identity(
         api="openai-responses",
         base_url="https://gateway.example/v1",
         api_key_env="CUSTOM_GATEWAY_API_KEY",
-        models=[PiModelConfig(id="custom-model")],
+        models=[
+            PiModelConfig(
+                id="custom-model",
+                reasoning=True,
+                context_window=200_000,
+                max_tokens=32_000,
+            ),
+            PiModelConfig(id="plain-model"),
+        ],
     )
     expected = canonical_json(
         {
@@ -949,7 +960,15 @@ def test_pi_typed_providers_render_canonical_models_json_with_existing_identity(
                     "api": "openai-responses",
                     "apiKey": "$CUSTOM_GATEWAY_API_KEY",
                     "baseUrl": "https://gateway.example/v1",
-                    "models": [{"id": "custom-model"}],
+                    "models": [
+                        {
+                            "contextWindow": 200_000,
+                            "id": "custom-model",
+                            "maxTokens": 32_000,
+                            "reasoning": True,
+                        },
+                        {"id": "plain-model", "reasoning": False},
+                    ],
                 }
             }
         }
@@ -1011,6 +1030,89 @@ def test_pi_typed_providers_render_canonical_models_json_with_existing_identity(
 def test_pi_model_config_strictly_validates_id(model_id: object) -> None:
     with pytest.raises((TypeError, ValueError), match="Pi model id"):
         PiModelConfig(id=model_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    (
+        ("reasoning", 0, "Pi model reasoning"),
+        ("reasoning", None, "Pi model reasoning"),
+        ("context_window", 0, "Pi model context_window"),
+        ("context_window", -1, "Pi model context_window"),
+        ("context_window", True, "Pi model context_window"),
+        ("context_window", 1.5, "Pi model context_window"),
+        ("max_tokens", 0, "Pi model max_tokens"),
+        ("max_tokens", -1, "Pi model max_tokens"),
+        ("max_tokens", False, "Pi model max_tokens"),
+        ("max_tokens", "32000", "Pi model max_tokens"),
+    ),
+)
+def test_pi_model_config_strictly_validates_capabilities(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "id": "custom-model",
+        "reasoning": False,
+        "context_window": None,
+        "max_tokens": None,
+    }
+    values[field_name] = value
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        PiModelConfig(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("key_state", ("missing", "empty"))
+def test_pi_typed_provider_requires_nonempty_api_key_before_starting_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key_state: str,
+) -> None:
+    api_key_env = "CUSTOM_GATEWAY_API_KEY"
+    started_file = tmp_path / "pi-started"
+    monkeypatch.setenv("PI_STARTED_FILE", str(started_file))
+    if key_state == "missing":
+        monkeypatch.delenv(api_key_env, raising=False)
+        resolved_environment: dict[str, str] = {}
+    else:
+        monkeypatch.setenv(api_key_env, "process-value-must-be-overridden")
+        resolved_environment = {api_key_env: ""}
+    provider = PiProviderConfig(
+        id="custom-gateway",
+        api="openai-responses",
+        base_url="https://gateway.example/v1",
+        api_key_env=api_key_env,
+        models=(PiModelConfig(id="custom-model"),),
+    )
+    spec = AgentSpec.load(_capsule(tmp_path / "agent", thinking="off"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    adapter = PiRpcAdapter(
+        (str(_fake_pi(tmp_path / "fake-pi")),),
+        "1.2.3",
+        env_resolver=lambda: resolved_environment,
+        providers=(provider,),
+    )
+
+    with pytest.raises(AgentResultError, match=api_key_env) as raised:
+        adapter.run(
+            AgentRequest(AgentTask("write"), {}, spec),
+            AgentRunContext(
+                workspace,
+                capsule_root,
+                10**9,
+                lambda event: None,
+                lambda name, data, media: None,
+            ),
+        )
+
+    assert raised.value.runtime_code is AgentRuntimeFailureCode.POLICY
+    assert raised.value.runtime_subcode is AgentRuntimeFailureSubCode.CONFIG_POLICY
+    assert not started_file.exists()
 
 
 @pytest.mark.parametrize(

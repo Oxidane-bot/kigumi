@@ -169,6 +169,9 @@ api_key_env = "CUSTOM_GATEWAY_API_KEY"
 
 [[tool.kigumi.agent_profiles.writer.providers.models]]
 id = "custom-model"
+reasoning = true
+context_window = 200000
+max_tokens = 32000
 """,
         encoding="utf-8",
     )
@@ -182,7 +185,14 @@ id = "custom-model"
             api="openai-responses",
             base_url="https://gateway.example/v1",
             api_key_env="CUSTOM_GATEWAY_API_KEY",
-            models=(PiModelConfig(id="custom-model"),),
+            models=(
+                PiModelConfig(
+                    id="custom-model",
+                    reasoning=True,
+                    context_window=200_000,
+                    max_tokens=32_000,
+                ),
+            ),
         ),
     )
 

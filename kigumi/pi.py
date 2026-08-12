@@ -260,6 +260,19 @@ class PiRpcAdapter:
         response_models: list[str] = []
         hook_evidence: list[Any] = []
         try:
+            missing_api_key_envs = sorted(
+                {
+                    provider.api_key_env
+                    for provider in self.providers
+                    if not environment.get(provider.api_key_env)
+                }
+            )
+            if missing_api_key_envs:
+                raise AgentRuntimeResultError(
+                    "Pi provider api_key_env is missing or empty: "
+                    + ", ".join(missing_api_key_envs),
+                    runtime_subcode=AgentRuntimeFailureSubCode.CONFIG_POLICY,
+                )
             version_stdout, version_stderr = self._probe_version(environment, context.deadline)
             if not _append_bounded(stderr, version_stderr, request.spec.limits.stderr_max_bytes):
                 stderr_truncated = True

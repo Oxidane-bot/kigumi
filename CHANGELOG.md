@@ -24,7 +24,8 @@
   provider/model 描述经 `canonical_json` 渲染为临时 Pi home 的 `models.json`；
   `AgentProfileConfig` 与 `[tool.kigumi.agent_profiles.<name>]` 的嵌套 TOML provider/model 表使用
   同一类型，并由 `Dag._resolve_agent_profile` 传入 adapter。`api_key_env` 只渲染为 `$ENV_NAME`，
-  resolved secret 不进入配置字节或 identity；typed providers 与手写
+  resolved secret 不进入配置字节或 identity；模型可严格声明 `reasoning`、`context_window` 与
+  `max_tokens`，并映射到 Pi 的 `reasoning`、`contextWindow`、`maxTokens`。typed providers 与手写
   `extra_config_files["models.json"]` 不能共存，其他 extra 配置文件继续作为 escape hatch。
 
 ### 修复
@@ -33,6 +34,8 @@
   可能已发出，provider 失败、空/截断响应以及缺失或非法 `usage.total_tokens` 都保守地把准入
   估算记入 `spent`，不能再按零 token 退款。缺失用量仍在写入成功缓存前 fail closed；
   `Budget(max_tokens=None)` 继续支持无用量 transport 的 best-effort 记账。
+- typed Pi provider 引用的 `api_key_env` 在 process environment 与 `env_resolver` 合并后缺失或为空时，
+  现在会在 version probe/spawn 前以 `CONFIG_POLICY` fail closed，不再先启动 Pi 才暴露凭据错误。
 
 ### 兼容性
 

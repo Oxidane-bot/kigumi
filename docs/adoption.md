@@ -83,6 +83,9 @@ api_key_env = "CUSTOM_GATEWAY_API_KEY" # 只写变量名，不带 `$`，更不�
 
 [[tool.kigumi.agent_profiles.writer.providers.models]]
 id = "custom-model"
+reasoning = true
+context_window = 200000
+max_tokens = 32000
 ```
 
 `agent_profiles` 是项目级的一次性绑定表：节点只需引用 `profile="writer"`，不必重复构造
@@ -113,7 +116,14 @@ adapter = PiRpcAdapter(
             api="openai-responses",
             base_url="https://gateway.example/v1",
             api_key_env="CUSTOM_GATEWAY_API_KEY",
-            models=(PiModelConfig(id="custom-model"),),
+            models=(
+                PiModelConfig(
+                    id="custom-model",
+                    reasoning=True,
+                    context_window=200_000,
+                    max_tokens=32_000,
+                ),
+            ),
         ),
     ),
 )
@@ -124,6 +134,12 @@ typed renderer 使用库的 `canonical_json` 产生最终 UTF-8 字节；这些�
 相同的最终字节，identity 也完全相同；仅 JSON 语义相同但空白或键序字节不同，仍按既有文件字节
 身份视为不同配置。`providers` 与手写 `extra_config_files["models.json"]` 不能同时出现，避免两个
 来源争夺同一路径。
+
+每个模型固定渲染 `reasoning`；`context_window` / `max_tokens` 非空时分别映射为 Pi 的
+`contextWindow` / `maxTokens`，为 `None` 时不写入。三者分别严格要求 bool、正整数或 `None`，
+不会把 TOML 字符串或 bool 当作整数。adapter 在做 `--version` 探测之前检查所有 typed provider
+引用的 api_key_env：以 `env_resolver` 覆盖 process environment 后，变量缺失或空字符串会作为
+`CONFIG_POLICY` 失败，Pi 进程尚未启动。
 
 `dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
 `check` / `graph` / `profile` / `resume` / `retry-resolve` / `recover` 要读内存里的图，而节点是靠

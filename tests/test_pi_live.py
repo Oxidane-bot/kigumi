@@ -35,7 +35,14 @@ _PI_SUPPORTED_APIS = (
 )
 
 
-def _live_providers(provider: str, model: str) -> tuple[PiProviderConfig, ...]:
+def _live_providers(
+    provider: str,
+    model: str,
+    *,
+    reasoning: bool = False,
+    context_window: int | None = None,
+    max_tokens: int | None = None,
+) -> tuple[PiProviderConfig, ...]:
     """Build optional typed live-fixture config without changing manifest selection."""
     api = os.environ.get("KIGUMI_PI_API", "openai-responses")
     if api not in _PI_SUPPORTED_APIS:
@@ -57,7 +64,14 @@ def _live_providers(provider: str, model: str) -> tuple[PiProviderConfig, ...]:
             api=api,
             base_url=base_url,
             api_key_env=api_key_env,
-            models=(PiModelConfig(id=model),),
+            models=(
+                PiModelConfig(
+                    id=model,
+                    reasoning=reasoning,
+                    context_window=context_window,
+                    max_tokens=max_tokens,
+                ),
+            ),
         ),
     )
 
@@ -104,7 +118,13 @@ def test_live_typed_provider_is_injected_into_pi_temp_config(
         (str(fake),),
         "1.2.3",
         env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": "sentinel"},
-        providers=_live_providers(provider, model),
+        providers=_live_providers(
+            provider,
+            model,
+            reasoning=True,
+            context_window=200_000,
+            max_tokens=32_000,
+        ),
     )
 
     adapter.run(
@@ -129,7 +149,14 @@ def test_live_typed_provider_is_injected_into_pi_temp_config(
                 "api": expected_api,
                 "apiKey": f"${api_key_env}",
                 "baseUrl": base_url,
-                "models": [{"id": model}],
+                "models": [
+                    {
+                        "contextWindow": 200_000,
+                        "id": model,
+                        "maxTokens": 32_000,
+                        "reasoning": True,
+                    }
+                ],
             }
         }
     }

@@ -38,21 +38,40 @@ class PiModelConfig:
     """One model admitted by a typed Pi provider configuration."""
 
     id: str
+    reasoning: bool = False
+    context_window: int | None = None
+    max_tokens: int | None = None
 
     def __post_init__(self) -> None:
         _strict_config_text(self.id, label="Pi model id")
+        if not isinstance(self.reasoning, bool):
+            raise TypeError("Pi model reasoning must be a bool")
+        for field_name in ("context_window", "max_tokens"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"Pi model {field_name} must be a positive integer or None")
+            if value <= 0:
+                raise ValueError(f"Pi model {field_name} must be positive")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> PiModelConfig:
         """Parse one strict model table from project configuration."""
         if not isinstance(values, Mapping):
             raise TypeError("Pi provider models must contain tables")
-        unknown = sorted(set(values) - {"id"})
+        known = {"id", "reasoning", "context_window", "max_tokens"}
+        unknown = sorted(set(values) - known)
         if unknown:
             raise ValueError(f"Unknown Pi model configuration keys: {', '.join(unknown)}")
         if "id" not in values:
             raise ValueError("Pi model configuration is missing required key: id")
-        return cls(id=values["id"])
+        return cls(
+            id=values["id"],
+            reasoning=values.get("reasoning", False),
+            context_window=values.get("context_window"),
+            max_tokens=values.get("max_tokens"),
+        )
 
 
 @dataclass(frozen=True)
@@ -145,8 +164,20 @@ def _pi_models_json_bytes(providers: tuple[PiProviderConfig, ...]) -> bytes:
             "api": provider.api,
             "apiKey": f"${provider.api_key_env}",
             "baseUrl": provider.base_url,
-            "models": [{"id": model.id} for model in provider.models],
+            "models": [_pi_model_value(model) for model in provider.models],
         }
         for provider in providers
     }
     return canonical_json({"providers": provider_values}).encode("utf-8")
+
+
+def _pi_model_value(model: PiModelConfig) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "id": model.id,
+        "reasoning": model.reasoning,
+    }
+    if model.context_window is not None:
+        value["contextWindow"] = model.context_window
+    if model.max_tokens is not None:
+        value["maxTokens"] = model.max_tokens
+    return value

@@ -241,8 +241,11 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
 
 - `AgentCapabilities(filesystem: bool = True, terminal: bool = False) -> None`：adapter 声明的
   capability；task admission 会据此拒绝不支持的请求。
-- `PiModelConfig(id: str) -> None`：一个 Pi typed provider 明确允许的模型；`id` 必须是不含
-  空白或控制字符的非空字符串。
+- `PiModelConfig(id: str, reasoning: bool = False, context_window: int | None = None,
+  max_tokens: int | None = None) -> None`：一个 Pi typed provider 明确允许的模型；`id` 必须是
+  不含空白或控制字符的非空字符串，`reasoning` 必须是 bool，两个可选额度必须是正整数。
+  renderer 固定输出 Pi 的 `reasoning` 布尔字段；非空额度分别输出为 `contextWindow` 与
+  `maxTokens`，值为 `None` 时省略。
 - `PiProviderConfig(id: str, api: str, base_url: str, api_key_env: str, models:
   tuple[PiModelConfig, ...]) -> None`：最小 Pi provider 描述。`api` 必须是 Pi 已知 text-model
   API，`base_url` 必须是不含 credential/query/fragment 的绝对 HTTP(S) URL，`api_key_env` 必须是
@@ -257,7 +260,8 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
   `extra_config_files["models.json"]` 同传会报错，其他 extra 配置文件仍是 escape hatch。
   `api_key_env="ACME_KEY"` 只会渲染为 `"apiKey": "$ACME_KEY"`，resolved secret 不进入配置
   字节或 adapter identity。identity 继续只绑定最终配置文件字节的 SHA-256，因此 typed 与手写
-  `models.json` 在最终字节完全相同时具有相同身份。
+  `models.json` 在最终字节完全相同时具有相同身份。合并 process environment 与
+  `env_resolver` 后，该变量缺失或为空会在 Pi version probe/spawn 前以 `CONFIG_POLICY` 失败。
 - `AgentRequest(task: AgentTask, inputs: dict[str, dict[str, Any]], spec: AgentSpec) -> None`：
   框架交给 `AgentAdapter.run` 的规范请求。
 - `AgentRunContext(workspace: Path, capsule_root: Path, deadline: float, emit_event: Callable[[Mapping[str, Any]], None], record_evidence: Callable[[str, bytes, str], None], session_in: bytes | None = None, record_session: Callable[[bytes], None] | None = None) -> None`：
