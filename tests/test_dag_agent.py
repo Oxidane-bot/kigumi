@@ -20,7 +20,7 @@ from kigumi.calling import LLMCaller
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
 from kigumi.evidence import EvidencePolicy
-from kigumi.pi import PiRpcAdapter
+from kigumi.pi import PiModelConfig, PiProviderConfig, PiRpcAdapter
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 from tests._agent_helpers import make_agent_spec
@@ -155,6 +155,50 @@ def test_agent_profile_binding_errors_are_explicit(tmp_path: Path) -> None:
             spec=spec,
             items_from=("source", "items"),
         )
+
+
+def test_agent_profile_constructs_pi_adapter_with_typed_providers(tmp_path: Path) -> None:
+    capsule = tmp_path / "agents" / "writer"
+    capsule.parent.mkdir(parents=True)
+    make_agent_spec(capsule)
+    provider = PiProviderConfig(
+        id="fake",
+        api="openai-responses",
+        base_url="https://gateway.example/v1",
+        api_key_env="CUSTOM_GATEWAY_API_KEY",
+        models=(PiModelConfig(id="fake-model"),),
+    )
+    config = KigumiConfig(
+        project_root=tmp_path,
+        source_dirs=[],
+        agent_profiles={
+            "writer": {
+                "capsule": "agents/writer",
+                "runtime": "pi",
+                "expected_version": "0.83.0",
+                "providers": [
+                    {
+                        "id": provider.id,
+                        "api": provider.api,
+                        "base_url": provider.base_url,
+                        "api_key_env": provider.api_key_env,
+                        "models": [{"id": provider.models[0].id}],
+                    }
+                ],
+            }
+        },
+    )
+    transport = FakeTransport(repeat(Response("model output", {"total_tokens": 1}, "stop")))
+    dag = Dag(config, LLMCaller(transport, tmp_path / "llm"))
+
+    @dag.agent("draft", profile="writer")
+    def draft(inputs: dict[str, Any], ctx: Any) -> AgentTask:
+        del inputs, ctx
+        return AgentTask("draft")
+
+    adapter = dag._nodes["draft"].agent_adapter
+    assert isinstance(adapter, PiRpcAdapter)
+    assert adapter.providers == (provider,)
 
 
 def test_dag_agent_uses_normal_cache_and_publishes_exact_attachments(tmp_path: Path) -> None:

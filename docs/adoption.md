@@ -74,17 +74,56 @@ expected_version = "0.83.0"
 # command = ["pi"]                  # 默认值
 # session_carry = false              # 默认值
 # session_max_bytes = 2097152        # 默认沿用 PiRpcAdapter
+
+[[tool.kigumi.agent_profiles.writer.providers]]
+id = "custom-gateway"
+api = "openai-responses"
+base_url = "https://gateway.example/v1"
+api_key_env = "CUSTOM_GATEWAY_API_KEY" # 只写变量名，不带 `$`，更不能写 secret
+
+[[tool.kigumi.agent_profiles.writer.providers.models]]
+id = "custom-model"
 ```
 
 `agent_profiles` 是项目级的一次性绑定表：节点只需引用 `profile="writer"`，不必重复构造
 `AgentSpec` 和 `PiRpcAdapter`。`capsule`、`runtime`、`expected_version` 是必填项；当前
-`runtime` 只接受 `pi`，`command` 默认是 `["pi"]`，session 选项默认关闭。profile 不接受
-密钥或 `extra_config_files`；需要每个 DAG 自己解析环境或注入额外配置时，仍可显式传入
-`adapter=` 与 `spec=`，这也是保留的 escape hatch。
+`runtime` 只接受 `pi`，`command` 默认是 `["pi"]`，session 选项默认关闭。可选 `providers`
+由 `PiProviderConfig` / `PiModelConfig` 的同一严格模式解析并规范渲染成 `models.json`；上例最终
+只含 `"apiKey": "$CUSTOM_GATEWAY_API_KEY"`，环境解析后的值不写配置或 identity。profile
+不接受明文密钥或 `extra_config_files`；需要注入 `models.json` 之外的 Pi 配置时，仍可显式传入
+`adapter=` 与 `spec=`，并使用 adapter 的 `extra_config_files` escape hatch。
 
 项目配置只负责把名字绑定到运行时和 Capsule。Capsule 内的 `agent.toml` 仍是 provider、model、
 thinking、system prompt、tools、skills、hooks 和 limits 的唯一来源；修改这些内容会由
 `AgentSpec.load()` 内容寻址并进入 Agent 节点的既有缓存身份。profile 名本身不会额外进入缓存身份。
+这里 Capsule 的 provider/model 是本 Agent 实际选择；profile 的 typed provider 只定义该 id/model
+在 Pi 中怎样连接，不引入通用 ModelRoute，也不会替代 Capsule 的选择。
+
+直接构造 adapter 时使用同一类型：
+
+```python
+from kigumi import PiModelConfig, PiProviderConfig, PiRpcAdapter
+
+adapter = PiRpcAdapter(
+    ("pi",),
+    expected_version="0.83.0",
+    providers=(
+        PiProviderConfig(
+            id="custom-gateway",
+            api="openai-responses",
+            base_url="https://gateway.example/v1",
+            api_key_env="CUSTOM_GATEWAY_API_KEY",
+            models=(PiModelConfig(id="custom-model"),),
+        ),
+    ),
+)
+```
+
+typed renderer 使用库的 `canonical_json` 产生最终 UTF-8 字节；这些字节仍以既有
+`extra_config_files_sha256["models.json"]` 进入 adapter identity。手写 escape hatch 若提供完全
+相同的最终字节，identity 也完全相同；仅 JSON 语义相同但空白或键序字节不同，仍按既有文件字节
+身份视为不同配置。`providers` 与手写 `extra_config_files["models.json"]` 不能同时出现，避免两个
+来源争夺同一路径。
 
 `dag_entry` 是唯一一个"打开一组命令"的键。`kigumi plan` / `describe` / `explain` /
 `check` / `graph` / `profile` / `resume` / `retry-resolve` / `recover` 要读内存里的图，而节点是靠

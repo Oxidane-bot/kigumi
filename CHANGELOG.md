@@ -18,12 +18,27 @@
   将 miss 并可能重新计费。附件 identity 只绑定内容摘要和稳定 MIME/detail 表示，不绑定
   base64 或临时绝对路径，实际发送仍展开为 provider wire 内容。
 
+### 新增
+
+- 新增 `PiModelConfig` 与 `PiProviderConfig`，`PiRpcAdapter(providers=...)` 可把严格校验的
+  provider/model 描述经 `canonical_json` 渲染为临时 Pi home 的 `models.json`；
+  `AgentProfileConfig` 与 `[tool.kigumi.agent_profiles.<name>]` 的嵌套 TOML provider/model 表使用
+  同一类型，并由 `Dag._resolve_agent_profile` 传入 adapter。`api_key_env` 只渲染为 `$ENV_NAME`，
+  resolved secret 不进入配置字节或 identity；typed providers 与手写
+  `extra_config_files["models.json"]` 不能共存，其他 extra 配置文件继续作为 escape hatch。
+
 ### 修复
 
 - 有限 `Budget(max_tokens=...)` 现在按 effective prepared request 预留；一旦 provider attempt
   可能已发出，provider 失败、空/截断响应以及缺失或非法 `usage.total_tokens` 都保守地把准入
   估算记入 `spent`，不能再按零 token 退款。缺失用量仍在写入成功缓存前 fail closed；
   `Budget(max_tokens=None)` 继续支持无用量 transport 的 best-effort 记账。
+
+### 兼容性
+
+- typed provider 配置没有在上述第 8 缓存族之外引入额外换族：最终仍沿用既有
+  `extra_config_files_sha256["models.json"]` 字节摘要身份；typed 与手写配置在最终
+  `models.json` 字节完全相同时具有相同 adapter identity。
 
 ## [0.13.1] - 2026-08-12
 

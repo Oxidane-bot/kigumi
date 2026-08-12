@@ -716,6 +716,7 @@ class Dag:
             expected_version=profile_config.expected_version,
             session_carry=profile_config.session_carry,
             session_max_bytes=profile_config.session_max_bytes,
+            providers=profile_config.providers,
         )
         binding = (adapter, spec)
         self._agent_profile_bindings[profile] = binding

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ._safe_io import _secure_directory_absolute
+from .pi_config import PiProviderConfig
 
 
 def _safe_configured_path(path: str | Path) -> Path:
@@ -68,6 +69,7 @@ class AgentProfileConfig:
     command: tuple[str, ...] = ("pi",)
     session_carry: bool = False
     session_max_bytes: int = 2 * 1024 * 1024
+    providers: tuple[PiProviderConfig, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("capsule", "expected_version"):
@@ -92,6 +94,15 @@ class AgentProfileConfig:
             or self.session_max_bytes <= 0
         ):
             raise ValueError("Agent profile session_max_bytes must be positive")
+        if not isinstance(self.providers, (list, tuple)):
+            raise TypeError("Agent profile providers must be a list of PiProviderConfig values")
+        providers = tuple(self.providers)
+        if not all(isinstance(provider, PiProviderConfig) for provider in providers):
+            raise TypeError("Agent profile providers must contain only PiProviderConfig values")
+        provider_ids = [provider.id for provider in providers]
+        if len(set(provider_ids)) != len(provider_ids):
+            raise ValueError("Agent profile provider ids must be unique")
+        object.__setattr__(self, "providers", providers)
 
     @classmethod
     def from_mapping(cls, name: str, values: Mapping[str, Any]) -> AgentProfileConfig:
@@ -104,6 +115,7 @@ class AgentProfileConfig:
             "expected_version",
             "session_carry",
             "session_max_bytes",
+            "providers",
         }
         unknown = sorted(set(values) - known)
         if unknown:
@@ -116,6 +128,10 @@ class AgentProfileConfig:
             raise ValueError(
                 f"Agent profile {name!r} is missing required keys: {', '.join(missing)}"
             )
+        raw_providers = values.get("providers", ())
+        if not isinstance(raw_providers, (list, tuple)):
+            raise TypeError(f"Agent profile {name!r} providers must be a list of tables")
+        providers = tuple(PiProviderConfig.from_mapping(provider) for provider in raw_providers)
         return cls(
             capsule=values["capsule"],
             runtime=values["runtime"],
@@ -123,6 +139,7 @@ class AgentProfileConfig:
             command=values.get("command", ("pi",)),
             session_carry=values.get("session_carry", False),
             session_max_bytes=values.get("session_max_bytes", 2 * 1024 * 1024),
+            providers=providers,
         )
 
 

@@ -40,6 +40,7 @@ kigumi/
 ├── artifacts.py    #     原子写入、规范 JSON 与 sidecar 基础件
 ├── agents.py       #     AgentSpec 胶囊、staging、completion、attachment 与 exact publish
 ├── pi.py           #     原生 Pi RPC adapter：版本、JSONL、进程组与证据
+├── pi_config.py    #     Pi provider/model 严格模式与 canonical models.json renderer
 ├── _pi_bridge.ts   #     wheel 内固定 Pi Extension：root tools 与 submit_result
 ├── _pi_bridge_policy.mjs # bridge 路径与运行时私有目录策略
 ├── bench.py        #     Function/Caller/Dag/Agent 实验主体的隔离证据网格
@@ -85,7 +86,8 @@ cache lookup 先于 builder；builder 只能看到 canonical upstream/item/carry
 published output 才受既有输出所有权约束并写项目。`AgentSpec` 把 manifest、SYSTEM、Skill、
 Hook、model/tool/limits 作为内容寻址 capsule；`PiRpcAdapter` 固定关闭隐式发现、context
 和 built-in tools，session 默认关闭且只能通过显式 `session_carry` 作为 scan carry 开启；
-只加载 staged capsule 与 wheel 内 bridge。bridge 提供 workspace-rooted
+可选 `PiProviderConfig` 只规范渲染 Pi 的 `models.json`，Capsule 仍选择 provider/model，不引入
+另一套 ModelRoute。只加载 staged capsule 与 wheel 内 bridge。bridge 提供 workspace-rooted
 `read/write/edit/grep/find/ls` 与终止工具 `submit_result`，但 workspace root 和关闭 shell 都不
 构成 OS sandbox，可信 Extension 仍有宿主权限。v1 不提供 Agent factory、自进化、多 Agent
 动态拓扑、winner 或自动 promotion；这些角色只能由静态 DAG 组合。

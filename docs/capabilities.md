@@ -82,6 +82,7 @@ adoption.md 的"设计边界"一节。
 | 多轮串行修订(session 作 carry) | `@dag.agent_scan` + `session_carry=True` |
 | 内容寻址的 agent 配置胶囊 | `AgentSpec` / `AgentLimits` / `AgentTask` / `AgentPublish` |
 | 接 Pi runtime | `PiRpcAdapter` |
+| 类型化声明 Pi 自定义 provider/model | `PiProviderConfig` / `PiModelConfig` / `PiRpcAdapter(providers=...)` |
 | 接自己的 agent runtime | `AgentAdapter` 协议 |
 | 控制证据保留形态 | `EvidencePolicy` |
 | 跨进程限制 agent 并发 | `[tool.kigumi].agent_slots` / `KIGUMI_AGENT_SLOTS` |

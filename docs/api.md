@@ -241,6 +241,23 @@ receipt，也不能替代 DAG 的 retry/resume/recovery 语义。
 
 - `AgentCapabilities(filesystem: bool = True, terminal: bool = False) -> None`：adapter 声明的
   capability；task admission 会据此拒绝不支持的请求。
+- `PiModelConfig(id: str) -> None`：一个 Pi typed provider 明确允许的模型；`id` 必须是不含
+  空白或控制字符的非空字符串。
+- `PiProviderConfig(id: str, api: str, base_url: str, api_key_env: str, models:
+  tuple[PiModelConfig, ...]) -> None`：最小 Pi provider 描述。`api` 必须是 Pi 已知 text-model
+  API，`base_url` 必须是不含 credential/query/fragment 的绝对 HTTP(S) URL，`api_key_env` 必须是
+  不带 `$` 的 ASCII 环境变量名，模型列表必须非空且 id 唯一。
+  `api` 接受 `anthropic-messages`、`openai-completions`、`openai-responses`、
+  `openai-codex-responses`、`azure-openai-responses`、`google-generative-ai`、`google-vertex`、
+  `mistral-conversations`、`bedrock-converse-stream`、`pi-messages`。
+- `PiRpcAdapter(command: tuple[str, ...], expected_version: str, env_resolver=None,
+  session_carry: bool = False, session_max_bytes: int = 2097152, extra_config_files:
+  Mapping[str, bytes] = {}, providers: tuple[PiProviderConfig, ...] = ()) -> None`：驱动固定版本 Pi
+  RPC。非空 `providers` 会经 `canonical_json` 渲染为临时 Pi home 的 `models.json`；与
+  `extra_config_files["models.json"]` 同传会报错，其他 extra 配置文件仍是 escape hatch。
+  `api_key_env="ACME_KEY"` 只会渲染为 `"apiKey": "$ACME_KEY"`，resolved secret 不进入配置
+  字节或 adapter identity。identity 继续只绑定最终配置文件字节的 SHA-256，因此 typed 与手写
+  `models.json` 在最终字节完全相同时具有相同身份。
 - `AgentRequest(task: AgentTask, inputs: dict[str, dict[str, Any]], spec: AgentSpec) -> None`：
   框架交给 `AgentAdapter.run` 的规范请求。
 - `AgentRunContext(workspace: Path, capsule_root: Path, deadline: float, emit_event: Callable[[Mapping[str, Any]], None], record_evidence: Callable[[str, bytes, str], None], session_in: bytes | None = None, record_session: Callable[[bytes], None] | None = None) -> None`：

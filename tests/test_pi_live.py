@@ -15,7 +15,7 @@ from kigumi.agents import (
     AgentRunContext,
     AgentTask,
 )
-from kigumi.pi import PiRpcAdapter
+from kigumi.pi import PiModelConfig, PiProviderConfig, PiRpcAdapter
 from tests._agent_helpers import make_agent_spec
 from tests._dag_helpers import _make_dag
 from tests.test_pi_first import _fake_pi
@@ -35,8 +35,8 @@ _PI_SUPPORTED_APIS = (
 )
 
 
-def _live_extra_config_files(provider: str, model: str) -> dict[str, bytes]:
-    """Build optional live-fixture config without changing manifest selection semantics."""
+def _live_providers(provider: str, model: str) -> tuple[PiProviderConfig, ...]:
+    """Build optional typed live-fixture config without changing manifest selection."""
     api = os.environ.get("KIGUMI_PI_API", "openai-responses")
     if api not in _PI_SUPPORTED_APIS:
         accepted = ", ".join(_PI_SUPPORTED_APIS)
@@ -44,31 +44,22 @@ def _live_extra_config_files(provider: str, model: str) -> dict[str, bytes]:
     base_url = os.environ.get("KIGUMI_PI_BASE_URL")
     api_key_env = os.environ.get("KIGUMI_PI_API_KEY_ENV")
     if base_url is None and api_key_env is None:
-        return {}
+        return ()
     if not base_url or not api_key_env:
         pytest.skip("KIGUMI_PI_BASE_URL and KIGUMI_PI_API_KEY_ENV are required together")
     if not api_key_env.isidentifier():
         pytest.skip("KIGUMI_PI_API_KEY_ENV must be a valid environment variable name")
     if api_key_env not in os.environ:
         pytest.skip(f"{api_key_env} must be set for the configured Pi provider")
-    models = {
-        "providers": {
-            provider: {
-                "api": api,
-                "apiKey": f"${api_key_env}",
-                "baseUrl": base_url,
-                "models": [{"id": model}],
-            }
-        }
-    }
-    return {
-        "models.json": json.dumps(
-            models,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    }
+    return (
+        PiProviderConfig(
+            id=provider,
+            api=api,
+            base_url=base_url,
+            api_key_env=api_key_env,
+            models=(PiModelConfig(id=model),),
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -76,7 +67,7 @@ def _live_extra_config_files(provider: str, model: str) -> dict[str, bytes]:
     ((None, "openai-responses"), ("openai-completions", "openai-completions")),
     ids=("default-responses", "explicit-completions"),
 )
-def test_live_custom_models_json_is_injected_into_pi_temp_config(
+def test_live_typed_provider_is_injected_into_pi_temp_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     configured_api: str | None,
@@ -113,7 +104,7 @@ def test_live_custom_models_json_is_injected_into_pi_temp_config(
         (str(fake),),
         "1.2.3",
         env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": "sentinel"},
-        extra_config_files=_live_extra_config_files(provider, model),
+        providers=_live_providers(provider, model),
     )
 
     adapter.run(
@@ -145,14 +136,14 @@ def test_live_custom_models_json_is_injected_into_pi_temp_config(
     assert "fake-live-key-not-real" not in captured["models.json"]
 
 
-def test_live_custom_models_json_rejects_unknown_api(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_typed_provider_rejects_unknown_api(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KIGUMI_PI_BASE_URL", "https://gateway.example/v1")
     monkeypatch.setenv("KIGUMI_PI_API_KEY_ENV", "KIGUMI_PI_TEST_API_KEY")
     monkeypatch.setenv("KIGUMI_PI_TEST_API_KEY", "fake-live-key-not-real")
     monkeypatch.setenv("KIGUMI_PI_API", "not-a-pi-api")
 
     with pytest.raises(ValueError, match="^KIGUMI_PI_API must be one of:") as raised:
-        _live_extra_config_files("custom-gateway", "custom-model")
+        _live_providers("custom-gateway", "custom-model")
     assert "openai-responses" in str(raised.value)
     assert "got 'not-a-pi-api'" in str(raised.value)
 
@@ -170,7 +161,7 @@ def test_real_pi_rpc_conformance(tmp_path: Path) -> None:
     model = os.environ.get("KIGUMI_PI_MODEL")
     if not provider or not model:
         pytest.skip("KIGUMI_PI_PROVIDER and KIGUMI_PI_MODEL are required")
-    extra_config_files = _live_extra_config_files(provider, model)
+    providers = _live_providers(provider, model)
 
     capsule = tmp_path / "agent"
     spec = make_agent_spec(capsule, tools=("write",))
@@ -185,7 +176,7 @@ def test_real_pi_rpc_conformance(tmp_path: Path) -> None:
         tuple(shlex.split(command)),
         version,
         env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": sentinel},
-        extra_config_files=extra_config_files,
+        providers=providers,
     )
 
     @dag.agent("pi", adapter=adapter, spec=spec, cache="off")
@@ -233,7 +224,7 @@ def test_real_pi_rpc_conformance(tmp_path: Path) -> None:
         version,
         env_resolver=lambda: {"KIGUMI_LIVE_SENTINEL": sentinel},
         session_carry=True,
-        extra_config_files=extra_config_files,
+        providers=providers,
     )
 
     @session_dag.node("session-source")

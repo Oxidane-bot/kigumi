@@ -18,6 +18,8 @@ import kigumi.pi as pi_module
 from kigumi import (
     AgentExecutionFailure,
     AgentRuntimeFailureCode,
+    PiModelConfig,
+    PiProviderConfig,
     ProviderFailure,
     ProviderFailureKind,
     ProviderFailureStage,
@@ -32,6 +34,7 @@ from kigumi.agents import (
     AgentSpec,
     AgentTask,
 )
+from kigumi.artifacts import canonical_json
 from kigumi.bench import AgentSubject, TrialContext
 from kigumi.failures import AgentRuntimeFailureSubCode
 from kigumi.pi import PiRpcAdapter, normalize_pi_trajectory_event
@@ -926,6 +929,143 @@ def test_pi_rpc_adapter_extra_config_files_write_identity_and_secret_guard(
     assert "endpoint.json" in str(raised.value)
     assert "fake-secret-value-not-real" not in str(raised.value)
     assert raised.value.runtime_subcode is AgentRuntimeFailureSubCode.CONFIG_POLICY
+
+
+def test_pi_typed_providers_render_canonical_models_json_with_existing_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = PiProviderConfig(
+        id="custom-gateway",
+        api="openai-responses",
+        base_url="https://gateway.example/v1",
+        api_key_env="CUSTOM_GATEWAY_API_KEY",
+        models=[PiModelConfig(id="custom-model")],
+    )
+    expected = canonical_json(
+        {
+            "providers": {
+                "custom-gateway": {
+                    "api": "openai-responses",
+                    "apiKey": "$CUSTOM_GATEWAY_API_KEY",
+                    "baseUrl": "https://gateway.example/v1",
+                    "models": [{"id": "custom-model"}],
+                }
+            }
+        }
+    ).encode("utf-8")
+    secret = "typed-provider-secret-not-real"
+    typed = PiRpcAdapter(
+        (str(_fake_pi(tmp_path / "fake-pi")),),
+        "1.2.3",
+        env_resolver=lambda: {"CUSTOM_GATEWAY_API_KEY": secret},
+        extra_config_files={"other.json": b'{"enabled":true}'},
+        providers=[provider],
+    )
+    manual = PiRpcAdapter(
+        typed.command,
+        typed.expected_version,
+        extra_config_files={
+            "models.json": expected,
+            "other.json": b'{"enabled":true}',
+        },
+    )
+
+    assert typed.cache_identity() == manual.cache_identity()
+    assert typed.cache_identity()["extra_config_files_sha256"] == {
+        "models.json": hashlib.sha256(expected).hexdigest(),
+        "other.json": hashlib.sha256(b'{"enabled":true}').hexdigest(),
+    }
+    assert secret not in json.dumps(typed.cache_identity(), sort_keys=True)
+
+    spec = AgentSpec.load(_capsule(tmp_path / "agent", thinking="off"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    capsule_root = workspace / ".kigumi" / "agent"
+    spec.stage(capsule_root)
+    config_dump = tmp_path / "pi-config.json"
+    monkeypatch.setenv("CONFIG_DUMP_FILE", str(config_dump))
+
+    typed.run(
+        AgentRequest(AgentTask("write"), {}, spec),
+        AgentRunContext(
+            workspace,
+            capsule_root,
+            10**9,
+            lambda event: None,
+            lambda name, data, media: None,
+        ),
+    )
+
+    captured = json.loads(config_dump.read_text(encoding="utf-8"))
+    assert captured["models.json"].encode("utf-8") == expected
+    assert captured["other.json"] == '{"enabled":true}'
+    assert secret not in captured["models.json"]
+    assert stat.S_IMODE((workspace / ".kigumi" / "pi-home" / "models.json").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ("", " ", " leading", "trailing\n", "internal space", "control\x7f", 1),
+)
+def test_pi_model_config_strictly_validates_id(model_id: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="Pi model id"):
+        PiModelConfig(id=model_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    (
+        ("id", " ", "Pi provider id"),
+        ("api", "unknown-api", "Pi provider api"),
+        ("base_url", "gateway.example/v1", "Pi provider base_url"),
+        ("base_url", "https://gate way.example/v1", "Pi provider base_url"),
+        ("base_url", "https://gateway.example:bad/v1", "Pi provider base_url"),
+        ("api_key_env", "$CUSTOM_KEY", "Pi provider api_key_env"),
+        ("models", [], "Pi provider models"),
+        (
+            "models",
+            [PiModelConfig(id="duplicate"), PiModelConfig(id="duplicate")],
+            "Pi provider model ids must be unique",
+        ),
+    ),
+)
+def test_pi_provider_config_strictly_validates_typed_fields(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "id": "custom-gateway",
+        "api": "openai-responses",
+        "base_url": "https://gateway.example/v1",
+        "api_key_env": "CUSTOM_GATEWAY_API_KEY",
+        "models": [PiModelConfig(id="custom-model")],
+    }
+    values[field_name] = value
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        PiProviderConfig(**values)  # type: ignore[arg-type]
+
+
+def test_pi_rpc_adapter_rejects_duplicate_or_conflicting_typed_providers() -> None:
+    provider = PiProviderConfig(
+        id="custom-gateway",
+        api="openai-responses",
+        base_url="https://gateway.example/v1",
+        api_key_env="CUSTOM_GATEWAY_API_KEY",
+        models=(PiModelConfig(id="custom-model"),),
+    )
+
+    with pytest.raises(ValueError, match="Pi provider ids must be unique"):
+        PiRpcAdapter(("pi",), "1.2.3", providers=(provider, provider))
+    with pytest.raises(ValueError, match="models.json"):
+        PiRpcAdapter(
+            ("pi",),
+            "1.2.3",
+            providers=(provider,),
+            extra_config_files={"models.json": b"{}"},
+        )
 
 
 @pytest.mark.parametrize(

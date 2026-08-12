@@ -96,7 +96,7 @@ from .failures import (
     ProviderFailureStage,
 )
 from .optimize import Candidate, EvolveResult, evolve_prompt
-from .pi import PiRpcAdapter
+from .pi import PiModelConfig, PiProviderConfig, PiRpcAdapter
 from .prompt import (
     Attachment,
     CarryRef,
@@ -212,6 +212,8 @@ __all__ = [
     "PreparedRequest",
     "observe",
     "PlanResult",
+    "PiModelConfig",
+    "PiProviderConfig",
     "PiRpcAdapter",
     "ProviderFailure",
     "ProviderFailureKind",

@@ -37,6 +37,8 @@ from .failures import (
     ProviderFailureKind,
     ProviderFailureStage,
 )
+from .pi_config import PiModelConfig as PiModelConfig
+from .pi_config import PiProviderConfig, _pi_models_json_bytes
 
 
 class _PiFailureCode(StrEnum):
@@ -135,6 +137,7 @@ class PiRpcAdapter:
     session_carry: bool = False
     session_max_bytes: int = 2 * 1024 * 1024
     extra_config_files: Mapping[str, bytes] = field(default_factory=dict)
+    providers: tuple[PiProviderConfig, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -180,6 +183,25 @@ class PiRpcAdapter:
                 raise ValueError("Pi extra_config_files names may not override Pi-owned files")
             if not isinstance(contents, bytes):
                 raise TypeError("Pi extra_config_files values must be bytes")
+        if not isinstance(self.providers, (list, tuple)):
+            raise TypeError("Pi providers must be a list of PiProviderConfig values")
+        providers = tuple(self.providers)
+        if not all(isinstance(provider, PiProviderConfig) for provider in providers):
+            raise TypeError("Pi providers must contain only PiProviderConfig values")
+        provider_ids = [provider.id for provider in providers]
+        if len(set(provider_ids)) != len(provider_ids):
+            raise ValueError("Pi provider ids must be unique")
+        if providers and "models.json" in self.extra_config_files:
+            raise ValueError(
+                "Pi providers may not be combined with extra_config_files['models.json']"
+            )
+        object.__setattr__(self, "providers", providers)
+
+    def _config_files(self) -> dict[str, bytes]:
+        files = dict(self.extra_config_files)
+        if self.providers:
+            files["models.json"] = _pi_models_json_bytes(self.providers)
+        return files
 
     def cache_identity(self) -> dict[str, Any]:
         identity: dict[str, Any] = {
@@ -195,10 +217,11 @@ class PiRpcAdapter:
             "session_carry": self.session_carry,
             "session_max_bytes": self.session_max_bytes,
         }
-        if self.extra_config_files:
+        config_files = self._config_files()
+        if config_files:
             identity["extra_config_files_sha256"] = {
-                name: hashlib.sha256(self.extra_config_files[name]).hexdigest()
-                for name in sorted(self.extra_config_files)
+                name: hashlib.sha256(config_files[name]).hexdigest()
+                for name in sorted(config_files)
             }
         return identity
 
@@ -214,7 +237,12 @@ class PiRpcAdapter:
         ):
             raise AgentResultError("Pi env_resolver must return string keys and values")
         environment.update(resolved)
-        secrets = tuple(value for value in resolved.values() if value)
+        provider_secrets = (
+            environment.get(provider.api_key_env, "") for provider in self.providers
+        )
+        secrets = tuple(
+            dict.fromkeys(value for value in (*resolved.values(), *provider_secrets) if value)
+        )
         rpc_evidence = bytearray()
         stderr = bytearray()
         stderr_truncated = False
@@ -244,15 +272,16 @@ class PiRpcAdapter:
             settings_path = pi_home / "settings.json"
             settings_path.write_bytes(_pi_rpc_settings_bytes())
             settings_path.chmod(0o600)
-            for name in sorted(self.extra_config_files):
-                contents = self.extra_config_files[name]
+            config_files = self._config_files()
+            for name in sorted(config_files):
+                contents = config_files[name]
                 if any(secret.encode() in contents for secret in secrets):
                     raise AgentRuntimeResultError(
                         f"Pi extra config file {name!r} contains a resolved env value",
                         runtime_subcode=AgentRuntimeFailureSubCode.CONFIG_POLICY,
                     )
-            for name in sorted(self.extra_config_files):
-                contents = self.extra_config_files[name]
+            for name in sorted(config_files):
+                contents = config_files[name]
                 config_path = pi_home / name
                 config_path.write_bytes(contents)
                 config_path.chmod(0o600)

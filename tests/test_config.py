@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from kigumi.config import KigumiConfig, find_project_root, load_config, load_env
+from kigumi.pi import PiModelConfig, PiProviderConfig
 
 
 def test_load_config_returns_none_without_kigumi_table(tmp_path: Path) -> None:
@@ -150,6 +151,83 @@ session_max_bytes = 4096
     assert profile.command == ("pi", "--verbose")
     assert profile.session_carry is True
     assert profile.session_max_bytes == 4096
+
+
+def test_agent_profile_config_parses_typed_pi_providers(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+
+[[tool.kigumi.agent_profiles.writer.providers]]
+id = "custom-gateway"
+api = "openai-responses"
+base_url = "https://gateway.example/v1"
+api_key_env = "CUSTOM_GATEWAY_API_KEY"
+
+[[tool.kigumi.agent_profiles.writer.providers.models]]
+id = "custom-model"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+
+    assert config is not None
+    assert config.agent_profiles["writer"].providers == (
+        PiProviderConfig(
+            id="custom-gateway",
+            api="openai-responses",
+            base_url="https://gateway.example/v1",
+            api_key_env="CUSTOM_GATEWAY_API_KEY",
+            models=(PiModelConfig(id="custom-model"),),
+        ),
+    )
+
+
+def test_agent_profile_typed_provider_rejects_unknown_provider_and_model_keys(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+
+[[tool.kigumi.agent_profiles.writer.providers]]
+id = "custom-gateway"
+api = "openai-responses"
+base_url = "https://gateway.example/v1"
+api_key_env = "CUSTOM_GATEWAY_API_KEY"
+api_key = "must-not-be-accepted"
+models = [{ id = "custom-model" }]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown Pi provider configuration keys: api_key"):
+        load_config(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.kigumi.agent_profiles.writer]
+capsule = "agents/writer"
+runtime = "pi"
+expected_version = "0.83.0"
+
+[[tool.kigumi.agent_profiles.writer.providers]]
+id = "custom-gateway"
+api = "openai-responses"
+base_url = "https://gateway.example/v1"
+api_key_env = "CUSTOM_GATEWAY_API_KEY"
+models = [{ id = "custom-model", name = "unknown" }]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown Pi model configuration keys: name"):
+        load_config(tmp_path)
 
 
 def test_agent_profile_config_rejects_unknown_keys_and_invalid_types(tmp_path: Path) -> None:

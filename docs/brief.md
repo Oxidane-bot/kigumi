@@ -122,7 +122,8 @@ def draft(inputs, ctx):
 
 command 默认是 `["pi"]`，session_carry 默认关闭；`@dag.agent_scan` 也接受同一个
 `profile=`。项目配置只绑定 Capsule 与 Pi adapter，Capsule 的 "agent.toml" 仍是
-provider、model、thinking、system prompt 及其它 Agent 行为设置的唯一来源。需要 secrets 或
+provider/model 选择、thinking、system prompt 及其它 Agent 行为设置的唯一来源。profile 可用
+typed providers 定义 Pi endpoint，但只接受 api_key_env 引用，不接受明文 secret；需要
 extra_config_files 时，继续显式传 `adapter=` 和 `spec=`，不要把它们放进项目 TOML。
 
 If the graph's shape or params depend on runtime input, give the factory
