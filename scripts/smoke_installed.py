@@ -171,7 +171,7 @@ def main() -> int:
 
         invalid_node = root / "nodes" / "invalid.py"
         invalid_node.write_text("for item in items:\n    client.call([])\n", encoding="utf-8")
-        run_cli_failure(root, "check")
+        run_cli_failure(root, "check", "--strict-unknown")
         invalid_node.unlink()
 
         hooks_root = root / "hooks-negative"

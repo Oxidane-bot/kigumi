@@ -340,6 +340,7 @@ def test_installed_smoke_covers_cli_positive_and_negative_paths() -> None:
     assert 'run_cli_failure(root, "init")' in smoke
     assert 'run_cli_failure(root, "docs", "not-a-shipped-doc")' in smoke
     assert 'run_cli(root, "init")' in smoke
+    assert 'run_cli_failure(root, "check", "--strict-unknown")' in smoke
     assert "pyproject_before_repeat" in smoke
 
 
