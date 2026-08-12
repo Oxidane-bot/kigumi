@@ -619,8 +619,7 @@ def _read_regular_bytes_allowing_atomic_replace(
                         stat.S_ISREG(current.st_mode)
                         and (current.st_dev, current.st_ino)
                         != (descriptor.st_dev, descriptor.st_ino)
-                        and descriptor.st_nlink == 0
-                        and before.st_nlink > 0
+                        and (descriptor.st_dev, descriptor.st_ino) == (before.st_dev, before.st_ino)
                         and descriptor.st_size == before.st_size
                         and descriptor.st_mtime_ns == before.st_mtime_ns
                     )
@@ -671,8 +670,6 @@ def _read_regular_bytes_allowing_atomic_replace(
             descriptor_changed = identity(final) != identity(initial)
             if descriptor_changed and not (
                 not descriptor_still_named
-                and final.st_nlink == 0
-                and initial.st_nlink > 0
                 and (final.st_dev, final.st_ino) == (initial.st_dev, initial.st_ino)
                 and final.st_size == initial.st_size
                 and final.st_mtime_ns == initial.st_mtime_ns
