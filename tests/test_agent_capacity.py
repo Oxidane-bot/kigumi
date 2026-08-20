@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 import time
 from itertools import repeat
@@ -18,6 +19,89 @@ from kigumi.slots import FileSlots
 from kigumi.testing import FakeTransport
 from kigumi.transport import Response
 from tests._agent_helpers import make_agent_spec
+
+
+def _run_capacity_failure_record(tmp_path: Path, *, scan: bool) -> tuple[bytes, dict[str, Any]]:
+    tmp_path.mkdir()
+    config = KigumiConfig(
+        project_root=tmp_path,
+        source_dirs=[],
+        agent_slot_timeout_seconds=0.01,
+    )
+    dag = Dag(config, LLMCaller(FakeTransport(), tmp_path / "llm"))
+    spec = make_agent_spec(tmp_path / "agent")
+    adapter = _SleepingAdapter()
+
+    if scan:
+
+        @dag.node("source")
+        def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            del inputs, ctx
+            return {"items": [{"id": "one"}]}
+
+        @dag.agent_scan(
+            "work",
+            adapter=adapter,
+            spec=spec,
+            items_from=("source", "items"),
+            key_fn=lambda item: item["id"],
+        )
+        def work(
+            item: dict[str, str],
+            carry: Any,
+            inputs: dict[str, dict[str, Any]],
+            ctx: Any,
+        ) -> AgentTask:
+            del item, carry, inputs, ctx
+            return AgentTask("capacity-task")
+
+    else:
+
+        @dag.agent("work", adapter=adapter, spec=spec)
+        def work(inputs: dict[str, dict[str, Any]], ctx: Any) -> AgentTask:
+            del inputs, ctx
+            return AgentTask("capacity-task")
+
+    with (
+        FileSlots(config.agent_lock_path, 1).acquire(),
+        pytest.raises(AgentExecutionFailure) as raised,
+    ):
+        dag.run(run_id="capacity")
+    assert raised.value.runtime_code is AgentRuntimeFailureCode.CAPACITY
+    assert adapter.runs == 0
+
+    failure_path = tmp_path / "artifacts" / "runs" / "capacity" / "failures" / "work.json"
+    return failure_path.read_bytes(), json.loads(failure_path.read_text(encoding="utf-8"))
+
+
+def test_agent_scan_capacity_failure_matches_ordinary_failure_evidence(tmp_path: Path) -> None:
+    ordinary_bytes, ordinary_record = _run_capacity_failure_record(
+        tmp_path / "ordinary", scan=False
+    )
+    scan_bytes, scan_record = _run_capacity_failure_record(tmp_path / "scan", scan=True)
+
+    assert scan_bytes == ordinary_bytes
+    assert scan_record == ordinary_record
+    assert set(scan_record) == {
+        "failure_schema",
+        "node",
+        "task_sha256",
+        "instruction_sha256",
+        "instruction_evidence",
+        "prompt_resolution",
+        "status",
+        "failure",
+        "usage",
+        "stop_reason",
+        "duration_seconds",
+        "workspace_manifest",
+        "attachments",
+        "published",
+        "trajectory",
+        "evidence",
+        "evidence_policy",
+        "evidence_policy_digest",
+    }
 
 
 class _SleepingAdapter:
