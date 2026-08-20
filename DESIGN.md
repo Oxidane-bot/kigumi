@@ -141,7 +141,8 @@ agent_slot_timeout_seconds = 300
 
 ### L1 calling
 - `LLMCaller(transport, cache_dir, seed, budget, dry)`,依赖注入,测试可替换。
-- 内容寻址缓存:键 = credential-free **transport identity** + **prepared canonical** + seed；
+- 内容寻址缓存:键 = credential-free **transport identity** + **prepared canonical** + seed；带非默认
+  `ResponseSpec` 时,键还绑定其 `format` 与 `schema_sha256`；
   transport 归一化后的 messages/model/params 变化都会换键，换 adapter/config 也不会跨语义回放；
   缺失缓存才是 miss；已存在的撕裂/空/摘要不匹配缓存 fail closed；**空响应拒入缓存**
   (transport 违约时的第二道闸)。
@@ -160,7 +161,7 @@ agent_slot_timeout_seconds = 300
   payload 重建，不新增 provider side effect。L1 payload 仍保留重放所需原文。
 - 大块内容按引用:消息体里的大负载(视频/图像 base64)以
   `{"kigumi_file": 路径}` 内容件表示,缓存键取文件内容哈希,缓存 payload
-  存引用不存字节(接口 P1.1 预留,实现随 P6a)。
+  存引用不存字节。`FileRef` 已实现,经 `preflight()` 的大小与文件身份校验后再读取。
 - managed request 解析为 `Message`、`Attachment` 与 `ResponseSpec`；`FileRef` 的文件哈希进入
   `PromptResolution`，`preflight()` 在 cache lookup 前拒绝过大请求，绝不以 `clip()` 静默缩短。
 - 跨进程限流(fcntl.flock 请求槽,多进程共享 provider 配额)归 P6a。
@@ -192,15 +193,16 @@ agent_slot_timeout_seconds = 300
 spec。`ResolvedPrompt` 是携带 content-free `PromptResolution` 的不可变 `str` 子类；任何
 字符串变换都自然退回 unmanaged，不做 lineage 猜测。
 
-贯穿不变式:同输入 → 逐字节同输出(缓存键与确定性重放压在此上)。
+贯穿不变式:对已入键事实,缓存命中与未命中路径以及已固化的 canonical task/artifact 逐字节一致；
+新鲜 live 执行,尤其 Agent session transcript,不承诺在 `refresh/off` 后逐字节复现(详见
+[确定性字节契约](docs/contracts/determinism.md))。
 公共 prompt 成分(措辞常量、schema 格式段模板、inject 围栏)以 golden
 snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须标注
 "本版本导致缓存失效"。
 
 截断三铁律:
 1. 库永不默认截断;上限必须显式写在调用方。
-2. 截断永不无声:prompt 内自动标注"(已截断:原文 N 字,注入前 M 字)",
-   事件记入 sidecar `clips: [{slot, from, to}]`。
+2. 截断永不无声:prompt 内自动标注"(已截断:原文 N 字,注入前 M 字)"。
 3. 修复环默认不截:continue 模式输出天然在对话历史;rebuild 模式
    echo 默认不限。
 
@@ -256,11 +258,11 @@ snapshot 测试锁字节;任何改动 = 全项目缓存换族,CHANGELOG 必须�
   provider/Pi side effect 前写 schema-2 receipt；成功先写 schema-2 candidate，
   因而 crash-after-success 可提交而不重请求。side effect 后无 terminal receipt 时必须人工
   `retry-resolve`，不假装 exactly-once。
-- 缓存键 = 节点源码哈希 + 节点静态可达的 helper/库哈希(source_dirs)+ 上游产物哈希
-  + prompt 文件哈希 + 参数 + **kigumi prompt 相关模块哈希 + pydantic 版本**
-  (库现在拥有 prompt 字节的生成权:inject 围栏/格式段/措辞常量变了,
-  节点键必须失效,否则升级库后回放陈旧渲染的产物)。声明外部状态时只把
-  `sha(external_fingerprint)` 作为可选 `external` 成分，原值不落 sidecar。普通依赖边声明
+- L3 缓存键的完整标签集合以[缓存键契约第 2 条](docs/contracts/cache-key.md#invariants)和
+  `Dag._key_components()` 为准:`source`、`libs`、`upstream:<dep>`、`prompts:<t>`、
+  `prompt_specs:<name>`、`files:<p>`、`params`、`item`、`item_files:<p>`、`carry`、`kigumi`；
+  检测到 Pydantic 模型时追加 `validated_models`,声明外部指纹时追加
+  `external=sha(external_fingerprint)`，原值不落 sidecar。普通依赖边声明
   `consumes` 时，`upstream:<dep>` 改为投影视图摘要，节点也只收到该 canonical 视图；未声明边
   仍按完整上游产物入键和传值。
 - `libs` 从节点函数所属模块出发沿静态 import 图计算传递闭包；它管理的源码宇宙严格是

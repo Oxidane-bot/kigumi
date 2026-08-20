@@ -22,7 +22,8 @@ Capability index (need -> symbol, grouped by domain):
 
 Every page below is readable offline from the installed wheel via `kigumi docs <name>`:
 brief, capabilities (full "I need X" index), adoption (narrative guide), api
-(signatures and failure handling), cli, contracts (promises), design, changelog.
+(signatures and failure handling), cli, recovery (terminal-state recovery),
+contracts (promises), design, changelog.
 """
 
 from ._declarations import CachePolicy, ResourceRequest
