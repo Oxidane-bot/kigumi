@@ -149,7 +149,7 @@ wheel 只做映射不做复制。
 | [docs/recovery.md](docs/recovery.md) | 如何继续 retry 或 approval 状态的 run,以及为 terminal failure 记录显式 recovery decision |
 | [docs/api.md](docs/api.md) | 公开名称是什么意思;签名、结果类型、策略、异常与工具函数速查 |
 | [docs/contracts/README.md](docs/contracts/README.md) | 哪些行为是承诺;索引化的不变式、失效行为与验证坐标 |
-| [docs/reviews/](docs/reviews/) | 某个时点审查出了什么;实然记录,不是规范 |
+| [docs/reviews/](https://github.com/Oxidane-bot/kigumi/blob/master/docs/reviews/) | 某个时点审查出了什么;实然记录,不是规范 |
 | [CHANGELOG.md](CHANGELOG.md) | 什么变了;缓存换族与破坏性变更必录 |
 | [AGENTS.md](AGENTS.md) | agent 进场先读什么;红线与验证命令 |
 
