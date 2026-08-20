@@ -10,7 +10,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from ._safe_io import open_regular_file, secure_atomic_write_json, secure_atomic_write_text
+from ._safe_io import (
+    digest_open_file,
+    open_regular_file,
+    secure_atomic_write_json,
+    secure_atomic_write_text,
+)
 
 
 def canonical_json(obj: Any) -> str:
@@ -45,11 +50,19 @@ def _open_regular_file_for_hash(path: str | Path):
 
 def sha256_file(path: str | Path) -> str:
     """Return a file's SHA-256 digest without loading the whole file into memory."""
-    digest = sha256()
-    with _open_regular_file_for_hash(path) as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    artifact_path = Path(path)
+    with _open_regular_file_for_hash(artifact_path) as handle:
+        digest, _size, _data = digest_open_file(
+            handle,
+            artifact_path,
+            identity=_artifact_file_identity,
+            expected_identity=None,
+            before_phase="hashing",
+            during_phase="hashing",
+            chunk_size=1024 * 1024,
+            error=_artifact_file_error,
+        )
+    return digest
 
 
 def atomic_write_text(path: str | Path, text: str) -> None:
@@ -63,7 +76,11 @@ def atomic_write_json(path: str | Path, obj: Any) -> None:
 
 
 def write_artifact(path: str | Path, data: str, meta: Mapping[str, Any]) -> None:
-    """Write artifact text and its timestamped metadata sidecar atomically."""
+    """Write artifact text and its metadata sidecar as separate atomic replacements.
+
+    The pair is not a transaction: a crash between the two writes can leave the
+    artifact newer than its sidecar.
+    """
     artifact_path = Path(path)
     artifact_meta = dict(meta)
     artifact_meta.setdefault("created_at", datetime.now(UTC).isoformat())
