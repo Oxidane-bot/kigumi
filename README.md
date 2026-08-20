@@ -184,6 +184,7 @@ source of truth; the wheel maps those files in rather than copying them.
 | [DESIGN.md](https://github.com/Oxidane-bot/kigumi/blob/master/DESIGN.md) | Why it is designed this way; layers, boundaries, settled trade-offs |
 | [docs/adoption.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/adoption.md) | How to adopt it; the path from a single caller to a DAG, plus troubleshooting |
 | [docs/cli.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/cli.md) | Which CLI owns an operation; every command, flag, default, and meaningful exit code |
+| [docs/recovery.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/recovery.md) | How to resume retry or approval runs and record explicit decisions for terminal failures |
 | [docs/api.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/api.md) | What the public names mean; terse signatures, result types, policies, exceptions, and utilities |
 | [docs/contracts/README.md](https://github.com/Oxidane-bot/kigumi/blob/master/docs/contracts/README.md) | Which behaviors are promises; indexed invariants, failure behavior, verification coordinates |
 | [docs/reviews/](https://github.com/Oxidane-bot/kigumi/blob/master/docs/reviews/) | What a review found at a point in time; descriptive records, not specs |

@@ -16,7 +16,7 @@ for you:
 - `kigumi guard` scans only the paths listed in `[tool.kigumi] source_dirs`
   (default `["nodes", "lib"]`). A bare model loop in main.py or in an ad-hoc
   `scripts/` file is never reported.
-- Graph commands (describe, plan, explain, graph, profile) only see nodes
+- Graph commands (check, plan, explain, describe, graph, profile, resume, retry-resolve, recover) only see nodes
   registered through `@dag.node` / `@dag.map` / `@dag.scan` / `@dag.agent` in the
   module named by `[tool.kigumi] dag_entry`.
 
