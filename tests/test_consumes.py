@@ -248,7 +248,8 @@ def test_consumes_preserves_label_set_and_describe_reports_only_declarations(
     def projected(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
         return dict(inputs["source"])
 
-    source_artifact = {"used": 1}
+    source_artifact = {"used": 1, "ignored": "not consumed"}
+    projected_view = {"used": source_artifact["used"]}
     plain_node = dag._nodes["plain"]
     projected_node = dag._nodes["projected"]
     plain_components = dag._key_components(
@@ -263,6 +264,8 @@ def test_consumes_preserves_label_set_and_describe_reports_only_declarations(
     description = dag.describe()
 
     assert set(projected_components) == set(plain_components)
+    assert projected_components["upstream:source"] == sha(projected_view)
+    assert projected_components["upstream:source"] != plain_components["upstream:source"]
     assert description["projected"]["consumes"] == ["source"]
     assert "consumes" not in description["plain"]
 
