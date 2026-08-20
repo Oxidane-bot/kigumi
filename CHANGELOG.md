@@ -4,9 +4,11 @@
 
 ## [Unreleased]
 
-### 变更
+### 修复
 
-- 暂无。
+- `Dag.recover()` 发现已存在但不可信的 schema-2 durable manifest、target bindings 或 force
+  bindings 时现在抛出 `RunManifestError`；该异常继承自 `RuntimeError` 而非 `ValueError`，捕获
+  `ValueError` 的调用方需相应更新。
 
 ### 修复
 

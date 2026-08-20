@@ -2345,7 +2345,7 @@ class Dag:
         if manifest_corrupted or manifest is None:
             raise ValueError(f"Run {run_id!r} was not found or has no valid manifest")
         if manifest.get("run_manifest_schema") != RUN_MANIFEST_SCHEMA:
-            raise ValueError(f"Run {run_id!r} has no valid schema-2 manifest")
+            raise RunManifestError(f"Run {run_id!r} has no valid schema-2 manifest")
         self._validate_execution_manifest_profile(run_id, manifest)
         dynamic_files_ledger = self._validate_dynamic_files_ledger(run_id, manifest)
         if manifest.get("status") != "failed":
@@ -2354,9 +2354,9 @@ class Dag:
         targets = manifest.get("targets")
         force = manifest.get("force")
         if not isinstance(targets, list) or not all(isinstance(name, str) for name in targets):
-            raise ValueError(f"Run {run_id!r} has invalid target bindings")
+            raise RunManifestError(f"Run {run_id!r} has invalid target bindings")
         if not isinstance(force, list) or not all(isinstance(name, str) for name in force):
-            raise ValueError(f"Run {run_id!r} has invalid force bindings")
+            raise RunManifestError(f"Run {run_id!r} has invalid force bindings")
         target_root = target.split("@", 1)[0]
         if target_root not in self._nodes:
             raise ValueError(f"Recovery target {target!r} is not registered in this graph")
