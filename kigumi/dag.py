@@ -3533,6 +3533,7 @@ class Dag:
             },
             "has_files_fn": node.files_fn is not None,
             "has_carry_fn": node.carry_fn is not None,
+            "has_key_fn": node.key_fn is not None,
             "has_aggregate_fn": node.aggregate_fn is not None,
             "cache": node.cache,
             "has_external_fingerprint": node.external_fingerprint_digest is not None,

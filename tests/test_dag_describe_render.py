@@ -104,6 +104,37 @@ def test_describe_and_summary_expose_registered_declarations(tmp_path: Path) -> 
     assert "| review | - | auto |  | node | source |" in dag.render_summary()
 
 
+def test_profile_declaration_distinguishes_map_key_fn(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "one"}]}
+
+    @dag.map("with_key", items_from=("source", "items"), key_fn=lambda item: item["id"])
+    def with_key(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return item
+
+    @dag.map("without_key", items_from=("source", "items"))
+    def without_key(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return item
+
+    declarations = {
+        entry["name"]: entry["declaration"] for entry in dag.profile()["graph"]["nodes"]
+    }
+
+    assert declarations["with_key"]["has_key_fn"] is True
+    assert declarations["without_key"]["has_key_fn"] is False
+    assert declarations["with_key"] != declarations["without_key"]
+
+    description = dag.describe()
+    assert description["with_key"]["has_key_fn"] is True
+    assert description["without_key"]["has_key_fn"] is False
+
+
 def test_describe_adds_doc_key_for_documented_and_undocumented_nodes(tmp_path: Path) -> None:
     """教训 graph_docs: 声明摘要必须展示注册函数已有的人类说明。"""
     dag = _make_dag(tmp_path)

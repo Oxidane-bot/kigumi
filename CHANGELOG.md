@@ -25,6 +25,9 @@
 
 - `profile --format json` 与 `describe --format json` 现在通过 `canonical_json` 输出，键序稳定，
   便于 CLI diff 与下游字节比较。
+- 修复 WorkflowProfile 节点声明遗漏 `has_key_fn`：画像与 `describe()` 现在能区分带自定义
+  `key_fn` 和未声明 `key_fn` 的 map/scan 节点。该字段进入 canonical profile bytes，因此嵌入
+  `_run.json` 的 profile digest 会变化；本次不改变 L3 内容键，也不递增 `CACHE_SCHEMA`。
 
 ### 文档
 
