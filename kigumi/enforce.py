@@ -983,9 +983,6 @@ class _LoopCallVisitor(ast.NodeVisitor):
                 return GuardVerdict.UNKNOWN
         return None
 
-    def _is_model_call(self, node: ast.Call, scope: _LoopScope | None = None) -> bool:
-        return self._model_call_verdict(node, scope) is not None
-
     def _model_higher_order_verdict(
         self,
         node: ast.Call,
@@ -1008,13 +1005,6 @@ class _LoopCallVisitor(ast.NodeVisitor):
         return (
             self._callback_risk_verdict(callback, current_scope) if callback is not None else None
         )
-
-    def _is_model_higher_order_callback(
-        self,
-        node: ast.Call,
-        scope: _LoopScope | None = None,
-    ) -> bool:
-        return self._model_higher_order_verdict(node, scope) is not None
 
     def _callback_risk_verdict(
         self,
@@ -1056,9 +1046,6 @@ class _LoopCallVisitor(ast.NodeVisitor):
             if isinstance(expression, (ast.Attribute, ast.Call, ast.Subscript))
             else None
         )
-
-    def _callback_has_risk(self, expression: ast.expr, scope: _LoopScope) -> bool:
-        return self._callback_risk_verdict(expression, scope) is not None
 
     def _looks_like_callback(self, expression: ast.expr, scope: _LoopScope) -> bool:
         expression = expression.value if isinstance(expression, ast.Starred) else expression
@@ -1102,9 +1089,6 @@ class _LoopCallVisitor(ast.NodeVisitor):
         # A statically selected but otherwise unknown callable is precisely the
         # finite boundary: it may be a model callback and needs review.
         return GuardVerdict.UNKNOWN
-
-    def _callable_has_risk(self, expression: ast.expr, scope: _LoopScope) -> bool:
-        return self._callable_risk_verdict(expression, scope) is not None
 
     def _contains_loop_risk(
         self,
