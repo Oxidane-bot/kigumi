@@ -321,6 +321,31 @@ def test_map_rejects_duplicate_item_ids_without_deduplicating(tmp_path: Path) ->
         dag.run()
 
 
+def test_map_reports_multiple_duplicate_item_ids_in_sorted_order(tmp_path: Path) -> None:
+    dag = _make_dag(tmp_path)
+
+    @dag.node("scan")
+    def scan(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        return {
+            "items": [
+                {"id": "z"},
+                {"id": "a"},
+                {"id": "z"},
+                {"id": "middle"},
+                {"id": "a"},
+            ]
+        }
+
+    @dag.map("m", items_from=("scan", "items"), key_fn=lambda item: item["id"])
+    def process(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        return item
+
+    with pytest.raises(ValueError) as error:
+        dag.run()
+
+    assert str(error.value) == "Map node 'm' has duplicate item_id values: a, z"
+
+
 def test_map_rejects_item_ids_that_are_not_single_path_components(tmp_path: Path) -> None:
     for item_id in ("../escape", "nested/item", "nested\\item", ".", ".."):
         dag = _make_dag(tmp_path / item_id.replace("/", "-"))

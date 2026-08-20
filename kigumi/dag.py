@@ -23,6 +23,7 @@ import threading
 import time
 import types
 import warnings
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext, suppress
@@ -4234,7 +4235,7 @@ class Dag:
                 )
             entries.append((item_id, item))
             ids.append(item_id)
-        duplicates = sorted({item_id for item_id in ids if ids.count(item_id) > 1})
+        duplicates = sorted(item_id for item_id, count in Counter(ids).items() if count > 1)
         if duplicates:
             raise ValueError(
                 f"Map node {node.name!r} has duplicate item_id values: {', '.join(duplicates)}"
