@@ -4,25 +4,34 @@
 
 ## [Unreleased]
 
-### 修复
+### 重大变更
 
 - `Dag.recover()` 发现已存在但不可信的 schema-2 durable manifest、target bindings 或 force
   bindings 时现在抛出 `RunManifestError`；该异常继承自 `RuntimeError` 而非 `ValueError`，捕获
-  `ValueError` 的调用方需相应更新。
+  `ValueError` 的调用方需相应更新。manifest 可信但状态不满足前置条件（run 不处于终态
+  failed、恢复目标未注册）仍抛 `ValueError`。
 
 ### 修复
 
 - `sha256_file()` 现在会在读取后重新校验绑定文件描述符的身份；哈希期间文件被截断等变化会
   fail closed，不再返回与完整文件不一致的摘要。
+- 修复 `Dag.resume()` 对普通节点与完整恢复的 map/scan 聚合节点的 `post_node` 回调行为不一致；
+  从 durable state 完整恢复的节点现在都不会调用该回调。
+- Agent scan 节点因 slot 容量超时失败时，现在与普通 Agent 节点一样写出 `failures/<node>.json`
+  失败证据，不再只抛出异常。
+- map 的重复 item_id 检测由逐项重复计数改为单遍统计，行为与错误消息不变。
+
+### 变更
+
+- `profile --format json` 与 `describe --format json` 现在通过 `canonical_json` 输出，键序稳定，
+  便于 CLI diff 与下游字节比较。
 
 ### 文档
 
 - 更正公开 `write_artifact()` 的原子性说明：artifact 与 metadata sidecar 分别原子替换，二者
   不是事务；两次写入之间崩溃可能留下更新的 artifact 与旧的或缺失的 sidecar。
-
-### 修复
-
-- 修复 `Dag.resume()` 对普通节点与完整恢复的 map/scan 聚合节点的 `post_node` 回调行为不一致；从 durable state 完整恢复的节点现在都不会调用该回调。
+- 更正 `DESIGN.md` 的 L3/L1 缓存键描述、命令清单与文档索引，补齐 `recovery` 页与
+  `check`/`resume`/`retry-resolve`/`recover` 四个命令。
 
 ## [0.14.0] - 2026-08-12
 

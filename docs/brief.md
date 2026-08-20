@@ -180,7 +180,7 @@ If a project has both, they inspect the same graph.
 
 `--json` on `kigumi trace`, `kigumi diff`, `kigumi runs list` and `kigumi runs show` is stable
 `canonical_json`, safe to parse. `kigumi profile --format json` and
-`kigumi describe --format json` are readable indented JSON, not byte-stable.
+`kigumi describe --format json` also use byte-stable `canonical_json` output.
 Every flag, default and exit code: `kigumi docs cli`.
 
 ## Working rules

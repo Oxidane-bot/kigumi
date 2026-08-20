@@ -1446,6 +1446,23 @@ def test_cli_profile_and_prompt_graph_share_canonical_ir(tmp_path: Path, capsys)
     assert "| source | managed | base |" in rendered
 
 
+def test_cli_json_outputs_use_canonical_json(tmp_path: Path, capsys) -> None:
+    dag = _cli_dag(tmp_path)
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, int]:
+        del inputs, ctx
+        return {"value": 1}
+
+    profile = dag.profile()
+    assert _run_dag_cli(dag, ["profile", "--format", "json"]) == 0
+    assert capsys.readouterr().out == f"{canonical_json(profile)}\n"
+
+    description = dag.describe()
+    assert _run_dag_cli(dag, ["describe", "--format", "json"]) == 0
+    assert capsys.readouterr().out == f"{canonical_json(description)}\n"
+
+
 def test_cli_explain(tmp_path: Path, capsys) -> None:
     dag = _cli_dag(tmp_path)
 
