@@ -76,7 +76,11 @@ def atomic_write_json(path: str | Path, obj: Any) -> None:
 
 
 def write_artifact(path: str | Path, data: str, meta: Mapping[str, Any]) -> None:
-    """Write artifact text and its timestamped metadata sidecar atomically."""
+    """Write artifact text and its metadata sidecar as separate atomic replacements.
+
+    The pair is not a transaction: a crash between the two writes can leave the
+    artifact newer than its sidecar.
+    """
     artifact_path = Path(path)
     artifact_meta = dict(meta)
     artifact_meta.setdefault("created_at", datetime.now(UTC).isoformat())
