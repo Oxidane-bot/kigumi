@@ -16,6 +16,7 @@ from kigumi import (
     RetryExhausted,
     RetryPolicy,
 )
+from kigumi._runstate import RunManifestError
 from kigumi.artifacts import sha
 from kigumi.config import KigumiConfig
 from kigumi.dag import Dag
@@ -309,6 +310,45 @@ def test_recovery_receipt_persists_reason_evidence_and_identity(tmp_path: Path) 
         ],
         "recovered_by": receipt.recovered_by,
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("run_manifest_schema", 1, "no valid schema-2 manifest"),
+        ("targets", {"invalid": "bindings"}, "invalid target bindings"),
+        ("force", {"invalid": "bindings"}, "invalid force bindings"),
+    ],
+)
+def test_recover_rejects_untrusted_manifest_fields_with_run_manifest_error(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    run_id = f"untrusted-{field}"
+    dag = _terminal_failed_dag(tmp_path, run_id=run_id)
+    manifest_path = tmp_path / "artifacts" / "runs" / run_id / "_run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RunManifestError, match=message):
+        dag.recover(run_id, "work", 1, "fail", "the durable manifest is untrusted")
+
+
+def test_recover_keeps_value_error_for_trusted_preconditions(tmp_path: Path) -> None:
+    successful = _dag(tmp_path / "successful")
+
+    @successful.node("work")
+    def successful_work(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"status": "ok"}
+
+    successful.run(run_id="done")
+    with pytest.raises(ValueError, match="not in terminal failed state"):
+        successful.recover("done", "work", 1, "retry_not_started", "not failed")
+
+    failed = _terminal_failed_dag(tmp_path / "failed", run_id="failed")
+    with pytest.raises(ValueError, match="not registered"):
+        failed.recover("failed", "missing", 1, "fail", "target is not registered")
 
 
 def test_recovery_inherits_successful_nodes_and_reruns_failed_branch_only(
