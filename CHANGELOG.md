@@ -20,6 +20,10 @@
 - 更正公开 `write_artifact()` 的原子性说明：artifact 与 metadata sidecar 分别原子替换，二者
   不是事务；两次写入之间崩溃可能留下更新的 artifact 与旧的或缺失的 sidecar。
 
+### 修复
+
+- 修复 `Dag.resume()` 对普通节点与完整恢复的 map/scan 聚合节点的 `post_node` 回调行为不一致；从 durable state 完整恢复的节点现在都不会调用该回调。
+
 ## [0.14.0] - 2026-08-12
 
 ### 重大变更

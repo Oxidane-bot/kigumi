@@ -1747,6 +1747,7 @@ class Dag:
                             item_cache_keys,
                             item_statuses,
                             effective_cache_policy,
+                            resumed_completed,
                         ) = execute_dynamic(
                             node,
                             inputs,
@@ -4275,7 +4276,7 @@ class Dag:
         budget_abort: threading.Event,
         file_snapshot: _FileSnapshot,
         allow_new_dynamic_files_ledger: bool,
-    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
+    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str, bool]:
         """Run a map's runtime list without exposing its items as graph vertices."""
         assert node.items_from is not None
         source_name, _ = node.items_from
@@ -4732,6 +4733,11 @@ class Dag:
             cache_keys,
             item_cache_statuses,
             effective_cache_policy,
+            bool(outcomes)
+            and all(
+                outcome["status"] == "success" and outcome["resumed_completed"]
+                for outcome in outcomes
+            ),
         )
 
     def _aggregate_map_artifact(
@@ -4767,7 +4773,7 @@ class Dag:
         budget_abort: threading.Event,
         file_snapshot: _FileSnapshot,
         allow_new_dynamic_files_ledger: bool,
-    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str]:
+    ) -> tuple[dict[str, Any], bool, list[str], dict[str, str], str, bool]:
         """Run one carry chain serially while retaining map's item cache and sidecar contract."""
         del workers, executor  # scan 的每项都依赖前一项 carry，串行是语义而非调度偏好。
         assert node.items_from is not None
@@ -4813,6 +4819,7 @@ class Dag:
         cache_keys: list[str] = []
         item_cache_statuses: dict[str, str] = {}
         effective_cache_policy = node.cache if libs_cache_reusable else "off"
+        all_resumed_completed = bool(entries)
 
         for item_id, item in entries:
             started = time.monotonic()
@@ -5211,6 +5218,7 @@ class Dag:
                         effective_cache_policy = "off"
                     cache_keys.append(cache_key)
                     item_cache_statuses[item_id] = "hit" if cache_hit else "miss"
+                    all_resumed_completed = all_resumed_completed and resumed_completed
                     label = f"{node.name}@{item_id}"
                     outputs = envelope.materialize(label, artifact)
                     if not resumed_completed:
@@ -5274,6 +5282,7 @@ class Dag:
             cache_keys,
             item_cache_statuses,
             effective_cache_policy,
+            all_resumed_completed,
         )
 
     def _node_key_decision(
