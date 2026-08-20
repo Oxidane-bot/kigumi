@@ -131,6 +131,46 @@ _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 atomic_write_json = _path_atomic_write_json
 
 
+def _write_agent_capacity_failure(
+    attempt_store: AttemptStore,
+    run_dir: Path,
+    *,
+    node_name: str,
+    task: AgentTask,
+    instruction_resolution: dict[str, Any] | None,
+    evidence_policy: EvidencePolicy,
+) -> AgentExecutionFailure:
+    """Persist the canonical failure receipt for an Agent slot timeout."""
+    capacity_error = AgentExecutionFailure(runtime_code=AgentRuntimeFailureCode.CAPACITY)
+    attempt_store._write_owned_json(  # noqa: SLF001
+        run_dir / "failures" / f"{node_name}.json",
+        {
+            "failure_schema": FAILURE_SCHEMA,
+            "node": node_name,
+            "task_sha256": sha(task.canonical()),
+            "instruction_sha256": sha(str(task.instruction)),
+            "instruction_evidence": scrub_evidence(
+                str(task.instruction),
+                mode=evidence_policy.request,
+            ),
+            "prompt_resolution": instruction_resolution,
+            "status": "failed",
+            "failure": canonical_failure(capacity_error),
+            "usage": None,
+            "stop_reason": "capacity",
+            "duration_seconds": 0.0,
+            "workspace_manifest": [],
+            "attachments": [],
+            "published": [],
+            "trajectory": None,
+            "evidence": [],
+            "evidence_policy": evidence_policy.canonical(),
+            "evidence_policy_digest": evidence_policy.digest,
+        },
+    )
+    return capacity_error
+
+
 class _ResourcePool:
     """Serialize multi-unit acquisition for one in-process semaphore."""
 
@@ -1888,40 +1928,13 @@ class Dag:
                                                     prompt_resolution=instruction_resolution,
                                                 )
                                         except SlotTimeoutError:
-                                            capacity_error = AgentExecutionFailure(
-                                                runtime_code=(AgentRuntimeFailureCode.CAPACITY)
-                                            )
-                                            attempt_store._write_owned_json(  # noqa: SLF001
-                                                run_dir / "failures" / f"{node.name}.json",
-                                                {
-                                                    "failure_schema": FAILURE_SCHEMA,
-                                                    "node": node.name,
-                                                    "task_sha256": sha(task.canonical()),
-                                                    "instruction_sha256": sha(
-                                                        str(task.instruction)
-                                                    ),
-                                                    "instruction_evidence": scrub_evidence(
-                                                        str(task.instruction),
-                                                        mode=evidence_policy.request,
-                                                    ),
-                                                    "prompt_resolution": (instruction_resolution),
-                                                    "status": "failed",
-                                                    "failure": canonical_failure(capacity_error),
-                                                    "usage": None,
-                                                    "stop_reason": "capacity",
-                                                    "duration_seconds": 0.0,
-                                                    "workspace_manifest": [],
-                                                    "attachments": [],
-                                                    "published": [],
-                                                    "trajectory": None,
-                                                    "evidence": [],
-                                                    "evidence_policy": (
-                                                        evidence_policy.canonical()
-                                                    ),
-                                                    "evidence_policy_digest": (
-                                                        evidence_policy.digest
-                                                    ),
-                                                },
+                                            capacity_error = _write_agent_capacity_failure(
+                                                attempt_store,
+                                                run_dir,
+                                                node_name=node.name,
+                                                task=task,
+                                                instruction_resolution=instruction_resolution,
+                                                evidence_policy=evidence_policy,
                                             )
                                             raise capacity_error from None
                                         artifact = outcome.artifact
@@ -5082,9 +5095,15 @@ class Dag:
                                                     session_in=session_in,
                                                 )
                                         except SlotTimeoutError:
-                                            raise AgentExecutionFailure(
-                                                runtime_code=AgentRuntimeFailureCode.CAPACITY
-                                            ) from None
+                                            capacity_error = _write_agent_capacity_failure(
+                                                attempt_store,
+                                                run_root,
+                                                node_name=node.name,
+                                                task=task,
+                                                instruction_resolution=instruction_resolution,
+                                                evidence_policy=evidence_policy,
+                                            )
+                                            raise capacity_error from None
                                         artifact = outcome.artifact
                                         agent_provenance = {
                                             **outcome.provenance,
