@@ -172,24 +172,28 @@ class FileSlots:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         path = self._lock_dir / f"key_{digest}.lock"
         with path.open("a+", encoding="utf-8") as handle:
-            started = time.monotonic()
-            if timeout_seconds is None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            else:
-                while True:
-                    try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        remaining = timeout_seconds - (time.monotonic() - started)
-                        if remaining <= 0:
-                            raise SlotTimeoutError(time.monotonic() - started) from None
-                        time.sleep(min(0.05, remaining))
-                    else:
-                        break
             try:
+                acquired = False
+                started = time.monotonic()
+                if timeout_seconds is None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            remaining = timeout_seconds - (time.monotonic() - started)
+                            if remaining <= 0:
+                                raise SlotTimeoutError(time.monotonic() - started) from None
+                            time.sleep(min(0.05, remaining))
+                        else:
+                            break
+                acquired = True
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if acquired:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def _validate_timeout(timeout_seconds: float | None) -> None:

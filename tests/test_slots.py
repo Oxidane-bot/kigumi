@@ -127,8 +127,10 @@ def test_file_key_slot_timeout_has_no_lock_leak(tmp_path: Path) -> None:
                 raise AssertionError("occupied key lock must not be acquired")
         except SlotTimeoutError as error:
             assert error.wait_seconds >= 0.01
+        assert not list((tmp_path / "locks").glob("key_*.lock"))
     with slots.acquire_key("same-key", timeout_seconds=0.1):
         pass
+    assert not list((tmp_path / "locks").glob("key_*.lock"))
 
 
 def test_capacity_file_clamps_and_invalid_values_fall_back(tmp_path: Path) -> None:

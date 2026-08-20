@@ -837,10 +837,7 @@ def test_cross_process_same_key_calls_provider_once(tmp_path: Path) -> None:
     assert json.loads((state_dir / "provider-count.json").read_text(encoding="utf-8")) == {
         "calls": 1
     }
-    key_lock_files = list(lock_dir.glob("key_*.lock"))
-    assert len(key_lock_files) == 1
-    assert len(key_lock_files[0].stem.removeprefix("key_")) == 64
-    assert key_lock_files[0].parent == lock_dir
+    assert not list(lock_dir.glob("key_*.lock"))
 
 
 def test_cross_process_key_lock_is_default_off(tmp_path: Path) -> None:
