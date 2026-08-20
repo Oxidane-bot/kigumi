@@ -22,7 +22,12 @@ N/A. This work order specifies a pure dead-code deletion, so no behavior-changin
 
 ## Commit
 
-Pending commit.
+`08a3323dc04712fe015a751d19e68d991c429546`
+
+    Enforce: Remove unreachable predicate wrappers
+
+    - Remove four unreachable boolean projections while preserving the live verdict methods
+    - Tests: 1241 passed, 6 skipped; RED N/A because this is pure dead-code deletion
 
 ## Notes
 
@@ -31,4 +36,10 @@ Pending commit.
 - The initial `uv run pytest -q` could not spawn because the dev tools were not installed. `uv sync --extra dev` installed the project-declared test and lint tools; this made no repository source change.
 - Deliberately did not touch `kigumi/prompt.py`, `kigumi/repair.py`, `CHANGELOG.md`, or the two `_visit_defaults` methods.
 
-Final `git status -sb` and `git diff --name-only` will be recorded after commit.
+Final `git status -sb`:
+
+    ## fix/enforce-dead-code
+
+Final `git diff --name-only`:
+
+    (empty; clean tree)
