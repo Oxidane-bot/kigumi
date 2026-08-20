@@ -2910,69 +2910,6 @@ class AttemptStore:
         if isinstance(agent, dict):
             resolution(agent.get("prompt_resolution"), "origin Agent Prompt resolution")
 
-    @staticmethod
-    def _read_json_bytes_safe(path: Path) -> tuple[bytes | None, BaseException | None]:
-        """Read durable JSON through a bound parent descriptor.
-
-        A lexical ``lstat`` followed by ``Path.read_text`` leaves both the
-        final file and every parent directory replaceable between the check and
-        the read.  Durable run paths are ownership boundaries, so bind the
-        complete parent path with the existing no-follow directory primitive
-        and open the final file relative to that descriptor.  The final open is
-        non-blocking and rejects symlinks and special files before any bytes are
-        consumed.
-
-        ``(None, None)`` is a genuine missing file.  A non-``None`` exception is
-        an integrity failure, including a symlinked parent or final entry.
-        """
-        try:
-            with SecureDirectory(Path(path).parent, create=False) as directory:
-                try:
-                    with _open_regular_file_at(
-                        directory,
-                        Path(path).name,
-                        phase="before reading durable JSON",
-                    ) as handle:
-                        return handle.read(), None
-                except FileNotFoundError:
-                    return None, None
-        except FileNotFoundError:
-            return None, None
-        except (OSError, ValueError) as error:
-            return None, error
-
-    @classmethod
-    def _read_json_safe(cls, path: Path) -> tuple[dict[str, Any] | None, bool]:
-        """Return ``(data, corrupted)`` while keeping missing distinct from torn JSON."""
-        raw, read_error = cls._read_json_bytes_safe(path)
-        if read_error is not None:
-            return None, True
-        if raw is None:
-            return None, False
-        try:
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None, True
-        return (value, False) if isinstance(value, dict) else (None, True)
-
-    @staticmethod
-    def _parse_error(path: Path) -> BaseException | str:
-        """Recover a useful parse explanation for a failed safe read."""
-        raw, read_error = AttemptStore._read_json_bytes_safe(path)
-        if read_error is not None:
-            return read_error
-        if raw is None:
-            return FileNotFoundError(str(path))
-        try:
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            return error
-        return TypeError(f"expected a JSON object, got {type(value).__name__}")
-
-    @classmethod
-    def _integrity_error(cls, path: Path, expected_schema: int) -> StateIntegrityError:
-        return StateIntegrityError(path, expected_schema, cls._parse_error(path))
-
     def _required_json(self, path: Path) -> dict[str, Any]:
         value, corrupted = self._read_owned_json(path)
         if corrupted:

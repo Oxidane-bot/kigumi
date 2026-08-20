@@ -213,23 +213,23 @@ def test_durable_json_read_rejects_symlinked_parent_final_file_and_fifo(
     external.write_text('{"target": "work"}', encoding="utf-8")
     state_path.unlink()
     state_path.symlink_to(external)
-    value, corrupted = AttemptStore._read_json_safe(state_path)
+    value, corrupted = store._read_owned_json(state_path)
     assert value is None
     assert corrupted is True
 
     state_path.unlink()
     if hasattr(os, "mkfifo"):
         os.mkfifo(state_path)
-        value, corrupted = AttemptStore._read_json_safe(state_path)
+        value, corrupted = store._read_owned_json(state_path)
         assert value is None
         assert corrupted is True
 
-    parent_alias = tmp_path / "attempt-alias"
+    parent_alias = store.run_root / "attempt-alias"
     real_parent = tmp_path / "external-attempt"
     real_parent.mkdir()
     (real_parent / "state.json").write_text('{"target": "work"}', encoding="utf-8")
     parent_alias.symlink_to(real_parent, target_is_directory=True)
-    value, corrupted = AttemptStore._read_json_safe(parent_alias / "state.json")
+    value, corrupted = store._read_owned_json(parent_alias / "state.json")
     assert value is None
     assert corrupted is True
 
