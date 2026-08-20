@@ -4004,7 +4004,7 @@ class Dag:
     def _cli_profile(self, args: argparse.Namespace) -> int:
         value = self.profile(args.run_id, include_content=args.include_content)
         if args.format == "json":
-            print(json.dumps(value, ensure_ascii=False, indent=2))
+            print(canonical_json(value))
         else:
             print(workflow_profile.render_profile_markdown(value))
         return 0
@@ -4017,7 +4017,7 @@ class Dag:
     def _cli_describe(self, args: argparse.Namespace) -> int:
         """Print the existing Markdown or JSON declaration summary."""
         if args.format == "json":
-            print(json.dumps(self.describe(), ensure_ascii=False, indent=2))
+            print(canonical_json(self.describe()))
         else:
             print(self.render_summary())
         return 0

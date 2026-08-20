@@ -6,7 +6,8 @@
 
 ### 变更
 
-- 暂无。
+- `profile --format json` 与 `describe --format json` 现在通过 `canonical_json` 输出，键序稳定，便于
+  CLI diff 与下游字节比较。
 
 ## [0.14.0] - 2026-08-12
 

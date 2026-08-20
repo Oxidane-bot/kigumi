@@ -264,8 +264,7 @@ kigumi explain scene_E2S4 --graph-arg episode=E2S4
 | `--format {json,md}` | 否 | `md` | 输出格式。 |
 | `--include-content` | 否 | `False` | 在运行画像中展开允许保留的 CALL/Agent 内容证据。 |
 
-这里的 JSON 使用带缩进的普通 JSON 输出，不承诺 `kigumi ... --json` 的
-`canonical_json` 字节格式。
+这里的 JSON 使用带缩进的 `canonical_json` 输出，键按字典序稳定排序。
 
 ### `kigumi explain NODE_NAME`
 
@@ -282,7 +281,7 @@ kigumi explain scene_E2S4 --graph-arg episode=E2S4
 
 | 参数 | 必需 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `--format {md,json}` | 否 | `md` | 输出 Markdown 或带缩进的普通 JSON。 |
+| `--format {md,json}` | 否 | `md` | 输出 Markdown 或带缩进的 `canonical_json`。 |
 
 ### `kigumi resume RUN_ID`
 
@@ -364,8 +363,8 @@ kigumi recover run-0042 transcode \
 
 ## 稳定机器输出
 
-带 `--json` 的 `kigumi trace`、`kigumi diff`、`kigumi runs list` 与
-`kigumi runs show` 都使用稳定 `canonical_json`，适合 `json.loads` 消费。
+带 `--json` 的 `kigumi trace`、`kigumi diff`、`kigumi runs list`、
+`kigumi runs show`，以及 `kigumi profile --format json` 与
+`kigumi describe --format json` 都使用稳定 `canonical_json`，适合 `json.loads` 消费。
 `kigumi call` 没有 `--json`：除 `--field response` 的裸文本外，它的输出同样是
-`canonical_json`。`kigumi profile --format json` 与 `kigumi describe --format json` 是可读的
-缩进 JSON，不属于这项字节稳定承诺。
+`canonical_json`。
