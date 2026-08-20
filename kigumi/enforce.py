@@ -334,9 +334,13 @@ def check_raw_io_node_paths(source_dirs: list[Path]) -> list[RawIOFinding]:
     """
     findings: list[RawIOFinding] = []
     for source_dir in source_dirs:
-        if not source_dir.is_dir():
-            continue
-        for path in sorted(source_dir.rglob("*.py")):
+        if source_dir.is_dir():
+            paths = sorted(source_dir.rglob("*.py"))
+        elif source_dir.is_file() and source_dir.suffix == ".py":
+            paths = [source_dir]
+        else:
+            raise ValueError(f"Source path must be an existing directory or .py file: {source_dir}")
+        for path in paths:
             findings.extend(check_raw_io_node_source(path.read_text(encoding="utf-8"), path))
     return findings
 

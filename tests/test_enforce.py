@@ -1029,6 +1029,43 @@ def ordinary():
     ]
 
 
+def test_raw_io_path_guard_accepts_single_files_and_rejects_invalid_paths(
+    tmp_path: Path,
+) -> None:
+    """项目级 raw-I/O 守卫统一支持单个 Python 文件与目录路径。"""
+    source_dir = tmp_path / "nodes"
+    source_dir.mkdir()
+    source_path = source_dir / "pipeline.py"
+    source_path.write_text(
+        """
+@dag.node("pipeline")
+def pipeline(inputs, ctx):
+    return open("secret.txt").read()
+""",
+        encoding="utf-8",
+    )
+
+    single_file_findings = check_raw_io_node_paths([source_path])
+    assert [
+        (finding.path, finding.lineno, finding.snippet) for finding in single_file_findings
+    ] == [
+        (source_path, 4, 'return open("secret.txt").read()'),
+    ]
+
+    directory_findings = check_raw_io_node_paths([source_dir])
+    assert [(finding.path, finding.lineno, finding.snippet) for finding in directory_findings] == [
+        (source_path, 4, 'return open("secret.txt").read()'),
+    ]
+
+    invalid_path = tmp_path / "notes.txt"
+    invalid_path.write_text("not Python", encoding="utf-8")
+    with pytest.raises(ValueError) as exc_info:
+        check_raw_io_node_paths([invalid_path])
+    assert str(exc_info.value) == (
+        "Source path must be an existing directory or .py file: " + str(invalid_path)
+    )
+
+
 def test_raw_io_path_guard_treats_agent_builder_as_a_node_body(tmp_path: Path) -> None:
     source = tmp_path / "nodes" / "agent.py"
     source.parent.mkdir(parents=True)
