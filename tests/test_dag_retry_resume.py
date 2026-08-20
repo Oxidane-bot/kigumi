@@ -237,6 +237,50 @@ def test_resume_before_retry_due_does_not_sleep_or_request_provider(
     assert transport.requests == 1
 
 
+def test_resume_post_node_is_consistent_for_ordinary_map_and_scan(
+    tmp_path: Path,
+) -> None:
+    observed: list[str] = []
+    config = KigumiConfig(project_root=tmp_path, source_dirs=[])
+    dag = Dag(
+        config,
+        LLMCaller(_SequenceTransport([]), tmp_path / "llm"),
+        post_node=lambda name, artifact, cache_hit: observed.append(name),
+    )
+
+    @dag.node("ordinary")
+    def ordinary(inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"value": "ordinary"}
+
+    @dag.node("source")
+    def source(inputs: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        del inputs, ctx
+        return {"items": [{"id": "a"}]}
+
+    @dag.map("mapped", items_from=("source", "items"), key_fn=lambda item: item["id"])
+    def mapped(item: dict[str, str], inputs: dict[str, Any], ctx: Any) -> dict[str, str]:
+        del inputs, ctx
+        return {"id": item["id"]}
+
+    @dag.scan("scanned", items_from=("source", "items"), key_fn=lambda item: item["id"])
+    def scanned(
+        item: dict[str, str],
+        carry: Any,
+        inputs: dict[str, Any],
+        ctx: Any,
+    ) -> dict[str, str]:
+        del carry, inputs, ctx
+        return {"id": item["id"]}
+
+    dag.run(run_id="post-node-resume")
+    observed.clear()
+
+    dag.resume("post-node-resume")
+
+    assert observed == []
+
+
 def test_retry_exhaustion_is_typed_and_marks_run_failed(tmp_path: Path) -> None:
     transport = _SequenceTransport([_rate_limit_failure(), _rate_limit_failure()])
     dag = _retry_dag(
