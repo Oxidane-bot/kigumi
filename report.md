@@ -43,7 +43,15 @@ $ uv run pytest -q tests/test_dag_retry_resume.py::test_resume_post_node_is_cons
 ## Commit
 
 - 实现 commit：N/A。因工作单的 RED 前提不成立，按指令停止，未提交实现改动。
-- 本报告作为唯一改动归档；报告提交的完整英文消息见最终 `git log` 和交付回复。
+- 报告归档 commit：`e4b0cae`，完整消息如下：
+
+  ```text
+  Report: Record scan guard premise mismatch
+
+  - Record the RED probe showing the requested scan callback regression is already green on the current branch.
+  - Preserve the clean implementation tree after stopping on the work order's false premise.
+  - tests: 1242 passed, 6 skipped; ruff check and format check passed
+  ```
 
 ## Notes
 
