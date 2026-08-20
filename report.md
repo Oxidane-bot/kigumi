@@ -24,13 +24,17 @@ $ uv run ruff format --check .
 
 ## Commit
 
-待提交后填写 commit hash；提交信息为：
+实现提交：`e0fd67ac8ea9174aaa14a0870a9ffeaeab48479f`
+
+完整提交信息：
 
 ```text
 Optimize map duplicate item detection
 
 - Replace quadratic list.count duplicate scanning with a single Counter pass
+
 - Lock the exact sorted error message for multiple duplicate item IDs
+
 - RED-verified by the pre-change behavior baseline; tests: 1242 passed, 6 skipped
 ```
 
@@ -41,8 +45,7 @@ Optimize map duplicate item detection
 
 ```text
 $ git status -sb
-待提交后填写
+## fix/dag-duplicate-ids
 
 $ git diff --name-only
-待提交后填写
 ```
