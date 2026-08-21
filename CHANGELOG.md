@@ -6,6 +6,8 @@
 
 ### 重大变更
 
+- **缓存族轮换**：`CACHE_SCHEMA` 从 8 升至 9。键绑定的 `prompt.py` 源字节发生重构，改变了
+  `prompt_source` 身份，导致全项目缓存族轮换；旧缓存条目首次访问会 miss，调用可能再次计费。
 - `Dag.recover()` 发现已存在但不可信的 schema-2 durable manifest、target bindings 或 force
   bindings 时现在抛出 `RunManifestError`；该异常继承自 `RuntimeError` 而非 `ValueError`，捕获
   `ValueError` 的调用方需相应更新。manifest 可信但状态不满足前置条件（run 不处于终态

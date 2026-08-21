@@ -415,6 +415,9 @@ progressive_annotation_pipeline.py)的 docstring 与注释提取能力清单逐�
 
 ## 修订记录
 
+- Unreleased：当前 `CACHE_SCHEMA=9`；键绑定的 `prompt.py` 源字节重构改变了 `prompt_source`
+  身份，导致全项目缓存族轮换，旧条目会 miss。
+
 - 2026-08-12 0.14.0：Transport 收敛为 `cache_identity/prepare/send`，冻结的
   `PreparedRequest` 统一 L1 identity/admission/provenance/send；provider 每次只发送一次，重试只由
   DAG `RetryPolicy` 表达；`CACHE_SCHEMA=8` 进行一次缓存族硬切。

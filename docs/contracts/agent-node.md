@@ -38,7 +38,7 @@ manifest 必须显式声明 `schema_version=1`、`runtime="pi"`、provider、mod
 2. Agent 复用普通 node 的拓扑、cache lookup、seal、output claim、materialize、sidecar 和 run。
 3. `external` 摘要包含 `agent_executor_schema=5`、adapter/Pi expected version、bridge 与路径
    policy digest、capsule digest、provider/model/thinking、工具和 limits；普通 L3
-   `CACHE_SCHEMA=8`。v0.11.0 的第 7 族已绑定 managed request 的附件内容哈希、typed message
+   `CACHE_SCHEMA=9`。v0.11.0 的第 7 族已绑定 managed request 的附件内容哈希、typed message
    摘要、response schema identity，并按节点细化静态 import `libs` 闭包；v0.14.0 的第 8 族
    再与 L1 transport/prepared identity 硬切同步，不改变 Agent 专属 identity 结构。
 4. miss 只 staging 声明文件、canonical upstream 和 capsule snapshot；scratch 不保留。

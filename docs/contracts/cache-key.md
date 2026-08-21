@@ -2,8 +2,8 @@
 
 Status: Active (0.14.0)
 
-> v0.14.0 将 L3 内容键切换到 `CACHE_SCHEMA=8`，L1 则硬切到 transport identity 与 effective
-> prepared request；这是一次统一换族，不提供旧键兼容读取。
+> 当前 L3 内容键为 `CACHE_SCHEMA=9`；v0.14.0 的第 8 族将 L1 硬切到 transport identity 与
+> effective prepared request；这是一次统一换族，不提供旧键兼容读取。
 > node cache envelope 继续为 schema 4；
 > 旧 schema 3 条目（即使已经带有 `cache_key`）按 `CORRUPT` 拒绝，不迁移；
 > `agent_executor_schema=5`。这是 Agent scan/session canonical artifact 的完整 L3 cache
@@ -113,7 +113,7 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    该节点视为本次 `off`，且 run、plan、explain、普通节点、map 与 scan 必须使用同一有效策略：
    不读取/写入 L3，不报告空 item 集合的 vacuous aggregate hit，但仍使用同一确定性声明 identity
    支持 durable resume/recovery。L1 不变。
-6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=8, pydantic})`；其中
+6. `kigumi` 成分等于 `sha({prompt_source, schema=CACHE_SCHEMA=9, pydantic})`；其中
    `prompt_source` 是按文件名固定排序的 `prompt.py`、`repair.py` 文件字节哈希联合值，
    不含发行版本号。
 7. 改变键成分推导、prompt 生成字节语义或 artifact 规范化形态时原则上必须递增
@@ -133,7 +133,9 @@ L1 键由 `kigumi.calling.LLMCaller.call()` 构造；L3 成分唯一由
    envelope 从 schema 3 升至 schema 4，以正式绑定请求的 L3 `cache_key`；这是 Greenfield
    envelope 硬切，不迁移旧 schema 3 条目，也不改变当时的内容键 `CACHE_SCHEMA`。
    0.14.0 从 7 升至 8，使 L1 transport/prepared identity 与 L3 内容族同步硬切；这是
-   本批变更唯一一次缓存族轮换。
+   本批变更唯一一次缓存族轮换。当前 Unreleased 从 8 升至 9，是因为键绑定的 `prompt.py`
+   源字节发生重构，改变了 `prompt_source` 身份；这是又一次全项目缓存族轮换，旧条目首次访问会
+   miss。
 9. `prompt_specs:<name>` 取当前 resolution digest：包含 spec/binding 结构、base、固定 layer、
    axis 实际 selection 与所选 fragment、material digest 和 rendered digest；不包含未选中
    variant 的内容 digest。resolution digest 还绑定 typed message 内容、附件 content hash

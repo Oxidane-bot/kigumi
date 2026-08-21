@@ -10,8 +10,11 @@ import kigumi.prompt as prompt_module
 from kigumi.artifacts import sha
 from kigumi.prompt import (
     Attachment,
+    InputRef,
     KigumiPromptWarning,
     Message,
+    ParamRef,
+    PromptDefinitionError,
     PromptResolution,
     PromptResolutionError,
     ResponseSpec,
@@ -62,6 +65,42 @@ class SnapshotModel(BaseModel):
     enabled: bool = Field(description="是否启用")
     location: SnapshotLocation = Field(description="地点")
     tags: list[str] = Field(description="标签")
+
+
+class ExplosiveInputRef(InputRef):
+    @property
+    def path(self) -> tuple[str | int, ...]:
+        raise RuntimeError("InputRef path accessor was evaluated")
+
+    @path.setter
+    def path(self, value: tuple[str | int, ...]) -> None:
+        object.__setattr__(self, "_path", value)
+
+
+class ExplosiveParamRef(ParamRef):
+    @property
+    def path(self) -> tuple[str | int, ...]:
+        raise RuntimeError("ParamRef path accessor was evaluated")
+
+    @path.setter
+    def path(self, value: tuple[str | int, ...]) -> None:
+        object.__setattr__(self, "_path", value)
+
+
+@pytest.mark.parametrize(
+    ("ref_type", "message"),
+    (
+        (ExplosiveInputRef, "InputRef input must be a non-empty string, got ''"),
+        (ExplosiveParamRef, "ParamRef param must be a non-empty string, got ''"),
+    ),
+)
+def test_invalid_binding_wins_before_subclass_path_access(
+    ref_type: type[InputRef | ParamRef], message: str
+) -> None:
+    with pytest.raises(PromptDefinitionError) as error:
+        ref_type("")
+
+    assert str(error.value) == message
 
 
 def test_managed_prompt_record_is_accepted_when_complete() -> None:

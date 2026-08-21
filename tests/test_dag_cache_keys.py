@@ -248,7 +248,7 @@ def test_kigumi_component_tracks_repair_bytes_and_uses_schema(
     assert changed != baseline
     inputs = dag_module._kigumi_key_inputs()
     assert inputs["schema"] == dag_module.CACHE_SCHEMA
-    assert inputs["schema"] == 8
+    assert inputs["schema"] == 9
     assert "version" not in inputs
     assert __version__ not in inputs.values()
 

@@ -288,9 +288,9 @@ def test_documented_schema_values_match_code() -> None:
     assert not mismatches, "Schema documentation drift:\n" + "\n".join(mismatches)
 
 
-def test_cache_schema_eight_is_recorded_once_in_release_changelog() -> None:
-    """CACHE_SCHEMA=8 belongs to 0.14.0; schema 7 stays historical."""
-    assert CACHE_SCHEMA == 8
+def test_cache_schema_nine_is_recorded_once_in_unreleased_changelog() -> None:
+    """CACHE_SCHEMA=9 is the current rotation; schema 8 stays historical."""
+    assert CACHE_SCHEMA == 9
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     headings = list(CHANGELOG_RELEASE_PATTERN.finditer(changelog))
@@ -298,6 +298,8 @@ def test_cache_schema_eight_is_recorded_once_in_release_changelog() -> None:
 
     unreleased_end = headings[0].start()
     unreleased = changelog[:unreleased_end]
+    schema_nine_rotations = re.findall(r"CACHE_SCHEMA[^\n]*升至\s*9\b", unreleased)
+    assert len(schema_nine_rotations) == 1
     assert not re.search(r"CACHE_SCHEMA[^\n]*升至\s*8\b", unreleased)
 
     released_sections: list[tuple[str, str]] = []

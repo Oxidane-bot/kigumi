@@ -708,6 +708,11 @@ def _record_bytes(value: Any, *, label: str) -> int:
     return value
 
 
+def _validate_persisted_digest_fields(value: Mapping[str, Any], *, label: str) -> None:
+    _record_text(value["sha256"], label=f"{label}.sha256")
+    _record_bytes(value["bytes"], label=f"{label}.bytes")
+
+
 def _record_path(value: Any, *, label: str) -> None:
     if not isinstance(value, list):
         raise TypeError(f"{label} must be a list")
@@ -741,10 +746,9 @@ def _validate_persisted_value_ref(value: Any, *, label: str, allow_file_ref: boo
 
 
 def _validate_persisted_descriptor(value: Any, *, label: str) -> None:
-    _record_fields(value, required={"ref", "sha256", "bytes"}, label=label)
-    _record_text(value["ref"], label=f"{label}.ref")
-    _record_text(value["sha256"], label=f"{label}.sha256")
-    _record_bytes(value["bytes"], label=f"{label}.bytes")
+    record = _record_fields(value, required={"ref", "sha256", "bytes"}, label=label)
+    _record_text(record["ref"], label=f"{label}.ref")
+    _validate_persisted_digest_fields(record, label=label)
 
 
 def _validate_persisted_layer(value: Any, *, index: int) -> None:
@@ -757,8 +761,7 @@ def _validate_persisted_layer(value: Any, *, index: int) -> None:
     )
     _record_text(record["slot"], label=f"{label}.slot")
     _record_text(record["ref"], label=f"{label}.ref")
-    _record_text(record["sha256"], label=f"{label}.sha256")
-    _record_bytes(record["bytes"], label=f"{label}.bytes")
+    _validate_persisted_digest_fields(record, label=label)
     axis_fields = {"axis", "selected"} & set(record)
     if axis_fields and axis_fields != {"axis", "selected"}:
         raise TypeError(f"{label} axis selection fields must be complete")
@@ -797,8 +800,7 @@ def _validate_persisted_file_manifest(value: Any, *, label: str) -> None:
         label=f"{label}.path_from",
         allow_file_ref=False,
     )
-    _record_text(record["sha256"], label=f"{label}.sha256")
-    _record_bytes(record["bytes"], label=f"{label}.bytes")
+    _validate_persisted_digest_fields(record, label=label)
 
 
 def _validate_persisted_material(value: Any, *, index: int) -> None:
@@ -814,8 +816,7 @@ def _validate_persisted_material(value: Any, *, index: int) -> None:
     title = record["title"]
     if title is not None and (not isinstance(title, str) or not title.strip()):
         raise TypeError(f"{label}.title must be a non-empty string or null")
-    _record_text(record["sha256"], label=f"{label}.sha256")
-    _record_bytes(record["bytes"], label=f"{label}.bytes")
+    _validate_persisted_digest_fields(record, label=label)
     if "file_ref" in record:
         _validate_persisted_file_manifest(record["file_ref"], label=f"{label}.file_ref")
 
@@ -1283,9 +1284,8 @@ class PromptCatalogSnapshot:
             *(material.slot for material in spec.materials),
         }
         actual_slots = set(slot_names(base.text))
-        if actual_slots != declared_slots:
-            missing = sorted(actual_slots - declared_slots)
-            extra = sorted(declared_slots - actual_slots)
+        missing, extra = _slot_differences(actual_slots, declared_slots)
+        if missing or extra:
             details: list[str] = []
             if missing:
                 details.append("undeclared base slots: " + ", ".join(missing))
@@ -1580,12 +1580,15 @@ def slot_names(text: str) -> list[str]:
     return list(dict.fromkeys(_SLOT_PATTERN.findall(text)))
 
 
+def _slot_differences(required: set[str], supplied: set[str]) -> tuple[list[str], list[str]]:
+    return sorted(required - supplied), sorted(supplied - required)
+
+
 def render_template(text: str, slots: dict[str, str]) -> str:
     """Render a declarative ``{{slot}}`` template with an exact slot contract."""
     required = set(slot_names(text))
     supplied = set(slots)
-    missing = sorted(required - supplied)
-    extra = sorted(supplied - required)
+    missing, extra = _slot_differences(required, supplied)
     if missing or extra:
         parts: list[str] = []
         if missing:

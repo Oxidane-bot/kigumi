@@ -124,7 +124,7 @@ _NO_ITEM = object()
 _DYNAMIC_FILES_LEDGER_FIELD = "dynamic_files_ledger"
 _DYNAMIC_FILES_LEDGER_DIGEST_FIELD = "dynamic_files_ledger_sha256"
 # Increment when key derivation, prompt-byte generation, or artifact normalization changes.
-CACHE_SCHEMA = 8
+CACHE_SCHEMA = 9
 _DEFAULT_EVIDENCE_POLICY = EvidencePolicy()
 
 # Kept as a module-level compatibility seam for callers that fault-inject the
